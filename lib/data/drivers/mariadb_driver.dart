@@ -4,7 +4,8 @@ import '../db_data.dart';
 import '../sql_row_cap.dart';
 import '../table_design.dart';
 import 'db_driver.dart';
-import 'mysql_driver.dart' show mysqlCollationNames, mysqlReadTableDesign;
+import 'mysql_driver.dart'
+    show mysqlCollationNames, mysqlReadTableDesign, openMysqlConnection;
 
 /// MariaDB 驱动(纯 Dart 实现,基于 mysql_client)。
 ///
@@ -23,18 +24,13 @@ class MariadbDriver implements DatabaseDriver {
   @override
   Future<void> connect() async {
     if (isConnected) return;
-    final conn = await MySQLConnection.createConnection(
+    _connection = await openMysqlConnection(
       host: _conn.host,
       port: int.tryParse(_conn.port) ?? 3306,
       userName: _conn.username,
       password: _conn.password,
-      databaseName:
-          _conn.database.isEmpty ? null : _conn.database,
-      // 本地 / 内网 MariaDB 通常未启用 SSL
-      secure: false,
+      databaseName: _conn.database.isEmpty ? null : _conn.database,
     );
-    await conn.connect(timeoutMs: 10000);
-    _connection = conn;
   }
 
   @override
@@ -320,15 +316,13 @@ class MariadbDriver implements DatabaseDriver {
   @override
   Future<void> killSession(int sessionId) async {
     // 主连接正被 executeQuery 的 await 占住,无法自取消 → 用第二条临时连接发 KILL
-    final killer = await MySQLConnection.createConnection(
+    final killer = await openMysqlConnection(
       host: _conn.host,
       port: int.tryParse(_conn.port) ?? 3306,
       userName: _conn.username,
       password: _conn.password,
-      secure: false,
     );
     try {
-      await killer.connect();
       await killer.execute('KILL $sessionId');
     } finally {
       await killer.close();

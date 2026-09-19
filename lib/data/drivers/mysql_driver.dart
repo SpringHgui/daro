@@ -1,3 +1,6 @@
+import 'dart:io';
+
+import 'package:mysql_client/exception.dart';
 import 'package:mysql_client/mysql_client.dart';
 
 import '../db_data.dart';
@@ -5,6 +8,83 @@ import '../db_metadata.dart';
 import '../sql_row_cap.dart';
 import '../table_design.dart';
 import 'db_driver.dart';
+
+/// 建立一条 MySQL 协议连接:优先 TLS,服务端不支持时回退明文。
+///
+/// MySQL 8 默认认证插件 `caching_sha2_password` 的密码交换只在加密通道上
+/// 进行(mysql_client 未实现 RSA 公钥交换),明文连接必然报
+/// 「Auth plugin caching_sha2_password is supported only with secure connections」;
+/// 而旧版 / 未开启 SSL 的服务器又不接受 TLS 握手。故先试 TLS,
+/// 仅在确认「TLS 不可用」时回退明文——此时服务端用的是
+/// `mysql_native_password`,明文可正常认证。
+Future<MySQLConnection> openMysqlConnection({
+  required String host,
+  required int port,
+  required String userName,
+  required String password,
+  String? databaseName,
+  int timeoutMs = 10000,
+}) async {
+  Future<MySQLConnection> attempt(bool secure) async {
+    final conn = await MySQLConnection.createConnection(
+      host: host,
+      port: port,
+      userName: userName,
+      password: password,
+      databaseName: databaseName,
+      secure: secure,
+    );
+    try {
+      await conn.connect(timeoutMs: timeoutMs);
+    } catch (_) {
+      // 握手失败时 mysql_client 已销毁 socket;这里兜住「已建立连接、
+      // 但随后的 SET 语句失败」留下的残留连接
+      if (conn.connected) {
+        try {
+          await conn.close();
+        } catch (_) {}
+      }
+      rethrow;
+    }
+    return conn;
+  }
+
+  try {
+    return await attempt(true);
+  } catch (e) {
+    if (!_tlsUnavailable(e)) rethrow;
+  }
+  try {
+    return await attempt(false);
+  } on MySQLClientException catch (e) {
+    // 服务器没开 SSL,账号又是 caching_sha2_password:两条路都走不通,
+    // 把库里的英文报错换成人能看懂的处置建议
+    if (e.message.contains('caching_sha2_password')) {
+      throw MySQLClientException(
+        '账号使用 caching_sha2_password 认证,必须走加密连接,'
+        '但服务器未启用 SSL。请在服务器上开启 SSL,'
+        '或把该账号改为 mysql_native_password 认证。',
+      );
+    }
+    rethrow;
+  }
+}
+
+/// 失败是否属于「TLS 不可用」——只有这种情况才值得回退明文重试。
+///
+/// 密码错误 / 权限不足(服务端已明确应答)必须原样抛出,否则会被一次明文
+/// 重试掩盖成误导性报错;主机不可达同理(重试只是白等一轮超时)。
+bool _tlsUnavailable(Object error) {
+  if (error is MySQLServerException) return false;
+  if (error is SocketException) return false;
+  if (error is MySQLClientException) {
+    // 认证插件不匹配:换明文也解决不了
+    return !error.message.contains('auth plugin') &&
+        !error.message.contains('caching_sha2_password');
+  }
+  // 其余(多为 TLS 握手失败:服务端只支持旧版 TLS / 证书异常等)按 TLS 不可用处理
+  return true;
+}
 
 /// MySQL 驱动(纯 Dart 实现,基于 mysql_client)。
 ///
@@ -22,18 +102,13 @@ class MysqlDriver implements DatabaseDriver {
   @override
   Future<void> connect() async {
     if (isConnected) return;
-    final conn = await MySQLConnection.createConnection(
+    _connection = await openMysqlConnection(
       host: _conn.host,
       port: int.tryParse(_conn.port) ?? 3306,
       userName: _conn.username,
       password: _conn.password,
-      databaseName:
-          _conn.database.isEmpty ? null : _conn.database,
-      // 本地 / 内网 MySQL 通常未启用 SSL
-      secure: false,
+      databaseName: _conn.database.isEmpty ? null : _conn.database,
     );
-    await conn.connect(timeoutMs: 10000);
-    _connection = conn;
   }
 
   @override
@@ -313,15 +388,13 @@ class MysqlDriver implements DatabaseDriver {
   @override
   Future<void> killSession(int sessionId) async {
     // 主连接正被 executeQuery 的 await 占住,无法自取消 → 用第二条临时连接发 KILL
-    final killer = await MySQLConnection.createConnection(
+    final killer = await openMysqlConnection(
       host: _conn.host,
       port: int.tryParse(_conn.port) ?? 3306,
       userName: _conn.username,
       password: _conn.password,
-      secure: false,
     );
     try {
-      await killer.connect();
       await killer.execute('KILL $sessionId');
     } finally {
       await killer.close();
