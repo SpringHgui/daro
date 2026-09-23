@@ -139,7 +139,7 @@ jobs:
             -Source "build\windows\x64\runner\Release" `
             -Version "${{ needs.meta.outputs.version }}" `
             -Publisher "CN=daro" `
-            -PackageName "com.example.daro"
+            -PackageName "io.github.springhgui.daro"
           $msix = Get-ChildItem -Path dist -Filter "daro-*windows-*.msix" -ErrorAction SilentlyContinue
           if (-not $msix) { Write-Error "dist 下未找到 .msix"; exit 1 }
           "打包完成: $($msix.Name) ($([math]::Round($msix.Length/1MB,1)) MB)"

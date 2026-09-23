@@ -49,7 +49,7 @@ installer\windows\build_msix.bat -Publisher "CN=daro" ^
 4. 补商店图标 + 截图（≥1 张 720p/1920×1080）+ 描述 → 提交版本。
 5. 认证通过（数小时~2 天）→ 发布。之后用户从商店安装，无 SmartScreen 拦截。
 
-> `PackageName`（清单 Identity Name，默认 `com.example.daro`）在商店内全局唯一，
+> `PackageName`（清单 Identity Name，默认 `io.github.springhgui.daro`）在商店内全局唯一，
 > 若被占用会在 Package Validation 报错——改成你自己的反向域名（如 `io.github.<你>.daro`）重打。
 
 ## ⚠️ AppData 落点（已在清单里解决，务必实测确认）
@@ -77,7 +77,7 @@ per-app 私有容器、卸载即清除。后果：① 商店版与 GitHub/绿色
 ```powershell
 # 装好并建一条连接、退出后：配置应落在真实 %APPDATA%\com.example\daro，而非 Packages 容器
 Test-Path "$env:APPDATA\com.example\daro\connections.json"          # 期望 True
-Get-ChildItem -Recurse "$env:LOCALAPPDATA\Packages\com.example.daro_*" -Filter connections.json -ErrorAction SilentlyContinue  # 期望空
+Get-ChildItem -Recurse "$env:LOCALAPPDATA\Packages\io.github.springhgui.daro_*" -Filter connections.json -ErrorAction SilentlyContinue  # 期望空
 # 卸载后重装，确认连接仍在（unvirtualizedResources 生效则不会丢）
 ```
 

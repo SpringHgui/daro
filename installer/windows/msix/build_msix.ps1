@@ -28,7 +28,7 @@ param(
     [string]$Publisher = 'CN=daro',
     # 商店里展示的发布者名（个人账号 = 注册时的 Publisher displayName）
     [string]$PublisherDisplayName = 'daro',
-    [string]$PackageName = 'com.example.daro',
+    [string]$PackageName = 'io.github.springhgui.daro',
     [string]$DisplayName = 'daro',
     [string]$Description = '高信息密度的桌面数据库管理工具',
     [string]$Out = '',

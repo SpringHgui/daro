@@ -1,4 +1,4 @@
-package com.example.daro
+package io.github.springhgui.daro
 
 import io.flutter.embedding.android.FlutterActivity
 

@@ -8,7 +8,7 @@
 
   注意：本注释里刻意不写出占位标记的字面形式（花括号井号），否则会被替换逻辑命中。
   占位标记（由 build_msix.ps1 注入实际值）及其含义：
-    PackageName        包唯一标识 Name（商店里不可与已有包冲突；一般用反向域名，如 com.example.daro）
+    PackageName        包唯一标识 Name（商店里不可与已有包冲突；一般用反向域名，如 io.github.springhgui.daro）
     Publisher          发布者主体，须与签名证书 Subject 完全一致（如 CN=daro）
     PublisherDisplayName 商店展示发布者名（个人账号 = 注册时的 Publisher displayName）
     PackageVersion     四段版本号 x.y.z.r（makeappx 要求，脚本由 pubspec 的 x.y.z 补成 x.y.z.0）

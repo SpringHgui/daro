@@ -7,7 +7,7 @@ rem 选项:
 rem   -Arch x64^|arm64      目标架构，默认 x64（arm64 只能在 arm64 主机上 flutter build）
 rem   -SkipBuild           跳过 flutter build，直接打包 build\windows\<arch>\runner\Release 现有产物
 rem   -Publisher "CN=xxx"  清单发布者主体，默认 CN=daro（须与签名证书 Subject 一致；上架时商店会覆盖）
-rem   -PackageId "com.xxx" 包唯一标识 Name，默认 com.example.daro（商店内不可与已有包冲突）
+rem   -PackageId "com.xxx" 包唯一标识 Name，默认 io.github.springhgui.daro（商店内不可与已有包冲突）
 rem   -SignPfx "<路径>"    用该 pfx 签名（本地自测用；不填则产出未签名 msix）
 rem   -SignPfxPwd "<口令>" 上述 pfx 的口令
 rem   -NoPause             结束不等待按键（CI 用）
@@ -27,7 +27,7 @@ set "SKIP_BUILD="
 set "NO_PAUSE="
 set "ARCH=x64"
 set "PUBLISHER=CN=daro"
-set "PACKAGE_ID=com.example.daro"
+set "PACKAGE_ID=io.github.springhgui.daro"
 set "SIGN_PFX="
 set "SIGN_PWD="
 :parse_args
