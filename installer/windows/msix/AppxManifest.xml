@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  daro MSIX 包清单模板。
+
+  本文件不直接使用：build_msix.ps1 会把下面正文里的占位标记替换成实际值后，
+  生成到打包布局目录里的 AppxManifest.xml，再交给 makeappx 打包。
+  所以改这里即可，改完无需手动同步别处。
+
+  注意：本注释里刻意不写出占位标记的字面形式（花括号井号），否则会被替换逻辑命中。
+  占位标记（由 build_msix.ps1 注入实际值）及其含义：
+    PackageName        包唯一标识 Name（商店里不可与已有包冲突；一般用反向域名，如 com.example.daro）
+    Publisher          发布者主体，须与签名证书 Subject 完全一致（如 CN=daro）
+    PublisherDisplayName 商店展示发布者名（个人账号 = 注册时的 Publisher displayName）
+    PackageVersion     四段版本号 x.y.z.r（makeappx 要求，脚本由 pubspec 的 x.y.z 补成 x.y.z.0）
+    Architecture       处理器架构：x64 / arm64
+    DisplayName        开始菜单/任务栏显示名
+    Description        应用简述
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap desktop6 rescap">
+
+  <Identity
+    Name="#{PackageName}"
+    Publisher="#{Publisher}"
+    Version="#{PackageVersion}"
+    ProcessorArchitecture="#{Architecture}" />
+
+  <Properties>
+    <DisplayName>#{DisplayName}</DisplayName>
+    <PublisherDisplayName>#{PublisherDisplayName}</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <!--
+      关闭 AppData 文件系统虚拟化。MSIX 默认会把打包应用（即便 runFullTrust）对
+      %APPDATA% 的新建写入重定向到 per-app 私有容器、卸载即清除——这会让 daro 的
+      connections.json / theme_custom.json / mcp_settings.json 落在容器里：
+        1) 与 GitHub/绿色版（真实 %APPDATA%\com.example\daro）不是同一份，老用户迁商店版看不到连接；
+        2) 商店版卸载时配置被清掉。
+      声明 unvirtualizedResources + FileSystemWriteVirtualization=disabled 后，这些写入
+      直接落到真实 %APPDATA%、对包外进程可见、且不随卸载清除——两个渠道天然共用同一份配置，
+      无需任何 Dart 代码改动或数据迁移。（需 Windows 10 1903 / build 18362 起，见 MinVersion。）
+    -->
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.18362.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="zh-CN" />
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Applications>
+    <!-- Flutter 桌面是 Win32 应用：EntryPoint 固定 Windows.FullTrustApplication -->
+    <Application Id="daro" Executable="daro.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="#{DisplayName}"
+        Description="#{Description}"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- runFullTrust：Win32 应用以完整权限运行（Flutter 桌面必需）。 -->
+    <rescap:Capability Name="runFullTrust" />
+    <!-- unvirtualizedResources：配合上面的 FileSystemWriteVirtualization=disabled，
+         让 AppData 写入落到真实位置、卸载不清除。见 Properties 段注释。 -->
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+
+</Package>

@@ -14,6 +14,9 @@ name: Release
 #   - Windows 一次 flutter build 出两个产物：Inno Setup 安装包 .exe 与绿色版 .zip
 #     （build_installer.bat -All；绿色版由 installer/windows/portable_zip.ps1 打包，
 #      解压得到一个带版本号的顶层目录，免安装、免管理员权限、不写注册表）。
+#   - 另有独立 job build-windows-msix：产出上架 Microsoft Store 用的 .msix（未签名，
+#     商店入库时重签）。artifact 名 msix-store 不匹配 daro-* 通配，故不进 GitHub Release，
+#     仅供从 Actions 运行页下载后提交 Partner Center。详见 installer/windows/msix/README.md。
 #   - pubspec.lock 未纳入版本控制，CI 每次 `flutter pub get` 现解析。
 #   - dart_odbc / mysql_client / sqlite3 为运行期加载系统库，编译期跨平台无碍；
 #     目标机需自行安装 ODBC / MySQL 客户端库才能用对应引擎（与 README 描述一致）。
@@ -97,6 +100,54 @@ jobs:
           path: |
             dist/daro-*windows-*.exe
             dist/daro-*windows-*-portable.zip
+          if-no-files-found: error
+
+  build-windows-msix:
+    name: Windows x64 MSIX（Microsoft Store 包）
+    needs: meta
+    runs-on: windows-latest
+    # 产出上架 Microsoft Store 用的 .msix。这里**不签名**——商店入库时会用微软证书
+    # 重签（Store signing），个人开发者无需购买代码签名证书。清单里已声明
+    # unvirtualizedResources + FileSystemWriteVirtualization=disabled，让配置落到真实
+    # %APPDATA%\com.example\daro，与 GitHub/绿色版共用、卸载不清除（见 installer/windows/msix/README.md）。
+    # 该产物不进 GitHub Release（artifact 名不匹配 daro-* 通配），仅供下载后提交 Partner Center。
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: false
+
+      - name: 依赖解析
+        run: flutter pub get
+
+      - name: 构建 Windows Release
+        run: flutter build windows --release
+
+      # build/ 未入库，MSIX 打包器依赖 build\ico\256.png 作图标母图——先跑生成用例。
+      - name: 生成图标母图 build/ico/*.png
+        run: flutter test test/app_icon_test.dart
+
+      - name: 打包 MSIX（未签名，商店重签）
+        shell: pwsh
+        run: |
+          & "${{ github.workspace }}\installer\windows\msix\build_msix.ps1" `
+            -Source "build\windows\x64\runner\Release" `
+            -Version "${{ needs.meta.outputs.version }}" `
+            -Publisher "CN=daro" `
+            -PackageName "com.example.daro"
+          $msix = Get-ChildItem -Path dist -Filter "daro-*windows-*.msix" -ErrorAction SilentlyContinue
+          if (-not $msix) { Write-Error "dist 下未找到 .msix"; exit 1 }
+          "打包完成: $($msix.Name) ($([math]::Round($msix.Length/1MB,1)) MB)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msix-store
+          path: dist/daro-*windows-*.msix
           if-no-files-found: error
 
   build-macos:
