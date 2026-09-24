@@ -21,8 +21,11 @@ name: Release
 #   - dart_odbc / mysql_client / sqlite3 为运行期加载系统库，编译期跨平台无碍；
 #     目标机需自行安装 ODBC / MySQL 客户端库才能用对应引擎（与 README 描述一致）。
 #   - macOS 未做开发者证书签名与公证，产物仅 ad-hoc 签名，用户首启需右键“打开”。
-#   - Release 正文（提交清单 + 关联 PR + Full Changelog）由 tool/gen_release_notes.py
-#     生成，本地可用 `python tool/gen_release_notes.py --tag v0.3.1 --no-pr` 预览。
+#   - Release 正文（下载表格 + 提交清单 + 关联 PR + Full Changelog）由
+#     tool/gen_release_notes.py 生成，本地可用 `python tool/gen_release_notes.py
+#     --tag v0.3.1 --no-pr` 预览。开头的下载表格按 DOWNLOAD_PLATFORMS 里写死的
+#     产物名拼 asset 下载链接，所以「校验正文里的下载链接」步骤会拿实际 artifacts
+#     逐个比对——改名漏同步时会直接让 release job 失败，而不是发出 404 链接。
 
 on:
   workflow_dispatch:
@@ -253,20 +256,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Release 正文由脚本生成：全部提交（按 Conventional Commits 分类）+ 关联 PR
-      # + Full Changelog 链接。不再用 action 的 generate_release_notes——它只统计
-      # 经 PR 合入的变更，本仓库直接推 master 的提交全会漏掉。
-      - name: 生成 Release 正文（提交 + PR）
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 tool/gen_release_notes.py \
-            --tag "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --output release_body.md
-          echo "----- release_body.md -----"
-          cat release_body.md
-
+      # 先把三平台产物拉到本地：后面生成正文时要读它们算「大小」与 SHA256，
+      # 最终上传 Release 也要用。pattern daro-* 只收三个安装包 job 的产物，
+      # 不含 msix-store（商店包，不进 Release）。
       - name: 下载全部平台的产物
         uses: actions/download-artifact@v4
         with:
@@ -276,6 +268,48 @@ jobs:
 
       - name: 列出待上传文件
         run: ls -R artifacts
+
+      # Release 正文由脚本生成：开头是各平台安装包下载表格（链接直指本次 Release
+      # 的 asset）+ 大小列，随后是完整 SHA256 校验和表、GitHub 自动生成的源码归档表，
+      # 再后面是全部提交（按 Conventional Commits 分类）+ 关联 PR + Full Changelog 链接。
+      # 不再用 action 的 generate_release_notes——它只统计经 PR 合入的变更，本仓库
+      # 直接推 master 的提交全会漏掉。
+      # --version 传 pubspec 解析出的版本号（安装包文件名用它拼，tag 只决定发不发 Release）；
+      # --artifacts-dir 指向刚下载的产物目录，用于填充大小列与 SHA256 表
+      # （目录不存在时这两块自动省略，不至于让发布失败）。
+      - name: 生成 Release 正文（下载表格 + 提交 + PR）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 tool/gen_release_notes.py \
+            --tag "${{ github.ref_name }}" \
+            --version "${{ needs.meta.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --artifacts-dir artifacts \
+            --output release_body.md
+          echo "----- release_body.md -----"
+          cat release_body.md
+
+      # 正文里的下载链接是「按约定拼出来的」，不是从 artifacts 列出来的。
+      # 产物改名 / 某个平台构建失败漏传时，链接会指向不存在的 asset（GitHub 上表现为
+      # 404）。这里把正文里出现的每个文件名与 artifacts 实际内容比对，不合格就中断发布。
+      - name: 校验正文里的下载链接
+        run: |
+          set -euo pipefail
+          missing=0
+          while read -r name; do
+            [ -z "$name" ] && continue
+            if [ ! -f "artifacts/$name" ]; then
+              echo "::error::$name 出现在正文里，但 artifacts 中没有这个文件"
+              missing=1
+            else
+              echo "OK  $name"
+            fi
+          done < <(grep -oE 'releases/download/[^/]+/[A-Za-z0-9._-]+' release_body.md | sed 's|.*/||' | sort -u)
+          if [ "$missing" -ne 0 ]; then
+            echo "正文与实际产物不一致：产物改名后需同步 tool/gen_release_notes.py 的 DOWNLOAD_PLATFORMS。"
+            exit 1
+          fi
 
       - name: 创建 Draft Release
         uses: softprops/action-gh-release@v2

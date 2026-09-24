@@ -122,11 +122,19 @@ git push origin v0.2.0
 
 - 打 `v*` tag：构建三平台 → 汇总成一个 **Draft Release**（预填变更说明，人工确认后手动
   Publish，避免误发）。
-- Release 正文由 `tool/gen_release_notes.py` 自动生成：取「上一个 tag → 当前 tag」的全部
-  提交，按 Conventional Commits 前缀（feat / fix / chore …）分节，逐个提交反查它归属的
-  PR 编号与作者，末尾补上 `Full Changelog` 比对链接。GitHub 自带的
-  `generate_release_notes` 只统计经 PR 合入的变更，直接推到 master 的提交会被漏掉，故弃用。
-  本地预览：`python tool/gen_release_notes.py --tag v0.3.1 --no-pr`（`--no-pr` 跳过联网查询）。
+- Release 正文由 `tool/gen_release_notes.py` 自动生成，自上而下三块：
+  1. **下载表格**：平台 × 安装包 / 绿色版的矩阵，链接直接指向本次 Release 的 asset
+     （`releases/download/<tag>/<文件名>`），文件名由 `--version` 传入的版本号拼出；
+  2. 取「上一个 tag → 当前 tag」的全部提交，按 Conventional Commits 前缀
+     （feat / fix / chore …）分节，逐个提交反查它归属的 PR 编号与作者；
+  3. 末尾补上 `Full Changelog` 比对链接。
+
+  GitHub 自带的 `generate_release_notes` 只统计经 PR 合入的变更，直接推到 master 的提交会被
+  漏掉，故弃用。本地预览：`python tool/gen_release_notes.py --tag v0.3.1 --no-pr`
+  （`--no-pr` 跳过联网查询，`--no-downloads` 可关掉下载表格）。
+- 下载表格里的产物名写在脚本的 `DOWNLOAD_PLATFORMS` 常量里，必须与三个打包脚本的实际产物
+  一致。`release.yml` 的「校验正文里的下载链接」步骤会拿实际 artifacts 逐个比对，改名漏同步
+  会让 release job 直接失败，而不是发出一个 404 的下载链接。
 - 只想试跑：在 Actions 页面手动 `Run workflow`（`workflow_dispatch`），产物以 artifacts
   形式保留，不建 Release。
 

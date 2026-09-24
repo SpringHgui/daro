@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""生成 GitHub Release 正文：全部提交 + 关联 PR + Full Changelog 链接。
+"""生成 GitHub Release 正文：各平台下载表格 + 全部提交 + 关联 PR + Full Changelog 链接。
 
 为什么需要它
 ------------
@@ -9,25 +9,31 @@ GitHub 自带的 `generate_release_notes` 只统计「经由 PR 合入的变更�
 空无一物（见 0.3.1 Draft）。
 
 本脚本改为以 git 提交为唯一准绳：
-  1. 取上一个 tag → 当前 tag 的全部提交（默认排除 merge commit）；
-  2. 按 Conventional Commits 前缀（feat/fix/chore…）归类成分节；
-  3. 逐个提交反查 GitHub API，把它归属的 PR 编号 / 标题 / 作者补进来；
-  4. 末尾补回 `**Full Changelog**: .../compare/<prev>...<tag>` 链接。
+  1. 正文开头先给一张「平台 × 安装包/绿色版」的下载表格（链接直指本 Release 的
+     asset，文件名由版本号拼出，见 DOWNLOAD_PLATFORMS）；
+  2. 取上一个 tag → 当前 tag 的全部提交（默认排除 merge commit）；
+  3. 按 Conventional Commits 前缀（feat/fix/chore…）归类成分节；
+  4. 逐个提交反查 GitHub API，把它归属的 PR 编号 / 标题 / 作者补进来；
+  5. 末尾补回 `**Full Changelog**: .../compare/<prev>...<tag>` 链接。
 
 用法
 ----
     python3 tool/gen_release_notes.py --tag v0.3.1 --output release_body.md
     python3 tool/gen_release_notes.py --tag v0.3.1 --prev v0.3.0     # 显式指定区间
     python3 tool/gen_release_notes.py --tag v0.3.1 --no-pr           # 离线：跳过 PR 反查
+    python3 tool/gen_release_notes.py --tag v0.3.1 --no-downloads    # 不要下载表格
 
 参数（除 --tag 外均可省略）
     --tag      当前发布的 tag（默认取 GITHUB_REF_NAME，再退回 `git describe --tags`）
+    --version  不带 v 的版本号（= pubspec.yaml 的 version），用来拼安装包文件名；
+               默认去掉 --tag 的 v 前缀。CI 从 pubspec 解析后显式传入
     --prev     上一个 tag；省略则用 `git describe --tags --abbrev=0 <tag>^` 自动推断，
                推断不到（首个 release）则用全量历史、且不输出 compare 链接
     --repo     owner/repo，默认取 GITHUB_REPOSITORY，再退回 origin 远程地址解析
     --output   写入的文件路径（UTF-8 / LF）；省略则打印到 stdout
     --token    GitHub token，默认取 GITHUB_TOKEN / GH_TOKEN；没有则走匿名查询（限流更低）
     --no-pr    完全不调用 GitHub API（PR 信息留空）
+    --no-downloads  不输出开头的下载表格
 
 退出码
 ------
@@ -39,6 +45,7 @@ GitHub 自带的 `generate_release_notes` 只统计「经由 PR 合入的变更�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -68,6 +75,59 @@ TYPE_GROUPS: List[Tuple[Tuple[str, ...], str]] = [
     (("chore",), "🔧 杂项"),
 ]
 OTHER_HEADING = "📌 其它变更"
+
+# ---------- 下载表格 ----------
+# 放在正文最前面（紧跟摘要行），让来访者先拿到安装包再往下看变更清单。
+# 文件名里的 {ver} 是不带 v 前缀的版本号（取自 pubspec.yaml，不是 tag）。
+# ⚠️ 这些文件名必须与 installer/ 下三个打包脚本的实际产物逐字一致：
+#      installer/windows/build_installer.bat   → -windows-x64.exe / -windows-x64-portable.zip
+#      installer/macos/make_dmg.sh             → -macos-universal.dmg / .zip
+#      installer/linux/package_linux.sh        → -linux-amd64.deb / -linux-x64.tar.xz
+#    改产物名时这里必须同步，否则 Release 里的链接会 404。
+#    release.yml 的「校验正文里的下载链接」步骤会拿实际 artifacts 逐个比对兜底。
+DOWNLOAD_COLUMNS = ("平台", "架构", "安装包", "便携 / 免安装")
+
+DOWNLOAD_PLATFORMS = [
+    (
+        "Windows",
+        "x64 (64-bit)",
+        ("EXE", "daro-{ver}-windows-x64.exe"),
+        ("ZIP", "daro-{ver}-windows-x64-portable.zip"),
+    ),
+    (
+        "macOS",
+        "universal (x64 + arm64)",
+        ("DMG", "daro-{ver}-macos-universal.dmg"),
+        ("ZIP", "daro-{ver}-macos-universal.zip"),
+    ),
+    (
+        "Linux",
+        "x64 (amd64)",
+        ("DEB", "daro-{ver}-linux-amd64.deb"),
+        ("TAR.XZ", "daro-{ver}-linux-x64.tar.xz"),
+    ),
+]
+
+DOWNLOAD_NOTES = [
+    "**Windows**：安装包需管理员权限；绿色版 ZIP 解压即用、不写注册表，适合放 U 盘或免装环境。",
+    "**macOS**：产物仅 ad-hoc 签名、未公证，首次打开请右键 →「打开」。",
+    "**Linux**：需系统库 `libgtk-3` / `libsqlite3`；`.deb` 面向 Debian / Ubuntu 系，`tar.xz` 解压后直接运行。",
+]
+
+# GitHub 为每个 tag 自动生成的源码归档（不进 artifacts、不由我们上传，
+# 但永远可用，故单独成表，且链接形如 archive/refs/tags/…、不参与
+# release.yml「校验正文里的下载链接」那道 releases/download/ 比对）。
+SOURCE_ARCHIVES = [
+    ("ZIP", "https://github.com/{repo}/archive/refs/tags/{tag}.zip"),
+    ("TAR.GZ", "https://github.com/{repo}/archive/refs/tags/{tag}.tar.gz"),
+]
+
+# Windows 的 Microsoft Store 渠道：.msix 由独立 job 产出、不进 GitHub Release
+# （artifact 名 msix-store 不匹配 daro-* 通配），这里只做说明，不给会 404 的链接。
+MSIX_NOTE = (
+    "**Microsoft Store**：Windows 另提供商店版 `.msix`（未签名，入库时由微软重签）。"
+    "从 Actions 运行页下载 `msix-store` 产物后提交 Partner Center。"
+)
 
 _CONVENTIONAL = re.compile(
     r"^(?P<type>[a-zA-Z]+)"
@@ -154,6 +214,15 @@ def resolve_tag(explicit: Optional[str], cwd: str) -> str:
     # 校验 tag 是否真实存在于仓库中
     _git(["rev-parse", "--verify", "refs/tags/" + tag], cwd=cwd)
     return tag
+
+
+def resolve_version(explicit: Optional[str], tag: str) -> str:
+    """下载表格里用的是「不带 v 前缀」的版本号（= pubspec.yaml 的 version）。
+    优先用 --version 显式传入（CI 从 pubspec 解析后传进来，最权威），
+    否则退化为「去掉 tag 的 v 前缀」——v0.3.1 → 0.3.1。"""
+    if explicit:
+        return explicit.strip()
+    return tag[1:] if tag[:1] in ("v", "V") else tag
 
 
 def resolve_prev(tag: str, explicit: Optional[str], cwd: str) -> Optional[str]:
@@ -249,12 +318,117 @@ def _title_for(ctype: str) -> str:
     return OTHER_HEADING
 
 
+def _human_size(n: int) -> str:
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024 or unit == "TB":
+            if unit == "B":
+                return "{} B".format(int(f))
+            return "{:.1f} {}".format(f, unit)
+        f /= 1024
+    return "{:.1f} TB".format(f)
+
+
+def _artifact_stats(filename: str, artifacts_dir: str) -> Tuple[str, str]:
+    """读本地 artifacts 目录，返回 (可读大小, sha256)；文件缺失则 ('—', '—')。"""
+    path = os.path.join(artifacts_dir, filename)
+    if not os.path.isfile(path):
+        return ("—", "—")
+    try:
+        size = os.path.getsize(path)
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return (_human_size(size), h.hexdigest())
+    except OSError:
+        return ("—", "—")
+
+
+def _join2(a: str, b: str) -> str:
+    return "<br>".join(x for x in (a, b) if x and x != "—") or "—"
+
+
+def render_downloads(
+    version: str, tag: str, repo: str, artifacts_dir: str = ""
+) -> List[str]:
+    """渲染「各平台安装包」表格 + 校验和表 + 源码表。
+
+    - repo 为空时退化为纯文件名（不带链接）；
+    - artifacts_dir 存在且有文件时，主表加「大小」列，并额外渲染一张完整 SHA256 表；
+      本地预览（无 artifacts）则省略这两块，只给链接。
+    """
+
+    def cell(label: str, filename: str) -> str:
+        name = filename.format(ver=version)
+        if not repo:
+            return "`{}`".format(name)
+        url = "https://github.com/{}/releases/download/{}/{}".format(repo, tag, name)
+        if artifacts_dir and os.path.isdir(artifacts_dir):
+            size, _sha = _artifact_stats(name, artifacts_dir)
+            suffix = "<br><sub>{}</sub>".format(size) if size != "—" else ""
+            return "[{}]({}){}".format(label, url, suffix)
+        return "[{}]({})".format(label, url)
+
+    has_artifacts = bool(artifacts_dir) and os.path.isdir(artifacts_dir)
+
+    columns = list(DOWNLOAD_COLUMNS)
+    if has_artifacts:
+        columns = columns + ["大小"]
+
+    lines = ["### 📦 下载", ""]
+    lines.append("| " + " | ".join(columns) + " |")
+    lines.append("|" + "---|" * len(columns))
+    for platform, arch, installer, portable in DOWNLOAD_PLATFORMS:
+        row = [platform, arch, cell(*installer), cell(*portable)]
+        if has_artifacts:
+            s1, _ = _artifact_stats(installer[1].format(ver=version), artifacts_dir)
+            s2, _ = _artifact_stats(portable[1].format(ver=version), artifacts_dir)
+            row.append(_join2(s1, s2))
+        lines.append("| " + " | ".join(row) + " |")
+    lines.append("")
+    for note in DOWNLOAD_NOTES:
+        lines.append("> - " + note)
+    lines.append("> - " + MSIX_NOTE)
+    lines.append("")
+
+    if has_artifacts:
+        lines.append("### 🔐 校验和 (SHA256)")
+        lines.append("")
+        lines.append("| 文件 | SHA256 |")
+        lines.append("|---|---|")
+        for _platform, _arch, installer, portable in DOWNLOAD_PLATFORMS:
+            for _label, fname in (installer, portable):
+                name = fname.format(ver=version)
+                _size, sha = _artifact_stats(name, artifacts_dir)
+                lines.append("| `{}` | `{}` |".format(name, sha if sha != "—" else ""))
+        lines.append("")
+
+    # 源码归档：GitHub 自动生成，永远可用，单独成表（链接走 archive/refs/tags/）。
+    if repo:
+        lines.append("### 📄 源码")
+        lines.append("")
+        lines.append("| 归档 | 链接 |")
+        lines.append("|---|---|")
+        for label, tpl in SOURCE_ARCHIVES:
+            url = tpl.format(repo=repo, tag=tag)
+            lines.append(
+                "| Source code ({}) | [{}]({}) |".format(label.lower(), label, url)
+            )
+        lines.append("")
+
+    return lines
+
+
 def render(
     tag: str,
     prev: Optional[str],
     repo: str,
     commits: List[Commit],
     pr_lookup_ran: bool,
+    version: Optional[str] = None,
+    with_downloads: bool = True,
+    artifacts_dir: str = "",
 ) -> str:
     lines = []  # type: List[str]
     lines.append("<!-- 自动生成：tool/gen_release_notes.py，请勿手工维护 -->")
@@ -275,6 +449,14 @@ def render(
         summary += "（首个发布，区间截至 `{}`）".format(tag)
     lines.append(summary + "。")
     lines.append("")
+
+    # 下载表格紧跟摘要行：访客第一眼就能拿到安装包，不必翻到正文末尾。
+    if with_downloads:
+        lines.extend(
+            render_downloads(
+                version or resolve_version(None, tag), tag, repo, artifacts_dir
+            )
+        )
 
     breaking = [c for c in commits if c.breaking]
 
@@ -343,14 +525,28 @@ def _render_commit(c: Commit, link: str) -> str:
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="生成 GitHub Release 正文（提交清单 + 关联 PR + Full Changelog）",
+        description="生成 GitHub Release 正文（下载表格 + 提交清单 + 关联 PR + Full Changelog）",
     )
     p.add_argument("--tag", help="当前发布的 tag，默认 GITHUB_REF_NAME 或 git describe")
+    p.add_argument(
+        "--version",
+        help="不带 v 的版本号（= pubspec.yaml 的 version），用于拼安装包文件名；"
+        "默认去掉 --tag 的 v 前缀",
+    )
     p.add_argument("--prev", help="上一个 tag；默认自动推断，传空串表示按首个发布处理")
     p.add_argument("--repo", help="owner/repo，默认 GITHUB_REPOSITORY 或 origin 地址")
     p.add_argument("--output", help="输出文件路径（UTF-8 / LF）；省略则打到 stdout")
     p.add_argument("--token", help="GitHub token，默认 GITHUB_TOKEN / GH_TOKEN")
     p.add_argument("--no-pr", action="store_true", help="跳过 GitHub API，正文不含 PR 信息")
+    p.add_argument(
+        "--no-downloads", action="store_true", help="不输出开头的「各平台安装包」下载表格"
+    )
+    p.add_argument(
+        "--artifacts-dir",
+        default="artifacts",
+        help="产物目录（CI 下载 artifacts 后传入），用于填充「大小」列与 SHA256 表；"
+        "目录不存在时这两块自动省略（本地预览常见）",
+    )
     return p.parse_args(argv)
 
 
@@ -373,6 +569,7 @@ def main(argv: List[str]) -> int:
         print("[gen_release_notes] 错误：{}".format(exc), file=sys.stderr)
         return 2
 
+    version = resolve_version(args.version, tag)
     repo = resolve_repo(args.repo, cwd)
     rev_range = "{}..{}".format(prev, tag) if prev else tag
     commits = collect_commits(rev_range, cwd)
@@ -399,7 +596,16 @@ def main(argv: List[str]) -> int:
         for c in commits:
             fetch_pr(c, repo, token, state)
 
-    body = render(tag, prev, repo, commits, pr_lookup_ran)
+    body = render(
+        tag,
+        prev,
+        repo,
+        commits,
+        pr_lookup_ran,
+        version=version,
+        with_downloads=not args.no_downloads,
+        artifacts_dir=args.artifacts_dir,
+    )
 
     if args.output:
         with open(args.output, "w", encoding="utf-8", newline="\n") as fh:
