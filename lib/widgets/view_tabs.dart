@@ -41,14 +41,26 @@ class ViewTabs extends StatelessWidget {
         // 延迟到下一帧再同步,避免鼠标事件处理期间触发 setState
         onChanged: (index) => WidgetsBinding.instance
             .addPostFrameCallback((_) => _activate(context, index)),
-        // 选中标签用内容底色 background(纯白),条底用 surface(面板灰),
-        // 让选中的白标签在灰条上明显"浮起";未选中标签回落到条底灰,
-        // 对比清晰。旧写法选中=surface、条底=background,在 surface==control
-        // 的纸白 / 暗色主题下对比几乎消失(仅差约 5 级),看起来像没切换。
-        tabBarColor: t.surface,
-        selectedTabColor: t.background,
+        // 对照 Navicat:选中的标签是灰、未选中是白、标签条最右侧没有标签的
+        // 区域也是白。TabControl 把 tabBarColor 同时用作「未选中标签」和
+        // 「标签条右侧空白区」的底色,selectedTabColor 只覆盖选中标签,
+        // 因此:条底 / 未选中 = background(白),选中 = secondary(#F1F1F1,灰,
+        // 接近 Navicat 的 #F0F0F0);悬停也落到 secondary 灰,提示可点击。
+        //
+        // 未选中标签额外**钉死**成 background:不给 unselectedTabColor 时组件
+        // 会做"向面色提亮一档",而 daro 的 surfaceColor 就等于 background,
+        // 提亮结果落在 #FCFCFC 这类近白上,白得不利落、整条标签发脏。纯白底
+        // 标签条必须给"纯白",不能靠混合算出来。
+        // 标签之间的分隔线由组件统一用控件边线(#D0D0D0)画,否则压在纯白标签
+        // 上的通用细线(#E7E7E7)几乎看不见,一排白标签会糊成一片。
+        tabBarColor: t.background,
+        selectedTabColor: t.secondary,
+        unselectedTabColor: t.background,
         hoverTabColor: t.secondary,
         barHeight: _kTabBarHeight,
+        // "对象"页是应用主入口,固定在条首、不参与滚动:打开的标签再多也
+        // 不用一路滚回最左才能回到对象面板(与 Navicat 的固定首页标签一致)。
+        pinnedCount: 1,
         // 纯标签条场景:不需要内容区
         contentPadding: EdgeInsets.zero,
         tabs: [
