@@ -243,12 +243,16 @@ class _ObjectPanelState extends State<ObjectPanel> {
         category == ObjectCategory.procedure;
 
     final stripTokens = _toolbarTokens(t);
+    // 搜索框底色随工具条走灰(secondary),但 surfaceColor 不能动 —— ToolStrip
+    // 下拉项的 hover 文字色依赖 surfaceColor(浅色才能压在强调色上);这里只给
+    // 搜索框单独一份 surfaceColor = t.secondary,使输入框灰底融进灰工具条。
+    final searchTokens = stripTokens.copyWith(surfaceColor: t.secondary);
 
     return ToolStrip(
       tokens: stripTokens,
       trailing: ExpandableSearch(
         key: ValueKey('$connection|$database|$category'),
-        tokens: stripTokens,
+        tokens: searchTokens,
         onChanged: (v) => setState(() => _objectSearchText = v.toLowerCase()),
       ),
       items: [
@@ -584,13 +588,14 @@ class _ObjectPanelState extends State<ObjectPanel> {
     );
   }
 
-  /// 对象面板工具栏的 tokens:底色取**内容区同色**(t.background)而不是铬件灰。
+  /// 对象面板工具栏的 tokens:底色取灰(t.secondary,明亮主题 #F1F1F1,
+  /// 与 Navicat 对象面板工具条的 #F0F0F0 对齐),而不是早先的"与正文同白"。
   ///
-  /// 面板宽度只有两百来逻辑像素,工具栏是铺满整宽的一条实心色带——用 t.surface
-  /// 时它在窄面板里视觉权重很高,整块面板读起来就"发灰"(实测同一屏里
-  /// 面板正文 99.5% 是 #FFFFFF,唯一压暗面板的就是这条带子)。
-  /// 改为与正文同色后,面板从标签条到列表都由发丝线分区、底色连成一张白纸,
-  /// hover / pressed 仍按该底色派生(暗色提亮、亮色加深),交互反馈不受影响。
+  /// 之前为规避窄面板"整条带子发灰"刻意用白底;但对比 Navicat 可见其工具条
+  /// 本就是灰底、列表才是白底,白底工具条反而和参考图差异明显。改回灰底后,
+  /// 面板从标签条到列表形成"灰工具条 + 白领区"的标准桌面布局;搜索框也随
+  /// 工具条走灰(见 [_buildToolbar] 里的 searchTokens),边框线仍把输入框勾勒
+  /// 出来。hover / pressed 在该灰底上派生(暗色提亮、亮色加深),交互反馈不变。
   DesktopTokens _toolbarTokens(AppPalette t) {
     final isDark = t.background.computeLuminance() < 0.5;
     final hoverBlend =
@@ -598,9 +603,9 @@ class _ObjectPanelState extends State<ObjectPanel> {
     final pressedBlend =
         isDark ? Colors.white.withValues(alpha: 0.14) : Colors.black.withValues(alpha: 0.14);
     return t.desktopTokensFor(context).copyWith(
-      controlColor: t.background,
-      controlHoverColor: Color.alphaBlend(hoverBlend, t.background),
-      controlPressedColor: Color.alphaBlend(pressedBlend, t.background),
+      controlColor: t.secondary,
+      controlHoverColor: Color.alphaBlend(hoverBlend, t.secondary),
+      controlPressedColor: Color.alphaBlend(pressedBlend, t.secondary),
       // 尺寸令牌一并收紧:条高 = controlHeight + compactSpacing * 2 ≈ 28
       controlHeight: 22,
       compactSpacing: 3,
@@ -1010,13 +1015,15 @@ class _ObjectPanelState extends State<ObjectPanel> {
     );
   }
 
-  /// 列表模式表头:与数据行共用 [_listColumns],列起点严格对齐
+  /// 列表模式表头:与数据行共用 [_listColumns],列起点严格对齐。
+  /// 底色取 secondary(灰),与上方工具条连成统一的灰色控制区,
+  /// 下方数据行才是白底 —— 对齐 Navicat 的"灰头 + 白领"。
   Widget _listHeader(AppPalette t) {
     return SizedBox(
       height: _listHeaderHeight,
       child: DecoratedBox(
         decoration: BoxDecoration(
-          color: t.surface,
+          color: t.secondary,
           border: Border(bottom: BorderSide(color: t.divider)),
         ),
         child: _listColumns(
