@@ -116,14 +116,22 @@ class Ribbon extends StatelessWidget {
     // 使「实体化视图」等长标签在 66px 内容宽内单行放下、且外框比默认更窄。
     final t = Tokens.of(context);
     final dt = TokenScope.maybeOf(context) ?? DesktopTokens.winForm;
+    // padding / decoration 必须**恒定非空**:Container 在 active 与否时要产出
+    // 同一棵子树形状(DecoratedBox > Padding > Button)。否则 active 从 false→true
+    // 时 Container.build 的返回值会从「直接就是 Button」变成「DecoratedBox 套
+    // Padding 再套 Button」,子槽位的运行时类型一变,Flutter 只能销毁旧的 Button
+    // element、重建一份新 State 与新 FocusNode;而「按下即 requestFocus」刚把焦点
+    // 交给这个旧节点,旧节点一销毁焦点就回退到上一个聚焦过的按钮 —— 症状即
+    // 「点了函数,却还是新建查询带着焦点圈」。恒定包裹后,按钮的 State / FocusNode
+    // 跨 active 切换存活,焦点稳稳留在被点的那一个。视觉不变(未选中时零内边距、
+    // 透明底色与原来直接返回 Button 等价)。
     return Container(
-      padding: active ? const EdgeInsets.only(bottom: 2) : null,
-      decoration: active
-          ? BoxDecoration(
-              color: Color.alphaBlend(
-                  t.accent.withValues(alpha: 0.16), t.control),
-            )
-          : null,
+      padding: active ? const EdgeInsets.only(bottom: 2) : EdgeInsets.zero,
+      decoration: BoxDecoration(
+        color: active
+            ? Color.alphaBlend(t.accent.withValues(alpha: 0.16), t.control)
+            : Colors.transparent,
+      ),
       child: Button(
         text: text,
         variant: ButtonVariant.ghost,
