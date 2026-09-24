@@ -41,10 +41,12 @@ class ViewTabs extends StatelessWidget {
         // 延迟到下一帧再同步,避免鼠标事件处理期间触发 setState
         onChanged: (index) => WidgetsBinding.instance
             .addPostFrameCallback((_) => _activate(context, index)),
-        // 选中标签用 surface(与内容区同底),悬浮用 secondary,
-        // 与 app 标题栏/标签栏配色一致
-        tabBarColor: t.background,
-        selectedTabColor: t.surface,
+        // 选中标签用内容底色 background(纯白),条底用 surface(面板灰),
+        // 让选中的白标签在灰条上明显"浮起";未选中标签回落到条底灰,
+        // 对比清晰。旧写法选中=surface、条底=background,在 surface==control
+        // 的纸白 / 暗色主题下对比几乎消失(仅差约 5 级),看起来像没切换。
+        tabBarColor: t.surface,
+        selectedTabColor: t.background,
         hoverTabColor: t.secondary,
         barHeight: _kTabBarHeight,
         // 纯标签条场景:不需要内容区
