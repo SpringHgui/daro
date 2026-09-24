@@ -1,9 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <!-- 连接分组(折叠态):实心文件夹,背板 + 左上标签深金、前面板亮金,
-       外缘一条暗金细描边把轮廓在明亮 / 暗黑主题下都立住(参考 Navicat 连接分组图标) -->
-  <path d="M4.6 4.4h4.9l1.9 2.4h8a2.2 2.2 0 0 1 2.2 2.2v1.4H2.4V6.6a2.2 2.2 0 0 1 2.2-2.2z" fill="#d98e1f"/>
-  <rect x="2.4" y="8" width="19.2" height="12" rx="2.2" fill="#f7c64b"/>
-  <rect x="2.4" y="8" width="19.2" height="1.9" rx=".95" fill="#ffdd7a"/>
-  <path d="M4.6 4.4h4.9l1.9 2.4h8a2.2 2.2 0 0 1 2.2 2.2" fill="none" stroke="#a8690f" stroke-width=".9" opacity=".5"/>
-  <rect x="2.4" y="8" width="19.2" height="12" rx="2.2" fill="none" stroke="#a8690f" stroke-width=".9" opacity=".45"/>
+  <defs>
+    <linearGradient id="cgBack" x1="12" y1="4.4" x2="12" y2="12" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#eeb04a"/>
+      <stop offset="1" stop-color="#e29a2e"/>
+    </linearGradient>
+    <linearGradient id="cgFront" x1="12" y1="8.4" x2="12" y2="19.8" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fdd264"/>
+      <stop offset="1" stop-color="#f7c247"/>
+    </linearGradient>
+  </defs>
+  <!-- 连接分组：哑光金色文件夹(参考 Windows 资源管理器)。背板带左上标签、
+       深一档琥珀金；前面板浅金近纯色，仅极轻的纵向渐变，无高光带、几乎无描边 -->
+  <path d="M4.3 4.4h4.8c.6 0 1.17.29 1.52.78l1.05 1.5c.35.5.92.78 1.52.78h6.29A2.3 2.3 0 0 1 21.8 9.8v7.2a1.7 1.7 0 0 1-1.7 1.7H3.9a1.7 1.7 0 0 1-1.7-1.7V6.7a2.3 2.3 0 0 1 2.1-2.3z"
+        fill="url(#cgBack)"/>
+  <rect x="2.5" y="8.4" width="19" height="11.4" rx="2.1" fill="url(#cgFront)"/>
+  <rect x="2.5" y="8.4" width="19" height="11.4" rx="2.1" fill="none" stroke="#c98a1e" stroke-width=".5" stroke-opacity=".28"/>
 </svg>
