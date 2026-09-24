@@ -708,11 +708,14 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
   }
 
   /// 工具栏:保存 | 预览 解释 视图创建工具 美化 SQL [规则页:添加/删除规则] … 全屏
+  ///
+  /// 底色取 secondary(栏底灰),与文档标签条里**选中标签**的底色一致 ——
+  /// 本行紧贴标签条、选中的标签底边开放,同色才能连成一整块,不留接缝。
   Widget _toolbar(AppPalette t) {
     const blue = Color(0xff1f6feb);
     return Container(
       height: 34,
-      color: t.control,
+      color: t.secondary,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(
         children: [

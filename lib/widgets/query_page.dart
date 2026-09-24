@@ -546,10 +546,15 @@ class _QueryPageState extends State<QueryPage> {
 
   // 顶部工具栏:保存 / 查询创建工具 / 美化SQL / 代码段 / 创建图表
   // (运行 / 停止 / 解释在下方运行上下文栏右侧,同查询页布局)
+  //
+  // 底色取 secondary(栏底灰)而不是 control(控件底):本行紧贴文档标签条,
+  // 而选中的标签就是 secondary 且**底边开放**(不画下边框),两者同色才能连成
+  // 一整块、不留接缝 —— Navicat 里标签条上/下那两行同样是 #F0F0F0。
+  // 用 control(#F8F8F8,本就是输入框/按钮的底)会与标签差一档灰,露出"色差"。
   Widget _toolbar(AppPalette t) {
     return Container(
       height: 34,
-      color: t.control,
+      color: t.secondary,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(
         children: [

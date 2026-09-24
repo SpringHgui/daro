@@ -519,11 +519,14 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
   }
 
   /// 工具栏:保存 / 运行 / 停止 / 调试 / 查找 / 自动换行
+  ///
+  /// 底色取 secondary(栏底灰),与文档标签条里**选中标签**的底色一致 ——
+  /// 本行紧贴标签条、选中的标签底边开放,同色才能连成一整块,不留接缝。
   Widget _toolbar(AppPalette t) {
     final c = AppColors.of(context);
     return Container(
       height: 34,
-      color: t.control,
+      color: t.secondary,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(
         children: [
