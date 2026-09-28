@@ -738,7 +738,10 @@ class PgsqlDriver implements DatabaseDriver {
       "CASE WHEN con.contype IN ('c', 'x') THEN pg_get_constraintdef(con.oid) "
       'END, '
       // 约束注释(`COMMENT ON CONSTRAINT`):设计表的外键「注释」列需回显
-      "shobj_description(con.oid, 'pg_constraint') "
+      "shobj_description(con.oid, 'pg_constraint'), "
+      // NO INHERIT 标记:pg_get_constraintdef 会把它拼进定义,但定义串还要
+      // 用来取表达式,单独读列比再解析一遍尾巴可靠。
+      'con.conconnoinherit '
       'FROM pg_constraint con '
       'JOIN pg_class cl ON cl.oid = con.conrelid '
       'JOIN pg_namespace nc ON nc.oid = cl.relnamespace '
@@ -779,17 +782,20 @@ class PgsqlDriver implements DatabaseDriver {
             DesignCheck(
                 name: name,
                 expression: _checkExpr(def),
+                noInherit: _boolOf(_text(row[13])),
                 comment: _text(row[12])),
           );
         case 'x':
-          final def = _text(row[11]);
-          final m = RegExp(r'^EXCLUDE\s+USING\s+(\w+)\s*\((.*)\)$',
-                  caseSensitive: false)
-              .firstMatch(def);
+          final parsed = parsePgExcludeDef(_text(row[11]));
           design.excludes.add(DesignExclude(
             name: name,
-            method: m?.group(1) ?? '',
-            columns: m?.group(2) ?? def,
+            method: parsed.method,
+            columns: parsed.elements,
+            predicate: parsed.predicate,
+            deferrable: _text(row[9]).isEmpty
+                ? ''
+                : (_text(row[9]) == 't' ? 'YES' : 'NO'),
+            deferred: _text(row[10]) == 't' ? 'YES' : 'NO',
             comment: _text(row[12]),
           ));
       }
@@ -852,7 +858,10 @@ class PgsqlDriver implements DatabaseDriver {
       'WHERE ih.inhrelid = c.oid), '
       '(SELECT ic.relname FROM pg_index ci JOIN pg_class ic '
       'ON ic.oid = ci.indexrelid WHERE ci.indrelid = c.oid '
-      'AND ci.indisclustered LIMIT 1) '
+      'AND ci.indisclustered LIMIT 1), '
+      // 表级存储参数(`WITH (...)`):整组取回,界面「选项」按清单逐项回显,
+      // 清单外的项(如服务端新加的 reloption)也原样保留
+      'c.reloptions '
       'FROM pg_class c '
       'JOIN pg_namespace nc ON nc.oid = c.relnamespace '
       "WHERE nc.nspname = $sch AND c.relname = $tbl "
@@ -868,6 +877,73 @@ class PgsqlDriver implements DatabaseDriver {
       design.owner = _text(row[4]);
       design.inherits = _text(row[5]);
       design.cluster = _text(row[6]);
+      for (final o in (row[7] as List? ?? const <Object>[])) {
+        final e = o.toString();
+        final eq = e.indexOf('=');
+        if (eq <= 0) continue;
+        design.setStorageOption(e.substring(0, eq).trim(), e.substring(eq + 1).trim());
+      }
+    }
+
+    // ── 触发器 ────────────────────────────────────────────────
+    // 只取用户触发器(`NOT tgisinternal`):外键自动生成的
+    // `RI_ConstraintTrigger_*` 由约束自身表达,放进设计器会变成一堆
+    // 用户没写过的行,而且删约束时它们会跟着消失(反查与依赖页的口径一致)。
+    //
+    // 用 `pg_get_triggerdef(oid, true)` 拿规范化 DDL 再反解析,而不是逐列读
+    // `tgtype` 位掩码:位掩码要自己拼 BEFORE/AFTER/INSTEAD OF + 七个事件位,
+    // 拼错了不报错、只是静默生成错 DDL;函数给的是服务端认定的真实定义。
+    try {
+      final trgResult = await conn.execute(
+        'SELECT tg.tgname, pg_get_triggerdef(tg.oid, true), '
+        'tg.tgenabled '
+        'FROM pg_catalog.pg_trigger tg '
+        'JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid '
+        'JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace '
+        'WHERE n.nspname = $sch AND c.relname = $tbl '
+        'AND NOT tg.tgisinternal '
+        'ORDER BY tg.tgname',
+      );
+      for (final row in trgResult) {
+        final parsed = parsePgTriggerDef(
+          _text(row[0]),
+          _text(row[1]),
+          enabled: _text(row[2]) != 'D',
+        );
+        if (parsed != null) design.triggers.add(parsed);
+      }
+    } catch (_) {
+      // 触发器读不到(权限 / 非 PG 家族服务端):不预填即可,界面仍可手工新增。
+      // 与序列选项同一取舍:附加信息失败不牵连整次反查。
+    }
+    // ── 规则 ──────────────────────────────────────────────────
+    // 表上的用户规则都在 pg_rewrite 里(ev_type: n/i/d/a/s),视图自动生成的
+    // `_RETURN` 与内部规则一并排除 —— 反查回来的必须是用户写得出来、也删得掉的那些。
+    // 与触发器同一思路:用 pg_get_ruledef 拿服务端认定的定义再反解析。
+    try {
+      final ruleResult = await conn.execute(
+        'SELECT r.rulename, pg_get_ruledef(r.oid), '
+        "shobj_description(r.oid, 'pg_rewrite'), "
+        // ev_enabled:d = DISABLE RULE 关掉的,其余(o / b / R)都算启用
+        'r.ev_enabled '
+        'FROM pg_catalog.pg_rewrite r '
+        'JOIN pg_catalog.pg_class c ON c.oid = r.ev_class '
+        'JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace '
+        'WHERE n.nspname = $sch AND c.relname = $tbl '
+        "AND r.rulename <> '_RETURN' AND NOT pg_catalog.is_internal(r.oid) "
+        'ORDER BY r.rulename',
+      );
+      for (final row in ruleResult) {
+        final parsed = parsePgRuleDef(
+          _text(row[0]),
+          _text(row[1]),
+          comment: _text(row[2]),
+          enabled: _text(row[3]).toLowerCase() != 'd',
+        );
+        if (parsed != null) design.rules.add(parsed);
+      }
+    } catch (_) {
+      // 规则读不到(权限 / 服务端版本):与触发器同一取舍,不牵连整次反查。
     }
     return design;
   }
@@ -1305,3 +1381,296 @@ const Set<String> _pgConstraintKinds = {
   'NOT NULL',
   'EXCLUSION',
 };
+
+/// 把 `pg_get_triggerdef()` 输出的一行 DDL 反解析成设计器用的 [DesignTrigger]。
+///
+/// 输入形如:
+/// ```
+/// CREATE TRIGGER trg AFTER INSERT OR UPDATE OF a ON t
+///   FOR EACH ROW WHEN ((new.a > 0)) EXECUTE FUNCTION f('x')
+/// ```
+/// 可延迟触发器则是 `CREATE CONSTRAINT TRIGGER … DEFERRABLE INITIALLY DEFERRED`。
+///
+/// 解析失败返回 `null`(不把半条数据塞进设计器,宁可少一行让人肉眼看见)。
+/// 全程大小写不敏感:PG 关键字输出为大写,但标识符与 WHEN 条件原样保留大小写。
+DesignTrigger? parsePgTriggerDef(
+  String name,
+  String def, {
+  bool enabled = true,
+}) {
+  if (name.trim().isEmpty || def.trim().isEmpty) return null;
+  final s = def.trim();
+  final upper = s.toUpperCase();
+
+  // 1. CONSTRAINT TRIGGER 与 TRIGGER 都要认(可延迟的只能建成约束触发器)
+  final isConstraint = upper.startsWith('CREATE CONSTRAINT TRIGGER ');
+  final headLen = isConstraint
+      ? 'CREATE CONSTRAINT TRIGGER '.length
+      : 'CREATE TRIGGER '.length;
+  if (!isConstraint && !upper.startsWith('CREATE TRIGGER ')) return null;
+
+  // 2. 触发器名:声明的形状是
+  //    `CREATE TRIGGER <name> <timing> <events> ON <table>`,
+  //    名字在 `<timing>` 关键字之前结束 —— 不能截到 " ON " 为止,那样会把
+  //    `<timing> <events>` 一起当成名字(实测踩过)。
+  final head = upper.substring(headLen);
+  final stop = <int>[
+    head.indexOf(' BEFORE '),
+    head.indexOf(' AFTER '),
+    head.indexOf(' INSTEAD OF '),
+  ].where((e) => e >= 0).fold<int>(-1, (a, b) => a < 0 ? b : (b < a ? b : a));
+  if (stop < 0) return null; // 认不出时机关键字 → 不是可解析的 PG 触发器定义
+  final timing = stop == head.indexOf(' BEFORE ')
+      ? 'BEFORE'
+      : (stop == head.indexOf(' INSTEAD OF ') ? 'INSTEAD OF' : 'AFTER');
+  final declName = _pgUnquote(s.substring(headLen, headLen + stop).trim());
+  if (declName.isEmpty) return null;
+
+  // 事件清单的右边界:到 " ON " 为止
+  final rest = s.substring(headLen + stop);
+  final onIdx = _pgTopLevelOnIndex(rest);
+  if (onIdx < 0) return null;
+
+  // 3. 事件勾选(只在 `<timing> … ON` 这一段里找,函数体 / WHEN 条件里的
+  //    INSERT / DELETE 字样不会被误判)
+  var insert = false;
+  var update = false;
+  var delete = false;
+  var truncate = false;
+  final declSeg = rest.substring(0, onIdx).toUpperCase();
+  for (final ev
+      in RegExp(r'\b(INSERT|UPDATE|DELETE|TRUNCATE)\b').allMatches(declSeg)) {
+    switch (ev.group(1)) {
+      case 'INSERT':
+        insert = true;
+      case 'UPDATE':
+        update = true;
+      case 'DELETE':
+        delete = true;
+      case 'TRUNCATE':
+        truncate = true;
+    }
+  }
+  final updateColumns = _pgUpdateOfColumns(rest.substring(0, onIdx));
+
+  // 5. FOR EACH ROW / STATEMENT
+  final forEach =
+      RegExp(r'FOR\s+EACH\s+STATEMENT', caseSensitive: false).hasMatch(s)
+          ? '语句'
+          : '行';
+
+  // 6. WHEN (…) —— 括号配对,条件里可能自带括号
+  var when = '';
+  final whenMatch =
+      RegExp(r'\bWHEN\s*\(', caseSensitive: false).firstMatch(s);
+  if (whenMatch != null) {
+    final open = s.indexOf('(', whenMatch.start);
+    final close = _pgMatchParen(s, open);
+    if (close > open) when = s.substring(open + 1, close).trim();
+  }
+
+  // 7. EXECUTE FUNCTION / PROCEDURE <fn>(args)
+  var function = '';
+  var parameters = '';
+  final execMatch = RegExp(
+    r'EXECUTE\s+(?:FUNCTION|PROCEDURE)\s+',
+    caseSensitive: false,
+  ).firstMatch(s);
+  if (execMatch != null) {
+    final tail = s.substring(execMatch.end).trim();
+    final paren = tail.indexOf('(');
+    if (paren < 0) {
+      function = _pgUnquote(tail.replaceAll(';', '').trim());
+    } else {
+      function = _pgUnquote(tail.substring(0, paren).trim());
+      final close = _pgMatchParen(tail, paren);
+      if (close > paren) {
+        parameters = tail.substring(paren + 1, close).trim();
+      }
+    }
+  }
+
+  // 8. 可延迟 / 延迟
+  var deferrable = '';
+  var deferred = '';
+  if (isConstraint || upper.contains('DEFERRABLE')) {
+    deferrable = 'YES';
+    deferred = upper.contains('INITIALLY DEFERRED') ? 'YES' : 'NO';
+  }
+
+  return DesignTrigger(
+    name: declName.isEmpty ? name.trim() : declName,
+    forEach: forEach,
+    timing: timing,
+    insert: insert,
+    update: update,
+    delete: delete,
+    truncate: truncate,
+    updateColumns: updateColumns,
+    enable: enabled,
+    when: when,
+    function: function,
+    parameters: parameters,
+    deferrable: deferrable,
+    deferred: deferred,
+  );
+}
+
+/// 从 `UPDATE OF col1, col2` 里取出列清单(逗号分隔);没有该子句返回空串。
+/// 结果里去掉标识符引号,与设计器 [DesignTrigger.updateColumns] 的存储格式一致。
+String _pgUpdateOfColumns(String s) {
+  final m = RegExp(r'\bUPDATE\s+OF\s+', caseSensitive: false).firstMatch(s);
+  if (m == null) return '';
+  // 列清单一路读到下一个事件关键字(OR DELETE / OR INSERT / OR TRUNCATE)
+  // 或 " ON " 为止
+  final tail = s.substring(m.end);
+  var cut = tail.length;
+  for (final stop in [
+    RegExp(r'\s+OR\s+', caseSensitive: false),
+    RegExp(r'\s+ON\s+', caseSensitive: false),
+    RegExp(r'\s+FOR\s+EACH\s+', caseSensitive: false),
+    RegExp(r'\s+WHEN\s*\(', caseSensitive: false),
+  ]) {
+    final hit = stop.firstMatch(tail);
+    if (hit != null && hit.start < cut) cut = hit.start;
+  }
+  return tail
+      .substring(0, cut)
+      .split(',')
+      .map(_pgUnquote)
+      .where((e) => e.isNotEmpty)
+      .join(', ');
+}
+
+/// 找 `rest` 里第一个**不在双引号内**的 ` ON ` 起始位置(返回 'O' 的下标)。
+/// 触发器名可能被引号包着并含空格(如 `"my trg on t"`),不能直接 indexOf。
+int _pgTopLevelOnIndex(String rest) {
+  var inQuote = false;
+  for (var i = 0; i < rest.length; i++) {
+    final c = rest[i];
+    if (c == '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (inQuote) continue;
+    if (i + 4 <= rest.length &&
+        rest.substring(i, i + 4).toUpperCase() == ' ON ') {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/// 去掉 PG 标识符的双引号并还原转义(`""` → `"`);未加引号的原样返回。
+String _pgUnquote(String s) {
+  var v = s.trim();
+  if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) {
+    v = v.substring(1, v.length - 1).replaceAll('""', '"');
+  }
+  return v.trim();
+}
+
+/// 从 [open] 处的 `(` 出发返回配对 `)` 的下标;找不到返回 -1。忽略引号内的括号。
+int _pgMatchParen(String s, int open) {
+  if (open < 0 || open >= s.length || s[open] != '(') return -1;
+  var depth = 0;
+  var inSingle = false;
+  for (var i = open; i < s.length; i++) {
+    final c = s[i];
+    if (c == "'") {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (inSingle) continue;
+    if (c == '(') depth++;
+    if (c == ')') {
+      depth--;
+      if (depth == 0) return i;
+    }
+  }
+  return -1;
+}
+
+/// 解析 `pg_get_constraintdef` 给出的排除约束定义。
+///
+/// 形态:`EXCLUDE USING gist (元素 WITH 操作符, ...) [WHERE (谓词)]
+/// [WITH (索引参数)] [TABLESPACE ts]`。括号一律配对扫描,因为排除元素里
+/// 常带函数调用(`lower(name) WITH =`),用 `.*` 正则会一路吞到 WHERE 的括号。
+({String method, String elements, String predicate}) parsePgExcludeDef(String def) {
+  var s = def.trim();
+  var method = '';
+  final head = RegExp(r'^EXCLUDE\s+USING\s+(\S+)\s*', caseSensitive: false).firstMatch(s);
+  if (head != null) {
+    method = _pgUnquote(head.group(1)!);
+    s = s.substring(head.end);
+  } else {
+    final bare = RegExp(r'^EXCLUDE\s*', caseSensitive: false).firstMatch(s);
+    if (bare != null) s = s.substring(bare.end);
+  }
+  final open = s.indexOf('(');
+  if (open < 0) return (method: method, elements: '', predicate: s.trim());
+  final close = _pgMatchParen(s, open);
+  if (close < 0) {
+    return (method: method, elements: s.substring(open + 1).trim(), predicate: '');
+  }
+  final elements = s.substring(open + 1, close).trim();
+  return (
+    method: method,
+    elements: elements,
+    predicate: _pgParenContentAfter(s.substring(close + 1), r'\bWHERE\s*\('),
+  );
+}
+
+/// 解析 `pg_get_ruledef` 给出的规则定义;认不出结构时返回 null(不猜)。
+///
+/// 形态:`CREATE RULE name AS ON INSERT TO tbl [WHERE (条件)]
+/// DO ALSO (语句)` / `DO NOTHING`。规则挂在哪个表由设计器当前表决定,
+/// 故 `TO` 与 `WHERE` / `DO` 之间那一段直接跳过。
+DesignRule? parsePgRuleDef(String name, String def,
+    {String comment = '', bool enabled = true}) {
+  if (name.trim().isEmpty || def.trim().isEmpty) return null;
+  final s = def.trim();
+  final head = RegExp(
+    r'^CREATE\s+RULE\s+(\S+)\s+AS\s+ON\s+(\w+)\s+TO\s+',
+    caseSensitive: false,
+  ).firstMatch(s);
+  if (head == null) return null;
+  final event = head.group(2)!.toUpperCase();
+  final tail = s.substring(head.end);
+  final doMatch = RegExp(r'\bDO\s+(ALSO|INSTEAD|NOTHING)\b', caseSensitive: false)
+      .firstMatch(tail);
+  if (doMatch == null) return null;
+  // `TO 表名` 的右边界就是 WHERE / DO,取在先出现的那个
+  final whereMatch =
+      RegExp(r'\bWHERE\s*\(', caseSensitive: false).firstMatch(tail);
+  final bodyStart = doMatch.end;
+  final stmt = _pgParenContentAfter(tail.substring(bodyStart), r'^\s*\(');
+  return DesignRule(
+    name: _pgUnquote(head.group(1)!),
+    event: event,
+    qualification: whereMatch == null
+        ? ''
+        : _pgParenContentAfter(tail.substring(whereMatch.start), r'\bWHERE\s*\('),
+    action: doMatch.group(1)!.toUpperCase(),
+    statement: stmt,
+    enable: enabled,
+    comment: comment,
+  );
+}
+
+/// 在 [s] 里找 [lead] 匹配到的第一个左括号,返回其配对括号内的内容(去掉
+/// 服务端可能多加的一层外层括号)。找不到返回空串。
+String _pgParenContentAfter(String s, String lead) {
+  final m = RegExp(lead, caseSensitive: false).firstMatch(s);
+  if (m == null) return '';
+  final open = s.indexOf('(', m.start);
+  if (open < 0) return '';
+  final close = _pgMatchParen(s, open);
+  if (close <= open) return '';
+  var v = s.substring(open + 1, close).trim();
+  // PG 把谓词写成 `WHERE ((a = b))`:外层括号是语法要求,不是用户输入的
+  if (v.startsWith('(') && _pgMatchParen(v, 0) == v.length - 1) {
+    v = v.substring(1, v.length - 1).trim();
+  }
+  return v;
+}

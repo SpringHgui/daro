@@ -21,6 +21,28 @@ const Set<String> kMysqlLikeTypes = {'mysql', 'mariadb'};
 /// SQL Server 家族类型 id
 const Set<String> kSqlServerLikeTypes = {'sqlserver', 'aliyun-rds-sqlserver'};
 
+/// 填充因子的 reloption 名(各方言共用这一项)
+const String kPgFillFactor = 'fillfactor';
+
+/// PostgreSQL 表级存储参数的稳定输出顺序(`fillfactor` 恒在最前,其余按此清单
+/// 排,清单外的键按字典序排在末尾)。界面只开放参考工具有的那几项,库里读到的
+/// 其它 reloption 不显示但**原样保留并参与生成**,不设计就不会被保存清掉。
+const List<String> kPgStorageOptionOrder = [
+  'autovacuum_enabled',
+  'autovacuum_vacuum_threshold',
+  'autovacuum_vacuum_scale_factor',
+  'autovacuum_analyze_threshold',
+  'autovacuum_analyze_scale_factor',
+  'autovacuum_vacuum_insert_threshold',
+  'autovacuum_vacuum_insert_scale_factor',
+  'autovacuum_vacuum_cost_limit',
+  'autovacuum_freeze_max_age',
+  'log_autovacuum_min_duration',
+  'toast_autovacuum_enabled',
+  'parallel_workers',
+  'user_catalog_table',
+];
+
 /// 不接受长度 / 精度参数的类型(小写比较)。
 /// 「长度」列对类型是信息性展示(如 int8 的 64 位宽),
 /// 拼进 DDL 会得到 `int8(64)` 这类非法语句,故 [DesignColumn.fullType] 跳过。
@@ -275,6 +297,8 @@ class DesignIndexColumn {
     this.opClass = '',
     this.order = '',
     this.nullsOrder = '',
+    this.operatorSchema = '',
+    this.operatorName = '',
   });
 
   /// 字段名
@@ -298,6 +322,13 @@ class DesignIndexColumn {
   /// Nulls 排序:空 / FIRST / LAST(界面「Nulls 排序」)
   String nullsOrder;
 
+  /// 运算符模式(运算符所在 schema,仅排除约束的「元素」用,界面「运算符模式」)
+  String operatorSchema;
+
+  /// 比较运算符(仅排除约束的「元素」用,界面「运算符」):非空即输出
+  /// `<元素> WITH <运算符>`;索引字段项忽略此项。
+  String operatorName;
+
   /// 是否携带任何需要落进 DDL 的选项
   bool get hasOptions =>
       collation.trim().isNotEmpty ||
@@ -313,6 +344,8 @@ class DesignIndexColumn {
         opClass: opClass,
         order: order,
         nullsOrder: nullsOrder,
+        operatorSchema: operatorSchema,
+        operatorName: operatorName,
       );
 }
 
@@ -449,6 +482,18 @@ class DesignUniqueKey {
   List<String> get columnList =>
       columns.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
 
+  /// 字段项(网格「字段」格的 `...` 弹窗写入)。非空时 UNIQUE 约束按逐项输出
+  /// COLLATE / 运算符类别 / 排序;为空时按 [columns] 输出裸字段名。
+  final List<DesignIndexColumn> columnItems = [];
+
+  /// 弹窗确认后把字段项回写成逗号串(网格格与差异比较都以 [columns] 为准)
+  void applyColumnItems() {
+    columns = columnItems
+        .map((e) => e.name.trim())
+        .where((e) => e.isNotEmpty)
+        .join(', ');
+  }
+
   DesignUniqueKey copy() => DesignUniqueKey(
         name: name,
         columns: columns,
@@ -457,19 +502,27 @@ class DesignUniqueKey {
         fillFactor: fillFactor,
         deferrable: deferrable,
         deferred: deferred,
-      );
+      )..columnItems.addAll(columnItems.map((e) => e.copy()));
 }
 
 /// 检查约束设计。
 class DesignCheck {
-  DesignCheck({this.name = '', this.expression = '', this.comment = ''});
+  DesignCheck({
+    this.name = '',
+    this.expression = '',
+    this.noInherit = false,
+    this.comment = '',
+  });
 
   String name;
   String expression;
+
+  /// NO INHERIT(仅 PostgreSQL):子表不继承该约束
+  bool noInherit;
   String comment;
 
   DesignCheck copy() => DesignCheck(
-      name: name, expression: expression, comment: comment);
+      name: name, expression: expression, noInherit: noInherit, comment: comment);
 }
 
 /// 排除约束设计(仅 PostgreSQL 家族生成 EXCLUDE USING ...)。
@@ -478,31 +531,99 @@ class DesignExclude {
     this.name = '',
     this.columns = '',
     this.method = 'gist',
+    this.predicate = '',
+    this.deferrable = '',
+    this.deferred = '',
     this.comment = '',
   });
 
   String name;
+
+  /// 排除元素列表,PG 原样进括号,故每列的操作符在这里写全:
+  /// `col WITH =` / `lower(name) WITH =` / `int4range(a,b) WITH &&`。
   String columns;
+
+  /// 索引访问方法(gist / spgist / gin / brin / btree ...)
   String method;
+
+  /// 部分排除条件的表达式(不带 WHERE 关键字),如 `state = 'active'`
+  String predicate;
+
+  /// 可延迟 / 初始延迟(YES / NO / 空 = 不生成子句,与唯一键同一口径)
+  String deferrable;
+  String deferred;
   String comment;
 
-  DesignExclude copy() =>
-      DesignExclude(name: name, columns: columns, method: method, comment: comment);
+  /// 排除元素项(网格「元素」格的 `...` 弹窗写入)。非空时按逐项输出
+  /// `<字段> [COLLATE …] [运算符类别] [ASC|DESC] [NULLS …] WITH <运算符>`;
+  /// 为空时按 [columns] 原样进括号(手输与驱动反查走这条路径)。
+  final List<DesignIndexColumn> columnItems = [];
+
+  /// 弹窗确认后把元素项回写成 `字段 WITH 运算符` 逗号串(网格与差异比对看的是
+  /// 这一串);生成 DDL 时 [DdlBuilder.excludeClause] 直接读 [columnItems],
+  /// 排序规则 / 运算符类别等选项不会因为这层的简写而丢失。
+  void applyColumnItems() {
+    columns = columnItems
+        .map((e) {
+          final name = e.name.trim();
+          final op = e.operatorName.trim();
+          if (name.isEmpty) return op;
+          return op.isEmpty ? name : '$name WITH $op';
+        })
+        .where((e) => e.trim().isNotEmpty)
+        .join(', ');
+  }
+
+  DesignExclude copy() => DesignExclude(
+        name: name,
+        columns: columns,
+        method: method,
+        predicate: predicate,
+        deferrable: deferrable,
+        deferred: deferred,
+        comment: comment,
+      )..columnItems.addAll(columnItems.map((e) => e.copy()));
 }
 
 /// 规则设计(仅 PostgreSQL 家族生成 CREATE RULE)。
 class DesignRule {
-  DesignRule({this.name = '', this.event = 'INSERT', this.statement = '', this.comment = ''});
+  DesignRule({
+    this.name = '',
+    this.event = 'INSERT',
+    this.qualification = '',
+    this.action = 'ALSO',
+    this.statement = '',
+    this.enable = true,
+    this.comment = '',
+  });
 
   String name;
 
   /// 事件:INSERT / UPDATE / DELETE / SELECT
   String event;
+
+  /// 限定条件(不带 WHERE 关键字),即 `CREATE RULE ... WHERE ( ... )`
+  String qualification;
+
+  /// DO 后的动作变体:ALSO / INSTEAD / NOTHING
+  String action;
+
+  /// 规则主体(`DO ALSO|INSTEAD` 后的语句;[action] 为 NOTHING 时不生成)
   String statement;
+
+  /// 启用(false 时补一条 ALTER TABLE … DISABLE RULE,与触发器的「启用」同口径)
+  bool enable;
   String comment;
 
   DesignRule copy() => DesignRule(
-      name: name, event: event, statement: statement, comment: comment);
+        name: name,
+        event: event,
+        qualification: qualification,
+        action: action,
+        statement: statement,
+        enable: enable,
+        comment: comment,
+      );
 }
 
 /// 触发器设计。触发函数 / 参数 / 当 为 PostgreSQL 形态;
@@ -522,6 +643,7 @@ class DesignTrigger {
     this.when = '',
     this.function = '',
     this.parameters = '',
+    this.body = '',
     this.deferrable = '',
     this.deferred = '',
   });
@@ -553,6 +675,11 @@ class DesignTrigger {
   /// 函数参数(如 NEW.id, 空则不输出括号)
   String parameters;
 
+  /// 触发主体(MySQL / SQL Server 形态:过程体写在触发器里,不引用函数)。
+  /// PostgreSQL 用 [function] + [parameters],本字段留空即完全不参与生成,
+  /// 因此既有设计数据(含驱动反查结果)的输出与从前逐字一致。
+  String body;
+
   /// 可延迟(界面「约束」子页):YES 生成 CREATE CONSTRAINT TRIGGER … DEFERRABLE
   String deferrable;
 
@@ -573,6 +700,7 @@ class DesignTrigger {
         when: when,
         function: function,
         parameters: parameters,
+        body: body,
         deferrable: deferrable,
         deferred: deferred,
       );
@@ -602,11 +730,22 @@ class DesignCandidates {
 }
 
 /// 新建表设计器的完整设计数据。
+/// 新建表的占位表名。
+///
+/// 设计器页面与 SQL 预览都拿它当「还没起名」的展示值(参考工具同样给个
+/// Untitled 占位),但**它不算已命名**:点保存时仍要弹窗要真名,否则会把
+/// 字面上的 Untitled 建成表。判「缺名」一律用 [isUntitledTableName]。
+const String kUntitledTableName = 'Untitled';
+
+/// [name] 是否等于占位表名(去空白、大小写不敏感)。
+bool isUntitledTableName(String name) =>
+    name.trim().isEmpty || name.trim().toLowerCase() == 'untitled';
+
 class DesignTable {
   DesignTable();
 
-  /// 表名(默认 Untitled,与参考工具一致,保存前可改)
-  String name = 'Untitled';
+  /// 表名(默认 [kUntitledTableName],与参考工具一致,保存前可改)
+  String name = kUntitledTableName;
 
   /// 目标模式(由打开设计器时的树上下文决定,PostgreSQL 等有模式层的类型使用)
   String? schema;
@@ -623,9 +762,53 @@ class DesignTable {
   /// 表注释(注释标签页)
   String tableComment = '';
 
-  /// 选项:填充因子(%) / 表空间(PostgreSQL 等生成 WITH / TABLESPACE)
-  String fillFactor = '';
+  /// 表空间(PostgreSQL 生成 `TABLESPACE`;SQL Server 的文件组是另一套语法)
   String tablespace = '';
+
+  /// 表级存储参数(界面「选项」标签):键为 PostgreSQL reloption 名
+  /// (`fillfactor` / `autovacuum_*` / `parallel_workers` …),值为录入文本。
+  /// 空值项不生成任何子句;[fillFactor] 是本表里唯一有具名读写的项。
+  final Map<String, String> storageOptions = {};
+
+  /// 填充因子(%):`WITH (fillfactor = n)`,SQL Server 也认这一项
+  /// (输出 `WITH (FILLFACTOR = n)`)。存进 [storageOptions],保留具名读写口。
+  String get fillFactor => storageOptions[kPgFillFactor] ?? '';
+  set fillFactor(String v) => setStorageOption(kPgFillFactor, v);
+
+  /// 写一项存储参数;值留空即从清单里移除(生成时不再输出该子句)。
+  void setStorageOption(String key, String value) {
+    final v = value.trim();
+    if (v.isEmpty) {
+      storageOptions.remove(key);
+    } else {
+      storageOptions[key] = v;
+    }
+  }
+
+  /// 生成用的有序参数对:`fillfactor` 最先,其后按 [kPgStorageOptionOrder]
+  /// 的清单顺序,再末尾挂清单外的项(库里读到但界面没有的 reloption)。
+  List<MapEntry<String, String>> storageOptionPairs() {
+    final ordered = <MapEntry<String, String>>[];
+    void take(String key) {
+      final v = storageOptions[key];
+      if (v != null && v.trim().isNotEmpty) ordered.add(MapEntry(key, v.trim()));
+    }
+
+    take(kPgFillFactor);
+    for (final key in kPgStorageOptionOrder) {
+      take(key);
+    }
+    final known = {kPgFillFactor, ...kPgStorageOptionOrder};
+    final extra = [
+      for (final e in storageOptions.entries)
+        if (!known.contains(e.key) && e.value.trim().isNotEmpty) e,
+    ]..sort((a, b) => a.key.compareTo(b.key));
+    return [...ordered, ...extra];
+  }
+
+  /// 主键约束名。新建模式留空(由 DDL 按各方言约定命名);「设计表」模式
+  /// 由驱动反查填入真名——ALTER 删主键必须按真名 DROP CONSTRAINT。
+  String pkName = '';
 
   /// 表选项(仅新建表生成,均为 PostgreSQL 家族专属):不记录(UNLOGGED) /
   /// 所有者(补一条 ALTER … OWNER TO) / 继承自(INHERITS) / 集群(CLUSTER … USING)。
@@ -638,10 +821,6 @@ class DesignTable {
   /// 集群索引名
   String cluster = '';
 
-  /// 主键约束名。新建模式留空(由 DDL 按各方言约定命名);「设计表」模式
-  /// 由驱动反查填入真名——ALTER 删主键必须按真名 DROP CONSTRAINT。
-  String pkName = '';
-
   /// 深拷贝为一份独立快照(用作「设计表」的原始基线)。
   /// 列表与元素均重新构造,编辑中的 [columns] 变化不会污染基线。
   DesignTable snapshot() {
@@ -649,13 +828,13 @@ class DesignTable {
       ..name = name
       ..schema = schema
       ..tableComment = tableComment
-      ..fillFactor = fillFactor
       ..tablespace = tablespace
       ..unlogged = unlogged
       ..owner = owner
       ..inherits = inherits
       ..cluster = cluster
       ..pkName = pkName;
+    s.storageOptions.addAll(storageOptions);
     s.columns.addAll(columns.map((e) => e.copy()));
     s.indexes.addAll(indexes.map((e) => e.copy()));
     s.foreignKeys.addAll(foreignKeys.map((e) => e.copy()));
@@ -741,10 +920,46 @@ class DdlBuilder {
     return false;
   }
 
+  /// SQL Server 注释语句:该方言没有 `COMMENT ON`,注释是 `MS_Description`
+  /// 扩展属性。[proc] 取 `sp_addextendedproperty` / `sp_updateextendedproperty`
+  /// / `sp_dropextendedproperty`(属性原值决定该用哪个),[value] 仅在 drop 时
+  /// 被忽略。
+  ///
+  /// 「设计表」的 ALTER 路径从前自带一份等价拼装,但 CREATE 路径漏了它、直接
+  /// 复用 PG 的 `COMMENT ON …`,结果是**在 SQL Server 上新建一张带注释的表必然
+  /// 语法报错**。两条路现在共用本方法。
+  static String sqlServerCommentSql(
+      {String? schema,
+      required String table,
+      String? column,
+      required String value,
+      String proc = 'sp_addextendedproperty'}) {
+    final levels = column == null
+        ? "'SCHEMA', ${lit(schema ?? 'dbo')}, 'TABLE', ${lit(table)}"
+        : "'SCHEMA', ${lit(schema ?? 'dbo')}, "
+            "'TABLE', ${lit(table)}, "
+            "'COLUMN', ${lit(column)}";
+    final args = proc == 'sp_dropextendedproperty'
+        ? lit('MS_Description')
+        : '${lit('MS_Description')}, ${lit(value)}';
+    return 'EXEC $proc $args, $levels;';
+  }
+
   /// 校验设计数据;不合规返回原因,可通过时 ok=true。
-  static DesignValidate validate(DesignTable d) {
+  ///
+  /// [typeId] 为连接类型 id:触发器的必填项按方言不同(PostgreSQL 必填触发
+  /// 函数,MySQL / SQL Server 必填过程体),没有方言就无法判断哪一侧算缺失,
+  /// 故为必传。
+  ///
+  /// [requireName] 为 false 时**不**把「表名为空」算作错误:表设计器的工具栏是
+  /// 纯图标(参考工具如此),表名不在页面上填,而是点「保存」时弹窗要 ——
+  /// 若在这里拦死,新建表就永远按不下保存键。其余校验(列 / 类型 / 重名)照做。
+  static DesignValidate validate(DesignTable d,
+      {required String typeId, bool requireName = true}) {
     final tableName = d.name.trim();
-    if (tableName.isEmpty) return const DesignValidate(false, '表名不能为空');
+    if (tableName.isEmpty && requireName) {
+      return const DesignValidate(false, '表名不能为空');
+    }
     if (d.columns.isEmpty) return const DesignValidate(false, '至少需要一列');
     for (var i = 0; i < d.columns.length; i++) {
       final c = d.columns[i];
@@ -802,10 +1017,50 @@ class DdlBuilder {
         return DesignValidate(false, '检查「${_nameOr(ck.name, '未命名')}」未指定条件');
       }
     }
+    for (final ex in d.excludes) {
+      // 逗号串与弹窗元素项二者有一即算填了(excludeClause 优先按元素项生成)
+      if (ex.columns.trim().isEmpty && ex.columnItems.isEmpty) {
+        return DesignValidate(false, '排除「${_nameOr(ex.name, '未命名')}」未指定字段 / 表达式');
+      }
+      // 弹窗里勾了字段却没填运算符 → EXCLUDE 括号里会是 `col`(缺 WITH),
+      // PG 直接报语法错。执行前拦住,不让用户拿一条非法语句去撞数据库。
+      for (final e in ex.columnItems) {
+        if (e.name.trim().isNotEmpty && e.operatorName.trim().isEmpty) {
+          return DesignValidate(false,
+              '排除「${_nameOr(ex.name, '未命名')}」的元素「${e.name.trim()}」未指定运算符');
+        }
+      }
+    }
+    for (final r in d.rules) {
+      final action = r.action.trim().isEmpty ? 'ALSO' : r.action.trim().toUpperCase();
+      if (action == 'NOTHING') continue; // DO NOTHING 本就没有语句体
+      if (r.statement.trim().isEmpty) {
+        return DesignValidate(false,
+            '规则「${_nameOr(r.name, _ruleName(r, d))}」未指定语句(DO $action 后的动作)');
+      }
+    }
     for (final tr in d.triggers) {
       if (tr.name.trim().isEmpty) return const DesignValidate(false, '存在未命名的触发器');
-      if (tr.function.trim().isEmpty) {
-        return DesignValidate(false, '触发器「${tr.name}」未指定触发函数');
+      // 触发器的「必填的另一半」按方言不同:PG 走独立函数,MySQL / SQL Server
+      // 把过程体写进触发器本身。留空即生成不出可执行的 CREATE。
+      if (isPgLike(typeId)) {
+        if (tr.function.trim().isEmpty) {
+          return DesignValidate(false, '触发器「${tr.name}」未指定触发函数');
+        }
+      } else if (isMysqlLike(typeId) || isSqlServerLike(typeId)) {
+        if (tr.truncate) {
+          return DesignValidate(false, '触发器「${tr.name}」:TRUNCATE 事件仅 PostgreSQL 支持');
+        }
+        if (tr.body.trim().isEmpty) {
+          return DesignValidate(false, '触发器「${tr.name}」未指定触发主体');
+        }
+        if (triggerEvents(tr, includeTruncate: false).isEmpty) {
+          return DesignValidate(false, '触发器「${tr.name}」未勾选触发事件');
+        }
+      } else {
+        // SQLite / Access:语法上 SQLite 有触发器,但这两个驱动都没有结构反查,
+        // 存进去的设计器里再也读不回来 —— 与其静默丢弃,不如在保存前说清楚。
+        return DesignValidate(false, '当前数据库类型不支持在设计器中定义触发器');
       }
     }
     return const DesignValidate(true);
@@ -822,14 +1077,21 @@ class DdlBuilder {
       stmts.add(buildCreateIndex(d, typeId, idx));
     }
     for (final rule in d.rules) {
-      if (isPgLike(typeId)) stmts.add(buildCreateRule(d, typeId, rule));
+      if (!isPgLike(typeId)) continue;
+      stmts.add(buildCreateRule(d, typeId, rule));
+      if (!rule.enable) {
+        stmts.add(buildSetRuleEnable(d, typeId, _ruleName(rule, d), false));
+      }
+      if (rule.comment.trim().isNotEmpty) {
+        stmts.add(buildRuleComment(d, typeId, rule));
+      }
     }
     for (final tr in d.triggers) {
-      if (isPgLike(typeId)) {
-        stmts.add(buildCreateTrigger(d, typeId, tr));
-        if (!tr.enable) {
-          stmts.add('ALTER TABLE ${_qualifiedTable(d, typeId)} DISABLE TRIGGER ${ident(typeId, tr.name.trim())};');
-        }
+      // 各方言的触发器语法互不相容(事件个数 / 行级语句级 / 主体形态都不同),
+      // 统一走 buildCreateTriggers 内部分流;SQLite 无触发器目录可反查 → 返回空。
+      stmts.addAll(buildCreateTriggers(d, typeId, tr));
+      if (isPgLike(typeId) && !tr.enable) {
+        stmts.add('ALTER TABLE ${_qualifiedTable(d, typeId)} DISABLE TRIGGER ${ident(typeId, tr.name.trim())};');
       }
     }
     // 表所有者 / 集群:PG 无内联子句,按 Navicat 做法补独立语句(集群需索引已建好)
@@ -839,8 +1101,23 @@ class DdlBuilder {
     if (isPgLike(typeId) && d.cluster.trim().isNotEmpty) {
       stmts.add('CLUSTER ${_qualifiedTable(d, typeId)} USING ${ident(typeId, d.cluster.trim())};');
     }
-    // 注释:MySQL / MariaDB 已内联进 CREATE TABLE,其余类型(仅 PostgreSQL)生成 COMMENT ON
-    if (!isMysqlLike(typeId)) {
+    // 注释:MySQL / MariaDB 已内联进 CREATE TABLE;SQL Server 走 MS_Description
+    // 扩展属性(它没有 COMMENT ON 语法);其余类型走 COMMENT ON … IS '…'
+    if (isSqlServerLike(typeId)) {
+      final tbl = d.name.trim();
+      if (d.tableComment.trim().isNotEmpty) {
+        stmts.add(sqlServerCommentSql(
+            schema: d.schema, table: tbl, value: d.tableComment.trim()));
+      }
+      for (final c in d.columns) {
+        if (c.comment.trim().isEmpty) continue;
+        stmts.add(sqlServerCommentSql(
+            schema: d.schema,
+            table: tbl,
+            column: c.name.trim(),
+            value: c.comment.trim()));
+      }
+    } else if (!isMysqlLike(typeId)) {
       if (d.tableComment.trim().isNotEmpty) {
         stmts.add('COMMENT ON TABLE ${_qualifiedTable(d, typeId)} IS ${lit(d.tableComment.trim())};');
       }
@@ -940,8 +1217,16 @@ class DdlBuilder {
         ? 'uq_${d.name.trim()}_${cols.first}'
         : uk.name.trim();
     final buf = StringBuffer(
-        'CONSTRAINT ${ident(typeId, name)} UNIQUE (${cols.map((n) => ident(typeId, n)).join(', ')})');
-    if (isPgLike(typeId)) buf.write(_deferrableClause(uk.deferrable, uk.deferred));
+        'CONSTRAINT ${ident(typeId, name)} UNIQUE (${_uniqueColumnsSql(uk, cols, typeId)})');
+    if (isPgLike(typeId)) {
+      // PG 的 UNIQUE 约束语法顺序:字段列表 → WITH(存储参数)→ TABLESPACE → 约束属性。
+      // 从前这两项只是界面上能填、这里从不读,等于给了两个死控件。
+      final ff = uk.fillFactor.trim();
+      if (ff.isNotEmpty) buf.write(' WITH (fillfactor = $ff)');
+      final ts = uk.tablespace.trim();
+      if (ts.isNotEmpty) buf.write(' TABLESPACE ${ident(typeId, ts)}');
+      buf.write(_deferrableClause(uk.deferrable, uk.deferred));
+    }
     return buf.toString();
   }
 
@@ -953,7 +1238,34 @@ class DdlBuilder {
     final name = ck.name.trim().isEmpty
         ? 'ck_${d.name.trim()}_$autoSuffix'
         : ck.name.trim();
-    return 'CONSTRAINT ${ident(typeId, name)} CHECK (${ck.expression.trim()})';
+    final buf = StringBuffer(
+        'CONSTRAINT ${ident(typeId, name)} CHECK (${ck.expression.trim()})');
+    // NO INHERIT 仅 PG 有(界面「无继承」格);子表继承检查时不加即视为继承。
+    if (isPgLike(typeId) && ck.noInherit) buf.write(' NO INHERIT');
+    return buf.toString();
+  }
+
+  /// 排除约束片段(不含缩进);无排除元素时返回空串。
+  ///
+  /// 语法顺序按 PG:`CONSTRAINT name EXCLUDE USING am (元素 WITH 操作符, ...)
+  /// [WHERE (谓词)] [DEFERRABLE ...]`。「元素」弹窗写入了 [DesignExclude.columnItems]
+  /// 时逐项生成;否则把 [DesignExclude.columns] 逗号串原样带出(手输表达式、
+  /// 驱动反查结果都走这条路径,里面的 `WITH 操作符` 不重新包装)。
+  static String excludeClause(DesignExclude ex, DesignTable d, String typeId) {
+    final cols = ex.columnItems.isEmpty
+        ? ex.columns.trim()
+        : ex.columnItems
+            .map((e) => excludeElementSql(e, typeId))
+            .where((e) => e.trim().isNotEmpty)
+            .join(', ');
+    if (cols.isEmpty) return '';
+    final method = ex.method.trim().isEmpty ? 'gist' : ex.method.trim();
+    final buf = StringBuffer(
+        'CONSTRAINT ${ident(typeId, _excludeName(ex, d))} EXCLUDE USING $method ($cols)');
+    final pred = ex.predicate.trim();
+    if (pred.isNotEmpty) buf.write(' WHERE ($pred)');
+    if (isPgLike(typeId)) buf.write(_deferrableClause(ex.deferrable, ex.deferred));
+    return buf.toString();
   }
 
   /// 外键约束片段(不含缩进);信息不全时返回空串。
@@ -970,7 +1282,11 @@ class DdlBuilder {
         : qualified(typeId, d.schema, fk.refTable.trim());
     final buf = StringBuffer(
         'CONSTRAINT ${ident(typeId, name)} FOREIGN KEY (${cols.map((n) => ident(typeId, n)).join(', ')}) REFERENCES $refTable (${refCols.map((n) => ident(typeId, n)).join(', ')})');
-    if (isPgLike(typeId) && fk.matchAll) buf.write(' MATCH FULL');
+    // MATCH FULL:PostgreSQL 与 MySQL 家族都有该子句(SQL Server 没有,由
+    // [createUnsupported] 拦住,不让它静默消失)
+    if ((isPgLike(typeId) || isMysqlLike(typeId)) && fk.matchAll) {
+      buf.write(' MATCH FULL');
+    }
     final od = fk.onDelete.trim().toUpperCase();
     if (od.isNotEmpty && od != 'NO ACTION') buf.write(' ON DELETE $od');
     final ou = fk.onUpdate.trim().toUpperCase();
@@ -1011,10 +1327,9 @@ class DdlBuilder {
     }
     for (final ex in d.excludes) {
       if (!isPgLike(typeId)) continue;
-      if (ex.columns.trim().isEmpty) continue;
-      final name = _excludeName(ex, d);
-      final method = ex.method.trim().isEmpty ? 'gist' : ex.method.trim();
-      lines.add('  CONSTRAINT ${ident(typeId, name)} EXCLUDE USING $method (${ex.columns.trim()})');
+      final clause = excludeClause(ex, d, typeId);
+      if (clause.isEmpty) continue;
+      lines.add('  $clause');
     }
     for (final fk in d.foreignKeys) {
       final clause = foreignKeyClause(fk, d, typeId);
@@ -1022,12 +1337,17 @@ class DdlBuilder {
       lines.add('  $clause');
     }
 
-    // 表选项(PostgreSQL / SQL Server 的 WITH + TABLESPACE;MySQL 表注释内联)
+    // 表选项(存储参数 + 表空间;MySQL 表注释内联)
     final suffix = <String>[];
-    final ff = d.fillFactor.trim();
-    if (ff.isNotEmpty) {
-      if (isPgLike(typeId)) suffix.add('WITH (fillfactor = $ff)');
-      if (isSqlServerLike(typeId)) suffix.add('WITH (FILLFACTOR = $ff)');
+    if (isPgLike(typeId)) {
+      final opts = d.storageOptionPairs();
+      if (opts.isNotEmpty) {
+        suffix.add('WITH (${opts.map((e) => '${e.key} = ${e.value}').join(', ')})');
+      }
+    } else if (isSqlServerLike(typeId)) {
+      // SQL Server 只有填充因子这一项,且关键字大写、无其它 reloption
+      final ff = d.fillFactor.trim();
+      if (ff.isNotEmpty) suffix.add('WITH (FILLFACTOR = $ff)');
     }
     final ts = d.tablespace.trim();
     if (ts.isNotEmpty && isPgLike(typeId)) suffix.add('TABLESPACE ${ident(typeId, ts)}');
@@ -1162,6 +1482,16 @@ class DdlBuilder {
     return idx.columnItems.map((e) => indexColumnSql(e, typeId)).join(', ');
   }
 
+  /// 唯一键字段列表 → DDL:「选择数据表字段」弹窗写入 [DesignUniqueKey.columnItems]
+  /// 时逐项输出排序规则 / 运算符类别 / 排序顺序,否则按逗号串输出裸字段名。
+  static String _uniqueColumnsSql(
+      DesignUniqueKey uk, List<String> cols, String typeId) {
+    if (uk.columnItems.isEmpty) {
+      return cols.map((n) => ident(typeId, n)).join(', ');
+    }
+    return uk.columnItems.map((e) => indexColumnSql(e, typeId)).join(', ');
+  }
+
   /// 单个索引字段项 → DDL。PG 语法顺序:
   /// `字段 [COLLATE 排序规则] [运算符类别] [ASC|DESC] [NULLS FIRST|LAST]`;
   /// 非 PG 类型忽略全部选项(不生成非法子句)。
@@ -1184,33 +1514,110 @@ class DdlBuilder {
     return parts.join(' ');
   }
 
-  // ── CREATE RULE(仅 PostgreSQL) ───────────────────────────────
-
-  static String buildCreateRule(DesignTable d, String typeId, DesignRule rule) {
-    final name = rule.name.trim().isEmpty
-        ? 'rule_${d.name.trim()}_${rule.event.trim().toLowerCase()}'
-        : rule.name.trim();
-    final event = rule.event.trim().isEmpty ? 'INSERT' : rule.event.trim().toUpperCase();
-    final stmt = rule.statement.trim().isEmpty ? 'NOTHING' : rule.statement.trim();
-    return 'CREATE RULE ${ident(typeId, name)} AS ON $event TO ${_qualifiedTable(d, typeId)} DO INSTEAD $stmt;';
+  /// 单个排除约束元素 → DDL:`<索引字段项> WITH <运算符>`。
+  /// 运算符名不套引号(PG 的 `&&` / `<=` 这类写法带引号反而不认),但可带
+  /// schema 前缀;没有运算符的项退化为裸字段项(手输逗号串与反查结果不经
+  /// 本方法,由 [excludeClause] 原样带出)。
+  static String excludeElementSql(DesignIndexColumn c, String typeId) {
+    final name = c.name.trim();
+    if (name.isEmpty) return '';
+    final item = indexColumnSql(c, typeId);
+    final op = c.operatorName.trim();
+    if (op.isEmpty) return item;
+    final schema = c.operatorSchema.trim();
+    final opSql = isPgLike(typeId) && schema.isNotEmpty
+        ? '${ident(typeId, schema)}.$op'
+        : op;
+    return '$item WITH $opSql';
   }
 
-  // ── CREATE TRIGGER(仅 PostgreSQL) ────────────────────────────
+  // ── CREATE RULE(仅 PostgreSQL) ───────────────────────────────
 
-  static String buildCreateTrigger(DesignTable d, String typeId, DesignTrigger tr) {
-    final events = <String>[
-      if (tr.insert) 'INSERT',
-      if (tr.update) 'UPDATE',
-      if (tr.delete) 'DELETE',
-      if (tr.truncate) 'TRUNCATE',
-    ];
+  /// 规则名:无名项按 `rule_表名_事件` 补齐(CREATE / 注释 / 差异配对共用一口径)
+  static String _ruleName(DesignRule r, DesignTable d) {
+    if (r.name.trim().isNotEmpty) return r.name.trim();
+    final event = r.event.trim().isEmpty ? 'insert' : r.event.trim().toLowerCase();
+    return 'rule_${d.name.trim()}_$event';
+  }
+
+  static String buildCreateRule(DesignTable d, String typeId, DesignRule rule) {
+    final name = _ruleName(rule, d);
+    final event = rule.event.trim().isEmpty ? 'INSERT' : rule.event.trim().toUpperCase();
+    final qual = rule.qualification.trim();
+    final where = qual.isEmpty ? '' : ' WHERE ($qual)';
+    final stmt = rule.statement.trim();
+    // SELECT 规则只能 DO INSTEAD(PG 语法限制);DO NOTHING 不带语句体。
+    final action = event == 'SELECT'
+        ? 'INSTEAD'
+        : (rule.action.trim().isEmpty ? 'ALSO' : rule.action.trim().toUpperCase());
+    final body = action == 'NOTHING' || stmt.isEmpty
+        ? 'DO NOTHING'
+        : 'DO $action (${_normalizeBody(stmt)})';
+    return 'CREATE RULE ${ident(typeId, name)} AS ON $event TO ${_qualifiedTable(d, typeId)}'
+        '$where $body;';
+  }
+
+  /// 规则注释语句(PG 的 RULE 是独立对象,注释走 `COMMENT ON RULE … ON 表`)。
+  static String buildRuleComment(DesignTable d, String typeId, DesignRule rule) =>
+      'COMMENT ON RULE ${ident(typeId, _ruleName(rule, d))} ON ${_qualifiedTable(d, typeId)} '
+          'IS ${_commentValue(rule.comment)};';
+
+  /// 删除规则语句(名字是表局部作用域,必须带 ON)。
+  static String buildDropRule(DesignTable d, String typeId, String name) =>
+      'DROP RULE IF EXISTS ${ident(typeId, name.trim())} ON ${_qualifiedTable(d, typeId)};';
+
+  /// 规则「启用」开关:PG 的启用状态不属于 CREATE RULE 文本,建成后再切。
+  static String buildSetRuleEnable(
+          DesignTable d, String typeId, String name, bool enable) =>
+      'ALTER TABLE ${_qualifiedTable(d, typeId)} '
+      '${enable ? 'ENABLE' : 'DISABLE'} RULE ${ident(typeId, name.trim())};';
+
+  // ── CREATE TRIGGER ───────────────────────────────────────────
+
+  /// 按方言生成 `CREATE TRIGGER`(可能多条,见 MySQL 分支);该方言不支持
+  /// (或 SQLite 这类无触发器目录的类型)时返回空列表,由调用方跳过。
+  ///
+  /// 三种语法形态互不相容,各自成函数,不共享拼装分支:
+  /// - PostgreSQL:`FOR EACH ROW/STATEMENT` + `WHEN` + `EXECUTE FUNCTION`,
+  ///   事件可 `INSERT OR UPDATE OF col OR DELETE OR TRUNCATE` 多个。
+  /// - MySQL / MariaDB:**一个触发器只能对应一个事件**,无 `WHEN`、无语句级、
+  ///   无 `TRUNCATE`,主体内联在触发器里(`NEW.col` / `OLD.col`)。
+  /// - SQL Server:语句级(无 `FOR EACH ROW`)、无 `BEFORE`(用 `AFTER`)、
+  ///   无 `TRUNCATE`,事件用逗号列表,主体内联(`inserted` / `deleted` 伪表)。
+  static List<String> buildCreateTriggers(DesignTable d, String typeId, DesignTrigger tr) {
+    if (isPgLike(typeId)) return [_pgTriggerSql(d, typeId, tr)];
+    if (isMysqlLike(typeId)) return _mysqlTriggerSql(d, typeId, tr);
+    if (isSqlServerLike(typeId)) return _sqlServerTriggerSql(d, typeId, tr);
+    return const [];
+  }
+
+  /// 触发事件清单(勾选顺序即输出顺序);一个都没勾时按各方言的默认事件。
+  static List<String> triggerEvents(DesignTrigger tr, {bool includeTruncate = true}) => [
+        if (tr.insert) 'INSERT',
+        if (tr.update) 'UPDATE',
+        if (tr.delete) 'DELETE',
+        if (includeTruncate && tr.truncate) 'TRUNCATE',
+      ];
+
+  /// 过程体归一化:去掉首尾空白与末尾多余的 `;`,由调用方按方言语法补回。
+  /// 用户从客户端里整段粘进来时通常带着结尾分号,直接拼会得到 `;;`。
+  static String _normalizeBody(String body) {
+    var s = body.trim();
+    while (s.endsWith(';')) {
+      s = s.substring(0, s.length - 1).trimRight();
+    }
+    return s;
+  }
+
+  static String _pgTriggerSql(DesignTable d, String typeId, DesignTrigger tr) {
+    final events = triggerEvents(tr);
     final eventsText = events.isEmpty ? 'INSERT' : events.join(' OR ');
     final updateOf = tr.updateColumns.trim().isNotEmpty
         ? ' OF ${tr.updateColumns.split(',').map((n) => ident(typeId, n.trim())).join(', ')}'
         : '';
     final buf = StringBuffer('CREATE ');
     // 可延迟的触发器在 PG 里只能以约束触发器形式创建
-    final deferAble = isPgLike(typeId) && tr.deferrable.trim().toUpperCase() == 'YES';
+    final deferAble = tr.deferrable.trim().toUpperCase() == 'YES';
     if (deferAble) buf.write('CONSTRAINT ');
     buf.write('TRIGGER ${ident(typeId, tr.name.trim())} ');
     buf.write('${tr.timing.trim().toUpperCase()} $eventsText$updateOf ON ${_qualifiedTable(d, typeId)}');
@@ -1225,6 +1632,54 @@ class DdlBuilder {
     final params = tr.parameters.trim();
     buf.write(' EXECUTE FUNCTION ${_pgFunctionRef(fn, params)}');
     return '$buf;';
+  }
+
+  /// MySQL / MariaDB:`CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE}
+  /// ON tbl FOR EACH ROW BEGIN … END`。
+  ///
+  /// MySQL 的一个触发器只能挂一个事件,而界面上「插入 / 更新 / 删除」是三列
+  /// 独立勾选(与 PG 的 `OR` 列表共用同一张网格)。勾了多个时按事件**各出一条
+  /// CREATE**,而不是静默只取第一个 —— 后者会让用户以为三个事件都会触发。
+  /// 单事件保留原名(与手工写的 DDL 一致),多事件才加 `_insert` / `_update`
+  /// 后缀,否则同名会撞 1359。
+  static List<String> _mysqlTriggerSql(DesignTable d, String typeId, DesignTrigger tr) {
+    final events = triggerEvents(tr, includeTruncate: false);
+    if (events.isEmpty) return const [];
+    final body = _normalizeBody(tr.body);
+    if (body.isEmpty) return const [];
+    final name = tr.name.trim();
+    // MySQL 只有行级触发器;INSTEAD OF 在该方言不存在,按 BEFORE 直译
+    final timing =
+        tr.timing.trim().toUpperCase() == 'BEFORE' ? 'BEFORE' : 'AFTER';
+    return [
+      for (final ev in events)
+        'CREATE TRIGGER ${ident(typeId, events.length == 1 ? name : '${name}_${ev.toLowerCase()}')} '
+            '$timing $ev ON ${_qualifiedTable(d, typeId)} FOR EACH ROW\n'
+            // 恒用 BEGIN … END 包裹:单语句同样合法,且免去「数有几条语句」
+            // 这类易错判定。分号由服务端解析,与 mysql CLI 的 DELIMITER 无关。
+            'BEGIN\n  $body;\nEND;'
+    ];
+  }
+
+  /// SQL Server:`CREATE TRIGGER name ON tbl {AFTER|INSTEAD OF} <事件列表> AS <主体>`。
+  /// 语句级(无 `FOR EACH ROW`);该方言没有 `BEFORE`,最接近的是 `INSTEAD OF`,
+  /// 其余时机一律按 `AFTER` 输出。事件用逗号列表,一条 CREATE 即可表达。
+  static List<String> _sqlServerTriggerSql(DesignTable d, String typeId, DesignTrigger tr) {
+    final events = triggerEvents(tr, includeTruncate: false);
+    if (events.isEmpty) return const [];
+    final body = _normalizeBody(tr.body);
+    if (body.isEmpty) return const [];
+    final timing =
+        tr.timing.trim().toUpperCase() == 'INSTEAD OF' ? 'INSTEAD OF' : 'AFTER';
+    // 触发器是 schema 级对象,与表同模式落位
+    final trgName = tr.name.trim();
+    final qualifiedName = d.schema == null || d.schema!.isEmpty
+        ? ident(typeId, trgName)
+        : '${ident(typeId, d.schema!)}.${ident(typeId, trgName)}';
+    return [
+      'CREATE TRIGGER $qualifiedName ON ${_qualifiedTable(d, typeId)} '
+          '$timing ${events.join(', ')} AS BEGIN\n  $body;\nEND;'
+    ];
   }
 
   /// 触发函数引用:函数名可能带模式前缀,参数为空时不输出括号。
@@ -1298,8 +1753,66 @@ class DdlBuilder {
       // COMMENT ON INDEX(见注释段),不计入签名以免无谓重建
       '${isMysqlLike(typeId) ? '|${e.comment.trim()}' : ''}';
 
+  /// 唯一键 / 索引字段项的逐字段选项 → 签名片段(弹窗改排序规则、排序顺序
+  /// 都要算「已修改」,与 [_indexSignature] 同口径)。
+  static String _columnItemsSignature(List<DesignIndexColumn> items) => items
+      .map((c) => '${c.name}:${c.collationSchema}.${c.collation}'
+          ':${c.opClassSchema}.${c.opClass}:${c.order}:${c.nullsOrder}'
+          ':${c.operatorSchema}.${c.operatorName}')
+      .join('/');
+
   static String _uniqueSignature(DesignUniqueKey e) =>
-      '${e.columns}|${e.deferrable}|${e.deferred}|${e.fillFactor}|${e.tablespace}';
+      '${e.columns}|${e.deferrable}|${e.deferred}|${e.fillFactor}|${e.tablespace}'
+      '|${_columnItemsSignature(e.columnItems)}';
+
+  /// 检查约束签名:表达式 + 无继承(它改变 CREATE 语句)。
+  static String _checkSignature(DesignCheck e) =>
+      '${e.expression.trim()}|${e.noInherit}';
+
+  /// 排除约束的「会影响 CREATE 语句」签名(注释不参与,与索引同一口径)。
+  static String _excludeSignature(DesignExclude e) => [
+        e.columns.trim(),
+        _columnItemsSignature(e.columnItems),
+        e.method.trim().toLowerCase(),
+        e.predicate.trim(),
+        e.deferrable.trim().toUpperCase(),
+        e.deferred.trim().toUpperCase(),
+      ].join('|');
+
+  /// 规则的签名:主体归一化后比较(补个换行、多个分号不算一次变更)。
+  static String _ruleSignature(DesignRule e) => [
+        e.event.trim().toUpperCase(),
+        e.action.trim().toUpperCase(),
+        e.qualification.trim(),
+        _normalizeBody(e.statement),
+      ].join('|');
+
+  /// 表级存储参数签名(编辑模式差异比对口径)。
+  static String _storageSignature(DesignTable d) =>
+      d.storageOptionPairs().map((e) => '${e.key}=${e.value}').join(',');
+
+  /// 触发器的「会影响 CREATE 语句」签名。
+  ///
+  /// 必须覆盖**所有**参与生成的字段:旧版只比 `name|function|timing`,于是
+  /// 改主体 / 改勾选事件 / 改 WHEN 都不算变更,「设计表」按「无变更」直接不保存,
+  /// 用户改完什么都没发生。[DesignTrigger.comment] 不进来 —— 没有任何方言有
+  /// COMMENT ON TRIGGER,它不参与生成,自然也不该触发「已修改」。
+  static String _triggerSignature(DesignTrigger e) => [
+        e.name.trim(),
+        e.timing,
+        e.forEach,
+        '${e.insert}${e.update}${e.delete}${e.truncate}',
+        e.updateColumns.trim(),
+        e.when.trim(),
+        e.function.trim(),
+        e.parameters.trim(),
+        // 归一化后比较:补个换行、删个尾分号不该被当成一次结构变更
+        _normalizeBody(e.body),
+        e.deferrable,
+        e.deferred,
+        '${e.enable}',
+      ].join('|');
+
 
   static String _fkSignature(DesignForeignKey e) =>
       '${e.columns}|${e.refSchema}|${e.refTable}|${e.refColumns}|${e.onDelete}|${e.onUpdate}|${e.matchAll}|${e.deferrable}|${e.deferred}';
@@ -1313,10 +1826,20 @@ class DdlBuilder {
   static String _checkName(DesignCheck ck, DesignTable d) =>
       ck.name.trim().isEmpty ? 'ck_${d.name.trim()}_${_nameKey(ck.expression)}' : ck.name.trim();
 
-  static String _excludeName(DesignExclude ex, DesignTable d) =>
-      ex.name.trim().isEmpty
-          ? 'ex_${d.name.trim()}_${ex.columns.trim().split(',').first.trim()}'
-          : ex.name.trim();
+  static String _excludeName(DesignExclude ex, DesignTable d) {
+    if (ex.name.trim().isNotEmpty) return ex.name.trim();
+    // 排除元素写的是 `col WITH =` / `lower(id) WITH =`,无名兜底只取第一个元素
+    // 的标识符部分,否则约束名里会带进空格和括号(`ex_t_lower(id) WITH =`)。
+    final word = ex.columns
+        .split(',')
+        .map((e) => e.trim())
+        .firstWhere((e) => e.isNotEmpty, orElse: () => '')
+        .split(RegExp(r'\s+'))
+        .first;
+    final bare = word.replaceFirst(RegExp(r'^["`\[]+'), '');
+    final head = RegExp(r'^[\w$]+').firstMatch(bare)?.group(0) ?? '';
+    return 'ex_${d.name.trim()}_${head.isEmpty ? 'x' : head}';
+  }
 
   /// 同名配对的注释是否发生了变更(非 PG 方言无对应语法时用于阻断提示)。
   static bool _hasCommentLoss<T>(
@@ -1385,6 +1908,67 @@ class DdlBuilder {
       return 'ALTER TABLE $tbl DROP INDEX ${ident(typeId, name)};';
     }
     return 'DROP INDEX IF EXISTS ${qualified(typeId, d.schema, name)};';
+  }
+
+  /// 触发器限定名:PG / SQL Server 的触发器是 schema 级对象,与表同模式落位;
+  /// MySQL 的触发器挂在库上、没有模式层,只用裸名(与 [_mysqlTriggerSql] 一致)。
+  static String _triggerRef(DesignTable d, String typeId, String name) {
+    if (isPgLike(typeId) || isSqlServerLike(typeId)) {
+      return qualified(typeId, d.schema, name);
+    }
+    return ident(typeId, name);
+  }
+
+  /// 删除触发器语句(各方言形式不同)。
+  ///
+  /// - PostgreSQL:`DROP TRIGGER name ON table` —— 名字是表局部作用域,必须带 ON。
+  /// - SQL Server:`DROP TRIGGER schema.name` —— 名字是 schema 级,不带 ON。
+  /// - MySQL:`DROP TRIGGER name` —— 名字是库级,不带 ON。
+  ///
+  /// 一律带 `IF EXISTS`:反查基线可能因为权限 / 内部触发器过滤而与库内实际
+  /// 不完全一致,少一条不该让整串变更失败。
+  static String _dropTriggerSql(DesignTable d, String typeId, String name) {
+    final id = ident(typeId, name.trim());
+    if (isPgLike(typeId)) {
+      return 'DROP TRIGGER IF EXISTS $id ON ${_qualifiedTable(d, typeId)};';
+    }
+    if (isSqlServerLike(typeId)) {
+      return 'DROP TRIGGER IF EXISTS ${_triggerRef(d, typeId, name.trim())};';
+    }
+    return 'DROP TRIGGER IF EXISTS $id;';
+  }
+
+  /// 按名配对的两路差异:结构变了 → DROP + CREATE;只有注释变了 → 单发注释。
+  ///
+  /// 与 [buildAlterStatements] 里的局部 `diffByName` 的区别就在注释:排除约束 /
+  /// 规则的注释是挂在对象上的独立语句,一旦走 DROP + CREATE 就随对象一起没了,
+  /// 所以必须知道这一行到底有没有被重建 —— `diffByName` 只交得出「删谁 / 加谁」,
+  /// 配不上对,补不回来。
+  static void _diffNamedObjects<T>(
+    List<T> olds,
+    List<T> news,
+    String Function(T) nameOf,
+    String Function(T) sigOf,
+    String Function(T) commentOf, {
+    required void Function(T) onDrop,
+    required void Function(T) onRecreate,
+    required void Function(T) onComment,
+  }) {
+    final oldMap = <String, T>{for (final e in olds) nameOf(e).toLowerCase(): e};
+    final newMap = <String, T>{for (final e in news) nameOf(e).toLowerCase(): e};
+    for (final o in olds) {
+      final t = newMap[nameOf(o).toLowerCase()];
+      if (t == null || sigOf(t) != sigOf(o)) onDrop(o);
+    }
+    for (final n in news) {
+      final o = oldMap[nameOf(n).toLowerCase()];
+      if (o == null || sigOf(o) != sigOf(n)) {
+        onRecreate(n);
+        if (commentOf(n).trim().isNotEmpty) onComment(n);
+        continue;
+      }
+      if (!_sameText(commentOf(o), commentOf(n))) onComment(n);
+    }
   }
 
   /// 生成「设计表」的变更语句:比较 [original](打开时的反查快照)与 [target]
@@ -1512,12 +2096,84 @@ class DdlBuilder {
       if (clause.isNotEmpty) adds.add('ALTER TABLE $tbl ADD $clause;');
     });
     diffByName<DesignCheck>(original.checks, target.checks,
-        (e) => _checkName(e, target), (e) => e.expression.trim(), (e) {
+        (e) => _checkName(e, target), _checkSignature, (e) {
       final name = _checkName(e, original);
       drops.add('ALTER TABLE $tbl DROP CONSTRAINT ${ident(typeId, name)};');
     }, (e) {
       final clause = checkClause(e, target, typeId);
       if (clause.isNotEmpty) adds.add('ALTER TABLE $tbl ADD $clause;');
+    });
+
+    // 3a2. 排除约束:同为表约束,按「DROP CONSTRAINT + ADD CONSTRAINT」重建。
+    // 注释随 DROP 一起消失,故重建路径必须把注释补回来(见 [_diffConstraintComments])。
+    if (isPg) {
+      _diffNamedObjects<DesignExclude>(
+        original.excludes,
+        target.excludes,
+        (e) => _excludeName(e, target),
+        _excludeSignature,
+        (e) => e.comment,
+        onDrop: (e) => drops.add('ALTER TABLE $tbl DROP CONSTRAINT '
+            '${ident(typeId, _excludeName(e, original))};'),
+        onRecreate: (e) {
+          final clause = excludeClause(e, target, typeId);
+          if (clause.isNotEmpty) adds.add('ALTER TABLE $tbl ADD $clause;');
+        },
+        onComment: (e) => comments.add('COMMENT ON CONSTRAINT '
+            '${ident(typeId, _excludeName(e, target))} ON $tbl IS '
+            '${_commentValue(e.comment)};'),
+      );
+      // 3a3. 规则:不是约束,ALTER 表达不了,整条 DROP RULE + CREATE RULE 重建。
+      _diffNamedObjects<DesignRule>(
+        original.rules,
+        target.rules,
+        (e) => _ruleName(e, target),
+        _ruleSignature,
+        (e) => e.comment,
+        onDrop: (e) => drops.add(buildDropRule(original, typeId, _ruleName(e, original))),
+        onRecreate: (e) => adds.add(buildCreateRule(target, typeId, e)),
+        onComment: (e) => comments.add(buildRuleComment(target, typeId, e)),
+      );
+      // 规则的「启用」不在 CREATE RULE 文本里(见 [_ruleSignature]),PG 用
+      // ALTER TABLE … ENABLE|DISABLE RULE 单独切换:只改勾选时补这一条,
+      // 跟着重建走的规则则在 CREATE 之后补上开关。
+      final origRuleByName = <String, DesignRule>{
+        for (final o in original.rules) _nameKey(_ruleName(o, target)): o,
+      };
+      for (final t in target.rules) {
+        final name = _ruleName(t, target);
+        if (name.isEmpty) continue;
+        final o = origRuleByName[_nameKey(name)];
+        if (o == null) {
+          if (!t.enable) {
+            adds.add(buildSetRuleEnable(target, typeId, name, false));
+          }
+          continue;
+        }
+        if (o.enable == t.enable) continue;
+        adds.add(buildSetRuleEnable(
+            target, typeId, _ruleName(o, original), t.enable));
+      }
+    }
+
+    // 3b. 触发器:先 DROP 再 CREATE(改主体 / 改事件都按「换一个」处理)。
+    //
+    // 触发器不是表约束,ALTER TABLE … ADD/DROP 表达不了,只能整条重建;
+    // 也不能像索引那样在 CREATE 上用 OR REPLACE(三种方言都没有)。
+    // 名字带 `_insert` 后缀的情况见 [_mysqlTriggerSql]:MySQL 一个触发器只能挂
+    // 一个事件,原始设计里一条会展开成多条 CREATE,反查回来即多条独立触发器,
+    // 因此这里按「触发器名」一一配对即可,不需要感知展开关系。
+    diffByName<DesignTrigger>(original.triggers, target.triggers,
+        (e) => e.name.trim(), _triggerSignature, (e) {
+      final name = e.name.trim();
+      if (name.isEmpty) return;
+      drops.add(_dropTriggerSql(original, typeId, name));
+    }, (e) {
+      adds.addAll(buildCreateTriggers(target, typeId, e));
+      // PG 的「启用」是触发器建好之后的独立动作(见 buildStatements 同款补语)
+      if (isPg && !e.enable && e.name.trim().isNotEmpty) {
+        adds.add('ALTER TABLE $tbl DISABLE TRIGGER ${ident(typeId, e.name.trim())};');
+      }
     });
 
     // 4a. 列重命名(PG / SQL Server;MySQL 由 CHANGE COLUMN 一并完成)
@@ -1574,6 +2230,28 @@ class DdlBuilder {
             : 'MODIFY COLUMN $def$pos');
       } else {
         colSqls.addAll(_alterColumnDiffSqls(o, t, target, tbl, typeId));
+      }
+    }
+
+    // 4e. 表存储参数 / 表空间(仅 PG 有对应 ALTER;SQL Server 改填充因子需重建表)
+    if (isPg) {
+      final tOpts = {for (final e in target.storageOptionPairs()) e.key: e.value};
+      final oOpts = {for (final e in original.storageOptionPairs()) e.key: e.value};
+      final setPairs = [
+        for (final e in tOpts.entries) //
+          if (!_sameText(oOpts[e.key] ?? '', e.value)) '${e.key} = ${e.value}',
+      ];
+      final resetKeys = [for (final k in oOpts.keys) if (!tOpts.containsKey(k)) k];
+      if (setPairs.isNotEmpty) {
+        colSqls.add('ALTER TABLE $tbl SET (${setPairs.join(', ')});');
+      }
+      if (resetKeys.isNotEmpty) {
+        colSqls.add('ALTER TABLE $tbl RESET (${resetKeys.join(', ')});');
+      }
+      if (!_sameText(target.tablespace, original.tablespace)) {
+        // 清空即回默认表空间(PG 没有 DROP TABLESPACE 这一说)
+        final ts = target.tablespace.trim().isEmpty ? 'pg_default' : target.tablespace.trim();
+        colSqls.add('ALTER TABLE $tbl SET TABLESPACE ${ident(typeId, ts)};');
       }
     }
 
@@ -1672,36 +2350,22 @@ class DdlBuilder {
         comments.add('COMMENT ON CONSTRAINT ${ident(typeId, name)} ON $tbl IS '
             '${_commentValue(t.comment)};');
       }
-      // 排除约束注释(结构变更已被 alterUnsupported 拦住,只会走到这里)
-      final origExByName = <String, DesignExclude>{
-        for (final o in original.excludes) _nameKey(_excludeName(o, target)): o,
-      };
-      for (final t in target.excludes) {
-        final name = _excludeName(t, target);
-        final o = origExByName[_nameKey(name)];
-        if (_sameText(o?.comment ?? '', t.comment)) continue;
-        comments.add('COMMENT ON CONSTRAINT ${ident(typeId, name)} ON $tbl IS '
-            '${_commentValue(t.comment)};');
-      }
+      // 排除约束的注释走 [_diffNamedObjects](结构变更要连注释一起重建)
     } else {
       void emitProp(String? oldVal, String newVal, String? column) {
         if (_sameText(oldVal ?? '', newVal)) return;
-        final schema = target.schema?.trim();
-        final levels = column == null
-            ? "'SCHEMA', ${lit(schema ?? 'dbo')}, 'TABLE', ${lit(target.name.trim())}"
-            : "'SCHEMA', ${lit(schema ?? 'dbo')}, "
-                "'TABLE', ${lit(target.name.trim())}, "
-                "'COLUMN', ${lit(column)}";
+        // 属性原值决定用哪个存储过程:无 → add,有 → update,清空 → drop
         final fn = newVal.trim().isEmpty
             ? 'sp_dropextendedproperty'
             : ((oldVal ?? '').trim().isEmpty
                 ? 'sp_addextendedproperty'
                 : 'sp_updateextendedproperty');
-        // 位置形式:第一个参数是属性名,第二个是值(删除时无值)
-        final args = newVal.trim().isEmpty
-            ? lit('MS_Description')
-            : '${lit('MS_Description')}, ${lit(newVal.trim())}';
-        comments.add('EXEC $fn $args, $levels;');
+        comments.add(sqlServerCommentSql(
+            schema: target.schema?.trim(),
+            table: target.name.trim(),
+            column: column,
+            value: newVal.trim(),
+            proc: fn));
       }
 
       emitProp(original.tableComment, target.tableComment, null);
@@ -1821,6 +2485,100 @@ class DdlBuilder {
   static bool hasChanges(DesignTable target, DesignTable original, String typeId) =>
       buildAlterStatements(target, original, typeId).isNotEmpty;
 
+  /// 新建表时「当前方言表达不了」的设计项;返回 null = 全部都能落进 DDL。
+  ///
+  /// 与 [alterUnsupported] 同一原则:**宁可拒于执行前,也不静默丢弃**。
+  /// 改造前这些项在 [buildStatements] 里被 `if (isPgLike)` 一类的门直接跳过,
+  /// 界面上却照样能填能勾 —— 用户在 MySQL 连接上写了三条规则点保存,库里一条
+  /// 都没有,而界面告诉他「保存成功」。本方法是那个缺口的唯一拦口。
+  static String? createUnsupported(DesignTable d, String typeId) {
+    final pg = isPgLike(typeId);
+    if (!pg && d.rules.isNotEmpty) {
+      return '规则(RULE)仅 PostgreSQL 支持,当前类型无法生成:请先清空「规则」标签的内容';
+    }
+    if (!pg && d.excludes.isNotEmpty) {
+      return '排除约束(EXCLUDE)仅 PostgreSQL 支持,当前类型无法生成:请先清空「排除」标签的内容';
+    }
+    for (final fk in d.foreignKeys) {
+      if (!pg && fk.comment.trim().isNotEmpty) {
+        return '外键注释仅 PostgreSQL 支持(需 COMMENT ON CONSTRAINT):'
+            '请清空外键「${_nameOr(fk.name, '未命名')}」的注释';
+      }
+      if (fk.matchAll && !pg && !isMysqlLike(typeId)) {
+        return '「符合全部」(MATCH FULL)仅 PostgreSQL / MySQL 支持:'
+            '请取消外键「${_nameOr(fk.name, '未命名')}」的勾选';
+      }
+    }
+    for (final uk in d.uniqueKeys) {
+      if (!pg && uk.comment.trim().isNotEmpty) {
+        return '唯一键注释仅 PostgreSQL 支持:请清空唯一键「${_nameOr(uk.name, '未命名')}」的注释';
+      }
+      if (!pg && uk.tablespace.trim().isNotEmpty) {
+        return '唯一键表空间仅 PostgreSQL 支持:请清空唯一键「${_nameOr(uk.name, '未命名')}」的表空间';
+      }
+      if (!pg && uk.fillFactor.trim().isNotEmpty) {
+        return '唯一键填充因子仅 PostgreSQL 支持:请清空唯一键「${_nameOr(uk.name, '未命名')}」的填充因子';
+      }
+      if (!pg && uk.columnItems.any((c) => c.hasOptions)) {
+        return '唯一键字段的排序规则 / 运算符类别 / 排序顺序仅 PostgreSQL 支持:'
+            '请在「${_nameOr(uk.name, '未命名')}」的字段弹窗里清空这些选项';
+      }
+    }
+    for (final ck in d.checks) {
+      if (!pg && ck.comment.trim().isNotEmpty) {
+        return '检查约束注释仅 PostgreSQL 支持:请清空检查「${_nameOr(ck.name, '未命名')}」的注释';
+      }
+      if (!pg && ck.noInherit) {
+        return '「无继承」(NO INHERIT)仅 PostgreSQL 支持:'
+            '请取消检查「${_nameOr(ck.name, '未命名')}」的勾选';
+      }
+    }
+    for (final ex in d.excludes) {
+      if (!pg && ex.comment.trim().isNotEmpty) {
+        return '排除约束注释仅 PostgreSQL 支持:请清空排除「${_nameOr(ex.name, '未命名')}」的注释';
+      }
+    }
+    for (final idx in d.indexes) {
+      final name = _nameOr(idx.name, '未命名');
+      if (!pg && idx.concurrent) {
+        return '并发创建索引(CONCURRENTLY)仅 PostgreSQL 支持:请取消索引「$name」的「并发」勾选';
+      }
+      if (!pg && idx.tablespace.trim().isNotEmpty) {
+        return '索引表空间仅 PostgreSQL 支持:请清空索引「$name」的表空间';
+      }
+      if (idx.fillFactor.trim().isNotEmpty && !pg && !isSqlServerLike(typeId)) {
+        return '索引填充因子仅 PostgreSQL / SQL Server 支持:请清空索引「$name」的填充因子';
+      }
+      if (!pg) {
+        // 弹窗里逐字段的排序规则 / 运算符类别 / 排序顺序 / Nulls 排序全是 PG 语法
+        final hasOpt = idx.columnItems.any((c) => c.hasOptions);
+        if (hasOpt) {
+          return '索引字段的排序规则 / 运算符类别 / 排序顺序仅 PostgreSQL 支持:'
+              '请在「$name」的字段弹窗里清空这些选项';
+        }
+      }
+    }
+    if (!pg) {
+      if (d.unlogged) return '「不记录」(UNLOGGED)仅 PostgreSQL 支持,请先取消勾选';
+      if (d.owner.trim().isNotEmpty) return '表所有者仅 PostgreSQL 支持,请先清空「所有者」';
+      if (d.inherits.trim().isNotEmpty) return '继承(INHERITS)仅 PostgreSQL 支持,请先清空「继承自」';
+      if (d.cluster.trim().isNotEmpty) return '集群(CLUSTER)仅 PostgreSQL 支持,请先清空「集群」';
+      // 表级 TABLESPACE 子句只有 PG 会输出(SQL Server 用的是 ON [PRIMARY]
+      // 文件组,是另一套语法,设计器尚未支持)
+      if (d.tablespace.trim().isNotEmpty) {
+        return '表空间仅 PostgreSQL 支持,请先清空「表空间」';
+      }
+      // 存储参数:PG 全量可生成,SQL Server 只认填充因子,其它方言一项都不出
+      for (final e in d.storageOptionPairs()) {
+        if (isSqlServerLike(typeId) && e.key == kPgFillFactor) continue;
+        return '表存储参数 ${e.key} 仅 PostgreSQL 支持'
+            '${isSqlServerLike(typeId) ? '(SQL Server 只认填充因子)' : ''},'
+            '请先在「选项」里清空它';
+      }
+    }
+    return null;
+  }
+
   /// 编辑模式下无法用 ALTER 表达的变更;返回 null = 可保存。
   ///
   /// 原则:宁可阻断保存并说明原因,也不静默丢弃用户的修改。
@@ -1829,23 +2587,22 @@ class DdlBuilder {
     if (!isPgLike(typeId) && !isMysqlLike(typeId) && !isSqlServerLike(typeId)) {
       return '当前数据库类型不支持编辑已有表结构';
     }
-    if (target.triggers.length != original.triggers.length ||
-        !_sameSigList(
-            target.triggers.map((e) => '${e.name}|${e.function}|${e.timing}').toList(),
-            original.triggers.map((e) => '${e.name}|${e.function}|${e.timing}').toList())) {
-      return '触发器 / 规则 / 排除约束暂不支持在「设计表」中修改';
-    }
-    if (target.rules.length != original.rules.length ||
-        !_sameSigList(
-            target.rules.map((e) => '${e.name}|${e.statement}').toList(),
-            original.rules.map((e) => '${e.name}|${e.statement}').toList())) {
-      return '触发器 / 规则 / 排除约束暂不支持在「设计表」中修改';
-    }
-    if (target.excludes.length != original.excludes.length ||
-        !_sameSigList(
-            target.excludes.map((e) => '${e.name}|${e.columns}').toList(),
-            original.excludes.map((e) => '${e.name}|${e.columns}').toList())) {
-      return '触发器 / 规则 / 排除约束暂不支持在「设计表」中修改';
+    // 触发器已支持编辑:增删改都按「DROP + CREATE」重建(见 buildAlterStatements 3b)。
+    // 先决条件是三个驱动都在 readTableDesign 里回填了 triggers —— 基线为空的话
+    // 这里会把库里既有的触发器全当成「新增」重复建,那份守卫在各驱动的反查里。
+    //
+    // 排除约束 / 规则同一套路:排除走 ALTER TABLE DROP + ADD CONSTRAINT,规则走
+    // DROP RULE + CREATE RULE(见 3a2 / 3a3)。两者都只有 PostgreSQL 有语法,
+    // 其余方言连反查都读不回来(基线恒空),变更只能阻断。
+    final pg = isPgLike(typeId);
+    if (!pg &&
+        (!_sameSigList(
+            target.rules.map((e) => '${e.name}|${_ruleSignature(e)}').toList(),
+            original.rules.map((e) => '${e.name}|${_ruleSignature(e)}').toList()) ||
+            !_sameSigList(
+                target.excludes.map((e) => '${e.name}|${_excludeSignature(e)}').toList(),
+                original.excludes.map((e) => '${e.name}|${_excludeSignature(e)}').toList()))) {
+      return '规则 / 排除约束仅 PostgreSQL 支持,当前数据库类型无法修改';
     }
     // 索引注释:PG 走 COMMENT ON INDEX、MySQL 内联进 CREATE INDEX(已计入索引
     // 签名),SQL Server 的扩展属性不覆盖索引层次 → 只能阻断提示
@@ -1862,9 +2619,23 @@ class DdlBuilder {
                 target.checks, original.checks, (e) => _checkName(e, target), (e) => e.comment))) {
       return '唯一键 / 检查约束注释暂仅支持 PostgreSQL 在「设计表」中修改';
     }
-    if (!_sameText(target.tablespace, original.tablespace) ||
-        !_sameText(target.fillFactor, original.fillFactor)) {
-      return '表空间 / 填充因子暂不支持在「设计表」中修改';
+    // 存储参数 / 表空间:PG 有 ALTER TABLE SET (…) / SET TABLESPACE(见 4e),
+    // SQL Server 改填充因子需重建表、MySQL 无表级 reloption → 只能阻断。
+    if (!pg &&
+        (!_sameText(target.tablespace, original.tablespace) ||
+            _storageSignature(target) != _storageSignature(original))) {
+      return '表空间 / 存储参数仅 PostgreSQL 支持在「设计表」中修改';
+    }
+    // 不记录 / 继承 / 集群:任何方言都没有对应的 ALTER(前两项需重建表),
+    // 改造前用户的修改会被静默丢弃,这里补上拦口。
+    if (target.unlogged != original.unlogged) {
+      return '「不记录」(UNLOGGED)只能在「新建表」时设定,已有表无法用 ALTER 修改';
+    }
+    if (!_sameText(target.inherits, original.inherits)) {
+      return '继承(INHERITS)只能在「新建表」时设定,已有表无法用 ALTER 修改';
+    }
+    if (!_sameText(target.cluster, original.cluster)) {
+      return '「集群」是一条 CLUSTER 命令而非结构变更,暂不支持在「设计表」中修改';
     }
     if (!isMysqlLike(typeId)) {
       // 列序调整:PG / SQL Server 无对应语法(不做隐式表重建)

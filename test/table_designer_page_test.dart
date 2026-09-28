@@ -9,6 +9,8 @@ import 'package:provider/provider.dart';
 import 'package:re_editor/re_editor.dart';
 import 'package:daro/app/app_state.dart';
 import 'package:daro/data/table_design.dart';
+import 'package:daro/theme/app_theme.dart';
+import 'package:daro/widgets/index_column_picker_dialog.dart';
 import 'package:daro/widgets/table_designer_page.dart';
 import 'package:daro/l10n/locale_config.dart';
 
@@ -33,6 +35,15 @@ void main() {
         ),
       );
 
+  /// 工具栏是**纯图标**(对齐参考工具):按钮上没有文字,统一按 tooltip 找。
+  Finder tool(String tip) => find.byTooltip(tip);
+
+  /// 属性面板的标签一律带冒号(参考工具实测「默认:」「排序规则:」)
+  Finder prop(String label) => find.text('$label:');
+
+  /// 保存按钮(软盘图标):新建与编辑模式的 tooltip 不同,按图标找最稳
+  final Finder saveBtn = find.widgetWithIcon(ToolbarButton, Icons.save_outlined);
+
   testWidgets('TableDesignerPage 11 个标签布局无异常', (tester) async {
     await tester.pumpWidget(harness());
     await tester.pumpAndSettle();
@@ -42,21 +53,26 @@ void main() {
       expect(find.text(label), findsWidgets, reason: '缺少标签: $label');
     }
     // 默认预置一行字段
-    expect(find.text('添加字段'), findsOneWidget);
-    expect(find.text('保存'), findsOneWidget);
+    expect(tool('添加字段'), findsOneWidget);
+    expect(saveBtn, findsOneWidget);
+    // 页内没有标题条:表名 / 库 / 连接都在文档标签标题上,工具栏也不放表名框
+    expect(find.text('表名'), findsNothing);
+    expect(find.textContaining('— 设计'), findsNothing);
   });
 
   testWidgets('添加字段按钮与字段行编辑', (tester) async {
     await tester.pumpWidget(harness());
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('添加字段'));
+    await tester.tap(tool('添加字段'));
     await tester.pumpAndSettle();
-    // 插入 / 删除按钮出现(行数 ≥ 1 时删除可用)
-    expect(find.text('插入字段'), findsOneWidget);
-    expect(find.text('删除字段'), findsOneWidget);
-    // 上移在第一行禁用、下移可用
-    expect(find.text('上移'), findsOneWidget);
+    // 删除按钮可用(行数 ≥ 1);插入 / 上移 / 下移收进行右键菜单
+    expect(tool('删除字段'), findsOneWidget);
+    await tester.tapAt(_rowAt(tester, 0), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+    for (final item in ['插入字段', '上移', '下移']) {
+      expect(find.text(item), findsOneWidget, reason: '右键菜单缺少: $item');
+    }
   });
 
   testWidgets('切换到 SQL 预览标签渲染 DDL', (tester) async {
@@ -84,7 +100,7 @@ void main() {
 
     // 默认连接类型 PostgreSQL:虚拟类型 + 完整序列属性均展示
     for (final label in ['默认', '排序规则', '维度', '虚拟类型', '递增', '最小', '最大', '开始值', '缓存', '循环']) {
-      expect(find.text(label), findsWidgets, reason: '属性面板缺少: $label');
+      expect(prop(label), findsOneWidget, reason: '属性面板缺少: $label');
     }
     // 未开启 IDENTITY 时虚拟类型显示为「无」
     expect(find.text('无'), findsOneWidget);
@@ -101,7 +117,7 @@ void main() {
     // 初始无主键:仅工具栏「主键 ▾」上一个钥匙图标
     expect(find.byIcon(Icons.key), findsNWidgets(1));
 
-    await tester.tap(find.text('主键'));
+    await tester.tap(tool('设置 / 取消主键(多选即复合主键)'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('设置主键'));
     await tester.pumpAndSettle();
@@ -177,9 +193,8 @@ void main() {
     await tester.pump();
   }
 
-  bool saveEnabled(WidgetTester tester) => tester
-      .widget<ToolbarButton>(find.widgetWithText(ToolbarButton, '保存'))
-      .enabled;
+  bool saveEnabled(WidgetTester tester) =>
+      tester.widget<ToolbarButton>(saveBtn).enabled;
 
   String previewSql(WidgetTester tester) =>
       tester.widget<CodeEditor>(find.byType(CodeEditor)).controller!.text;
@@ -191,7 +206,6 @@ void main() {
 
     await openEdit(tester, editHarness(loader: (db, t, s) async => readBack()));
 
-    expect(find.text('configs'), findsOneWidget); // 表名输入框预填
     expect(find.text('id'), findsOneWidget); // 首行列名
     expect(find.text('64'), findsOneWidget); // int8 长度格显示位宽
     expect(find.text('32'), findsOneWidget);
@@ -201,11 +215,11 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('varchar'), findsWidgets); // 类型下拉回显
-    expect(find.byIcon(Icons.arrow_right), findsOneWidget); // ▶ 当前行标记
-    expect(find.textContaining('— 设计'), findsOneWidget); // 标题条区分两种模式
+    // 行首不再有 ▶ 三角:当前行标记换成淡蓝槽 + 2px 强调条(参考工具同)
+    expect(find.byIcon(Icons.arrow_right), findsNothing);
     expect(find.text('无变更'), findsOneWidget);
     expect(saveEnabled(tester), isFalse); // 无变更不可保存
-    // PG / SQL Server 无对应 ALTER,列序动作置灰并提示
+    // PG / SQL Server 无对应 ALTER,列序动作置灰并提示(文字已从工具栏挪到状态栏)
     expect(find.text('调整已有列的顺序仅 MySQL / MariaDB 支持'), findsOneWidget);
   });
 
@@ -279,14 +293,11 @@ void main() {
     expect(find.textContaining('暂不支持编辑已有表结构'), findsOneWidget);
     expect(find.text('只读'), findsOneWidget);
     expect(saveEnabled(tester), isFalse);
-    // 表名输入框禁用(不可改名 → 不会生成 RENAME)
-    expect(tester.widget<Input>(find.byType(Input).first).enabled, isFalse);
-    // 动作按钮整组置灰
+    // 动作按钮整组置灰(只读降级不开放任何编辑)
     expect(
       tester
           .widget<IgnorePointer>(find
-              .ancestor(
-                  of: find.text('添加字段'), matching: find.byType(IgnorePointer))
+              .ancestor(of: tool('添加字段'), matching: find.byType(IgnorePointer))
               .first)
           .ignoring,
       isTrue,
@@ -331,6 +342,61 @@ void main() {
     expect(tester.takeException(), isNull, reason: '切到「$label」标签时报错');
   }
 
+  /// 属性面板里某一行右侧的输入框(标签行是 Row,内部含 TextField)
+  Finder propField(WidgetTester tester, String label) => find.descendant(
+        of: find.ancestor(of: prop(label), matching: find.byType(Row)).last,
+        matching: find.byType(TextField),
+      );
+
+  /// 打开一个只读下拉的面板,直到候选 [item] 出现在树里。
+  ///
+  /// 网格里首次点单元格会把它设为「当前格」并重建该行,刚插进 Overlay 的面板
+  /// 跟着被关掉(实测第二下必开),故点不开就补点,最多三次。
+  /// [item] 只用来判「面板开了没」,别传与当前值同字的候选(那样关着也算命中)。
+  Future<void> openComboPanel(
+      WidgetTester tester, Finder combo, String item) async {
+    for (var i = 0; i < 3; i++) {
+      await tester.tap(combo);
+      await tester.pumpAndSettle();
+      if (find.text(item).evaluate().isNotEmpty) return;
+    }
+    throw StateError('下拉面板打不开:候选「$item」始终没出现');
+  }
+
+  /// 属性面板某行的只读下拉:打开面板并选中 [value]
+  Future<void> pickCombo(WidgetTester tester, String label, String value) async {
+    await openComboPanel(
+      tester,
+      find.descendant(
+        of: find.ancestor(of: prop(label), matching: find.byType(Row)).last,
+        matching: find.byType(ComboBox<String>),
+      ),
+      value,
+    );
+    await tester.tap(find.text(value).last);
+    await tester.pumpAndSettle();
+  }
+
+  /// 网格行里的下拉控件,按出现顺序编号(如规则行:0 = 事件,1 = 代替运行)
+  Finder gridCombo(WidgetTester tester, int index) => find
+      .descendant(of: find.byType(ListView), matching: find.byType(ComboBox<String>))
+      .at(index);
+
+  /// 网格某格的下拉:打开面板并选中 [value]
+  Future<void> pickGridCombo(WidgetTester tester, int index, String value) async {
+    await openComboPanel(tester, gridCombo(tester, index), value);
+    await tester.tap(find.text(value).last);
+    await tester.pumpAndSettle();
+  }
+
+  /// 「字段 / 元素 / 表达式」格右侧的 `...` 按钮(第 [index] 个)
+  Future<void> tapDots(WidgetTester tester, [int index = 0]) async {
+    await tester.tap(find
+        .descendant(of: find.byType(ListView), matching: find.text('...'))
+        .at(index));
+    await tester.pumpAndSettle();
+  }
+
   testWidgets('11 个标签逐个切换都能渲染(表头与列宽不成套即崩)', (tester) async {
     wideView(tester);
     await tester.pumpWidget(harness());
@@ -359,7 +425,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // 弹窗行来源是表字段:先建一个名为 amount 的字段
-    await tester.tap(find.text('添加字段'));
+    await tester.tap(tool('添加字段'));
     await tester.pumpAndSettle();
     await tester.enterText(
       find.descendant(
@@ -369,7 +435,7 @@ void main() {
     await tester.pump();
 
     await openTab(tester, '索引');
-    await tester.tap(find.text('添加索引'));
+    await tester.tap(tool('添加索引'));
     await tester.pumpAndSettle();
     expect(find.text('...'), findsOneWidget); // 字段格右侧的 `...`
 
@@ -406,7 +472,7 @@ void main() {
     await tester.pumpAndSettle();
 
     await openTab(tester, '外键');
-    await tester.tap(find.text('添加外键'));
+    await tester.tap(tool('添加外键'));
     await tester.pumpAndSettle();
 
     for (final h in ['被引用的模式', '被引用的表（父）', '被引用的字段', '删除时', '更新时']) {
@@ -414,8 +480,8 @@ void main() {
     }
     // 「注释」= 标签条 + 外键表头 + 空单元格 hint
     expect(find.text('注释'), findsNWidgets(3));
-    expect(find.text('符合全部'), findsOneWidget);
-    expect(find.text('可延迟'), findsOneWidget);
+    expect(prop('符合全部'), findsOneWidget);
+    expect(prop('可延迟'), findsOneWidget);
 
     // 注释格确实写进模型:预览生成 COMMENT ON CONSTRAINT
     final cells = find.descendant(
@@ -438,29 +504,29 @@ void main() {
     await tester.pumpAndSettle();
 
     await openTab(tester, '触发器');
-    await tester.tap(find.text('添加触发器'));
+    await tester.tap(tool('添加触发器'));
     await tester.pumpAndSettle();
 
     // 常规子页:当 / 触发函数(模式 + 函数名)/ 参数
     expect(find.text('常规'), findsOneWidget);
     expect(find.text('约束'), findsOneWidget);
-    expect(find.text('当'), findsOneWidget);
-    expect(find.text('触发函数'), findsOneWidget);
+    expect(prop('当'), findsOneWidget);
+    expect(prop('触发函数'), findsOneWidget);
     expect(find.text('模式'), findsOneWidget);
     expect(find.text('函数名'), findsOneWidget);
-    expect(find.text('可延迟'), findsNothing);
+    expect(prop('可延迟'), findsNothing);
 
     await tester.tap(find.text('约束'));
     await tester.pumpAndSettle();
-    expect(find.text('触发函数'), findsNothing);
-    expect(find.text('可延迟'), findsOneWidget);
-    expect(find.text('延迟'), findsOneWidget);
+    expect(prop('触发函数'), findsNothing);
+    expect(prop('可延迟'), findsOneWidget);
+    expect(prop('延迟'), findsOneWidget);
     expect(find.textContaining('延迟需先置「可延迟 = YES」'), findsOneWidget);
 
     // 切回常规:子页状态不影响网格
     await tester.tap(find.text('常规'));
     await tester.pumpAndSettle();
-    expect(find.text('触发函数'), findsOneWidget);
+    expect(prop('触发函数'), findsOneWidget);
   });
 
   testWidgets('选项标签含参考工具的字段集', (tester) async {
@@ -469,8 +535,10 @@ void main() {
     await tester.pumpAndSettle();
 
     await openTab(tester, '选项');
-    for (final label in ['不记录', '所有者', '表空间', '继承自', '填充因子 (%)', '集群']) {
-      expect(find.text(label), findsOneWidget, reason: '选项页缺少: $label');
+    // 「不记录」是勾选框自带的标签(不是「xxx:」属性行),其余走属性面板
+    expect(find.text('不记录'), findsOneWidget);
+    for (final label in ['所有者', '表空间', '继承自', '填充因子 (%)', '集群']) {
+      expect(prop(label), findsOneWidget, reason: '选项页缺少: $label');
     }
     expect(
       tester.widget<CheckBox>(find.byType(CheckBox).first).enabled,
@@ -486,15 +554,363 @@ void main() {
     expect(find.text('选择继承的父表'), findsNothing);
   });
 
-  testWidgets('编辑模式:选项页整页不开放(无对应 ALTER)', (tester) async {
+  testWidgets('继承自弹窗:限定名逐段加引号,↑↓ 决定 INHERITS 的书写顺序',
+      (tester) async {
+    wideView(tester);
+    await tester.pumpWidget(harness());
+    await tester.pumpAndSettle();
+
+    await openTab(tester, '选项');
+    // 无真实连接时候选表列表为空,弹窗要能把手工输入的值也列成行(否则勾一下就丢)
+    await tester.enterText(propField(tester, '继承自'), 'public.logs, base_t');
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('...'));
+    await tester.pumpAndSettle();
+
+    Finder inDlg(Finder f) => find.descendant(
+        of: find.byType(ListPickerDialog<String>), matching: f);
+    // 参考工具那一列:表头「名称」+ 行首 ▶ 当前行标记
+    expect(inDlg(find.text('名称')), findsOneWidget);
+    expect(inDlg(find.byIcon(Icons.arrow_right)), findsOneWidget);
+    expect(inDlg(find.text('"public"."logs"')), findsOneWidget);
+    expect(inDlg(find.text('"base_t"')), findsOneWidget);
+    // 弹窗显示带引号的限定名,模型里存的不带引号 → 生成的 INHERITS 由 DdlBuilder 加引号
+
+    await tester.tap(inDlg(find.byIcon(Icons.arrow_downward)));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+
+    await openTab(tester, 'SQL 预览');
+    expect(previewSql(tester), contains('INHERITS ("base_t", "public"."logs")'));
+  });
+
+  testWidgets('编辑模式:选项页只放开有对应 ALTER 的那几项', (tester) async {
     wideView(tester);
     await openEdit(tester, editHarness(loader: (db, t, s) async => readBack()));
 
     await openTab(tester, '选项');
     expect(find.text('不记录'), findsOneWidget);
+    // 不记录 / 继承:任何方言都没有 ALTER 表达 → 只回显,不给「改了不生效」的控件
     expect(tester.widget<CheckBox>(find.byType(CheckBox).first).enabled, isFalse);
     expect(tester.widget<IconBtn>(find.byType(IconBtn).last).onTap, isNull);
-    expect(find.textContaining('无对应的 ALTER 语句'), findsOneWidget);
+    // 填充因子 / 表空间 / 所有者:PG 有 SET / SET TABLESPACE / OWNER TO → 照改照存
+    expect(
+      tester
+          .widget<TextField>(propField(tester, '填充因子 (%)'))
+          .enabled,
+      isTrue,
+    );
+    expect(find.textContaining('原样保留'), findsOneWidget);
+  });
+
+  testWidgets('排除标签:属性面板的排除条件 / 可延迟 / 延迟都进 EXCLUDE 子句',
+      (tester) async {
+    wideView(tester);
+    await tester.pumpWidget(harness());
+    await tester.pumpAndSettle();
+
+    await openTab(tester, '排除');
+    await tester.tap(tool('添加排除'));
+    await tester.pumpAndSettle();
+
+    for (final label in ['排除条件 (WHERE)', '可延迟', '延迟']) {
+      expect(prop(label), findsOneWidget, reason: '排除属性面板缺少: $label');
+    }
+    // 比较操作符的写法有说明(不是让用户猜「字段 / 表达式」格该填什么)
+    expect(find.textContaining('int4range(a, b) WITH &&'), findsOneWidget);
+
+    // 网格三个输入格:名称 / 字段表达式 / 注释(排除方法是下拉)
+    final cells = find.descendant(
+        of: find.byType(ListView), matching: find.byType(TextField));
+    expect(cells, findsNWidgets(3));
+    await tester.enterText(cells.first, 'ex_rng');
+    await tester.pump();
+    await tester.enterText(cells.at(1), 'rng WITH &&');
+    await tester.pump();
+    await tester.enterText(propField(tester, '排除条件 (WHERE)'), "state = 'active'");
+    await tester.pump();
+    await pickCombo(tester, '可延迟', 'YES');
+    await pickCombo(tester, '延迟', 'YES');
+
+    await openTab(tester, 'SQL 预览');
+    expect(
+      previewSql(tester),
+      contains('CONSTRAINT "ex_rng" EXCLUDE USING gist (rng WITH &&) '
+          "WHERE (state = 'active') DEFERRABLE INITIALLY DEFERRED"),
+    );
+  });
+
+  testWidgets('唯一键:字段格 `...` 打开「选择数据表字段」,选项落进 UNIQUE 括号',
+      (tester) async {
+    wideView(tester);
+    await tester.pumpWidget(harness());
+    await tester.pumpAndSettle();
+
+    // 弹窗的行来自表字段:先给新建页预置的那一行命名
+    await tester.enterText(
+      find.descendant(
+          of: find.byType(ListView), matching: find.byType(TextField)).first,
+      'id',
+    );
+    await tester.pumpAndSettle();
+
+    await openTab(tester, '唯一键');
+    await tester.tap(tool('添加唯一键'));
+    await tester.pumpAndSettle();
+
+    final cells = find.descendant(
+        of: find.byType(ListView), matching: find.byType(TextField));
+    // 名称 / 字段 / 注释 三格,字段格右侧带 `...`
+    expect(cells, findsNWidgets(3));
+    await tester.enterText(cells.first, 'uq_id');
+    await tester.pumpAndSettle();
+    await tapDots(tester);
+    expect(find.byType(IndexColumnPickerDialog), findsOneWidget);
+
+    // 勾上 id 行 → 该行的选项格才可编辑;排序顺序是第 5 个下拉
+    await tester.tap(find
+        .descendant(of: find.byType(IndexColumnPickerDialog),
+            matching: find.byType(CheckBox))
+        .first);
+    await tester.pumpAndSettle();
+    final dlgCombos = find.descendant(
+        of: find.byType(IndexColumnPickerDialog),
+        matching: find.byType(ComboBox<String>));
+    await openComboPanel(tester, dlgCombos.at(4), 'DESC');
+    await tester.tap(find.text('DESC').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+    expect(find.byType(IndexColumnPickerDialog), findsNothing);
+
+    await openTab(tester, 'SQL 预览');
+    expect(previewSql(tester), contains('CONSTRAINT "uq_id" UNIQUE ("id" DESC)'));
+  });
+
+  testWidgets('检查:表达式 `...` 开大弹窗录入,「无继承」勾选落 NO INHERIT',
+      (tester) async {
+    wideView(tester);
+    await tester.pumpWidget(harness());
+    await tester.pumpAndSettle();
+
+    await openTab(tester, '检查');
+    await tester.tap(tool('添加检查'));
+    await tester.pumpAndSettle();
+
+    final cells = find.descendant(
+        of: find.byType(ListView), matching: find.byType(TextField));
+    expect(cells, findsNWidgets(3));
+    await tester.enterText(cells.first, 'ck_pos');
+    await tester.pumpAndSettle();
+
+    await tapDots(tester);
+    expect(find.text('检查表达式'), findsOneWidget);
+    await tester.enterText(
+      find.descendant(
+          of: find.byType(DialogBox), matching: find.byType(TextField)).first,
+      'id > 0 AND id < 100',
+    );
+    await tester.pump();
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find
+        .descendant(of: find.byType(ListView), matching: find.byType(CheckBox))
+        .first);
+    await tester.pumpAndSettle();
+
+    await openTab(tester, 'SQL 预览');
+    expect(
+      previewSql(tester),
+      contains('CONSTRAINT "ck_pos" CHECK (id > 0 AND id < 100) NO INHERIT'),
+    );
+  });
+
+  testWidgets('排除:元素格 `...` 的弹窗带「运算符」列,勾字段填运算符后生成 WITH',
+      (tester) async {
+    wideView(tester);
+    await tester.pumpWidget(harness());
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.descendant(
+          of: find.byType(ListView), matching: find.byType(TextField)).first,
+      'id',
+    );
+    await tester.pumpAndSettle();
+
+    await openTab(tester, '排除');
+    await tester.tap(tool('添加排除'));
+    await tester.pumpAndSettle();
+
+    final cells = find.descendant(
+        of: find.byType(ListView), matching: find.byType(TextField));
+    // 名称 / 元素 / 注释(索引方法是下拉),元素格右侧 `...`
+    expect(cells, findsNWidgets(3));
+    await tester.enterText(cells.first, 'ex_id');
+    await tester.pumpAndSettle();
+    await tapDots(tester);
+
+    // 排除模式的列集:少排序规则两列,多运算符两列(运算符是最后一个下拉)
+    Finder inDialog(String text) => find.descendant(
+        of: find.byType(IndexColumnPickerDialog), matching: find.text(text));
+    expect(inDialog('元素'), findsOneWidget);
+    expect(inDialog('运算符'), findsOneWidget);
+    expect(inDialog('排序规则'), findsNothing);
+    await tester.tap(find
+        .descendant(of: find.byType(IndexColumnPickerDialog),
+            matching: find.byType(CheckBox))
+        .first);
+    await tester.pumpAndSettle();
+    final dlgCombos = find.descendant(
+        of: find.byType(IndexColumnPickerDialog),
+        matching: find.byType(ComboBox<String>));
+    await openComboPanel(tester, dlgCombos.last, '=');
+    await tester.tap(find.text('=').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+
+    await openTab(tester, 'SQL 预览');
+    expect(previewSql(tester),
+        contains('CONSTRAINT "ex_id" EXCLUDE USING gist ("id" WITH =)'));
+  });
+
+  testWidgets('规则标签:代替运行 / 启用在网格,语句与限定条件在属性面板',
+      (tester) async {
+    wideView(tester);
+    await tester.pumpWidget(harness());
+    await tester.pumpAndSettle();
+
+    await openTab(tester, '规则');
+    await tester.tap(tool('添加规则'));
+    await tester.pumpAndSettle();
+
+    // 列集与参考工具一致:名称 / 事件 / 代替运行 / 启用 / 注释
+    for (final h in ['名称', '事件', '代替运行', '启用', '注释']) {
+      expect(find.text(h, findRichText: true), findsWidgets, reason: '规则网格缺少列: $h');
+    }
+    expect(prop('语句'), findsOneWidget);
+    expect(prop('限定条件 (WHERE)'), findsOneWidget);
+    // 网格两个输入格(名称 / 注释)+ 两个下拉(事件 / 代替运行)+ 一个勾选(启用)
+    final cells = find.descendant(
+        of: find.byType(ListView), matching: find.byType(TextField));
+    expect(cells, findsNWidgets(2));
+    expect(
+        find.descendant(of: find.byType(ListView), matching: find.byType(CheckBox)),
+        findsOneWidget);
+
+    await tester.enterText(cells.first, 'r_log');
+    await tester.pump();
+    await tester.enterText(propField(tester, '语句'), 'INSERT INTO log VALUES (1)');
+    await tester.pump();
+    await tester.enterText(propField(tester, '限定条件 (WHERE)'), 'NEW.id > 0');
+    await tester.pump();
+    await pickGridCombo(tester, 1, 'INSTEAD');
+
+    await openTab(tester, 'SQL 预览');
+    expect(
+      previewSql(tester),
+      contains('CREATE RULE "r_log" AS ON INSERT TO "Untitled" '
+          'WHERE (NEW.id > 0) DO INSTEAD (INSERT INTO log VALUES (1));'),
+    );
+
+    // 事件换成 SELECT:代替运行下拉置灰,值也扳成 INSTEAD —— 回显必须与生成的 SQL 一致
+    await openTab(tester, '规则');
+    await pickGridCombo(tester, 0, 'SELECT');
+    expect(tester.widget<ComboBox<String>>(gridCombo(tester, 1)).enabled, isFalse);
+    expect(tester.widget<ComboBox<String>>(gridCombo(tester, 1)).value, 'INSTEAD');
+    await openTab(tester, 'SQL 预览');
+    expect(
+      previewSql(tester),
+      contains('CREATE RULE "r_log" AS ON SELECT TO "Untitled" '
+          'WHERE (NEW.id > 0) DO INSTEAD (INSERT INTO log VALUES (1));'),
+    );
+  });
+
+  testWidgets('规则「启用」取消勾选:CREATE RULE 之后补 DISABLE RULE', (tester) async {
+    wideView(tester);
+    await tester.pumpWidget(harness());
+    await tester.pumpAndSettle();
+
+    await openTab(tester, '规则');
+    await tester.tap(tool('添加规则'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+        find.descendant(
+            of: find.byType(ListView), matching: find.byType(TextField)).first,
+        'r_log');
+    await tester.pumpAndSettle();
+    await tester.enterText(propField(tester, '语句'), 'SELECT 1');
+    await tester.pumpAndSettle();
+    // 规则行的「启用」格
+    await tester.tap(find
+        .descendant(of: find.byType(ListView), matching: find.byType(CheckBox))
+        .first);
+    await tester.pumpAndSettle();
+
+    await openTab(tester, 'SQL 预览');
+    final sql = previewSql(tester);
+    expect(sql, contains('CREATE RULE "r_log" AS ON INSERT TO "Untitled" DO ALSO (SELECT 1);'));
+    expect(sql, contains('ALTER TABLE "Untitled" DISABLE RULE "r_log";'));
+  });
+
+  testWidgets('选项标签(新建):只有参考工具那六项,填充因子进 WITH (…)', (tester) async {
+    wideView(tester);
+    await tester.pumpWidget(harness());
+    await tester.pumpAndSettle();
+    // 命名首列,免得「存在未命名的列」把状态栏占住
+    await tester.enterText(
+      find.descendant(
+          of: find.byType(ListView), matching: find.byType(TextField)).first,
+      'id',
+    );
+    await tester.pumpAndSettle();
+
+    await openTab(tester, '选项');
+    // PG 的其余 reloption 不在界面上铺(参考工具只有这六项)
+    for (final extra in ['自动清理', '并行工作进程数', '系统目录表']) {
+      expect(prop(extra), findsNothing, reason: '选项页多铺了: $extra');
+    }
+    await tester.enterText(propField(tester, '填充因子 (%)'), '90');
+    await tester.pumpAndSettle();
+
+    await openTab(tester, 'SQL 预览');
+    expect(previewSql(tester), contains('WITH (fillfactor = 90)'));
+  });
+
+  testWidgets('编辑模式(PG):改填充因子落 SET / RESET,界面没显示的存储参数原样保留',
+      (tester) async {
+    wideView(tester);
+    await openEdit(
+      tester,
+      editHarness(loader: (db, t, s) async => readBack()
+        ..storageOptions['fillfactor'] = '90'
+        ..storageOptions['autovacuum_enabled'] = 'true'),
+    );
+
+    await openTab(tester, '选项');
+    final fill = propField(tester, '填充因子 (%)');
+    // 反查回来的值先回显
+    expect(tester.widget<TextField>(fill).controller!.text, '90');
+
+    await tester.enterText(fill, '80');
+    await tester.pumpAndSettle();
+    expect(find.text('已修改'), findsOneWidget);
+    await openTab(tester, 'SQL 预览');
+    expect(previewSql(tester),
+        contains('ALTER TABLE "public"."configs" SET (fillfactor = 80);'));
+    // 界面没显示的那项既不该被 SET 覆盖,也不该被 RESET 掉
+    expect(previewSql(tester), isNot(contains('autovacuum_enabled')));
+
+    await openTab(tester, '选项');
+    await tester.enterText(propField(tester, '填充因子 (%)'), '');
+    await tester.pumpAndSettle();
+    await openTab(tester, 'SQL 预览');
+    expect(previewSql(tester),
+        contains('ALTER TABLE "public"."configs" RESET (fillfactor);'));
   });
 
   testWidgets('注释标签整区为编辑器(无标题与底部说明)', (tester) async {
@@ -551,7 +967,7 @@ void main() {
     );
 
     // 弹窗行来源是表字段:先建一个名为 amount 的字段
-    await tester.tap(find.text('添加字段'));
+    await tester.tap(tool('添加字段'));
     await tester.pumpAndSettle();
     await tester.enterText(
       find.descendant(
@@ -562,9 +978,9 @@ void main() {
 
     // 索引属性面板的「表空间」由手输框升级为候选下拉
     await openTab(tester, '索引');
-    await tester.tap(find.text('添加索引'));
+    await tester.tap(tool('添加索引'));
     await tester.pumpAndSettle();
-    await tester.tap(find.byIcon(Icons.arrow_right).first);
+    await tester.tapAt(_rowAt(tester, 0)); // 行首槽点行:不碰单元格
     await tester.pumpAndSettle();
     expect(offers('zz_fast_storage'), isTrue);
 
@@ -583,16 +999,13 @@ void main() {
 
   // ── 字段网格多选 / 复制粘贴 ────────────────────────────────
 
-  /// 点字段网格第 [index] 行:落点在行首 ▶ 标记列,只触发行选中,
+  /// 点字段网格第 [index] 行:落点在行首「当前行」槽(12 宽)内,只触发行选中,
   /// 不会顺带改到单元格(输入框 / 勾选框 / 键列)
   Future<void> tapRow(WidgetTester tester, int index,
       {bool ctrl = false, bool shift = false}) async {
-    final grid = tester.getRect(find.byType(ListView));
-    // ListView 上下 padding 2,itemExtent 30
-    final y = grid.top + 2 + index * 30 + 15;
     if (ctrl) await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
     if (shift) await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
-    await tester.tapAt(Offset(grid.left + 10, y));
+    await tester.tapAt(_rowAt(tester, index));
     if (ctrl) await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
     if (shift) await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
     await tester.pumpAndSettle();
@@ -604,19 +1017,40 @@ void main() {
       .evaluate()
       .length;
 
-  testWidgets('Ctrl 加选 / Shift 连选:工具栏按选中行数改文案', (tester) async {
+  /// 打开第 [index] 行的右键菜单(落点在行首槽,不会顺带改单元格)
+  Future<void> openRowMenu(WidgetTester tester, int index) async {
+    await tester.tapAt(_rowAt(tester, index), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+  }
+
+  /// 关掉浮层菜单:点网格右侧的空白(菜单的透明遮罩收到这一次按下就收起,
+  /// 且该点没有别的监听者,不会顺带改选中)。菜单没关就再点会命中旧菜单项。
+  Future<void> dismissMenu(WidgetTester tester) async {
+    await tester.tapAt(Offset(tester.view.physicalSize.width /
+            tester.view.devicePixelRatio - 20,
+        tester.view.physicalSize.height / tester.view.devicePixelRatio - 60));
+    await tester.pumpAndSettle();
+    expect(find.text('插入字段'), findsNothing, reason: '菜单没收起来,后续断言不可信');
+  }
+
+  testWidgets('Ctrl 加选 / Shift 连选:右键菜单按选中行数改文案', (tester) async {
     wideView(tester);
     await openEdit(tester, editHarness(loader: (db, t, s) async => readBack()));
 
     await tapRow(tester, 0);
     expect(fieldRowCount(tester), 2);
+    await openRowMenu(tester, 0);
     expect(find.text('复制行'), findsOneWidget);
+    await dismissMenu(tester);
 
     await tapRow(tester, 1, ctrl: true);
+    await openRowMenu(tester, 0);
     expect(find.text('复制 2 行'), findsOneWidget);
+    await dismissMenu(tester);
 
     // 再 Ctrl 点同一行 = 取消加选,回到单选
     await tapRow(tester, 1, ctrl: true);
+    await openRowMenu(tester, 0);
     expect(find.text('复制行'), findsOneWidget);
   });
 
@@ -627,6 +1061,7 @@ void main() {
 
     await tapRow(tester, 0);
     await tapRow(tester, 1, shift: true); // 锚点起连选成段
+    await openRowMenu(tester, 0);
     await tester.tap(find.text('复制 2 行'));
     await tester.pumpAndSettle();
 
@@ -644,14 +1079,14 @@ void main() {
     await tester.pumpAndSettle();
     expect(fieldRowCount(tester), 1); // 新建表预置的空行
 
+    await openRowMenu(tester, 0);
     await tester.tap(find.text('粘贴行'));
     await tester.pumpAndSettle();
 
     // 两行都进来,且粘贴结果整体成为选中区
     expect(fieldRowCount(tester), 2);
+    await openRowMenu(tester, 0);
     expect(find.text('复制 2 行'), findsOneWidget);
-
-    // 再复制回去:类型括号里的长度已拆进「长度 / 小数点」两格
     await tester.tap(find.text('复制 2 行'));
     await tester.pumpAndSettle();
     expect(clip.text,
@@ -667,22 +1102,22 @@ void main() {
     wideView(tester);
     await tester.pumpWidget(harness());
     await tester.pumpAndSettle();
-    await tester.tap(find.text('添加字段'));
+    await tester.tap(tool('添加字段'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('添加字段'));
+    await tester.tap(tool('添加字段'));
     await tester.pumpAndSettle();
     expect(fieldRowCount(tester), 3);
 
     // 单选删一行
     await tapRow(tester, 1);
-    await tester.tap(find.text('删除字段'));
+    await tester.tap(tool('删除字段'));
     await tester.pumpAndSettle();
     expect(fieldRowCount(tester), 2);
 
     // 全选一次删掉
     await tapRow(tester, 0);
     await tapRow(tester, 1, shift: true);
-    await tester.tap(find.text('删除字段'));
+    await tester.tap(tool('删除字段'));
     await tester.pumpAndSettle();
     expect(fieldRowCount(tester), 0);
   });
@@ -710,15 +1145,285 @@ void main() {
     await openEdit(tester, editHarness(loader: (db, t, s) async => readBack()));
 
     final grid = tester.getRect(find.byType(ListView));
-    await tester.tapAt(Offset(grid.left + 10, grid.top + 2 + 15),
+    await tester.tapAt(Offset(grid.left + 6, grid.top + 10.5),
         buttons: kSecondaryButton);
     await tester.pumpAndSettle();
-    expect(find.text('复制行'), findsNWidgets(2)); // 工具栏 + 菜单项
+    // 工具栏已改纯图标,「复制行」只剩菜单里这一处
+    expect(find.text('复制行'), findsOneWidget);
 
-    await tester.tap(find.text('复制行').last);
+    await tester.tap(find.text('复制行'));
     await tester.pumpAndSettle();
     expect(clip.text, 'id\tint8\t64\t\t1\tPRI\t');
   });
+
+  testWidgets('新建表点保存先弹窗要表名(工具栏纯图标,页面上没有表名框)',
+      (tester) async {
+    wideView(tester);
+    await tester.pumpWidget(harness());
+    await tester.pumpAndSettle();
+
+    // 列名补齐后,状态栏给的是「未命名表」提示(校验不过时优先报校验)
+    await tester.enterText(
+      find.descendant(
+          of: find.byType(ListView), matching: find.byType(TextField)).first,
+      'id',
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('未命名表:点「保存」时会要求输入表名'), findsOneWidget);
+    expect(saveEnabled(tester), isTrue);
+
+    await tester.tap(saveBtn);
+    await tester.pumpAndSettle();
+    expect(find.text('表名'), findsWidgets); // InputDialog 标题
+    expect(find.text('请输入要创建的表名'), findsOneWidget);
+
+    await tester.enterText(find.byType(TextField).last, 'orders');
+    await tester.tap(find.text('保存'));
+    await tester.pumpAndSettle();
+
+    // 名字落进模型:预览里的 CREATE 用上它
+    await openTab(tester, 'SQL 预览');
+    expect(previewSql(tester), contains('CREATE TABLE "orders"'));
+  });
+
+  /// 页面上第一块铺了 [color] 的 DecoratedBox 的位置(没有则 null)。
+  ///
+  /// 当前格(实色强调底)与焦点列表头块 / 行首槽(淡蓝档)都是纯色块,
+  /// 按颜色找比按结构找稳。测试 harness 的亮度是 dark,故取 [AppTheme.dark]。
+  Rect? rectWithColor(WidgetTester tester, Color color) {
+    for (final b in tester.widgetList<DecoratedBox>(find.byType(DecoratedBox))) {
+      final d = b.decoration;
+      if (d is BoxDecoration && d.color == color) {
+        return tester.getRect(find.byWidget(b));
+      }
+    }
+    return null;
+  }
+
+  testWidgets('当前格实色反白 + 表头同步高亮该列;点别的格会跟着走',
+      (tester) async {
+    wideView(tester);
+    await openEdit(tester, editHarness(loader: (db, t, s) async => readBack()));
+
+    // 初始:锚点第 0 行、当前列 0(名称列)→ 有一个实色格,且表头有淡蓝块
+    // (harness 的 AppState 是「跟随系统」,测试环境的平台亮度是 light,
+    //  所以生效色板是 AppTheme.light —— 与 ThemeData(brightness: dark) 无关)
+    final accent = AppTheme.light.accent;
+    final soft = AppTheme.light.accentSoftBg;
+    expect(rectWithColor(tester, accent), isNotNull, reason: '初始没有当前格');
+    expect(rectWithColor(tester, soft), isNotNull,
+        reason: '没有淡蓝块(焦点列表头 / 行首槽)');
+
+    // 点第 0 行的「长度」格(行首槽 12 + 名称 200 + 类型 120 之后)
+    final grid = tester.getRect(find.byType(ListView));
+    await tester.tapAt(
+        Offset(grid.left + 12 + 200 + 120 + 30, grid.top + 10.5));
+    await tester.pumpAndSettle();
+
+    final moved = rectWithColor(tester, accent);
+    expect(moved, isNotNull);
+    expect(moved!.left, greaterThan(grid.left + 12 + 200 + 120 - 1),
+        reason: '当前格应跟着点到「长度」列,而不是留在名称列');
+  });
+
+  testWidgets('度量对表:网格 / 字号 / 勾选框 / 属性字段落在参考工具实测值上',
+      (tester) async {
+    wideView(tester);
+    await openEdit(tester, editHarness(loader: (db, t, s) async => readBack()));
+
+    // 网格块总宽 = 行首槽 12 + 名称 200 + 类型 120 + 长度 60 + 小数点 60
+    //                  + 不是 null 60 + 键 60 + 注释 300 = 872
+    final grid = tester.getRect(find.byType(ListView));
+    expect(grid.width, closeTo(872, 0.5), reason: '列宽与实测不成套');
+    // 行距 21(实测 20.5 = 内容 19.5 + 1px 底线):量两行勾选框的中心差
+    final boxes = find.descendant(
+        of: find.byType(ListView), matching: find.byType(CheckBox));
+    expect(
+        tester.getCenter(boxes.at(1)).dy - tester.getCenter(boxes.at(0)).dy,
+        closeTo(21, 0.5),
+        reason: '行高不是 20.5 档');
+
+    // 表头与属性标签都是 12 号常规字(实测中文墨迹 24 设备像素 = 12 逻辑)
+    // 「长度」同时是空单元格的占位提示,故限定取表头那一个
+    final headLen = find
+        .ancestor(of: find.text('长度'), matching: find.byType(DecoratedBox))
+        .last;
+    expect(tester.widget<Text>(find.descendant(of: headLen, matching: find.text('长度')).first).style!.fontSize, 12);
+    expect(
+        tester
+            .widget<Text>(
+                find.descendant(of: headLen, matching: find.text('长度')).first)
+            .style!
+            .fontWeight,
+        FontWeight.w400);
+    expect(tester.widget<Text>(prop('默认')).style!.fontSize, 12);
+
+    // 勾选框恒 13:不随行高缩到 10
+    expect(tester.widget<CheckBox>(find.byType(CheckBox).first).size, 13);
+
+    // 属性面板字段:标签左起 11、字段左起 201(= 11 + 标签列 190),宽 300。
+    // 必须限定在「默认:」那一行里找 —— 网格里第一列之后也全是 ComboBox,
+    // 直接取 byType.first 会量到「类型」格(左起 212)。
+    final propRow =
+        find.ancestor(of: prop('默认'), matching: find.byType(Row)).last;
+    expect(tester.getRect(find.descendant(of: propRow, matching: prop('默认'))).left,
+        closeTo(11, 0.5));
+    final field = tester.getRect(find.descendant(
+        of: propRow, matching: find.byType(ComboBox<String>)));
+    expect(field.left, closeTo(201, 1.5), reason: '字段没对齐到网格第一列之后');
+    expect(field.width, closeTo(300, 1.5));
+    expect(field.height, closeTo(20, 0.5), reason: '属性字段实测 19.5 高');
+
+    // 工具栏纯图标按钮:点击块宽 25(14 图标 + 5.5 × 2)
+    expect(tester.getSize(saveBtn).width, closeTo(25, 0.5));
+  });
+
+  testWidgets('网格静止态每格不描边(扁平单元格)', (tester) async {
+    wideView(tester);
+    await openEdit(tester, editHarness(loader: (db, t, s) async => readBack()));
+
+    final inputs = tester.widgetList<Input>(find.descendant(
+        of: find.byType(ListView), matching: find.byType(Input)));
+    expect(inputs, isNotEmpty);
+    expect(
+      inputs.where((i) => !i.showBorder).length,
+      inputs.length,
+      reason: '每格都画框就退回「表单」观感,不是参考工具的网格',
+    );
+    final combos = tester.widgetList<ComboBox<String>>(find.descendant(
+        of: find.byType(ListView), matching: find.byType(ComboBox<String>)));
+    expect(combos.every((c) => !c.showBorder), isTrue);
+  });
+
+  group('方言门控:不给用户「改了不生效」的控件', () {
+    /// 按指定方言打开设计器。
+    ///
+    /// 走 [TableDesignerPage.dialectOverride] 而不是注册一条真连接:后者会让
+    /// initState 的候选查询真去建驱动连库,断言永远等不到静止帧(实测把
+    /// pumpAndSettle 挂满 10 分钟)。
+    Future<void> openDialect(WidgetTester tester, String typeId) async {
+      await tester.pumpWidget(ChangeNotifierProvider(
+        create: (_) => AppState(),
+        child: MaterialApp(
+          locale: const Locale('zh'),
+          localizationsDelegates: kAppLocalizationsDelegates,
+          supportedLocales: kSupportedLocales,
+          theme: ThemeData(brightness: Brightness.dark),
+          home: Material(
+            type: MaterialType.transparency,
+            child: TableDesignerPage(
+              key: ValueKey(typeId),
+              title: '新建表',
+              connection: '无此连接',
+              database: 'db',
+              dialectOverride: typeId,
+            ),
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('MySQL:触发器属性面板给「触发主体」,不给 PG 的触发函数 / 参数',
+        (tester) async {
+      wideView(tester);
+      await openDialect(tester, 'mysql');
+      await tester.tap(find.text('触发器'));
+      await tester.pumpAndSettle();
+      await tester.tap(tool('添加触发器'));
+      await tester.pumpAndSettle();
+
+      expect(prop('触发主体'), findsOneWidget);
+      expect(prop('触发函数'), findsNothing);
+      expect(prop('参数'), findsNothing);
+      // 「给每个」在 MySQL 里只有行级一个取值,语句级是无效选项
+      final forEach = tester.widget<ComboBox<String>>(find.descendant(
+          of: find.byType(ListView), matching: find.byType(ComboBox<String>)).first);
+      expect(forEach.items, ['行']);
+    });
+
+    testWidgets('PostgreSQL:仍是触发函数 + 参数,没有触发主体(行为未回退)',
+        (tester) async {
+      wideView(tester);
+      await openDialect(tester, 'postgresql');
+      await tester.tap(find.text('触发器'));
+      await tester.pumpAndSettle();
+      await tester.tap(tool('添加触发器'));
+      await tester.pumpAndSettle();
+
+      expect(prop('触发函数'), findsOneWidget);
+      expect(prop('触发主体'), findsNothing);
+    });
+
+    testWidgets('MySQL:索引「并发」勾选框置灰(PG 才有的 CONCURRENTLY)',
+        (tester) async {
+      wideView(tester);
+      await openDialect(tester, 'mysql');
+      await tester.tap(find.text('索引'));
+      await tester.pumpAndSettle();
+      await tester.tap(tool('添加索引'));
+      await tester.pumpAndSettle();
+
+      final boxes = tester
+          .widgetList<CheckBox>(find.descendant(
+              of: find.byType(ListView), matching: find.byType(CheckBox)))
+          .toList();
+      // 列序:唯一键、并发
+      expect(boxes, hasLength(2));
+      expect(boxes[0].enabled, isTrue, reason: 'UNIQUE 各方言都支持');
+      expect(boxes[1].enabled, isFalse, reason: 'CONCURRENTLY 仅 PG');
+
+      // 换到 PG:同一格必须可点,否则就是门控写反了
+      await openDialect(tester, 'postgresql');
+      await tester.tap(find.text('索引'));
+      await tester.pumpAndSettle();
+      await tester.tap(tool('添加索引'));
+      await tester.pumpAndSettle();
+      final pgBoxes = tester
+          .widgetList<CheckBox>(find.descendant(
+              of: find.byType(ListView), matching: find.byType(CheckBox)))
+          .toList();
+      expect(pgBoxes[1].enabled, isTrue);
+    });
+
+    testWidgets('MySQL 上填了规则:保存键灰掉且状态栏说明原因,不是静默丢弃',
+        (tester) async {
+      wideView(tester);
+      await openDialect(tester, 'mysql');
+      // 新建页预置一行空字段,「存在未命名的列」会抢在方言门控之前报错;
+      // 先把这一列命名,状态栏剩下的那条才是方言拦口给的。
+      await tester.enterText(
+          find.descendant(
+                  of: find.byType(ListView), matching: find.byType(Input))
+              .first,
+          'id');
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('规则'));
+      await tester.pumpAndSettle();
+      await tester.tap(tool('添加规则'));
+      await tester.pumpAndSettle();
+
+      // 空语句会先被「未指定语句」拦住,填上才轮到方言门控说话。
+      // 规则行两个输入格:名称 / 注释(事件、代替运行是下拉,启用是勾选,语句在属性面板)。
+      final cells = find.descendant(
+          of: find.byType(ListView), matching: find.byType(Input));
+      expect(cells, findsNWidgets(2));
+      await tester.enterText(propField(tester, '语句'), 'NOTIFY audit');
+      await tester.pumpAndSettle();
+
+      expect(tester.widget<ToolbarButton>(saveBtn).enabled, isFalse);
+      expect(find.textContaining('规则(RULE)仅 PostgreSQL 支持'), findsOneWidget);
+    });
+  });
+}
+
+/// 编辑网格第 [index] 行的落点。
+///
+/// 行高 [_kRowExtent]=21(ListView.itemExtent)、上下 padding 0,
+/// 默认落在行首「当前行」槽(12 宽)正中 —— 那里没有控件,点它只改行选中。
+Offset _rowAt(WidgetTester tester, int index, {double dx = 6}) {
+  final grid = tester.getRect(find.byType(ListView));
+  return Offset(grid.left + dx, grid.top + index * 21 + 10.5);
 }
 
 /// 系统剪贴板桩:测试环境没有真实剪贴板,读写都落在这里

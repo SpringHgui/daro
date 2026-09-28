@@ -4,12 +4,16 @@ import 'package:flutter/material.dart';
 import '../data/table_design.dart';
 import '../theme/app_theme.dart';
 
-/// 「选择数据表字段」弹窗:索引 / 唯一键的「字段」格点 `...` 打开。
+/// 「选择数据表字段」弹窗:索引 / 唯一键的「字段」格、排除约束的「元素」格点 `...` 打开。
 ///
-/// 行 = 已加入索引的字段(保持其顺序)在前 + 表内其余字段在后;
-/// 勾选框决定是否参与索引,底部 ↑ ↓ + − 依次为上移 / 下移 / 加入 / 移出。
+/// 行 = 已加入的字段(保持其顺序)在前 + 表内其余字段在后;
+/// 勾选框决定是否参与,底部 ↑ ↓ + − 依次为上移 / 下移 / 加入 / 移出。
 /// 确定后按顺序回传 [DesignIndexColumn] 列表(含排序规则 / 运算符类别 /
-/// 排序顺序 / Nulls 排序),由调用方写回索引并同步逗号串。
+/// 排序顺序 / Nulls 排序),由调用方写回并同步逗号串。
+///
+/// [forExclude] = 排除约束的「元素」模式:列集换成参考工具那一套
+/// (元素 / 运算符类别模式 / 运算符类别 / 排序顺序 / Nulls 排序 / 运算符模式 / 运算符),
+/// 排序规则两列在 EXCLUDE 元素里不常用,故不出现。
 class IndexColumnPickerDialog extends StatefulWidget {
   const IndexColumnPickerDialog({
     super.key,
@@ -18,15 +22,17 @@ class IndexColumnPickerDialog extends StatefulWidget {
     this.schemaCandidates = const [],
     this.collationCandidates = const [],
     this.opClassCandidates = const [],
+    this.operatorCandidates = const [],
+    this.forExclude = false,
   });
 
   /// 表的全部字段名(弹窗行来源)
   final List<String> fields;
 
-  /// 索引当前字段项(决定初始勾选与顺序)
+  /// 当前字段项(决定初始勾选与顺序)
   final List<DesignIndexColumn> selected;
 
-  /// 「排序规则模式 / 运算符类别模式」候选(schema 列表;仍可手输)
+  /// 「排序规则模式 / 运算符类别模式 / 运算符模式」候选(schema 列表;仍可手输)
   final List<String> schemaCandidates;
 
   /// 「排序规则」候选
@@ -35,7 +41,13 @@ class IndexColumnPickerDialog extends StatefulWidget {
   /// 「运算符类别」候选
   final List<String> opClassCandidates;
 
-  /// 弹出选择;取消返回 null,确定返回选中的字段项(可能为空列表 = 清空索引字段)
+  /// 「运算符」候选(PG 的比较操作符;仍可手输)
+  final List<String> operatorCandidates;
+
+  /// 排除约束「元素」模式(列集不同,见类注释)
+  final bool forExclude;
+
+  /// 弹出选择;取消返回 null,确定返回选中的字段项(可能为空列表 = 清空字段)
   static Future<List<DesignIndexColumn>?> show(
     BuildContext context, {
     required List<String> fields,
@@ -43,6 +55,8 @@ class IndexColumnPickerDialog extends StatefulWidget {
     List<String> schemaCandidates = const [],
     List<String> collationCandidates = const [],
     List<String> opClassCandidates = const [],
+    List<String> operatorCandidates = const [],
+    bool forExclude = false,
   }) {
     return showDialog<List<DesignIndexColumn>>(
       context: context,
@@ -52,6 +66,8 @@ class IndexColumnPickerDialog extends StatefulWidget {
         schemaCandidates: schemaCandidates,
         collationCandidates: collationCandidates,
         opClassCandidates: opClassCandidates,
+        operatorCandidates: operatorCandidates,
+        forExclude: forExclude,
       ),
     );
   }
@@ -67,17 +83,36 @@ class _IndexColumnPickerDialogState extends State<IndexColumnPickerDialog> {
   /// 当前行(▶ 标记);↑↓ 与 +− 都作用于它
   int _current = 0;
 
-  static const List<double> _widths = [
-    150, // 名称
-    118, // 排序规则模式
-    128, // 排序规则
-    128, // 运算符类别模式
-    122, // 运算符类别
-    96, // 排序顺序
-    96, // Nulls 排序
-  ];
+  static const double _nameWidth = 150;
 
   static const double _rowMarkerWidth = 16;
+
+  /// 选项列定义:索引 / 唯一键带排序规则两列,排除约束的「元素」把这两列
+  /// 换成运算符模式 / 运算符(与参考工具的列集一致)。
+  late final List<_PickerColumn> _columns = [
+    if (!widget.forExclude)
+      _PickerColumn('排序规则模式', 118, (c) => c.collationSchema,
+          (c, v) => c.collationSchema = v, (c) => widget.schemaCandidates),
+    if (!widget.forExclude)
+      _PickerColumn('排序规则', 128, (c) => c.collation,
+          (c, v) => c.collation = v,
+          (c) => _withCurrent(widget.collationCandidates, c.collation)),
+    _PickerColumn('运算符类别模式', 128, (c) => c.opClassSchema,
+        (c, v) => c.opClassSchema = v, (c) => widget.schemaCandidates),
+    _PickerColumn('运算符类别', 122, (c) => c.opClass, (c, v) => c.opClass = v,
+        (c) => _withCurrent(widget.opClassCandidates, c.opClass)),
+    _PickerColumn('排序顺序', 96, (c) => c.order, (c, v) => c.order = v,
+        (c) => _orderOptions),
+    _PickerColumn('Nulls 排序', 96, (c) => c.nullsOrder,
+        (c, v) => c.nullsOrder = v, (c) => _nullsOptions),
+    if (widget.forExclude)
+      _PickerColumn('运算符模式', 118, (c) => c.operatorSchema,
+          (c, v) => c.operatorSchema = v, (c) => widget.schemaCandidates),
+    if (widget.forExclude)
+      _PickerColumn('运算符', 128, (c) => c.operatorName,
+          (c, v) => c.operatorName = v,
+          (c) => _withCurrent(widget.operatorCandidates, c.operatorName)),
+  ];
 
   @override
   void initState() {
@@ -189,7 +224,10 @@ class _IndexColumnPickerDialogState extends State<IndexColumnPickerDialog> {
   }
 
   Widget _grid(AppPalette t) {
-    final total = _widths.fold(0.0, (a, b) => a + b) + _rowMarkerWidth;
+    double total = _nameWidth + _rowMarkerWidth;
+    for (final c in _columns) {
+      total += c.width;
+    }
     return SizedBox(
       width: double.infinity,
       child: Column(
@@ -211,8 +249,8 @@ class _IndexColumnPickerDialogState extends State<IndexColumnPickerDialog> {
                       child: Row(
                         children: [
                           const SizedBox(width: _rowMarkerWidth),
-                          for (var i = 0; i < _headers.length; i++)
-                            _headCell(t, _headers[i], _widths[i]),
+                          _headCell(t, widget.forExclude ? '元素' : '名称', _nameWidth),
+                          for (final c in _columns) _headCell(t, c.title, c.width),
                           const Spacer(),
                         ],
                       ),
@@ -234,16 +272,6 @@ class _IndexColumnPickerDialogState extends State<IndexColumnPickerDialog> {
       ),
     );
   }
-
-  static const List<String> _headers = [
-    '名称',
-    '排序规则模式',
-    '排序规则',
-    '运算符类别模式',
-    '运算符类别',
-    '排序顺序',
-    'Nulls 排序',
-  ];
 
   Widget _headCell(AppPalette t, String title, double width) => Container(
         width: width,
@@ -284,7 +312,7 @@ class _IndexColumnPickerDialogState extends State<IndexColumnPickerDialog> {
                   : null,
             ),
             SizedBox(
-              width: _widths[0],
+              width: _nameWidth,
               child: Row(
                 children: [
                   CheckBox(
@@ -299,20 +327,9 @@ class _IndexColumnPickerDialogState extends State<IndexColumnPickerDialog> {
                 ],
               ),
             ),
-            _comboCell(row, row.item.collationSchema,
-                (v) => row.item.collationSchema = v,
-                widget.schemaCandidates, _widths[1]),
-            _comboCell(row, row.item.collation, (v) => row.item.collation = v,
-                _withCurrent(widget.collationCandidates, row.item.collation), _widths[2]),
-            _comboCell(row, row.item.opClassSchema,
-                (v) => row.item.opClassSchema = v,
-                widget.schemaCandidates, _widths[3]),
-            _comboCell(row, row.item.opClass, (v) => row.item.opClass = v,
-                _withCurrent(widget.opClassCandidates, row.item.opClass), _widths[4]),
-            _comboCell(row, row.item.order, (v) => row.item.order = v,
-                _orderOptions, _widths[5]),
-            _comboCell(
-                row, row.item.nullsOrder, (v) => row.item.nullsOrder = v, _nullsOptions, _widths[6]),
+            for (final c in _columns)
+              _comboCell(row, c.read(row.item), (v) => c.write(row.item, v),
+                  c.candidates(row.item), c.width),
           ],
         ),
       ),
@@ -350,4 +367,16 @@ class _Row {
 
   final DesignIndexColumn item;
   bool checked;
+}
+
+/// 弹窗的一个选项列:读写 [DesignIndexColumn] 的一项,候选随当前值算
+/// (排序规则 / 运算符类别 / 运算符 要把库外手输的值也留在下拉里)。
+class _PickerColumn {
+  _PickerColumn(this.title, this.width, this.read, this.write, this.candidates);
+
+  final String title;
+  final double width;
+  final String Function(DesignIndexColumn) read;
+  final void Function(DesignIndexColumn, String) write;
+  final List<String> Function(DesignIndexColumn) candidates;
 }

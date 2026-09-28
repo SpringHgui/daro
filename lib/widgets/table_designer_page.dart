@@ -9,20 +9,46 @@ import '../app/app_state.dart';
 import '../app/connection_manager.dart';
 import '../data/column_clipboard.dart';
 import '../data/db_metadata.dart';
-import '../data/db_types.dart';
 import '../data/drivers/db_driver.dart';
 import '../data/table_design.dart';
 import '../theme/app_theme.dart';
 import 'index_column_picker_dialog.dart';
+
+// ── 度量:全部取自参考工具(Navicat 表设计器)截图的设备像素实测 ÷ 200% 缩放 ──
+//
+// 截图为 3338×1802 设备像素、Windows 200% 缩放,故逻辑像素 = 实测值 / 2。
+// 这些数字彼此是有关系的,不是凑出来的整数:
+//   行内容 19.5 + 1px 底线 = 行距 20.5;属性面板控件同样 19.5 高、行距 26;
+//   表头 29.5(淡蓝块自顶内缩 5、底端压 2px 强调条);行首槽 12(淡蓝块 + 2px 强调条);
+//   工具栏 28.5、内标签条 20.5、属性面板上分隔条 3、属性标签列左起 11、字段自 201 起宽 300。
+// 布局时把「内容 + 1px 线」拆成整数(20 + 1 = 21),避免 0.5px 造成 1px 线糊成两档。
+const double _kRowContentH = 20; // 行内容高(= gridCellTokens 的 controlHeight)
+const double _kRowExtent = _kRowContentH + 1; // 行占位 = 内容 + 1px 底线
+const double _kHeaderH = 30; // 表头行占位(含 1px 底线)
+const double _kHeaderInsetTop = 5; // 焦点列表头淡蓝块的顶部内缩
+const double _kGutterW = 12; // 行首「当前行」槽宽
+const double _kAccentBarW = 2; // 槽右端 / 焦点列表头下划线的强调条宽
+const double _kCellPadX = 5; // 单元格文字水平留白(经 gridCellTokens 下发)
+const double _kCheckSize = 13; // 勾选框方框边长(不随行高缩放)
+const double _kToolbarH = 29; // 工具栏高
+const double _kTabBarH = 21; // 「字段 / 索引 …」标签条高
+const double _kIconBtnW = 25; // 纯图标按钮的点击块宽(实测 25 = 14 图标 + 5.5 × 2)
+const double _kIconPadX = (_kIconBtnW - 14) / 2; // 图标按钮水平内边距 = 5.5
+const double _kToolSepW = 17; // 工具栏分隔块宽(1px 线 + 两侧 8 留白)
+const double _kPropSplitterH = 3; // 网格与属性面板之间的分隔条
+const double _kPropRowH = 26; // 属性面板行距
+const double _kPropPadL = 11; // 属性标签左起
+const double _kPropLabelW = 190; // 属性标签列宽(字段起点 = 11 + 190 = 201)
+const double _kPropFieldW = 300; // 属性字段默认宽
 
 /// 表设计器:「新建表」与「设计表」共用同一页面(新建 + 编辑双模式)。
 ///
 /// 以文档标签页形式打开(新建见 [AppState.newTableDesigner],编辑已有表见
 /// [AppState.designTable]),含 11 个标签:
 /// 字段 / 索引 / 外键 / 唯一键 / 检查 / 排除 / 规则 / 触发器 / 选项 / 注释 / SQL 预览。
-/// 各标签实时采集设计数据([DesignTable]),「字段」页为「网格 + 行首 ▶ 当前行
-/// 标记 + 底部纵向属性面板」:属性面板按方言展示默认 / 排序规则 / 维度 /
-/// 虚拟类型(IDENTITY)及其序列选项 / 循环;「键」列以 钥匙 + 序号 表示主键。
+/// 各标签实时采集设计数据([DesignTable]),「字段」页为「网格 + 底部纵向属性面板」:
+/// 属性面板按方言展示默认 / 排序规则 / 维度 / 虚拟类型(IDENTITY)及其序列选项 /
+/// 循环;「键」列以 钥匙 + 序号 表示主键。
 /// 「字段」网格支持像数据表格那样操作行:Ctrl 加选 / Shift 连选,选中行可整批
 /// 复制 / 粘贴(见 [ColumnRowClipboard],Tab 分隔一行一字段)/ 删除 / 设主键。
 /// 「SQL 预览」标签按当前连接类型实时生成方言 DDL(预览即所见):
@@ -35,8 +61,13 @@ import 'index_column_picker_dialog.dart';
 /// 驱动不支持结构反查时(SQLite / Access)降级为只读展示 —— 编辑控件全部
 /// 禁用并提示,与「读取失败」(展示错误 + 重试)严格区分。
 ///
+/// 版式(工具栏纯图标、网格度量、当前格反白、属性面板对齐)按参考工具逐像素
+/// 复刻,数值见文件级 `_k*` 常量;表名不在页面上填:新建时点「保存」弹窗要,
+/// 已有表改名走对象树 F2([AppState.renameTable])。
+///
 /// 交互约定:行选中与「键」列切换用 [Listener.onPointerDown] 零延迟;输入框一律
-/// `selectAllOnFocus: false`(桌面聚焦全选坑);颜色全部走 [Tokens.of] / [AppColors.of]。
+/// `selectAllOnFocus: false`(桌面聚焦全选坑);颜色全部走 [Tokens.of] / [AppColors.of],
+/// 尺寸档位经 [gridCellTokens] 由 [TokenScope] 一次性下发。
 class TableDesignerPage extends StatefulWidget {
   const TableDesignerPage({
     super.key,
@@ -47,6 +78,7 @@ class TableDesignerPage extends StatefulWidget {
     this.existingTable,
     this.designLoader,
     this.candidatesLoader,
+    this.dialectOverride,
   });
 
   /// 标签标题(保存成功后关闭本标签用)
@@ -72,6 +104,13 @@ class TableDesignerPage extends StatefulWidget {
   /// 下拉候选注入点(测试用):默认 null 走 ConnectionManager 的系统目录查询。
   final Future<DesignCandidates> Function(String database)? candidatesLoader;
 
+  /// 方言覆盖注入点(测试用):默认 null 取 [connection] 那条连接的类型。
+  ///
+  /// 存在的必要不是省事:单测里只要注册一条真连接,initState 的
+  /// [_loadRefTables] / [_ensureCandidates] 就会真去建驱动连库,断言永远等不到
+  /// 静止帧。只给方言、不给连接,才能把「界面按方言门控」这类分支测起来。
+  final String? dialectOverride;
+
   @override
   State<TableDesignerPage> createState() => _TableDesignerPageState();
 }
@@ -93,9 +132,9 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   /// (焦点一旦进入单元格输入框,这两个键就是文本复制 / 粘贴,归输入框)
   final FocusNode _gridFocus = FocusNode(debugLabel: 'tableDesignerGrid');
 
-  /// 当前连接类型 id 与显示名
+  /// 当前连接类型 id(方言分支全靠它;类型显示名不在本页出现 ——
+  /// 参考工具的设计器页面上没有标题条,库 / 连接 / 类型都在文档标签标题里)
   String _typeId = 'postgresql';
-  String _typeLabel = '';
 
   /// 外键引用表候选(当前模式,懒加载)
   List<String> _refTables = const [];
@@ -119,6 +158,40 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   /// 编辑基线:打开时反查到的结构快照,差异 / 脏态一律与它比较
   DesignTable? _original;
 
+  @override
+  void setState(VoidCallback fn) {
+    // 整页级变更(增删行 / 换标签 / 改主键 / 保存态)都可能动到设计数据,
+    // 差异清单一律作废,避免「已修改」显示成旧状态。
+    _diffCache = null;
+    super.setState(fn);
+  }
+
+  /// 编辑模式的差异清单 + 「改不动」原因,一次算完两处共用。
+  ///
+  /// 一次敲字有三处要读它:保存键可用性、状态栏「已修改 / 无变更」、SQL 预览。
+  /// 而 `hasChanges` 的实现是「把整套 ALTER 生成出来再看空不空」,同一帧里
+  /// 重复付三遍就是白给的开销(150 列的表上尤其明显),故缓存一份。
+  ///
+  /// [blocked] 与语句清单一起算:ALTER 表达不了的变更(触发器 / 规则 / 排除 /
+  /// 存储参数)不会出现在 [stmts] 里,只看 `stmts.isEmpty` 会把「用户明明改了,
+  /// 只是这页改不动」显示成「无变更」并灰掉保存键 —— 用户连拒绝原因都看不到。
+  /// 作废口:[setState] 与 [_touchCell] / [_touchChrome]。
+  ({List<String> stmts, String? blocked})? _diffCache;
+
+  ({List<String> stmts, String? blocked}) get _diff {
+    final base = _original;
+    if (!_isEdit || _readOnly || base == null) {
+      return (stmts: const [], blocked: null);
+    }
+    return _diffCache ??= (
+      stmts: DdlBuilder.buildAlterStatements(_design, base, _typeId),
+      blocked: DdlBuilder.alterUnsupported(_design, base, _typeId),
+    );
+  }
+
+  /// 编辑模式的差异语句清单 = 「保存」要执行的东西。
+  List<String> get _alterStatements => _diff.stmts;
+
   bool _saving = false;
   String? _error;
 
@@ -130,14 +203,92 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   /// 上次保存成功的提示(状态栏显示,一有变更即撤下)
   String? _note;
 
-  /// 设计数据是否通过校验(由 build 实时计算,用于禁用「保存」并提示)
-  bool _valid = true;
-
-  /// 校验未通过的原因(用于状态栏灰色提示)
-  String _invalidReason = '';
+  /// 校验结果**现算**:定向重建改造后,build 里缓存的快照会在「只重建了
+  /// 某一行 / 某块 chrome」时变陈旧,一律在需要它的那一块里当场算。
+  /// 表名为空不算无效 —— 纯图标工具栏没有表名框,名字在点保存时弹窗补。
+  ///
+  /// 两条「改不动」的拦口都在这里并进状态栏,原则是**拒于按下保存之前**:
+  /// - 新建:[DdlBuilder.createUnsupported]。方言表达不了的设计项(MySQL 连接
+  ///   上的规则 / 排除 / 索引并发 …)会被 [DdlBuilder.buildStatements] 的方言门
+  ///   跳过,不拦就是用户填了、界面回「保存成功」、库里什么都没有。
+  /// - 编辑:[DdlBuilder.alterUnsupported](见 [_diff])。不并进来的话,改触发器
+  ///   只会让保存键灰着 + 状态栏写「无变更」,拒绝原因永远看不到。
+  DesignValidate get _validation {
+    final r = DdlBuilder.validate(_design, typeId: _typeId, requireName: false);
+    if (!r.ok) return r;
+    if (_isEdit) {
+      final blocked = _diff.blocked;
+      return blocked == null ? r : DesignValidate(false, blocked);
+    }
+    final blocked = DdlBuilder.createUnsupported(_design, _typeId);
+    return blocked == null ? r : DesignValidate(false, blocked);
+  }
 
   /// 当前活动标签索引(TabControl 内部持有选中态,通过 onChanged 同步到此)
   int _tabIndex = 0;
+
+  /// 当前单元格所在列(参考工具的「当前格」模型:点哪格哪格反白,
+  /// 表头同步给该列画淡蓝块 + 2px 强调下划线)。切标签时归 0,
+  /// 因为各标签列数与语义都不同。
+  int _curCol = 0;
+
+  // ── 定向重建(性能)──────────────────────────────────────────
+  //
+  // 整页 setState 是这个页面的卡顿根因:一屏有 160+ 个常开编辑器,实测
+  // **每按一个字符重建整页 ≈ 140ms、每点一行 ≈ 130ms**(探针 A/B,见
+  // 提交说明)。改成按依赖面分档通知:
+  //
+  // * [_rowRevs] —— 每行一个信号,单元格文本 / 勾选 / 下拉只重建**所在行**;
+  // * [_chromeRev] —— 依赖「设计数据内容」的那几小块:保存键可用性、工具栏
+  //   动作可用性、状态栏提示、表头当前列、底部属性面板、SQL 预览;
+  // * 结构性变化(增删行 / 换标签 / 改主键 / 上下移)仍走整页 setState,
+  //   它们本来就要重建全部行,且是低频动作。
+  //
+  // 行号会随增删错位,但 notifier 只是**信号**、内容永远现读模型,
+  // 且任何改变行数的操作都伴随整页重建,因此最多多重建一次、不会漏重建。
+  final ValueNotifier<int> _chromeRev = ValueNotifier<int>(0);
+  final List<ValueNotifier<int>> _rowRevs = <ValueNotifier<int>>[];
+
+  /// 底部属性面板单独一档:只有「换选中行」或「改到面板要显示的那个属性」
+  /// (典型是改类型 → 排序规则可用性、改虚拟类型 → 序列那一组)才需要重画。
+  /// 面板里有 10+ 个编辑器,跟着每次敲字重建就是白付的钱。
+  final ValueNotifier<int> _propsRev = ValueNotifier<int>(0);
+
+  /// 表头单独一档:它只依赖「当前列」,不依赖设计数据内容。
+  final ValueNotifier<int> _curColRev = ValueNotifier<int>(0);
+
+  ValueNotifier<int> _rowRev(int i) {
+    while (_rowRevs.length <= i) {
+      _rowRevs.add(ValueNotifier<int>(0));
+    }
+    return _rowRevs[i];
+  }
+
+  /// 单元格内容变了:重建所在行 + 依赖设计数据的那几小块。
+  /// [propsAlso] = 这次改动会牵动底部属性面板(改类型 / 改勾选类属性)。
+  void _touchCell(int row, {bool propsAlso = false}) {
+    _diffCache = null;
+    _dropStaleNote();
+    if (row >= 0) _rowRev(row).value++;
+    _chromeRev.value++;
+    if (propsAlso) _propsRev.value++;
+  }
+
+  /// 只刷依赖设计数据的小块(保存键 / 状态栏 / 工具栏可用性),不动任何行
+  void _touchChrome() {
+    _diffCache = null;
+    _dropStaleNote();
+    _chromeRev.value++;
+    _propsRev.value++;
+  }
+
+  /// 一有实质变更就撤下上次保存的提示,不长期挂「已保存」。
+  ///
+  /// 定向重建后 `build()` 不再每次敲字都跑,这句必须挂在变更信号上,
+  /// 否则改完半天状态栏还写着「已保存 3 条变更」。
+  void _dropStaleNote() {
+    if (_note != null && _dirty) _note = null;
+  }
 
   // ── 模式判定 ────────────────────────────────────
 
@@ -145,30 +296,29 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   bool get _isEdit => widget.existingTable != null;
 
   /// 相对编辑基线是否有待应用的变更。
-  /// 不自己逐字段比对:直接复用差异生成,保证与「SQL 预览」同一口径。
-  bool get _dirty {
-    final base = _original;
-    if (!_isEdit || _readOnly || base == null) return false;
-    return DdlBuilder.hasChanges(_design, base, _typeId);
-  }
+  /// 不自己逐字段比对:直接复用差异生成,保证与「SQL 预览」同一口径
+  /// (清单本身缓存在 [_alterStatements],一处算、三处用)。
+  bool get _dirty => _alterStatements.isNotEmpty;
 
   /// 「保存」是否可点:编辑模式额外要求「有变更」且不在加载中
   bool get _canSave =>
       !_saving &&
       !_loading &&
       _loadError == null &&
-      _valid &&
+      _validation.ok &&
       !_readOnly &&
       (!_isEdit || _dirty);
 
   /// 调整已有列顺序仅 MySQL 家族能生成 `MODIFY ... AFTER`
   bool get _canReorderColumns => !_isEdit || DdlBuilder.isMysqlLike(_typeId);
 
-  /// 当前标签的动作按钮是否可用:只读降级与编辑模式不支持的标签(触发器 /
-  /// 规则 / 排除)置灰,与 [DdlBuilder.alterUnsupported] 的拦口保持一致
+  /// 当前标签的动作按钮是否可用:只读降级时全灰;编辑模式下排除 / 规则两个标签
+  /// 在非 PostgreSQL 连接上置灰(该方言库里既读不出也改不了这两类对象),
+  /// 与 [DdlBuilder.alterUnsupported] 的拦口保持一致。
+  /// 触发器(标签 7)已支持编辑(按 DROP + CREATE 重建),不在置灰名单内。
   bool get _actionsEnabled {
     if (_readOnly) return false;
-    if (_isEdit && (_tabIndex == 5 || _tabIndex == 6 || _tabIndex == 7)) {
+    if (_isEdit && (_tabIndex == 5 || _tabIndex == 6) && !DdlBuilder.isPgLike(_typeId)) {
       return false;
     }
     return true;
@@ -250,6 +400,33 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   /// 排除约束方法
   static const List<String> _excludeMethods = ['gist', 'spgist', 'btree', 'hash', 'gin', 'brin'];
 
+  /// 排除元素的比较运算符候选(仍可手输)。EXCLUDE 只能用到与所选索引方法
+  /// 配对的那些操作符,列表按常用排在前,首项空 = 未指定(保存时校验拦下)。
+  static const List<String> _excludeOperators = [
+    '',
+    '&&',
+    '=',
+    '<<<',
+    '>>>',
+    '<<',
+    '>>',
+    '&<',
+    '&>',
+    '&<=',
+    '>>=',
+    '@>',
+    '<@',
+    '-|-',
+    '~-',
+    '@-@',
+    '##',
+    '<',
+    '>',
+    '<=',
+    '>=',
+    '<>',
+  ];
+
   /// 外键删除 / 更新行为
   static const List<String> _fkActions = [
     'NO ACTION',
@@ -268,8 +445,30 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   /// 触发器时机
   static const List<String> _timingOptions = ['BEFORE', 'AFTER', 'INSTEAD OF'];
 
+  /// 触发器 FOR EACH(候选按方言:MySQL 只有行级;SQL Server 根本没有该子句,
+  /// 列表留空让控件置灰,而不是给一个改了不生效的选项)
+  List<String> get _forEachChoices {
+    if (DdlBuilder.isPgLike(_typeId)) return _forEachOptions;
+    if (DdlBuilder.isMysqlLike(_typeId)) return const ['行'];
+    return const [];
+  }
+
+  /// 触发器时机(候选按方言:MySQL 无 INSTEAD OF;SQL Server 无 BEFORE)
+  List<String> get _timingChoices {
+    if (DdlBuilder.isMysqlLike(_typeId)) return const ['BEFORE', 'AFTER'];
+    if (DdlBuilder.isSqlServerLike(_typeId)) return const ['AFTER', 'INSTEAD OF'];
+    return _timingOptions;
+  }
+
+  /// 触发器主体形态:PostgreSQL 引用独立函数,MySQL / SQL Server 把过程体
+  /// 写进触发器本身。两条路互斥,属性面板只画当前方言用得上的那一组。
+  bool get _triggerUsesFunction => DdlBuilder.isPgLike(_typeId);
+
   /// 规则事件
   static const List<String> _ruleEvents = ['INSERT', 'UPDATE', 'DELETE', 'SELECT'];
+
+  /// 规则动作变体:`DO ALSO`(附带执行)/ `DO INSTEAD`(代替执行)/ `DO NOTHING`(丢弃)
+  static const List<String> _ruleActions = ['ALSO', 'INSTEAD', 'NOTHING'];
 
   /// 「虚拟类型」下拉候选(与截图一致;与 identityMode 的双向映射见下方函数)
   static const List<String> _identityOptions = [
@@ -300,14 +499,18 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     'zh_CN.utf8',
   ];
 
-  /// 删除类动作图标色(功能强调色,主题无关,与本文件错误提示同色)
-  static const Color _iconDanger = Color(0xFFDC2626);
+  /// 删除类动作图标色(实测参考工具的红圈减号 #FF4A37)
+  static const Color _iconDanger = Color(0xFFFF4A37);
 
-  /// 字段网格列宽(与截图比例一致;前导行标记另占 [_rowMarkerWidth])
-  static const List<double> _fieldWidths = [170, 160, 64, 64, 72, 64, 210];
+  /// 添加类动作图标色(实测参考工具绿圈加号 #45C300)
+  static const Color _iconAdd = Color(0xFF45C300);
 
-  /// 行首「当前行」标记列宽(表头与行同时预留,保证列对齐)
-  static const double _rowMarkerWidth = 16;
+  /// 「键」列 / 主键按钮的金色钥匙(实测 #F5AA00)
+  static const Color _iconKey = Color(0xFFF5AA00);
+
+  /// 字段网格列宽(实测:名称 200 / 类型 120 / 长度 60 / 小数点 60 /
+  /// 不是 null 60 / 键 60 / 注释 300;行首槽另占 [_kGutterW])
+  static const List<double> _fieldWidths = [200, 120, 60, 60, 60, 60, 300];
 
   // ── 生命周期 ──────────────────────────────────────────────
 
@@ -316,13 +519,7 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     super.initState();
     final app = context.read<AppState>();
     final conn = app.connectionByName(widget.connection);
-    _typeId = conn?.typeId ?? 'postgresql';
-    for (final e in kAllDbTypes) {
-      if (e.id == _typeId) {
-        _typeLabel = e.label;
-        break;
-      }
-    }
+    _typeId = widget.dialectOverride ?? conn?.typeId ?? 'postgresql';
     // 新建模式预置一行空字段(与参考工具一致);编辑模式的列由反查结果填充
     if (!_isEdit) _design.columns.add(DesignColumn());
     _loadRefTables();
@@ -336,6 +533,12 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     _commentCtrl.dispose();
     _sqlCtrl.dispose();
     _gridFocus.dispose();
+    _chromeRev.dispose();
+    _propsRev.dispose();
+    _curColRev.dispose();
+    for (final r in _rowRevs) {
+      r.dispose();
+    }
     super.dispose();
   }
 
@@ -467,9 +670,17 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       ..name = name
       ..schema = widget.schema
       ..tableComment = read.tableComment
-      ..fillFactor = read.fillFactor
+      ..unlogged = read.unlogged
+      ..owner = read.owner
+      ..inherits = read.inherits
+      ..cluster = read.cluster
       ..tablespace = read.tablespace
       ..pkName = read.pkName;
+    // 存储参数整张表带走:reloptions 除 fillfactor 外还有 autovacuum_* 等一堆,
+    // 只搬 fillFactor 会让「选项」页其余格子空着,基线里却有值 → 一保存就被当成清空。
+    _design.storageOptions
+      ..clear()
+      ..addAll(read.storageOptions);
     _design.columns
       ..clear()
       ..addAll(read.columns);
@@ -536,13 +747,38 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   // ── 保存 ──────────────────────────────────────────────────
 
   /// 保存:新建模式执行 CREATE 全套语句;编辑模式先二次确认再执行 ALTER。
+  ///
+  /// 工具栏是纯图标、页面上没有表名框(参考工具同),所以表名在这里补:
+  /// 名为空时先弹「表名」输入框,取消即放弃这次保存。已有表的改名走对象树 F2
+  /// (`AppState.renameTable`),不在本页做 —— 那是整棵对象树的统一入口。
   Future<void> _save() async {
     if (_readOnly || _loading || _saving) return;
     final app = context.read<AppState>();
+    if (isUntitledTableName(_design.name)) {
+      final typed = await InputDialog.show(
+        context,
+        title: '表名',
+        message: '请输入要创建的表名',
+        initialValue: '',
+        okText: '保存',
+      );
+      if (typed == null) return;
+      final name = typed.trim();
+      if (name.isEmpty) {
+        if (mounted) setState(() => _error = '表名不能为空');
+        return;
+      }
+      if (!mounted) return;
+      setState(() {
+        _design.name = name;
+        _nameCtrl.text = name;
+        _error = null;
+      });
+    }
     final base = _original;
     if (_isEdit && base == null) return;
     final stmts = _isEdit
-        ? DdlBuilder.buildAlterStatements(_design, base!, _typeId)
+        ? _alterStatements
         : DdlBuilder.buildStatements(_design, _typeId);
     if (_isEdit) {
       // 无法用 ALTER 表达的变更(改列序 / 触发器 / 表选项等)直接阻断并说明原因,
@@ -635,9 +871,6 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   @override
   Widget build(BuildContext context) {
     final t = Tokens.of(context);
-    final validation = DdlBuilder.validate(_design);
-    _valid = validation.ok;
-    _invalidReason = validation.error ?? '设计数据不完整';
     // 一有实质变更就撤下上次保存的提示,不长期挂「已保存」
     if (_note != null && _dirty) _note = null;
     return Shortcuts(
@@ -654,39 +887,52 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
             },
           ),
         },
-        child: Container(
-          color: t.background,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              _header(t),
-              _toolbar(t),
-              // TabControl 仅作标签条(子标签不挂 child,内容区由下方 Expanded
-              // 自渲染——TabControl 内容区是 shrink-wrap,不能承载 Expanded 子级)
-              TabControl(
-                initialIndex: 0,
-                tabBarColor: t.background,
-                selectedTabColor: t.surface,
-                hoverTabColor: t.secondary,
-                contentPadding: EdgeInsets.zero,
-                onChanged: (i) => setState(() => _tabIndex = i),
-                tabs: [
-                  for (final label in const [
-                    '字段', '索引', '外键', '唯一键', '检查', '排除',
-                    '规则', '触发器', '选项', '注释', 'SQL 预览',
-                  ])
-                    TabItem(label: label),
-                ],
-              ),
-              Expanded(
-                child: Focus(
-                  focusNode: _gridFocus,
-                  onKeyEvent: _onGridKey,
-                  child: _tabBody(t, _tabIndex),
+        child: TokenScope(
+          // 整页落到「单元格档」:字号 12 / 控件 20 高 / 水平留白 5。
+          // 参考工具的设计器从工具栏到属性面板都是这一档,逐控件传 height
+          // 会漏(且 ComboBox 没有 height 形参),在 TokenScope 上一次性收口。
+          tokens: gridCellTokens(
+              TokenScope.maybeOf(context) ?? DesktopTokens.winForm),
+          child: Container(
+            color: t.background,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // 页内不再有标题条:表名 @ 库.模式 由文档标签标题承载
+                _toolbar(t),
+                // TabControl 仅作标签条(子标签不挂 child,内容区由下方 Expanded
+                // 自渲染——TabControl 内容区是 shrink-wrap,不能承载 Expanded 子级)
+                TabControl(
+                  initialIndex: 0,
+                  barHeight: _kTabBarH,
+                  tabPaddingX: 11.5,
+                  tabBarColor: t.muted,
+                  selectedTabColor: t.surface,
+                  unselectedTabColor: t.muted,
+                  hoverTabColor: t.secondary,
+                  contentPadding: EdgeInsets.zero,
+                  onChanged: (i) => setState(() {
+                    _tabIndex = i;
+                    _curCol = 0;
+                  }),
+                  tabs: [
+                    for (final label in const [
+                      '字段', '索引', '外键', '唯一键', '检查', '排除',
+                      '规则', '触发器', '选项', '注释', 'SQL 预览',
+                    ])
+                      TabItem(label: label),
+                    ],
                 ),
-              ),
-              _statusBar(t),
-            ],
+                Expanded(
+                  child: Focus(
+                    focusNode: _gridFocus,
+                    onKeyEvent: _onGridKey,
+                    child: _tabBody(t, _tabIndex),
+                  ),
+                ),
+                _statusBar(t),
+              ],
+            ),
           ),
         ),
       ),
@@ -773,69 +1019,34 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     }
   }
 
-  /// 标题栏:表名 @ 库.模式 (连接 · 类型),编辑模式尾部追加「— 设计」
-  Widget _header(AppPalette t) {
-    final name = _design.name.trim().isEmpty ? '无标题' : _design.name.trim();
-    final schemaSuffix = widget.schema == null || widget.schema!.isEmpty
-        ? ''
-        : '.${widget.schema}';
-    return Container(
-      height: 28,
-      alignment: Alignment.centerLeft,
-      padding: const EdgeInsets.only(left: 12),
-      color: t.secondary,
-      child: Text(
-        '$name @ ${widget.database}$schemaSuffix (${widget.connection} · $_typeLabel)'
-        '${_isEdit ? ' — 设计' : ''}',
-        style: TextStyle(
-          fontSize: 12.5,
-          color: t.mutedForeground,
-          decoration: TextDecoration.none,
-          fontWeight: FontWeight.w400,
-        ),
-      ),
-    );
-  }
-
-  /// 工具栏:表名 + 保存 + 当前标签的动作按钮
   Widget _toolbar(AppPalette t) {
-    final c = AppColors.of(context);
     return Container(
-      height: 42,
+      height: _kToolbarH,
       color: t.secondary,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(
         children: [
-          Text('表名', style: TextStyle(fontSize: 12.5, color: t.mutedForeground)),
-          const SizedBox(width: 6),
-          SizedBox(
-            width: 170,
-            child: Input(
-              controller: _nameCtrl,
-              hint: '输入表名',
-              enabled: !_readOnly,
-              selectAllOnFocus: false,
-              // 编辑模式改表名 = 生成 RENAME
-              onChanged: (v) => setState(() => _design.name = v),
+          // 保存按钮的可用性取决于设计数据(校验 + 是否有变更),挂在 chrome
+          // 信号上:敲字时只重画这一颗按钮,不牵动整页与网格。
+          ValueListenableBuilder(
+            valueListenable: _chromeRev,
+            builder: (context, _, __) => ToolbarButton(
+              icon: Icons.save_outlined,
+              iconColor: AppColors.of(context).iconPrimary,
+              tooltip: _isEdit ? '保存变更 (Ctrl+S)' : '保存并建表 (Ctrl+S)',
+              enabled: _canSave,
+              paddingX: _kIconPadX,
+              onTap: _save,
             ),
           ),
-          const SizedBox(width: 10),
-          ToolbarButton(
-            icon: Icons.save_outlined,
-            iconColor: c.iconPrimary,
-            text: '保存',
-            outlined: true,
-            enabled: _canSave,
-            onTap: _save,
-          ),
-          const SizedBox(width: 14),
-          Container(width: 1, height: 22, color: t.border),
-          const SizedBox(width: 14),
+          _toolSep(t),
           // 窄窗口下动作按钮可能多于可用宽:横向滚动而非 RenderFlex 溢出
           Expanded(
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
-              child: _tabActions(t),
+              child: ValueListenableBuilder(
+                valueListenable: _chromeRev,
+                builder: (context, _, __) => _tabActions(t),
+              ),
             ),
           ),
         ],
@@ -843,114 +1054,90 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     );
   }
 
-  /// 「添加 X / 删除 X」按钮对(与参考工具一致:绿色 ⊕ / 红色 ⊖)
+  /// 工具栏分隔块:1px 竖线 + 两侧留白(实测分隔线 23 高,几乎占满工具栏)
+  Widget _toolSep(AppPalette t) => SizedBox(
+        width: _kToolSepW,
+        child: Center(
+          child: Container(width: 1, height: 23, color: t.border),
+        ),
+      );
+
+  /// 「添加 X / 删除 X」图标对(绿色 ⊕ / 红色 ⊖)
   List<Widget> _addRemoveActions({
     required String label,
     required VoidCallback onAdd,
     required VoidCallback onRemove,
   }) {
-    final c = AppColors.of(context);
     return [
       ToolbarButton(
         icon: Icons.add_circle_outline,
-        iconColor: c.iconSuccess,
-        text: '添加$label',
+        iconColor: _iconAdd,
+        tooltip: '添加$label',
+        paddingX: _kIconPadX,
         onTap: onAdd,
       ),
-      const SizedBox(width: 10),
       ToolbarButton(
         icon: Icons.remove_circle_outline,
         iconColor: _iconDanger,
-        text: '删除$label',
+        tooltip: '删除$label',
+        enabled: _actionsEnabled,
+        paddingX: _kIconPadX,
         onTap: onRemove,
       ),
     ];
   }
 
-  /// 当前标签专属动作按钮(字段:增删插/主键/上下移;其余:增删)
+  /// 当前标签的图标动作。
+  ///
+  /// 只放参考工具图标栏上有的那几个:字段页 = ⊕ 添加 / ⊖ 删除 / 🔑 主键 ▾,
+  /// 其余标签 = ⊕ / ⊖。插入字段 / 复制 / 粘贴 / 上移 / 下移收进行右键菜单
+  /// (见 [_columnContextMenu]),工具栏不再挂文字按钮。
   Widget _tabActions(AppPalette t) {
-    final c = AppColors.of(context);
     final actions = <Widget>[];
     switch (_tabIndex) {
       case 0:
-        final cols = _design.columns;
-        final selCount = _selectedColumns().length;
-        final hasSel = selCount > 0;
+        final hasSel = _selectedColumns().isNotEmpty;
         actions.addAll([
           ToolbarButton(
             icon: Icons.add_circle_outline,
-            iconColor: c.iconSuccess,
-            text: '添加字段',
+            iconColor: _iconAdd,
+            tooltip: '添加字段',
+            enabled: _actionsEnabled,
+            paddingX: _kIconPadX,
             onTap: _addColumn,
           ),
-          const SizedBox(width: 2),
-          ToolbarButton(
-            icon: Icons.subdirectory_arrow_right,
-            text: '插入字段',
-            onTap: _insertColumn,
-          ),
-          const SizedBox(width: 2),
           ToolbarButton(
             icon: Icons.remove_circle_outline,
             iconColor: _iconDanger,
-            text: '删除字段',
-            enabled: hasSel,
+            tooltip: '删除字段',
+            enabled: _actionsEnabled && hasSel,
+            paddingX: _kIconPadX,
             onTap: _removeColumn,
           ),
-          const SizedBox(width: 10),
-          // 多选行 → 像数据表格那样整批复制 / 粘贴(Ctrl+C / Ctrl+V 同口径)
-          ToolbarButton(
-            icon: Icons.copy_outlined,
-            text: selCount > 1 ? '复制 $selCount 行' : '复制行',
-            enabled: hasSel,
-            onTap: _copyColumns,
-          ),
-          const SizedBox(width: 2),
-          ToolbarButton(
-            icon: Icons.paste_outlined,
-            text: '粘贴行',
-            onTap: _pasteColumns,
-          ),
-          const SizedBox(width: 10),
           // 「主键 ▾」:弹层开合由 DropDownButton 的 Listener 处理,按钮仅提供视觉态
           DropDownButton(
-            width: 156,
+            width: 140,
             trigger: ToolbarButton(
               icon: Icons.key,
-              iconColor: c.iconWarning,
-              text: '主键',
+              iconColor: _iconKey,
+              tooltip: '设置 / 取消主键(多选即复合主键)',
               showCaret: true,
-              enabled: cols.isNotEmpty,
+              enabled: _actionsEnabled && _design.columns.isNotEmpty,
+              paddingX: _kIconPadX,
               onTap: () {},
             ),
             items: [
               ListItem(
                 title: '设置主键',
-                enabled: hasSel,
+                enabled: _actionsEnabled && hasSel,
                 onSelect: () => _setPk(true),
               ),
               ListItem(
                 title: '取消主键',
-                enabled: hasSel,
+                enabled: _actionsEnabled && hasSel,
                 onSelect: () => _setPk(false),
               ),
             ],
-          ),
-          const SizedBox(width: 10),
-          ToolbarButton(
-            icon: Icons.arrow_upward,
-            text: '上移',
-            enabled: _selColumn > 0 && _canReorderColumns,
-            onTap: _moveColumnUp,
-          ),
-          const SizedBox(width: 2),
-          ToolbarButton(
-            icon: Icons.arrow_downward,
-            text: '下移',
-            enabled: hasSel &&
-                _selColumn < cols.length - 1 &&
-                _canReorderColumns,
-            onTap: _moveColumnDown,
           ),
         ]);
       case 1:
@@ -998,23 +1185,6 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       default:
         return const SizedBox.shrink();
     }
-    // 排除 / 规则 / 触发器仅 PostgreSQL 家族生成 DDL,其它类型提示但不拦截
-    if ((_tabIndex == 5 || _tabIndex == 6 || _tabIndex == 7) &&
-        !DdlBuilder.isPgLike(_typeId)) {
-      actions.add(const SizedBox(width: 12));
-      actions.add(Text(
-        '仅 PostgreSQL 支持该功能,其它类型保存时忽略',
-        style: TextStyle(fontSize: 11, color: t.disabledForeground),
-      ));
-    }
-    // 编辑已有表时上移 / 下移置灰(PG / SQL Server 无对应 ALTER)
-    if (_tabIndex == 0 && !_canReorderColumns) {
-      actions.add(const SizedBox(width: 12));
-      actions.add(Text(
-        '调整已有列的顺序仅 MySQL / MariaDB 支持',
-        style: TextStyle(fontSize: 11, color: t.disabledForeground),
-      ));
-    }
     final row = Row(mainAxisSize: MainAxisSize.min, children: actions);
     if (_actionsEnabled) return row;
     // 只读降级 / 不支持编辑的标签:整组动作置灰不可点
@@ -1024,10 +1194,24 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     );
   }
 
-  /// 底部状态条:错误 / 校验提示 / 上次保存结果 + 变更状态 + 保存中提示
+  /// 工具栏当前标签的补充说明(图标栏放不下文字,统一挪到状态条)
+  String? _toolbarHint(AppPalette t) {
+    // 排除 / 规则 / 触发器仅 PostgreSQL 家族生成 DDL,其它类型提示但不拦截
+    if ((_tabIndex == 5 || _tabIndex == 6 || _tabIndex == 7) &&
+        !DdlBuilder.isPgLike(_typeId)) {
+      return '仅 PostgreSQL 支持该功能,其它类型保存时忽略';
+    }
+    // 编辑已有表时上移 / 下移置灰(PG / SQL Server 无对应 ALTER)
+    if (_tabIndex == 0 && !_canReorderColumns) {
+      return '调整已有列的顺序仅 MySQL / MariaDB 支持';
+    }
+    return null;
+  }
+
+  /// 底部状态条:错误 / 校验提示 / 上次保存结果 / 当前标签说明 + 变更状态。
+  /// 整块挂在 [_chromeRev] 上:校验结果与「已修改 / 无变更」都随敲字变化,
+  /// 但不该为此重建整页(实测整页重建一次 ≈ 130ms)。
   Widget _statusBar(AppPalette t) {
-    // 加载期间字段为空并非「设计无效」,不抢提示位
-    final showInvalid = !_valid && !_loading && _loadError == null;
     return Container(
       height: 26,
       padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -1035,54 +1219,80 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
         color: t.statusBar,
         border: Border(top: BorderSide(color: t.border)),
       ),
-      child: Row(
-        children: [
-          if (_error != null)
-            Expanded(
-              child: Text(
-                _error!,
-                style: const TextStyle(fontSize: 12, color: Color(0xFFDC2626)),
-                overflow: TextOverflow.ellipsis,
-              ),
-            )
-          else if (showInvalid)
-            Expanded(
-              child: Text(
-                _invalidReason,
-                style: TextStyle(fontSize: 12, color: t.disabledForeground),
-                overflow: TextOverflow.ellipsis,
-              ),
-            )
-          else if (_note != null)
-            Expanded(
-              child: Text(
-                _note!,
-                style: TextStyle(fontSize: 12, color: t.mutedForeground),
-                overflow: TextOverflow.ellipsis,
-              ),
-            )
-          else
-            const Spacer(),
-          // 变更状态指示(仅编辑模式):只读 / 已修改 / 无变更
-          if (_isEdit && !_loading && _loadError == null) ...[
-            Text(
-              _readOnly ? '只读' : (_dirty ? '已修改' : '无变更'),
-              style: TextStyle(
-                fontSize: 12,
-                color: _dirty ? t.accent : t.disabledForeground,
-              ),
-            ),
-            const SizedBox(width: 10),
-          ],
-          if (_saving) ...[
-            const Spinner(size: 12),
-            const SizedBox(width: 8),
-            Text(
-              _isEdit ? '正在保存变更 ...' : '正在创建表 ...',
-              style: TextStyle(fontSize: 12, color: t.mutedForeground),
-            ),
-          ],
-        ],
+      child: ValueListenableBuilder(
+        valueListenable: _chromeRev,
+        builder: (context, _, __) {
+          final validation = _validation;
+          // 加载期间字段为空并非「设计无效」,不抢提示位
+          final showInvalid =
+              !validation.ok && !_loading && _loadError == null;
+          // 工具栏改纯图标后,原来挂在按钮后面的说明文字统一挪到这里
+          final hint = showInvalid || _error != null || _note != null
+              ? null
+              : (!_isEdit && isUntitledTableName(_design.name)
+                  ? '未命名表:点「保存」时会要求输入表名'
+                  : _toolbarHint(t));
+          return Row(
+            children: [
+              if (_error != null)
+                Expanded(
+                  child: Text(
+                    _error!,
+                    style: const TextStyle(
+                        fontSize: 12, color: Color(0xFFDC2626)),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                )
+              else if (showInvalid)
+                Expanded(
+                  child: Text(
+                    validation.error ?? '设计数据不完整',
+                    style:
+                        TextStyle(fontSize: 12, color: t.disabledForeground),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                )
+              else if (_note != null)
+                Expanded(
+                  child: Text(
+                    _note!,
+                    style: TextStyle(fontSize: 12, color: t.mutedForeground),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                )
+              else if (hint != null)
+                Expanded(
+                  child: Text(
+                    hint,
+                    style:
+                        TextStyle(fontSize: 12, color: t.disabledForeground),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                )
+              else
+                const Spacer(),
+              // 变更状态指示(仅编辑模式):只读 / 已修改 / 无变更
+              if (_isEdit && !_loading && _loadError == null) ...[
+                Text(
+                  _readOnly ? '只读' : (_dirty ? '已修改' : '无变更'),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: _dirty ? t.accent : t.disabledForeground,
+                  ),
+                ),
+                const SizedBox(width: 10),
+              ],
+              if (_saving) ...[
+                const Spinner(size: 12),
+                const SizedBox(width: 8),
+                Text(
+                  _isEdit ? '正在保存变更 ...' : '正在创建表 ...',
+                  style: TextStyle(fontSize: 12, color: t.mutedForeground),
+                ),
+              ],
+            ],
+          );
+        },
       ),
     );
   }
@@ -1091,7 +1301,6 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
 
   Widget _fieldsTab(AppPalette t) {
     final cols = _design.columns;
-    final sel = _selColumn.clamp(0, cols.isEmpty ? 0 : cols.length - 1);
     // 主键序号与表级 PRIMARY KEY 列序同一来源,保证 🔑n 与 SQL 一致
     final ordinals = DdlBuilder.pkOrdinals(_design);
     return _editorGrid(
@@ -1099,14 +1308,17 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       headers: const ['名称', '类型', '长度', '小数点', '不是 null', '键', '注释'],
       widths: _fieldWidths,
       rowCount: cols.length,
-      selected: cols.isEmpty ? -1 : _selColumn,
-      selectedRows: _selColumns,
+      anchor: () => cols.isEmpty ? -1 : _selColumn,
+      selectedRows: () => _selColumns,
       onSelect: _selectColumnAt,
       onContextMenu: _columnContextMenu,
-      rowBuilder: (i) => _fieldRow(t, cols[i], i, ordinals[cols[i]]),
+      cells: (i) => _fieldRow(t, cols[i], i, ordinals[cols[i]]),
       propsPanel: _props(
         t,
-        cols.isEmpty ? null : cols[sel],
+        () {
+          if (cols.isEmpty) return null;
+          return cols[_selColumn.clamp(0, cols.length - 1)];
+        },
         (c) => _columnProps(t, c),
         hint: _identityHintText(),
       ),
@@ -1130,30 +1342,36 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
           editable: true,
           enabled: !_readOnly,
           hint: '字符串自动加引号',
-          onChanged: (v) => setState(() => c.defaultValue = v ?? ''),
+          onChanged: (v) {
+              c.defaultValue = v ?? '';
+              _touchCell(_selColumn, propsAlso: true);
+            },
         ),
       ),
       _propField(
         t,
         '排序规则',
-        // 两个下拉并排(同截图):左为排序规则名(仅字符类型可用),
-        // 右为占位(PG 无对应语法,不参与 DDL)
+        // 两个下拉并排(实测 200 + 204,紧挨着不留缝):左为排序规则名
+        // (仅字符类型可用),右为占位(PG 无对应语法,不参与 DDL)
         Row(
           children: [
             SizedBox(
-              width: 168,
+              width: 200,
               child: ComboBox<String>(
                 items: _collationChoices,
                 value: c.collation,
                 editable: true,
                 enabled: _isTextType(c.type) && !_readOnly,
-                onChanged: (v) => setState(() => c.collation = v ?? ''),
+                onChanged: (v) {
+                  c.collation = v ?? '';
+                  _touchCell(_selColumn, propsAlso: true);
+                },
               ),
             ),
-            const SizedBox(width: 6),
-            Expanded(child: _disabledInput),
+            SizedBox(width: 204, child: _disabledInput),
           ],
         ),
+        fieldWidth: 404,
       ),
       _propField(
         t,
@@ -1172,8 +1390,12 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
           children: [
             CheckBox(
               value: c.autoIncrement,
+              size: _kCheckSize,
               enabled: !_readOnly,
-              onChanged: (v) => setState(() => c.autoIncrement = v ?? false),
+              onChanged: (v) {
+                c.autoIncrement = v ?? false;
+                _touchCell(_selColumn, propsAlso: true);
+              },
             ),
             const SizedBox(width: 6),
             Text('AUTO_INCREMENT', style: TextStyle(fontSize: 12, color: t.mutedForeground)),
@@ -1190,7 +1412,11 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
         value: _identityLabelOf(c.identityMode),
         // SQLite / Access 无自增 / 标识列的统一写法,禁用并提示
         enabled: (isPg || isSqlServer) && !_readOnly,
-        onChanged: (v) => setState(() => _applyIdentity(c, _identityModeOf(v ?? '无'))),
+        onChanged: (v) {
+            _applyIdentity(c, _identityModeOf(v ?? '无'));
+            // 虚拟类型直接决定面板自身要不要展开「序列」那一组属性
+            _touchCell(_selColumn, propsAlso: true);
+          },
       ),
     ));
     Widget num(String label, String value, ValueChanged<String> set) =>
@@ -1216,8 +1442,12 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
           children: [
             CheckBox(
               value: c.identityCycle,
+              size: _kCheckSize,
               enabled: identityOn && !_readOnly,
-              onChanged: (v) => setState(() => c.identityCycle = v ?? false),
+              onChanged: (v) {
+                c.identityCycle = v ?? false;
+                _touchCell(_selColumn, propsAlso: true);
+              },
             ),
             const SizedBox(width: 6),
             Text('CYCLE', style: TextStyle(fontSize: 12, color: t.mutedForeground)),
@@ -1276,100 +1506,96 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     }
   }
 
-  Widget _fieldRow(AppPalette t, DesignColumn c, int index, int? pkOrdinal) {
-    final colors = AppColors.of(context);
-    final w = _fieldWidths;
+  /// 「字段」一行:名称 / 类型 / 长度 / 小数点 / 不是 null / 键 / 注释。
+  ///
+  /// 只交内容出去,宽度与网格线由 [_cell] 统一包(见 [_editorGrid])。
+  /// 数值格(长度 / 小数点)**左对齐**:参考工具的设计器不右对齐数字
+  /// (右对齐是数据浏览页的规则,那里是查询结果,不是表单)。
+  List<_GridCell> _fieldRow(AppPalette t, DesignColumn c, int index, int? pkOrdinal) {
     // 无长度参数的整数类型:长度格显示位宽(仅信息展示,禁用编辑)
     final bit = bitWidthOf(c.type);
-    return Row(
-      children: [
-        SizedBox(width: w[0], child: _modelInput(c.name, (v) => c.name = v, hint: '列名')),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: w[1],
-          child: ComboBox<String>(
-            items: _typeOptions,
-            value: c.type.isEmpty ? null : c.type,
-            editable: true,
-            enabled: !_readOnly,
-            hint: '类型',
-            onChanged: (v) => setState(() => _onColumnTypeChanged(c, v ?? '')),
-          ),
+    return [
+      _GridCell(_modelInput(c.name, (v) => c.name = v,
+          hint: '列名', flat: true, row: index)),
+      _GridCell(ComboBox<String>(
+        items: _typeOptions,
+        value: c.type.isEmpty ? null : c.type,
+        editable: true,
+        enabled: !_readOnly,
+        showBorder: false,
+        hint: '类型',
+        onChanged: (v) {
+          _onColumnTypeChanged(c, v ?? '');
+          // 类型变了:本行的「长度 / 小数点」可用性、面板的「排序规则」都要跟着变
+          _touchCell(index, propsAlso: true);
+        },
+      )),
+      _GridCell(_modelInput(
+        bit ?? c.length,
+        (v) => c.length = v,
+        hint: '长度',
+        enabled: bit == null,
+        keyboardType: TextInputType.number,
+        flat: true,
+        row: index,
+      )),
+      _GridCell(_modelInput(
+        c.decimal,
+        (v) => c.decimal = v,
+        hint: '小数点',
+        enabled: bit == null,
+        keyboardType: TextInputType.number,
+        flat: true,
+        row: index,
+      )),
+      _GridCell(
+        CheckBox(
+          value: c.notNull,
+          // 方框恒 13:不随行高缩到 10,否则参考工具里那颗醒目的勾选块会变小
+          size: _kCheckSize,
+          // IDENTITY 列必须 NOT NULL(由 _applyIdentity 保证),不再开放编辑
+          enabled: !(c.hasIdentity && DdlBuilder.isPgLike(_typeId)) && !_readOnly,
+          onChanged: (v) {
+            c.notNull = v ?? false;
+            _touchCell(index);
+          },
         ),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: w[2],
-          child: _modelInput(
-            bit ?? c.length,
-            (v) => c.length = v,
-            hint: '长度',
-            enabled: bit == null,
-            textAlign: TextAlign.right,
-            keyboardType: TextInputType.number,
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: w[3],
-          child: _modelInput(
-            c.decimal,
-            (v) => c.decimal = v,
-            hint: '小数点',
-            enabled: bit == null,
-            textAlign: TextAlign.right,
-            keyboardType: TextInputType.number,
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: w[4],
-          child: Center(
-            child: CheckBox(
-              value: c.notNull,
-              // IDENTITY 列必须 NOT NULL(由 _applyIdentity 保证),不再开放编辑
-              enabled: !(c.hasIdentity && DdlBuilder.isPgLike(_typeId)) && !_readOnly,
-              onChanged: (v) => setState(() => c.notNull = v ?? false),
-            ),
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: w[5],
-          // 「键」格:按下即切换主键(零延迟);主键行显示 钥匙 + 序号
+        center: true,
+      ),
+      // 「键」格:按下即切换主键(零延迟);主键行显示 钥匙 + 序号
+      _GridCell(
+        MouseRegion(
+          cursor: SystemMouseCursors.click,
           child: Listener(
             onPointerDown: (_) {
               if (!_readOnly) _togglePkAt(index);
             },
             behavior: HitTestBehavior.opaque,
-            child: MouseRegion(
-              cursor: SystemMouseCursors.click,
-              child: Center(
-                child: c.primaryKey
-                    ? Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.key, size: 14, color: colors.iconWarning),
-                          const SizedBox(width: 2),
-                          Text(
-                            '${pkOrdinal ?? 1}',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: t.foreground,
-                              decoration: TextDecoration.none,
-                              fontWeight: FontWeight.w400,
-                            ),
-                          ),
-                        ],
-                      )
-                    : const SizedBox.shrink(),
-              ),
-            ),
+            child: c.primaryKey
+                ? Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.key, size: 14, color: _iconKey),
+                      const SizedBox(width: 2),
+                      Text(
+                        '${pkOrdinal ?? 1}',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: t.foreground,
+                          decoration: TextDecoration.none,
+                          fontWeight: FontWeight.w400,
+                        ),
+                      ),
+                    ],
+                  )
+                : const SizedBox.shrink(),
           ),
         ),
-        const SizedBox(width: 6),
-        Expanded(child: _modelInput(c.comment, (v) => c.comment = v, hint: '注释')),
-      ],
-    );
+        center: true,
+      ),
+      _GridCell(_modelInput(c.comment, (v) => c.comment = v,
+          hint: '注释', flat: true, row: index)),
+    ];
   }
 
   // ── 索引标签 ──────────────────────────────────────────────
@@ -1381,18 +1607,21 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       headers: const ['名称', '字段', '索引方法', '唯一键', '并发', '注释'],
       widths: const [140, 150, 110, 64, 64, 180],
       rowCount: items.length,
-      selected: _selIndex,
+      anchor: () => _selIndex,
       onSelect: (i, ctrl, shift) => setState(() => _selIndex = i),
-      rowBuilder: (i) => _indexRow(t, items[i]),
+      cells: (i) => _indexRow(t, items[i], i),
       propsPanel: _props(
         t,
-        _selIndex >= 0 && _selIndex < items.length ? items[_selIndex] : null,
+        () => _selIndex >= 0 && _selIndex < items.length
+            ? items[_selIndex]
+            : null,
         (it) => [
           _propField(t, '表空间',
               _candidateCombo(_tablespaces, it.tablespace,
                   (v) => it.tablespace = v, '表空间名',
                   enabled: DdlBuilder.isPgLike(_typeId))),
-          _propField(t, '填充因子 (%)', _modelInput(it.fillFactor, (v) => it.fillFactor = v)),
+          _propField(t, '填充因子 (%)', _modelInput(it.fillFactor, (v) => it.fillFactor = v,
+              enabled: DdlBuilder.isPgLike(_typeId) || DdlBuilder.isSqlServerLike(_typeId))),
           _propField(t, '正在缓冲', _disabledInput),
           _propField(t, '快速更新', _disabledInput),
           _propField(t, '待处理列表限制', _disabledInput),
@@ -1417,69 +1646,98 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     return '';
   }
 
-  /// 打开「选择数据表字段」弹窗,确认后写回字段项并同步逗号串
-  Future<void> _pickIndexColumns(DesignIndex idx) async {
+  /// 打开「选择数据表字段」弹窗,确认后写回字段项并同步逗号串。
+  ///
+  /// [target] 是宿主对象(索引 / 唯一键 / 排除)持有的字段项列表,原地替换;
+  /// [apply] 让宿主把项回写成网格显示的逗号串。索引与唯一键用同一列集,
+  /// 排除约束的「元素」多两列运算符([forExclude])。
+  Future<void> _pickColumnItems(
+    List<DesignIndexColumn> target,
+    VoidCallback apply, {
+    bool forExclude = false,
+  }) async {
     await _ensureCandidates();
     final picked = await IndexColumnPickerDialog.show(
       context,
       fields: [
         for (final c in _design.columns) c.name.trim(),
       ].where((e) => e.isNotEmpty).toList(),
-      selected: idx.columnItems,
+      selected: target,
       schemaCandidates: _schemas,
       collationCandidates: _collationChoices,
       opClassCandidates: _opClasses,
+      operatorCandidates: _excludeOperators,
+      forExclude: forExclude,
     );
     if (picked == null) return;
     setState(() {
-      idx.columnItems
+      target
         ..clear()
         ..addAll(picked);
-      idx.applyColumnItems();
+      apply();
     });
   }
 
-  Widget _indexRow(AppPalette t, DesignIndex it) {
-    // 复选框可用性统一收口(只读降级不逐个传参)
-    Widget box(bool value, ValueChanged<bool> set) => CheckBox(
+  Future<void> _pickIndexColumns(DesignIndex idx) =>
+      _pickColumnItems(idx.columnItems, idx.applyColumnItems);
+
+  Future<void> _pickUniqueColumns(DesignUniqueKey uk) =>
+      _pickColumnItems(uk.columnItems, uk.applyColumnItems);
+
+  Future<void> _pickExcludeElements(DesignExclude ex) =>
+      _pickColumnItems(ex.columnItems, ex.applyColumnItems, forExclude: true);
+
+  /// 「字段 / 元素」格:可直填逗号串,也可点 `...` 逐项设选项
+  Widget _columnCell(String value, ValueChanged<String> set, int row,
+          String hint, VoidCallback pick) =>
+      Row(
+        children: [
+          Expanded(
+            child: _modelInput(value, set, hint: hint, flat: true, row: row),
+          ),
+          _dotsButton(onTap: _readOnly ? null : pick),
+        ],
+      );
+
+  List<_GridCell> _indexRow(AppPalette t, DesignIndex it, int row) {
+    // 复选框可用性统一收口(只读降级不逐个传参);[dialectOk] 再叠一层方言门,
+    // 与 [DdlBuilder.createUnsupported] 的拦口一致:改了不生效的开关直接灰掉。
+    Widget box(bool value, ValueChanged<bool> set, {bool dialectOk = true}) => CheckBox(
         value: value,
+        size: _kCheckSize,
+        enabled: !_readOnly && dialectOk,
+        onChanged: (v) {
+          set(v ?? false);
+          _touchCell(row);
+        });
+    final isPg = DdlBuilder.isPgLike(_typeId);
+    return [
+      _GridCell(_modelInput(it.name, (v) => it.name = v,
+          hint: '索引名', flat: true, row: row)),
+      // 字段格:可直接输逗号串,也可点 `...` 用弹窗逐字段设选项
+      _GridCell(_columnCell(it.columns, (v) => it.columns = v, row,
+          '多列用逗号分隔', () => _pickIndexColumns(it))),
+      _GridCell(ComboBox<String>(
+        items: _indexMethods,
+        value: it.method.isEmpty ? null : it.method,
         enabled: !_readOnly,
-        onChanged: (v) => setState(() => set(v ?? false)));
-    return Row(
-      children: [
-        SizedBox(width: 140, child: _modelInput(it.name, (v) => it.name = v, hint: '索引名')),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: 150,
-          // 字段格:可直接输逗号串,也可点 `...` 用弹窗逐字段设选项
-          child: Row(
-            children: [
-              Expanded(
-                child: _modelInput(it.columns, (v) => it.columns = v, hint: '多列用逗号分隔'),
-              ),
-              const SizedBox(width: 4),
-              _dotsButton(onTap: _readOnly ? null : () => _pickIndexColumns(it)),
-            ],
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: 110,
-          child: ComboBox<String>(
-            items: _indexMethods,
-            value: it.method.isEmpty ? null : it.method,
-            enabled: !_readOnly,
-            onChanged: (v) => setState(() => it.method = v ?? ''),
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(width: 64, child: Center(child: box(it.unique, (v) => it.unique = v))),
-        const SizedBox(width: 6),
-        SizedBox(width: 64, child: Center(child: box(it.concurrent, (v) => it.concurrent = v))),
-        const SizedBox(width: 6),
-        Expanded(child: _modelInput(it.comment, (v) => it.comment = v, hint: '注释')),
-      ],
-    );
+        showBorder: false,
+        onChanged: (v) {
+          it.method = v ?? '';
+          _touchCell(row);
+        },
+      )),
+      _GridCell(box(it.unique, (v) => it.unique = v), center: true),
+      // CONCURRENTLY 是 PostgreSQL 专属
+      _GridCell(box(it.concurrent, (v) => it.concurrent = v, dialectOk: isPg),
+          center: true),
+      // 注释:PG 走 COMMENT ON INDEX,MySQL 内联进 CREATE INDEX,SQL Server
+      // 的扩展属性不覆盖索引层次 → 那一型上填了必然丢,直接灰掉
+      _GridCell(_modelInput(it.comment, (v) => it.comment = v,
+          hint: '注释', flat: true, row: row,
+          // _modelInput 内部已并上 !_readOnly,这里只表达方言门
+          enabled: DdlBuilder.isPgLike(_typeId) || DdlBuilder.isMysqlLike(_typeId))),
+    ];
   }
 
   // ── 外键标签 ──────────────────────────────────────────────
@@ -1491,21 +1749,28 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       headers: const ['名称', '字段', '被引用的模式', '被引用的表（父）', '被引用的字段', '删除时', '更新时', '注释'],
       widths: const [110, 100, 100, 120, 100, 96, 96, 180],
       rowCount: items.length,
-      selected: _selFk,
+      anchor: () => _selFk,
       onSelect: (i, ctrl, shift) => setState(() => _selFk = i),
-      rowBuilder: (i) => _fkRow(t, items[i]),
+      cells: (i) => _fkRow(t, items[i], i),
       propsPanel: _props(
         t,
-        _selFk >= 0 && _selFk < items.length ? items[_selFk] : null,
+        () => _selFk >= 0 && _selFk < items.length ? items[_selFk] : null,
         (fk) => [
           _propField(
             t,
             '符合全部',
             CheckBox(
               value: fk.matchAll,
-              enabled: !_readOnly,
-              onChanged: (v) => setState(() => fk.matchAll = v ?? false),
+              size: _kCheckSize,
+              // MATCH FULL 只有 PG / MySQL 会输出(SQL Server 无此子句)
+              enabled: !_readOnly &&
+                  (DdlBuilder.isPgLike(_typeId) || DdlBuilder.isMysqlLike(_typeId)),
+              onChanged: (v) {
+                fk.matchAll = v ?? false;
+                _touchChrome();
+              },
             ),
+            fieldWidth: 24,
           ),
           _propField(t, '可延迟', _yesNoCombo(fk.deferrable, (v) => fk.deferrable = v)),
           _propField(t, '延迟', _yesNoCombo(fk.deferred, (v) => fk.deferred = v)),
@@ -1514,52 +1779,52 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     );
   }
 
-  Widget _fkRow(AppPalette t, DesignForeignKey fk) {
-    return Row(
-      children: [
-        SizedBox(width: 110, child: _modelInput(fk.name, (v) => fk.name = v, hint: '约束名')),
-        const SizedBox(width: 6),
-        SizedBox(width: 100, child: _modelInput(fk.columns, (v) => fk.columns = v, hint: '本表字段')),
-        const SizedBox(width: 6),
-        SizedBox(width: 100, child: _modelInput(fk.refSchema, (v) => fk.refSchema = v, hint: widget.schema ?? '模式')),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: 120,
-          child: ComboBox<String>(
-            items: _refTables,
-            value: fk.refTable.isEmpty ? null : fk.refTable,
-            editable: true,
-            enabled: !_readOnly,
-            hint: '表名',
-            onChanged: (v) => setState(() => fk.refTable = v ?? ''),
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(width: 100, child: _modelInput(fk.refColumns, (v) => fk.refColumns = v, hint: '如 id')),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: 96,
-          child: ComboBox<String>(
-            items: _fkActions,
-            value: fk.onDelete,
-            enabled: !_readOnly,
-            onChanged: (v) => setState(() => fk.onDelete = v ?? 'NO ACTION'),
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: 96,
-          child: ComboBox<String>(
-            items: _fkActions,
-            value: fk.onUpdate,
-            enabled: !_readOnly,
-            onChanged: (v) => setState(() => fk.onUpdate = v ?? 'NO ACTION'),
-          ),
-        ),
-        const SizedBox(width: 6),
-        Expanded(child: _modelInput(fk.comment, (v) => fk.comment = v, hint: '注释')),
-      ],
-    );
+  List<_GridCell> _fkRow(AppPalette t, DesignForeignKey fk, int row) {
+    return [
+      _GridCell(_modelInput(fk.name, (v) => fk.name = v,
+          hint: '约束名', flat: true, row: row)),
+      _GridCell(_modelInput(fk.columns, (v) => fk.columns = v,
+          hint: '本表字段', flat: true, row: row)),
+      _GridCell(_modelInput(fk.refSchema, (v) => fk.refSchema = v,
+          hint: widget.schema ?? '模式', flat: true, row: row)),
+      _GridCell(ComboBox<String>(
+        items: _refTables,
+        value: fk.refTable.isEmpty ? null : fk.refTable,
+        editable: true,
+        enabled: !_readOnly,
+        showBorder: false,
+        hint: '表名',
+        onChanged: (v) {
+          fk.refTable = v ?? '';
+          _touchCell(row);
+        },
+      )),
+      _GridCell(_modelInput(fk.refColumns, (v) => fk.refColumns = v,
+          hint: '如 id', flat: true, row: row)),
+      _GridCell(ComboBox<String>(
+        items: _fkActions,
+        value: fk.onDelete,
+        enabled: !_readOnly,
+        showBorder: false,
+        onChanged: (v) {
+          fk.onDelete = v ?? 'NO ACTION';
+          _touchCell(row);
+        },
+      )),
+      _GridCell(ComboBox<String>(
+        items: _fkActions,
+        value: fk.onUpdate,
+        enabled: !_readOnly,
+        showBorder: false,
+        onChanged: (v) {
+          fk.onUpdate = v ?? 'NO ACTION';
+          _touchCell(row);
+        },
+      )),
+      _GridCell(_modelInput(fk.comment, (v) => fk.comment = v,
+          hint: '注释', flat: true, row: row,
+          enabled: DdlBuilder.isPgLike(_typeId))),
+    ];
   }
 
   // ── 唯一键标签 ────────────────────────────────────────────
@@ -1571,18 +1836,20 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       headers: const ['名称', '字段', '注释'],
       widths: const [160, 200, 240],
       rowCount: items.length,
-      selected: _selUnique,
+      anchor: () => _selUnique,
       onSelect: (i, ctrl, shift) => setState(() => _selUnique = i),
-      rowBuilder: (i) => _uniqueRow(t, items[i]),
+      cells: (i) => _uniqueRow(t, items[i], i),
       propsPanel: _props(
         t,
-        _selUnique >= 0 && _selUnique < items.length ? items[_selUnique] : null,
+        () =>
+            _selUnique >= 0 && _selUnique < items.length ? items[_selUnique] : null,
         (uk) => [
           _propField(t, '表空间',
               _candidateCombo(_tablespaces, uk.tablespace,
                   (v) => uk.tablespace = v, '表空间名',
                   enabled: DdlBuilder.isPgLike(_typeId))),
-          _propField(t, '填充因子 (%)', _modelInput(uk.fillFactor, (v) => uk.fillFactor = v)),
+          _propField(t, '填充因子 (%)', _modelInput(uk.fillFactor, (v) => uk.fillFactor = v,
+              enabled: DdlBuilder.isPgLike(_typeId))),
           _propField(t, '可延迟', _yesNoCombo(uk.deferrable, (v) => uk.deferrable = v)),
           _propField(t, '延迟', _yesNoCombo(uk.deferred, (v) => uk.deferred = v)),
         ],
@@ -1590,16 +1857,16 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     );
   }
 
-  Widget _uniqueRow(AppPalette t, DesignUniqueKey uk) {
-    return Row(
-      children: [
-        SizedBox(width: 160, child: _modelInput(uk.name, (v) => uk.name = v, hint: '约束名')),
-        const SizedBox(width: 6),
-        SizedBox(width: 200, child: _modelInput(uk.columns, (v) => uk.columns = v, hint: '多列用逗号分隔')),
-        const SizedBox(width: 6),
-        Expanded(child: _modelInput(uk.comment, (v) => uk.comment = v, hint: '注释')),
-      ],
-    );
+  List<_GridCell> _uniqueRow(AppPalette t, DesignUniqueKey uk, int row) {
+    return [
+      _GridCell(_modelInput(uk.name, (v) => uk.name = v,
+          hint: '约束名', flat: true, row: row)),
+      _GridCell(_columnCell(uk.columns, (v) => uk.columns = v, row,
+          '多列用逗号分隔', () => _pickUniqueColumns(uk))),
+      _GridCell(_modelInput(uk.comment, (v) => uk.comment = v,
+          hint: '注释', flat: true, row: row,
+          enabled: DdlBuilder.isPgLike(_typeId))),
+    ];
   }
 
   // ── 检查标签 ──────────────────────────────────────────────
@@ -1608,26 +1875,55 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     final items = _design.checks;
     return _editorGrid(
       t,
-      headers: const ['名称', '条件', '注释'],
-      widths: const [160, 320, 240],
+      headers: const ['名称', '表达式', '无继承', '注释'],
+      widths: const [160, 300, 60, 220],
       rowCount: items.length,
-      selected: _selCheck,
+      anchor: () => _selCheck,
       onSelect: (i, ctrl, shift) => setState(() => _selCheck = i),
-      rowBuilder: (i) => _checkRow(t, items[i]),
+      cells: (i) => _checkRow(t, items[i], i),
       propsPanel: null,
     );
   }
 
-  Widget _checkRow(AppPalette t, DesignCheck ck) {
-    return Row(
-      children: [
-        SizedBox(width: 160, child: _modelInput(ck.name, (v) => ck.name = v, hint: '约束名')),
-        const SizedBox(width: 6),
-        SizedBox(width: 320, child: _modelInput(ck.expression, (v) => ck.expression = v, hint: '如 age > 0')),
-        const SizedBox(width: 6),
-        Expanded(child: _modelInput(ck.comment, (v) => ck.comment = v, hint: '注释')),
-      ],
+  List<_GridCell> _checkRow(AppPalette t, DesignCheck ck, int row) {
+    return [
+      _GridCell(_modelInput(ck.name, (v) => ck.name = v,
+          hint: '约束名', flat: true, row: row)),
+      // 表达式往往跨几行(如 CHECK (a > 0 AND b <> a)),格子里塞不下 → `...` 开大弹窗
+      _GridCell(Row(
+        children: [
+          Expanded(
+            child: _modelInput(ck.expression, (v) => ck.expression = v,
+                hint: '如 age > 0', flat: true, row: row),
+          ),
+          _dotsButton(onTap: _readOnly ? null : () => _editCheckExpression(ck)),
+        ],
+      )),
+      _GridCell(CheckBox(
+          value: ck.noInherit,
+          size: _kCheckSize,
+          // NO INHERIT 是 PG 语法,其余方言勾了也不生成 → 直接灰掉
+          enabled: !_readOnly && DdlBuilder.isPgLike(_typeId),
+          onChanged: (v) {
+            ck.noInherit = v ?? false;
+            _touchCell(row);
+          }),
+          center: true),
+      _GridCell(_modelInput(ck.comment, (v) => ck.comment = v,
+          hint: '注释', flat: true, row: row,
+          enabled: DdlBuilder.isPgLike(_typeId))),
+    ];
+  }
+
+  Future<void> _editCheckExpression(DesignCheck ck) async {
+    final text = await _MultilineEditorDialog.show(
+      context,
+      title: '检查表达式',
+      value: ck.expression,
+      hint: '如 age > 0 AND age < 130(不含 CHECK 关键字)',
     );
+    if (text == null || text == ck.expression) return;
+    setState(() => ck.expression = text);
   }
 
   // ── 排除标签(仅 PostgreSQL) ──────────────────────────────
@@ -1636,36 +1932,57 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     final items = _design.excludes;
     return _editorGrid(
       t,
-      headers: const ['名称', '字段 / 表达式', '排除方法', '注释'],
-      widths: const [150, 260, 110, 180],
+      headers: const ['名称', '索引方法', '元素', '注释'],
+      widths: const [150, 110, 280, 180],
       rowCount: items.length,
-      selected: _selExclude,
+      anchor: () => _selExclude,
       onSelect: (i, ctrl, shift) => setState(() => _selExclude = i),
-      rowBuilder: (i) => _excludeRow(t, items[i]),
-      propsPanel: null,
+      cells: (i) => _excludeRow(t, items[i], i),
+      propsPanel: _props(
+        t,
+        () => _selExclude >= 0 && _selExclude < items.length
+            ? items[_selExclude]
+            : null,
+        (ex) => [
+          _propField(
+            t,
+            '排除条件 (WHERE)',
+            _modelInput(
+              ex.predicate,
+              (v) => ex.predicate = v,
+              hint: "部分排除,如 state = 'active'",
+            ),
+          ),
+          _propField(t, '可延迟', _yesNoCombo(ex.deferrable, (v) => ex.deferrable = v)),
+          _propField(t, '延迟', _yesNoCombo(ex.deferred, (v) => ex.deferred = v)),
+        ],
+        hint: '「元素」按 PostgreSQL 原样进括号,每个元素的比较操作符写在同一格:'
+            'col WITH = / int4range(a, b) WITH &&;点 `...` 可逐字段配运算符与排序。',
+      ),
     );
   }
 
-  Widget _excludeRow(AppPalette t, DesignExclude ex) {
-    return Row(
-      children: [
-        SizedBox(width: 150, child: _modelInput(ex.name, (v) => ex.name = v, hint: '约束名')),
-        const SizedBox(width: 6),
-        SizedBox(width: 260, child: _modelInput(ex.columns, (v) => ex.columns = v, hint: '如 col WITH =')),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: 110,
-          child: ComboBox<String>(
-            items: _excludeMethods,
-            value: ex.method,
-            enabled: !_readOnly,
-            onChanged: (v) => setState(() => ex.method = v ?? 'gist'),
-          ),
-        ),
-        const SizedBox(width: 6),
-        Expanded(child: _modelInput(ex.comment, (v) => ex.comment = v, hint: '注释')),
-      ],
-    );
+  List<_GridCell> _excludeRow(AppPalette t, DesignExclude ex, int row) {
+    return [
+      _GridCell(_modelInput(ex.name, (v) => ex.name = v,
+          hint: '约束名', flat: true, row: row)),
+      _GridCell(ComboBox<String>(
+        items: _excludeMethods,
+        value: ex.method,
+        enabled: !_readOnly,
+        showBorder: false,
+        onChanged: (v) {
+          ex.method = v ?? 'gist';
+          _touchCell(row);
+        },
+      )),
+      // 元素格:`col WITH =` 可直接输,也可点 `...` 用弹窗逐字段配运算符 / 排序
+      _GridCell(_columnCell(ex.columns, (v) => ex.columns = v, row,
+          '如 col WITH =', () => _pickExcludeElements(ex))),
+      _GridCell(_modelInput(ex.comment, (v) => ex.comment = v,
+          hint: '注释', flat: true, row: row,
+          enabled: DdlBuilder.isPgLike(_typeId))),
+    ];
   }
 
   // ── 规则标签(仅 PostgreSQL) ──────────────────────────────
@@ -1674,36 +1991,89 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     final items = _design.rules;
     return _editorGrid(
       t,
-      headers: const ['名称', '事件', '语句', '注释'],
-      widths: const [150, 100, 320, 160],
+      headers: const ['名称', '事件', '代替运行', '启用', '注释'],
+      widths: const [150, 100, 100, 56, 200],
       rowCount: items.length,
-      selected: _selRule,
+      anchor: () => _selRule,
       onSelect: (i, ctrl, shift) => setState(() => _selRule = i),
-      rowBuilder: (i) => _ruleRow(t, items[i]),
-      propsPanel: null,
+      cells: (i) => _ruleRow(t, items[i], i),
+      propsPanel: _props(
+        t,
+        () => _selRule >= 0 && _selRule < items.length
+            ? items[_selRule]
+            : null,
+        (r) => [
+          // 语句体跨行是常态(INSERT INTO … VALUES (…) 后面还跟分号),
+          // 网格那一格放不下,参考工具也把它放在属性区。
+          _propField(
+            t,
+            '语句',
+            _ModelTextarea(
+              value: r.statement,
+              hint: 'DO 后括号里的语句,如 INSERT INTO log VALUES (NEW.id)',
+              enabled: !_readOnly,
+              onChanged: (v) {
+                r.statement = v;
+                _touchChrome();
+              },
+            ),
+            height: 78,
+            expandField: true,
+          ),
+          _propField(
+            t,
+            '限定条件 (WHERE)',
+            _modelInput(
+              r.qualification,
+              (v) => r.qualification = v,
+              hint: '如 NEW.amount > 1000',
+            ),
+          ),
+        ],
+        hint: 'SELECT 规则只能 DO INSTEAD(PG 语法限制);代替运行选 NOTHING 时不生成语句体。',
+      ),
     );
   }
 
-  Widget _ruleRow(AppPalette t, DesignRule r) {
-    return Row(
-      children: [
-        SizedBox(width: 150, child: _modelInput(r.name, (v) => r.name = v, hint: '规则名')),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: 100,
-          child: ComboBox<String>(
-            items: _ruleEvents,
-            value: r.event,
-            enabled: !_readOnly,
-            onChanged: (v) => setState(() => r.event = v ?? 'INSERT'),
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(width: 320, child: _modelInput(r.statement, (v) => r.statement = v, hint: 'DO INSTEAD 后的语句')),
-        const SizedBox(width: 6),
-        Expanded(child: _modelInput(r.comment, (v) => r.comment = v, hint: '注释')),
-      ],
-    );
+  List<_GridCell> _ruleRow(AppPalette t, DesignRule r, int row) {
+    return [
+      _GridCell(
+          _modelInput(r.name, (v) => r.name = v, hint: '规则名', flat: true, row: row)),
+      _GridCell(ComboBox<String>(
+        items: _ruleEvents,
+        value: r.event,
+        enabled: !_readOnly,
+        showBorder: false,
+        onChanged: (v) {
+          r.event = v ?? 'INSERT';
+          // SELECT 规则只能 DO INSTEAD(PG 语法限制):把模型一起扳过来,
+          // 否则网格里显示「ALSO」而生成的 SQL 写「INSTEAD」,两者对不上。
+          if (r.event == 'SELECT') r.action = 'INSTEAD';
+          _touchCell(row, propsAlso: true);
+        },
+      )),
+      _GridCell(ComboBox<String>(
+        items: _ruleActions,
+        value: r.action,
+        enabled: !_readOnly && r.event != 'SELECT',
+        showBorder: false,
+        onChanged: (v) {
+          r.action = v ?? 'ALSO';
+          _touchCell(row, propsAlso: true);
+        },
+      )),
+      _GridCell(CheckBox(
+          value: r.enable,
+          size: _kCheckSize,
+          enabled: !_readOnly,
+          onChanged: (v) {
+            r.enable = v ?? true;
+            _touchCell(row);
+          }),
+          center: true),
+      _GridCell(_modelInput(r.comment, (v) => r.comment = v,
+          hint: '注释', flat: true, row: row)),
+    ];
   }
 
   // ── 触发器标签 ────────────────────────────────────────────
@@ -1715,12 +2085,14 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       headers: const ['名称', '给每个', '触发', '插入', '更新', '删除', '截断', '更新字段', '启用', '注释'],
       widths: const [110, 70, 90, 44, 44, 44, 44, 110, 44, 140],
       rowCount: items.length,
-      selected: _selTrigger,
+      anchor: () => _selTrigger,
       onSelect: (i, ctrl, shift) => setState(() => _selTrigger = i),
-      rowBuilder: (i) => _triggerRow(t, items[i]),
+      cells: (i) => _triggerRow(t, items[i], i),
       propsPanel: _props(
         t,
-        _selTrigger >= 0 && _selTrigger < items.length ? items[_selTrigger] : null,
+        () => _selTrigger >= 0 && _selTrigger < items.length
+            ? items[_selTrigger]
+            : null,
         (tr) => [
           // 属性面板内再分「常规 / 约束」两个子页(与参考工具一致)
           TabControl(
@@ -1740,8 +2112,37 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     );
   }
 
-  /// 触发器「常规」子页:WHEN 条件 / 触发函数(模式 + 函数名)/ 参数
+  /// 触发器「常规」子页。
+  ///
+  /// PostgreSQL:WHEN 条件 / 触发函数(模式 + 函数名)/ 参数。
+  /// MySQL 与 SQL Server:没有独立函数,过程体直接写在触发器里 → 换成多行
+  /// 「触发主体」输入区;此时画「触发函数」会得到一个填了也不生成任何语句的
+  /// 死控件,故整组不出现。
   List<Widget> _triggerGeneralProps(AppPalette t, DesignTrigger tr) {
+    if (!_triggerUsesFunction) {
+      return [
+        _propField(
+          t,
+          '触发主体',
+          _ModelTextarea(
+            value: tr.body,
+            hint: DdlBuilder.isMysqlLike(_typeId)
+                ? '如 SET NEW.updated_at = NOW()(多条语句各占一行)'
+                : '如 UPDATE audit SET n = n + 1 FROM inserted',
+            enabled: !_readOnly,
+            onChanged: (v) {
+              tr.body = v;
+              _touchChrome();
+            },
+          ),
+          height: 78,
+          expandField: true,
+        ),
+        _propField(t, '当', _modelInput(tr.when, (v) => tr.when = v, hint: 'WHEN 条件',
+            // WHEN 子句是 PG 专属:MySQL / SQL Server 里条件写进主体的 IF
+            enabled: !_readOnly && DdlBuilder.isPgLike(_typeId))),
+      ];
+    }
     final fn = tr.function.trim();
     final dot = fn.lastIndexOf('.');
     final fnSchema = dot < 0 ? '' : fn.substring(0, dot);
@@ -1780,6 +2181,8 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
             ),
           ],
         ),
+        // 两个下拉合计 172 + 6 + 182 = 360,比默认字段宽(300)宽一档
+        fieldWidth: 360,
       ),
       _propField(t, '参数', _modelInput(tr.parameters, (v) => tr.parameters = v, hint: '如 NEW.id')),
     ];
@@ -1815,61 +2218,77 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     return n.isEmpty ? s : '$s.$n';
   }
 
-  Widget _triggerRow(AppPalette t, DesignTrigger tr) {
-    Widget cell(Widget child) => Center(child: child);
-    Widget box(bool value, ValueChanged<bool> set, {bool fallback = false}) => CheckBox(
-        value: value,
+  List<_GridCell> _triggerRow(AppPalette t, DesignTrigger tr, int row) {
+    // 复选框可用性统一收口(只读降级不逐个传参);[dialectOk] 再叠一层方言门:
+    // 方言用不上的开关一律灰掉,不给「改了不生效」的控件。
+    Widget box(bool value, ValueChanged<bool> set,
+            {bool fallback = false, bool dialectOk = true}) =>
+        CheckBox(
+            value: value,
+            size: _kCheckSize,
+            enabled: !_readOnly && dialectOk,
+            onChanged: (v) {
+              set(v ?? fallback);
+              _touchCell(row);
+            });
+    final isPg = DdlBuilder.isPgLike(_typeId);
+    return [
+      _GridCell(_modelInput(tr.name, (v) => tr.name = v,
+          hint: '触发器名', flat: true, row: row)),
+      _GridCell(ComboBox<String>(
+        items: _forEachChoices,
+        value: tr.forEach,
+        enabled: !_readOnly && _forEachChoices.isNotEmpty,
+        showBorder: false,
+        onChanged: (v) {
+          tr.forEach = v ?? '行';
+          _touchCell(row);
+        },
+      )),
+      _GridCell(ComboBox<String>(
+        items: _timingChoices,
+        value: tr.timing,
         enabled: !_readOnly,
-        onChanged: (v) => setState(() => set(v ?? fallback)));
-    return Row(
-      children: [
-        SizedBox(width: 110, child: _modelInput(tr.name, (v) => tr.name = v, hint: '触发器名')),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: 70,
-          child: ComboBox<String>(
-            items: _forEachOptions,
-            value: tr.forEach,
-            enabled: !_readOnly,
-            onChanged: (v) => setState(() => tr.forEach = v ?? '行'),
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(
-          width: 90,
-          child: ComboBox<String>(
-            items: _timingOptions,
-            value: tr.timing,
-            enabled: !_readOnly,
-            onChanged: (v) => setState(() => tr.timing = v ?? 'BEFORE'),
-          ),
-        ),
-        const SizedBox(width: 6),
-        SizedBox(width: 44, child: cell(box(tr.insert, (v) => tr.insert = v))),
-        const SizedBox(width: 6),
-        SizedBox(width: 44, child: cell(box(tr.update, (v) => tr.update = v))),
-        const SizedBox(width: 6),
-        SizedBox(width: 44, child: cell(box(tr.delete, (v) => tr.delete = v))),
-        const SizedBox(width: 6),
-        SizedBox(width: 44, child: cell(box(tr.truncate, (v) => tr.truncate = v))),
-        const SizedBox(width: 6),
-        SizedBox(width: 110, child: _modelInput(tr.updateColumns, (v) => tr.updateColumns = v, hint: '更新字段')),
-        const SizedBox(width: 6),
-        SizedBox(width: 44, child: cell(box(tr.enable, (v) => tr.enable = v, fallback: true))),
-        const SizedBox(width: 6),
-        Expanded(child: _modelInput(tr.comment, (v) => tr.comment = v, hint: '注释')),
-      ],
-    );
+        showBorder: false,
+        onChanged: (v) {
+          tr.timing = v ?? 'BEFORE';
+          _touchCell(row);
+        },
+      )),
+      _GridCell(box(tr.insert, (v) => tr.insert = v), center: true),
+      _GridCell(box(tr.update, (v) => tr.update = v), center: true),
+      _GridCell(box(tr.delete, (v) => tr.delete = v), center: true),
+      // TRUNCATE 事件只有 PostgreSQL 有(MySQL / SQL Server 无此触发点)
+      _GridCell(box(tr.truncate, (v) => tr.truncate = v), center: true),
+      // UPDATE OF 子句是 PG 专属
+      _GridCell(_modelInput(tr.updateColumns, (v) => tr.updateColumns = v,
+          hint: '更新字段', flat: true, row: row, enabled: isPg)),
+      // DISABLE TRIGGER 是 PG 专属
+      _GridCell(box(tr.enable, (v) => tr.enable = v, fallback: true, dialectOk: isPg),
+          center: true),
+      // 注释:PostgreSQL 没有 COMMENT ON TRIGGER,MySQL / SQL Server 同样没有,
+      // 即没有任何方言能把这一格落进 DDL。灰掉并说明,不给「填了会丢」的入口。
+      _GridCell(_modelInput(tr.comment, (v) => tr.comment = v,
+          hint: '各方言均不支持', flat: true, row: row, enabled: false)),
+    ];
   }
 
   // ── 选项标签 ──────────────────────────────────────────────
 
   Widget _optionsTab(AppPalette t) {
     final isPg = DdlBuilder.isPgLike(_typeId);
-    // 表选项没有对应的 ALTER(不记录 / 继承 / 填充因子 都需重建表),编辑模式整页不开放
-    final editable = !_readOnly && !_isEdit;
-    final pgOn = editable && isPg;
-    final ffOn = editable && (isPg || DdlBuilder.isSqlServerLike(_typeId));
+    final isSrv = DdlBuilder.isSqlServerLike(_typeId);
+    // 分组按「有没有对应的 ALTER」划,而不是按「是不是新建」划:
+    // - 表空间 / 所有者 / 填充因子:PG 能用 ALTER TABLE SET TABLESPACE / OWNER TO /
+    //   SET (…) 落地 → 设计表里照改照存。
+    // - 不记录 / 继承 / 集群:任何方言都没有对应 ALTER(前两项要重建表),编辑模式
+    //   只回显不改写,免得给出一个改了不生效的控件。
+    // - SQL Server 的填充因子只在 CREATE TABLE 里认(`WITH (FILLFACTOR = n)`),
+    //   改它同样得重建表。
+    final createOnly = !_readOnly && !_isEdit;
+    final pgCreateOnly = createOnly && isPg;
+    final storageOn = !_readOnly && (isPg || (isSrv && !_isEdit));
+    final ownerOn = !_readOnly && isPg;
     Widget combo(List<String> items, String value, ValueChanged<String> set, String hint,
             {bool enabled = true}) =>
         ComboBox<String>(
@@ -1880,7 +2299,7 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
           hint: hint,
           onChanged: (v) => setState(() => set(v ?? '')),
         );
-    return Padding(
+    return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1890,20 +2309,21 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
             child: CheckBox(
               value: _design.unlogged,
               label: '不记录',
-              enabled: pgOn,
+              enabled: pgCreateOnly,
               onChanged: (v) => setState(() => _design.unlogged = v ?? false),
             ),
           ),
           _propField(
             t,
             '所有者',
-            combo(_users, _design.owner, (v) => _design.owner = v, '角色名', enabled: pgOn),
+            combo(_users, _design.owner, (v) => _design.owner = v, '角色名',
+                enabled: ownerOn),
           ),
           _propField(
             t,
             '表空间',
             combo(_tablespaces, _design.tablespace, (v) => _design.tablespace = v, '表空间名',
-                enabled: pgOn),
+                enabled: storageOn),
           ),
           _propField(
             t,
@@ -1912,10 +2332,10 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
               children: [
                 Expanded(
                   child: _modelInput(_design.inherits, (v) => _design.inherits = v,
-                      enabled: pgOn, hint: '父表,多个用逗号分隔'),
+                      enabled: pgCreateOnly, hint: '父表,多个用逗号分隔'),
                 ),
                 const SizedBox(width: 4),
-                _dotsButton(tooltip: '选择父表', onTap: pgOn ? _pickInherits : null),
+                _dotsButton(tooltip: '选择父表', onTap: pgCreateOnly ? _pickInherits : null),
               ],
             ),
           ),
@@ -1923,23 +2343,32 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
             t,
             '填充因子 (%)',
             _modelInput(_design.fillFactor, (v) => _design.fillFactor = v,
-                enabled: ffOn, keyboardType: TextInputType.number),
+                enabled: storageOn, keyboardType: TextInputType.number),
           ),
           _propField(
             t,
             '集群',
             combo(_clusterCandidates, _design.cluster, (v) => _design.cluster = v, '索引名',
-                enabled: pgOn),
+                enabled: pgCreateOnly),
           ),
+          // 参考工具的「选项」页就这六项,不再往下铺 PG 的全部 reloption:
+          // autovacuum_* / parallel_workers 等由反查留在模型里(见 _applyDesign),
+          // 生成时原样带进 WITH (…),界面不动它们就不会在保存时被清掉。
           const SizedBox(height: 10),
           Text(
-            // 表选项无对应 ALTER(改填充因子需重建表),编辑模式不开放
             _isEdit
-                ? '「设计表」不修改不记录 / 所有者 / 表空间 / 继承 / 填充因子 / 集群:无对应的 ALTER 语句。'
+                ? (isPg
+                    ? '「设计表」用 ALTER TABLE SET / RESET 改填充因子,'
+                        'SET TABLESPACE 改表空间、OWNER TO 改所有者;'
+                        '不记录 / 继承 / 集群没有对应的 ALTER,只回显。'
+                        '库里读到的其它存储参数不在本页显示,也原样保留。'
+                    : '表空间 / 填充因子没有对应的 ALTER(仅 PostgreSQL 有),已有表不修改。')
                 : isPg
-                    ? '不记录生成 CREATE UNLOGGED TABLE,继承生成 INHERITS(...),填充因子生成 WITH (fillfactor = n),'
-                        '表空间生成 TABLESPACE;所有者与集群各补一条 ALTER TABLE … OWNER TO / CLUSTER … USING。'
-                    : '表选项仅 PostgreSQL / SQL Server 部分支持;填充因子以外的表选项对其它类型不生成。',
+                    ? '不记录生成 CREATE UNLOGGED TABLE,继承生成 INHERITS(...),'
+                        '填充因子生成 WITH (fillfactor = …),表空间生成 TABLESPACE;'
+                        '所有者与集群各补一条 ALTER TABLE … OWNER TO / CLUSTER … USING。'
+                        '库里已有的其它存储参数原样保留,不改写。'
+                    : '表选项仅 PostgreSQL / SQL Server 部分支持;SQL Server 只认填充因子,其它项对其它类型不生成。',
             style: TextStyle(fontSize: 11.5, color: t.disabledForeground),
           ),
         ],
@@ -1954,25 +2383,37 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       ].where((e) => e.isNotEmpty).toList();
 
   /// 选父表(排除本表自身;手工输入的不在候选里时并入,以免勾选丢失)
+  ///
+  /// 候选与回写都用**未加引号**的 `模式.表`(参考工具那样带引号显示,生成时由
+  /// [DdlBuilder] 自己加);这也和驱动反查的口径一致——库里读回的「继承自」就是
+  /// `nspname.relname`,弹窗里勾一下不该把它变成裸表名、进而被判成「改了继承」。
   Future<void> _pickInherits() async {
     final self = _design.name.trim().toLowerCase();
+    final schema = (_design.schema ?? widget.schema ?? '').trim();
     final current = _design.inherits
         .split(',')
         .map((e) => e.trim())
         .where((e) => e.isNotEmpty)
         .toList();
+    String lastName(String value) => value.split('.').last.trim().toLowerCase();
     final items = <String>[
       for (final e in _refTables)
-        if (e.trim().isNotEmpty && e.trim().toLowerCase() != self) e.trim(),
+        if (e.trim().isNotEmpty && e.trim().toLowerCase() != self)
+          if (schema.isEmpty) e.trim() else '$schema.${e.trim()}',
     ];
     for (final c in current) {
-      if (!items.contains(c) && c.toLowerCase() != self) items.add(c);
+      // 并入时按原文比对:模型里的名字一律会被加引号,`PUBLIC.LOGS` 与
+      // `public.logs` 是两个不同的表,忽略大小写去重会把用户写的那份弄丢
+      if (!items.contains(c) && lastName(c) != self) {
+        items.add(c);
+      }
     }
     final picked = await ListPickerDialog.show<String>(
       context,
       title: '选择继承的父表',
       items: items,
       selected: current,
+      itemToString: _inheritLabel,
       emptyHint: '当前库 / 模式没有其它表,可直接在输入框填写父表名。',
       okText: '确定',
       cancelText: '取消',
@@ -1980,6 +2421,14 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     if (picked == null) return;
     setState(() => _design.inherits = picked.join(', '));
   }
+
+  /// 「继承自」弹窗的行文本:逐段加引号的限定名(与生成的 INHERITS 写法一致)
+  String _inheritLabel(String value) => value
+      .split('.')
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty)
+      .map((e) => DdlBuilder.ident(_typeId, e))
+      .join('.');
 
   // ── 注释标签 ──────────────────────────────────────────────
 
@@ -2004,8 +2453,9 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   String _previewSql() {
     final base = _original;
     if (!_isEdit || base == null) return DdlBuilder.buildPreview(_design, _typeId);
-    final alter = DdlBuilder.alterPreview(_design, base, _typeId);
-    return alter.trim().isEmpty ? '-- 没有待应用的变更' : alter;
+    // 与「保存」执行的是同一份清单(缓存见 [_alterStatements])
+    final alter = _alterStatements;
+    return alter.isEmpty ? '-- 没有待应用的变更' : alter.join('\n');
   }
 
   Widget _sqlTab(AppPalette t) {
@@ -2070,114 +2520,233 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
 
   // ── 通用网格脚手架 ─────────────────────────────────────────
 
-  /// 表头 + 行列表 + 底部属性面板(可选)的编辑网格。
+  /// 1 设备像素的线宽:参考工具是原生窗口,网格线恒为 1 **物理**像素,
+  /// 200% 缩放下是 0.5 逻辑像素。用固定 1.0 会画成两倍粗。
+  double get _hairline =>
+      (TokenScope.maybeOf(context) ?? DesktopTokens.winForm).borderWidth;
+
+  /// 表头 + 行列表 + 底部属性面板(可选)的编辑网格(参考工具同款度量)。
+  ///
+  /// 结构:行首 [_kGutterW] 宽的「当前行」槽 + 按 [widths] 定宽的列,每格自带
+  /// 右 / 下 1px 网格线;表头白底 + 1px 底线(不是灰底表头),行高 [_kRowExtent]。
+  /// 网格块总宽 = 行首槽 + Σwidths,**最后一列不跟着窗口拉伸**,右侧余下是空白
+  /// 内容底 —— 参考工具就是这样(实测注释列固定 300,右边整片留白)。
   /// 表头与行放在同一个水平滚动容器内,超宽时一起滚动、始终对齐。
-  /// [rowMarker] 控制行首「当前行」▶ 标记(表头同步预留宽度)。
+  ///
+  /// [cells] 返回一行的**单元格内容**:宽度、网格线、当前格反白由 [_cell] 统一包,
+  /// 各标签不再各自写 SizedBox 宽度与列间距。
   /// [onSelect] 收到 Ctrl / Shift 修饰键,由调用方决定是否支持多选。
-  /// [selectedRows] 为多选高亮集合(为空时按 [selected] 单选高亮);
+  /// [anchor] / [selectedRows] 传**取值闭包**而不是值:行与表头各自挂在
+  /// notifier 上延迟重建,拿到快照值就会显示成上一次选中的样子。
+  /// [selectedRows] 非空时命中 ≥2 行才给整行淡蓝底(批量操作要有可见范围),
+  /// 单选时只留行首槽与当前格的标记,与参考工具一致。
   /// [onContextMenu] 非空时行右键可弹菜单(命中行 + 光标位置)。
   Widget _editorGrid(
     AppPalette t, {
     required List<String> headers,
     required List<double> widths,
     required int rowCount,
-    required Widget Function(int row) rowBuilder,
-    required int selected,
+    required List<_GridCell> Function(int row) cells,
+    required int Function() anchor,
     required void Function(int index, bool ctrl, bool shift) onSelect,
-    Set<int>? selectedRows,
+    Set<int> Function()? selectedRows,
     void Function(int index, Offset position)? onContextMenu,
     Widget? propsPanel,
-    bool rowMarker = true,
   }) {
-    final total = widths.fold(0.0, (a, b) => a + b) +
-        (rowMarker ? _rowMarkerWidth : 0);
+    final line = _hairline;
+    final total = _kGutterW + widths.fold(0.0, (a, b) => a + b);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Expanded(
-          child: SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: SizedBox(
-              width: total + 20,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // 表头
-                  Container(
-                    height: 26,
-                    color: t.secondary,
-                    padding: const EdgeInsets.only(left: 8, right: 12),
-                    child: Row(
-                      children: [
-                        if (rowMarker) const SizedBox(width: _rowMarkerWidth),
-                        for (var i = 0; i < headers.length; i++)
-                          _headCell(t, headers[i], widths[i]),
-                        const Spacer(),
-                      ],
+          child: Container(
+            color: t.background,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: SizedBox(
+                width: total,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // 表头只随「当前列」变而变 → 挂 chrome 信号,不跟整页走
+                    ValueListenableBuilder(
+                      valueListenable: _curColRev,
+                      builder: (context, _, __) => SizedBox(
+                        height: _kHeaderH,
+                        child: Row(
+                          children: [
+                            _gutterCell(t,
+                                line: line,
+                                height: _kHeaderH,
+                                header: true),
+                            for (var i = 0; i < headers.length; i++)
+                              _headCell(t, headers[i], widths[i],
+                                  line: line, active: i == _curCol),
+                          ],
+                        ),
+                      ),
                     ),
-                  ),
-                  // 行列表(垂直滚动);无数据时留白,不显示空态提示
-                  Expanded(
-                    child: rowCount == 0
-                        ? const SizedBox.shrink()
-                        : ListView.builder(
-                            itemCount: rowCount,
-                            itemExtent: 30,
-                            padding: const EdgeInsets.symmetric(vertical: 2),
-                            itemBuilder: (context, i) => _rowWrap(
-                              t,
-                              i,
-                              selected: selectedRows == null
-                                  ? i == selected
-                                  : selectedRows.contains(i),
-                              anchor: i == selected,
-                              onTap: (ctrl, shift) => onSelect(i, ctrl, shift),
-                              onContextMenu: onContextMenu == null
-                                  ? null
-                                  : (pos) => onContextMenu(i, pos),
-                              showMarker: rowMarker,
-                              child: rowBuilder(i),
+                    // 行列表(垂直滚动);无数据时留白,不显示空态提示。
+                    // 每行一层 ValueListenableBuilder:改单元格只重建所在行。
+                    Expanded(
+                      child: rowCount == 0
+                          ? const SizedBox.shrink()
+                          : ListView.builder(
+                              itemCount: rowCount,
+                              itemExtent: _kRowExtent,
+                              padding: EdgeInsets.zero,
+                              itemBuilder: (context, i) =>
+                                  ValueListenableBuilder(
+                                valueListenable: _rowRev(i),
+                                builder: (context, _, __) {
+                                  final a = anchor();
+                                  final rows = selectedRows;
+                                  return _rowWrap(
+                                    t,
+                                    i,
+                                    selected:
+                                        rows == null ? i == a : rows().contains(i),
+                                    anchor: i == a,
+                                    batch: rows != null && rows().length > 1,
+                                    widths: widths,
+                                    cells: cells(i),
+                                    line: line,
+                                    onTap: (ctrl, shift) =>
+                                        onSelect(i, ctrl, shift),
+                                    onContextMenu: onContextMenu == null
+                                        ? null
+                                        : (pos) => onContextMenu(i, pos),
+                                  );
+                                },
+                              ),
                             ),
-                          ),
-                  ),
-                ],
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
         ),
-        if (propsPanel != null) propsPanel,
+        if (propsPanel != null) ...[
+          // 网格与属性面板之间是 3px 的分隔条(参考工具的可拖动缝)
+          SizedBox(
+            height: _kPropSplitterH,
+            child: ColoredBox(color: t.secondary),
+          ),
+          propsPanel,
+        ],
       ],
     );
   }
 
-  Widget _headCell(AppPalette t, String title, double width) => Container(
-        width: width,
-        alignment: Alignment.centerLeft,
-        padding: const EdgeInsets.symmetric(horizontal: 6),
-        child: Text(
-          title,
-          style: TextStyle(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w600,
-            color: t.mutedForeground,
-            decoration: TextDecoration.none,
+  /// 表头格:白底 + 右 / 下 1px 结构线 + 5px 左内边距的常规字重黑字;
+  /// [active](当前列)额外压一层淡蓝块,块自顶内缩 5、底端是 2px 强调条。
+  Widget _headCell(AppPalette t, String title, double width,
+      {required double line, required bool active}) {
+    return SizedBox(
+      width: width,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border(
+            right: BorderSide(color: t.border, width: line),
+            bottom: BorderSide(color: t.border, width: line),
           ),
-          overflow: TextOverflow.ellipsis,
-          maxLines: 1,
         ),
-      );
+        child: Stack(
+          children: [
+            if (active)
+              Positioned(
+                left: 0,
+                right: 0,
+                top: _kHeaderInsetTop,
+                bottom: 0,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: t.accentSoftBg,
+                    border: Border(
+                      bottom:
+                          BorderSide(color: t.highlight, width: _kAccentBarW),
+                    ),
+                  ),
+                ),
+              ),
+            Positioned.fill(
+              child: Padding(
+                padding: const EdgeInsets.only(left: _kCellPadX, right: 2),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    title,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w400,
+                      color: bodyTextColor(context),
+                      decoration: TextDecoration.none,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
-  /// 行容器:Listener.onPointerDown 零延迟选中 + zebra / 选中底色;
-  /// [anchor] 为当前行(▶ 标记 + 实色),[selected] 为多选命中的行(浅色);
-  /// 左键按下带 Ctrl / Shift 修饰键,右键交给 [onContextMenu]
+  /// 行首「当前行」槽:当前行是淡蓝底 + 右端 2px 强调条(参考工具没有 ▶ 三角)。
+  /// 槽内的横线比数据区深一档(实测 #DCDCDC vs #F0F0F0),照做。
+  ///
+  /// [height] 必须显式给:Row 给子项的是**无界高度**,DecoratedBox 没有子项时
+  /// 会塌成 0 高 —— 那样淡蓝块与右端强调条根本不画,而且整行的 Listener
+  /// (deferToChild)在这一列收不到命中,右键落在行首槽上就弹不出菜单。
+  Widget _gutterCell(AppPalette t,
+      {required double line,
+      required double height,
+      bool current = false,
+      bool header = false}) {
+    return SizedBox(
+      width: _kGutterW,
+      height: height,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: current ? t.accentSoftBg : null,
+          border: Border(
+            right: BorderSide(color: t.border, width: line),
+            bottom: BorderSide(color: t.border, width: line),
+          ),
+        ),
+        child: current
+            ? Align(
+                alignment: Alignment.centerRight,
+                child: ColoredBox(
+                  color: t.highlight,
+                  child: SizedBox(
+                      width: _kAccentBarW,
+                      height: height - (header ? 0 : line)),
+                ),
+              )
+            : null,
+      ),
+    );
+  }
+
+  /// 一行:Listener.onPointerDown 零延迟选中(无双击判定、无点击特效)+
+  /// 行首槽 + 各列单元格。[batch] 为真时整行铺淡蓝底(多选批次)。
   Widget _rowWrap(AppPalette t, int index,
       {required bool selected,
       required bool anchor,
+      required bool batch,
+      required List<double> widths,
+      required List<_GridCell> cells,
       required void Function(bool ctrl, bool shift) onTap,
       void Function(Offset position)? onContextMenu,
-      required Widget child,
-      bool showMarker = true}) {
+      required double line}) {
     return Listener(
+      // opaque:整行是一条通宽带,落在行首槽 / 格与格之间的缝也算点这一行。
+      // 默认的 deferToChild 会让 0 高的子项(见 [_gutterCell])把命中漏掉。
+      behavior: HitTestBehavior.opaque,
       onPointerDown: (e) {
         if (e.buttons & kSecondaryButton != 0) {
           onContextMenu?.call(e.position);
@@ -2187,85 +2756,144 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
             HardwareKeyboard.instance.isShiftPressed);
       },
       child: Container(
-        height: 30,
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        color: anchor
-            ? t.treeSelectedBg
-            : (selected
-                // 多选中非锚点的行:由选中色派生,明暗两套都保持可辨
-                ? Color.alphaBlend(
-                    t.treeSelectedBg.withValues(alpha: 0.45), t.background)
-                : (index.isOdd
-                    ? Color.alphaBlend(
-                        t.foreground.withValues(alpha: 0.03), t.background)
-                    : t.background)),
+        height: _kRowExtent,
+        color: (batch && selected) ? t.accentSoftBg : null,
         child: Row(
           children: [
-            SizedBox(
-              width: showMarker ? _rowMarkerWidth : 0,
-              child: showMarker && anchor
-                  ? Icon(Icons.arrow_right, size: 16, color: t.foreground)
-                  : null,
-            ),
-            Expanded(child: child),
+            _gutterCell(t,
+                line: line, height: _kRowExtent, current: anchor),
+            for (var c = 0; c < cells.length && c < widths.length; c++)
+              _cell(t, c, widths[c], cells[c],
+                  line: line, current: anchor && c == _curCol),
           ],
         ),
       ),
+    );
+  }
+
+  /// 一个单元格:定宽 + 右 / 下 1px 网格线 + 内容;[current] 为当前格
+  /// (锚点行 × 当前列),整格铺强调色底并把文字 / 光标 / 占位换成反白档。
+  ///
+  /// 控件本身一律扁平([Input.showBorder] / [ComboBox.showBorder] = false):
+  /// 静止态每格只有文字与网格线,这是参考工具设计器网格的关键观感。
+  Widget _cell(AppPalette t, int col, double width, _GridCell content,
+      {required double line, required bool current}) {
+    final dt = TokenScope.maybeOf(context) ?? DesktopTokens.winForm;
+    Widget cell = SizedBox(
+      width: width,
+      // 显式给高:Row 给子项的是松高度约束,内容塌成 0 高时(空的「键」格)
+      // 右 / 下网格线就画不出来,同一行的线也会各自错位。
+      height: _kRowExtent,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: current ? t.accent : null,
+          border: Border(
+            right: BorderSide(color: t.gridLine, width: line),
+            bottom: BorderSide(color: t.gridLine, width: line),
+          ),
+        ),
+        child: content.center ? Center(child: content.child) : content.child,
+      ),
+    );
+    if (current) {
+      cell = TokenScope(
+        tokens: dt.copyWith(
+          foregroundColor: t.accentForeground,
+          // 禁用格(如整数类型的位宽只读长度)在实色底上要仍可辨
+          disabledForegroundColor:
+              t.accentForeground.withValues(alpha: 0.72),
+          // 光标取 primaryColor:不换成反白就会蓝底上画蓝线,看不见插入点
+          primaryColor: t.accentForeground,
+        ),
+        child: cell,
+      );
+    }
+    // 点哪格哪格成为当前格(表头同步高亮该列)。Listener 不吞事件,
+    // 编辑器照常拿到这一次点击;behavior=opaque 让格子空白处也算命中。
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (_) => _setCurrentCol(col),
+      child: cell,
     );
   }
 
   /// 底部属性面板:每行一个属性(标签列 + 控件列),超高时面板内滚动;
   /// model 为空(无选中行)时整个面板隐藏。
+  ///
+  /// [model] 传**取值闭包**:面板挂在 [_chromeRev] 上延迟重建,快照 model 会
+  /// 一直显示切换前的那一行。
   Widget _props<T>(
     AppPalette t,
-    T? model,
+    T? Function() model,
     List<Widget> Function(T) builder, {
     String? hint,
   }) {
-    if (model == null) return const SizedBox.shrink();
-    return Container(
-      width: double.infinity,
-      constraints: const BoxConstraints(maxHeight: 232),
-      padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
-      decoration: BoxDecoration(
-        border: Border(top: BorderSide(color: t.border)),
-        color: t.surface,
-      ),
-      child: SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            for (final w in builder(model)) w,
-            if (hint != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 4),
-                child: Text(
-                  hint,
-                  style: TextStyle(fontSize: 11.5, color: t.disabledForeground),
-                ),
-              ),
-          ],
-        ),
-      ),
+    return ValueListenableBuilder(
+      valueListenable: _propsRev,
+      builder: (context, _, __) {
+        final m = model();
+        if (m == null) return const SizedBox.shrink();
+        return Container(
+          width: double.infinity,
+          constraints: const BoxConstraints(maxHeight: 232),
+          padding: const EdgeInsets.fromLTRB(_kPropPadL, 10, _kPropPadL, 8),
+          color: t.background,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final w in builder(m)) w,
+                if (hint != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      hint,
+                      style:
+                          TextStyle(fontSize: 11.5, color: t.disabledForeground),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
-  /// 属性字段:左侧标签(固定宽 180)+ 右侧控件(固定宽 360),单行高 30
-  Widget _propField(AppPalette t, String label, Widget child) {
+  /// 属性字段:标签列(左起 11、宽 190)+ 控件列(自 201 起、默认宽 300),
+  /// 行距 26、标签带冒号 —— 字段起点 201 正好落在网格第一列(200 宽)之后,
+  /// 上下两块因此是对齐的。
+  Widget _propField(AppPalette t, String label, Widget child,
+      {double? fieldWidth, double? height, bool expandField = false}) {
+    // [expandField] = 控件吃掉剩余宽度(典型是多行框);此时行高不锁死,
+    // 让子项按自身固有高度撑开,标签顶对齐,否则单行标签会垂直居中地飘在多行框中间。
+    final rowH = height ?? _kPropRowH;
     return SizedBox(
-      height: 30,
+      height: expandField && height == null ? null : rowH,
       child: Row(
+        crossAxisAlignment: expandField || height != null
+            ? CrossAxisAlignment.start
+            : CrossAxisAlignment.center,
         children: [
           SizedBox(
-            width: 180,
+            width: _kPropLabelW,
+            height: _kPropRowH,
             child: Text(
-              label,
-              style: TextStyle(fontSize: 12, color: t.mutedForeground),
+              '$label:',
+              style: TextStyle(
+                fontSize: 12,
+                color: bodyTextColor(context),
+                decoration: TextDecoration.none,
+                fontWeight: FontWeight.w400,
+              ),
               overflow: TextOverflow.ellipsis,
               maxLines: 1,
             ),
           ),
-          SizedBox(width: 360, child: child),
+          if (expandField)
+            Expanded(child: child)
+          else
+            SizedBox(width: fieldWidth ?? _kPropFieldW, child: child),
         ],
       ),
     );
@@ -2277,6 +2905,11 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   ///
   /// 只读降级在本方法统一门控:字段网格里几十处文本格共用此入口,
   /// 逐个传参会漏改且淹没真正的差异。
+  ///
+  /// [flat] = 网格单元格样式:不描边、不填底,文字直接落在网格上
+  /// (水平留白走 [gridCellTokens] 的 controlPaddingX = 5)。
+  /// [row] = 所在行号(网格内的单元格才传):写回时只重建该行 + 依赖设计数据
+  /// 的那几小块;不传(属性面板 / 选项页)则只刷那几小块。
   Widget _modelInput(
     String value,
     ValueChanged<String> onChanged, {
@@ -2285,6 +2918,8 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     double? width,
     TextAlign? textAlign,
     TextInputType? keyboardType,
+    bool flat = false,
+    int? row,
   }) {
     final input = _ModelInput(
       value: value,
@@ -2292,10 +2927,10 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       hint: hint,
       textAlign: textAlign,
       keyboardType: keyboardType,
+      showBorder: !flat,
       onChanged: (v) {
         onChanged(v);
-        // 触发父级重建,使「SQL 预览」与校验状态实时刷新(预览即所见)
-        setState(() {});
+        _touchCell(row ?? -1);
       },
     );
     return width == null ? input : SizedBox(width: width, child: input);
@@ -2314,7 +2949,10 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
         editable: true,
         enabled: enabled && !_readOnly,
         hint: hint,
-        onChanged: (v) => setState(() => onChanged(v ?? '')),
+        onChanged: (v) {
+          onChanged(v ?? '');
+          _touchChrome();
+        },
       );
 
   /// 灰色占位输入(正在缓冲 / 快速更新 等暂未支持项)
@@ -2324,13 +2962,14 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   Widget _readonlyInput(String value) =>
       _ModelInput(value: value, onChanged: (_) {}, enabled: false, hint: '—');
 
-  /// 单元格右侧的 `...` 按钮(打开选择弹窗);onTap 为 null 时置灰
+  /// 单元格右侧的 `...` 按钮(打开选择弹窗);onTap 为 null 时置灰。
+  /// 尺寸贴网格档:比行高再矮一档,才不会顶破 [_kRowContentH] 的行。
   Widget _dotsButton({required VoidCallback? onTap, String? tooltip}) => IconBtn(
         child: const Text(
           '...',
           style: TextStyle(fontSize: 13, height: 1.0, fontWeight: FontWeight.w600),
         ),
-        size: const Size(24, 26),
+        size: const Size(20, 18),
         outline: true,
         tooltip: tooltip,
         onTap: onTap,
@@ -2342,7 +2981,10 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       items: _yesNo,
       value: value,
       enabled: enabled && !_readOnly,
-      onChanged: (v) => setState(() => onChanged(v ?? '')),
+      onChanged: (v) {
+        onChanged(v ?? '');
+        _touchChrome();
+      },
     );
   }
 
@@ -2393,9 +3035,33 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       ..add(index);
   }
 
+  /// 选中集变化:只重建**状态真的变了**的那几行 + 依赖设计数据的那几小块。
+  ///
+  /// 整页 setState 实测每点一行 ≈ 130ms(一屏 160+ 个常开编辑器全部重建),
+  /// 而移动一个选中标记根本不需要重建没变的行。notifier 只是信号,
+  /// 行内容一律现读模型,所以这里漏算最坏是多重建一次、不会显示成旧状态。
+  void _applyFieldSelection(void Function() mutate) {
+    final before = Set<int>.of(_selColumns);
+    final beforeAnchor = _selColumn;
+    mutate();
+    final affected = <int>{
+      ...before.where((r) => !_selColumns.contains(r)),
+      ..._selColumns.where((r) => !before.contains(r)),
+      beforeAnchor,
+      _selColumn,
+    };
+    for (final r in affected) {
+      if (r >= 0 && r < _design.columns.length) _rowRev(r).value++;
+    }
+    _chromeRev.value++;
+    // 面板显示的是「选中那一行」的属性:锚点没换就不必重画(点同一行的
+    // 另一格是最常见操作,面板 10+ 个编辑器重建一次就是十几毫秒)
+    if (beforeAnchor != _selColumn) _propsRev.value++;
+  }
+
   /// 点行:Ctrl 加选 / 取消单行,Shift 从锚点连选一段,普通点击为单选
   void _selectColumnAt(int index, bool ctrl, bool shift) {
-    setState(() {
+    _applyFieldSelection(() {
       if (shift && _selColumn >= 0) {
         final lo = index < _selColumn ? index : _selColumn;
         final hi = index < _selColumn ? _selColumn : index;
@@ -2417,19 +3083,67 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     _focusGrid();
   }
 
+  /// 点格:该列成为当前列(该格反白、表头跟着高亮)。锚点行不变。
+  void _setCurrentCol(int col) {
+    if (_curCol == col) return;
+    final old = _selColumn;
+    _curCol = col;
+    // 反白块要从旧位置挪走:锚点行(可能没变)+ 表头的当前列
+    if (old >= 0 && old < _design.columns.length) _rowRev(old).value++;
+    if (_selColumn >= 0 &&
+        _selColumn < _design.columns.length &&
+        _selColumn != old) {
+      _rowRev(_selColumn).value++;
+    }
+    _curColRev.value++;
+  }
+
   /// 行右键菜单:批量动作的稳定入口(焦点落在输入框里时 Ctrl+C 会被文本框
   /// 当作复制选中文本处理,这里给一条不依赖焦点的路径)
   void _columnContextMenu(int index, Offset position) {
     final cols = _design.columns;
     if (index < 0 || index >= cols.length) return;
-    if (!_selColumns.contains(index)) setState(() => _selectOnly(index));
+    if (!_selColumns.contains(index)) {
+      _applyFieldSelection(() => _selectOnly(index));
+    }
     _focusGrid();
     final n = _selectedColumns().length;
     final multi = n > 1;
+    final canEdit = _actionsEnabled;
     showContextMenu(
       context,
       position: position,
       items: [
+        // 工具栏是纯图标(参考工具同),这些动作全部收在右键菜单里
+        MenuItem(
+            text: '插入字段',
+            enabled: canEdit,
+            onPressed: _insertColumn),
+        MenuItem(
+            text: multi ? '删除 $n 个字段' : '删除字段',
+            enabled: canEdit,
+            onPressed: _removeColumn),
+        const MenuSeparator(),
+        MenuItem(
+            text: '设置主键',
+            enabled: canEdit && multi,
+            onPressed: () => _setPk(true)),
+        MenuItem(
+            text: '取消主键',
+            enabled: canEdit && multi,
+            onPressed: () => _setPk(false)),
+        const MenuSeparator(),
+        MenuItem(
+            text: '上移',
+            enabled: canEdit && _canReorderColumns && _selColumn > 0,
+            onPressed: _moveColumnUp),
+        MenuItem(
+            text: '下移',
+            enabled: canEdit &&
+                _canReorderColumns &&
+                _selColumn < cols.length - 1,
+            onPressed: _moveColumnDown),
+        const MenuSeparator(),
         MenuItem(
             text: multi ? '复制 $n 行' : '复制行',
             shortcut: 'Ctrl+C',
@@ -2437,13 +3151,8 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
         MenuItem(
             text: '粘贴行',
             shortcut: 'Ctrl+V',
-            enabled: _actionsEnabled,
+            enabled: canEdit,
             onPressed: _pasteColumns),
-        const MenuSeparator(),
-        MenuItem(
-            text: multi ? '删除 $n 个字段' : '删除字段',
-            enabled: _actionsEnabled,
-            onPressed: _removeColumn),
       ],
     );
   }
@@ -2455,7 +3164,8 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     if (idx.isEmpty) return;
     final picked = [for (final i in idx) _design.columns[i]];
     Clipboard.setData(ClipboardData(text: ColumnRowClipboard.encode(picked)));
-    setState(() => _note = '已复制 ${idx.length} 个字段');
+    _note = '已复制 ${idx.length} 个字段';
+    _touchChrome();
   }
 
   /// 粘贴字段:剪贴板文本按行解析,整批插到选中区之后(无选中则追加到末尾)
@@ -2628,6 +3338,20 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
 }
 
 /// Ctrl/Cmd + S 触发的保存意图(供 [Shortcuts] / [Actions] 绑定)
+/// 编辑网格里的一格内容。
+///
+/// 只带内容与「怎么摆」,宽度 / 网格线 / 当前格反白由 [_editorGrid] 一侧的
+/// [_cell] 统一负责 —— 各标签的行构建器因此不必各自写死列宽与列间距。
+class _GridCell {
+  const _GridCell(this.child, {this.center = false});
+
+  final Widget child;
+
+  /// 在列内水平居中(勾选框 / 钥匙图标这类定宽内容);
+  /// 文字格为 false,左内边距由控件自己的 controlPaddingX 提供。
+  final bool center;
+}
+
 class _SaveIntent extends Intent {
   const _SaveIntent();
 }
@@ -2642,6 +3366,7 @@ class _ModelInput extends StatefulWidget {
     this.enabled = true,
     this.textAlign,
     this.keyboardType,
+    this.showBorder = true,
   });
 
   final String value;
@@ -2652,6 +3377,9 @@ class _ModelInput extends StatefulWidget {
   /// 数字属性右对齐用
   final TextAlign? textAlign;
   final TextInputType? keyboardType;
+
+  /// `false` = 网格单元格样式(不描边不填底,水平留白由 tokens 给)
+  final bool showBorder;
 
   @override
   State<_ModelInput> createState() => _ModelInputState();
@@ -2689,7 +3417,144 @@ class _ModelInputState extends State<_ModelInput> {
       selectAllOnFocus: false,
       textAlign: widget.textAlign,
       keyboardType: widget.keyboardType,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+      showBorder: widget.showBorder,
+      // 不写死 contentPadding:留白与垂直居中交给 tokens(controlPaddingX /
+      // controlHeight),这样网格格(5 / 20)与属性面板字段共用同一档
+      onChanged: widget.onChanged,
+    );
+  }
+}
+
+/// 网格格子塞不下时的多行编辑大弹窗(参考工具点 `...` 打开的那一个)。
+///
+/// 用在「检查」的表达式格:条件常写成 `a > 0 AND b <> a` 这类跨行 SQL,
+/// 单行输入框既看不清也改不动。确定回传文本,取消返回 null。
+class _MultilineEditorDialog extends StatefulWidget {
+  const _MultilineEditorDialog({
+    required this.title,
+    required this.value,
+    this.hint,
+  });
+
+  final String title;
+  final String value;
+  final String? hint;
+
+  static Future<String?> show(
+    BuildContext context, {
+    required String title,
+    required String value,
+    String? hint,
+  }) {
+    return showDialog<String>(
+      context: context,
+      builder: (_) =>
+          _MultilineEditorDialog(title: title, value: value, hint: hint),
+    );
+  }
+
+  @override
+  State<_MultilineEditorDialog> createState() => _MultilineEditorDialogState();
+}
+
+class _MultilineEditorDialogState extends State<_MultilineEditorDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.value);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DialogBox(
+      title: widget.title,
+      width: 640,
+      height: 260,
+      onClose: () => Navigator.of(context).pop(),
+      footer: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            Button(
+                text: '确定',
+                onPressed: () => Navigator.of(context).pop(_controller.text)),
+            const SizedBox(width: 8),
+            Button(text: '取消', onPressed: () => Navigator.of(context).pop()),
+          ],
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+        child: Textarea(
+          controller: _controller,
+          hint: widget.hint,
+          expands: true,
+          showBorder: true,
+        ),
+      ),
+    );
+  }
+}
+
+/// [_ModelInput] 的多行版:同一套「自持控制器 + 外部值变化时同步」契约。
+///
+/// 只用在属性面板里那些值本身是多段 SQL 的字段(典型是 MySQL / SQL Server 的
+/// 触发主体)。单行 Input 装不下它,而直接写 [Textarea] 又要调用方自己管控制器。
+class _ModelTextarea extends StatefulWidget {
+  const _ModelTextarea({
+    required this.value,
+    required this.onChanged,
+    this.hint,
+    this.enabled = true,
+  });
+
+  final String value;
+  final ValueChanged<String> onChanged;
+  final String? hint;
+  final bool enabled;
+
+  @override
+  State<_ModelTextarea> createState() => _ModelTextareaState();
+}
+
+class _ModelTextareaState extends State<_ModelTextarea> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.value);
+  }
+
+  @override
+  void didUpdateWidget(_ModelTextarea oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.value != _controller.text) {
+      _controller.text = widget.value;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 不用 expands:属性面板整体挂在 SingleChildScrollView 里,子项拿到的是
+    // **无界高度**约束,撑满式的文本框会在布局阶段自激(实测直接把 pumpAndSettle
+    // 卡死)。按固定行数自然撑高,行高由 _propField 的 height 留出。
+    return Textarea(
+      controller: _controller,
+      hint: widget.hint,
+      enabled: widget.enabled,
+      minLines: 3,
+      maxLines: 3,
       onChanged: widget.onChanged,
     );
   }
