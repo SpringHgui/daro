@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../app/app_state.dart';
 import '../data/db_data.dart';
+import '../data/matview_sql.dart';
 import '../data/user_sql.dart';
 import '../l10n/locale_config.dart';
 import 'data_export_wizard.dart';
@@ -243,18 +244,18 @@ Future<void> _copyRenameTable(
   );
 }
 
-/// 视图 / 实体化视图实例右键菜单:打开 / 设计 / 删除 / 转储SQL。
+/// 视图 / 实体化视图实例右键菜单:打开 / 设计 / 刷新 / 删除 / 转储SQL。
 /// 连接树与对象面板共用,保证两处交互一致。
 ///
 /// 菜单项按**引擎真实能力**裁剪,而不是一律摆出来再禁用:
-/// - 「设计」与「转储SQL」都依赖驱动 [DatabaseDriver.getDefinition] 读出 CREATE
-///   定义。Access 的该方法恒返回 null(ODBC 无对应目录),因此对 Access 不提供
-///   这两项 —— 点开只会是空编辑器、转储只会是空文件。
-/// - 实体化视图同样没有可读定义(驱动只支持 view/function/procedure),故只给
-///   「打开」与「删除」。
+/// - 「设计」与「转储SQL」都要先读出 CREATE 定义。视图走驱动
+///   [DatabaseDriver.getDefinition],Access 的该方法恒返回 null(ODBC 无对应目录),
+///   故对 Access 不提供这两项 —— 点开只会是空编辑器、转储只会是空文件。
+///   实体化视图的定义由界面侧 [MatViewSql] 从 PG 目录读取,故只在 PG 家族出现。
 /// - MySQL 的 CREATE OR REPLACE VIEW 不含 SQL SECURITY 子句,设计页保存会把它
 ///   重置回默认。因此对 MySQL 系隐藏「设计」,避免一次无意的保存悄悄改掉视图的
 ///   权限语义(见下方 [_mysqlLosesSqlSecurity] 说明)。
+/// - 「刷新 / 并发刷新」是实体化视图专属(视图是虚的,没有可刷新的物化内容)。
 void showViewContextMenu({
   required BuildContext context,
   required AppState app,
@@ -268,10 +269,14 @@ void showViewContextMenu({
   final isOpen = app.connectionManager.isConnected(conn.name);
   final l = context.l10n;
   final label = category.labelOf(l);
-  // 实体化视图:驱动读不到定义(text)也重写不了(materializedView 分支直接返回 null)
-  final canReadDefinition = category == ObjectCategory.view &&
-      _supportsReadableView(conn.typeId);
-  final canDesign = canReadDefinition && !_mysqlLosesSqlSecurity(conn.typeId);
+  final isMatView = category == ObjectCategory.materializedView;
+  // 实体化视图只有 PG 家族有(与非 PG 连接上根本列不出该分类一致)
+  final matViewCapable = isMatView && MatViewSql.supports(conn.typeId);
+  final canReadDefinition = isMatView
+      ? matViewCapable
+      : _supportsReadableView(conn.typeId);
+  final canDesign = canReadDefinition &&
+      (isMatView || !_mysqlLosesSqlSecurity(conn.typeId));
 
   showContextMenu(
     context,
@@ -300,6 +305,21 @@ void showViewContextMenu({
             schema: schema,
           ),
         ),
+      if (isMatView) ...[
+        MenuItem(
+          text: l.actionRefresh(label),
+          enabled: isOpen,
+          onPressed: () =>
+              _refreshMatView(context, app, conn, database, name, schema),
+        ),
+        MenuItem(
+          text: l.actionRefreshConcurrently(label),
+          enabled: isOpen,
+          onPressed: () => _refreshMatView(context, app, conn, database, name,
+              schema,
+              concurrently: true),
+        ),
+      ],
       MenuItem(
         text: l.actionDelete(label),
         enabled: isOpen,
@@ -316,6 +336,77 @@ void showViewContextMenu({
         ),
       ],
     ],
+  );
+}
+
+/// 右键菜单里的刷新:整表重填,耗时不可预估,故不弹进度、只在结束后报结果。
+/// [concurrently] 走 `REFRESH ... CONCURRENTLY`(不锁读,但需要覆盖全部列的唯一索引)。
+Future<void> _refreshMatView(
+  BuildContext context,
+  AppState app,
+  ConnectionInfo conn,
+  String database,
+  String name,
+  String? schema, {
+  bool concurrently = false,
+}) async {
+  final l = context.l10n;
+  final title = concurrently
+      ? l.actionRefreshConcurrently(l.catMaterializedView)
+      : l.actionRefresh(l.catMaterializedView);
+  if (concurrently) {
+    // 条件不满足时先问一句:并发刷新会直接报错,而报错信息是一句目录术语,
+    // 不如这里说清前提。探测读不出就放行,交给服务端判定。
+    bool? ready;
+    try {
+      final r = await app.connectionManager.runQuery(
+        conn,
+        MatViewSql.concurrentlyReadySql(name, schema: schema),
+        database: database,
+        limit: 1,
+      );
+      ready = MatViewSql.parseExists(r.rows);
+    } catch (_) {
+      ready = null;
+    }
+    if (ready == false) {
+      if (!context.mounted) return;
+      final go = await MessageBox.show(
+        context,
+        title: title,
+        message: '${l.matvConcurrentlyNeedUnique}\n${l.matvConcurrentlyAsk}',
+        type: MessageBoxType.warning,
+        buttons: MessageBoxButtons.okCancel,
+        okText: l.btnOk,
+        cancelText: l.btnCancel,
+      );
+      if (go != MessageBoxResult.ok) return;
+    }
+  }
+  final sw = Stopwatch()..start();
+  // 走 runDdl:成功后顺带刷新对象列表,估算行数才会跟着变
+  final outcome = await app.runDdl(
+      MatViewSql.refreshSql(name, schema: schema, concurrently: concurrently),
+      connection: conn.name,
+      database: database,
+      schema: schema);
+  if (!context.mounted) return;
+  if (!outcome.ok) {
+    MessageBox.show(
+      context,
+      title: title,
+      message: l.matvRefreshFailed('${outcome.error}'),
+      type: MessageBoxType.error,
+      okText: l.btnGotIt,
+    );
+    return;
+  }
+  MessageBox.show(
+    context,
+    title: title,
+    message: l.matvRefreshed(name, '${sw.elapsedMilliseconds}'),
+    type: MessageBoxType.info,
+    okText: l.btnGotIt,
   );
 }
 

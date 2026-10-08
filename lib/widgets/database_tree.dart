@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+// RenderAbstractViewport(新增连接的滚动定位用)不在 material 导出面里
+import 'package:flutter/rendering.dart' show RenderAbstractViewport;
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:base_ui_flutter/base_ui_flutter.dart';
@@ -41,6 +43,10 @@ class _DatabaseTreeState extends State<DatabaseTree> {
   /// 对象行图标尺寸(表/视图/函数):与树节点图标同尺寸。
   static const double _objectIconSize = 16;
 
+  /// 节点行高(与 [_node] 的 Container height 一致)。仅用于新增连接的
+  /// 滚动定位估算:提示行为 24px 造成的少量偏差由第二段精确定位校正。
+  static const double _kNodeRowHeight = 26;
+
   /// 展开节点 key 集合:连接名 / "连接名|库" / "连接名|库|模式"。
   /// 分组(表 / 视图 / 函数 / 用户 / 查询)不可展开,不入此集合。
   final Set<String> _expanded = {};
@@ -59,6 +65,18 @@ class _DatabaseTreeState extends State<DatabaseTree> {
 
   /// 树列表键盘焦点:点行即取得,F2 就地重命名由此触发。
   final FocusNode _treeFocus = FocusNode();
+
+  /// 树纵向滚动:新增连接的滚动定位由它执行
+  final ScrollController _treeScroll = ScrollController();
+
+  /// 新增连接滚动定位:值 = 待定位的连接名(null = 无)。目标行在 build 时
+  /// 携带 [_revealRowKey] 并登记行号 [_revealRowIndex],post-frame 由
+  /// [_scrollToReveal] 消费后清空。
+  String? _revealConnName;
+  final GlobalKey _revealRowKey = GlobalKey();
+
+  /// 本次 build 中定位目标行的行号(rows 列表下标,估算滚动偏移用)
+  int? _revealRowIndex;
 
   /// 正在内联改名的节点 key(null = 无编辑)。支持三类:
   /// 分组 `g:名` / 连接 `名` / 表 `连接|库[|模式]|table|名`(与行 key 一致)。
@@ -212,6 +230,100 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     // 库/模式未打开时分组节点本就不可见,选中无视觉效果也不报错
   }
 
+  /// 新增连接(向导确定 / 复制):树选中该连接并滚动到其所在位置。
+  /// 所在分组处于折叠态时先展开,否则节点根本不在树里;
+  /// 被搜索 / 类型筛选滤除时只选中、不滚动(节点未渲染,无从定位)。
+  void _onConnectionAdded() {
+    final app = _listenedApp;
+    if (app == null) return;
+    final name = app.connectionAdded.value.$2;
+    if (name.isEmpty) return;
+    ConnectionInfo? found;
+    for (final c in app.connections) {
+      if (c.name == name) {
+        found = c;
+        break;
+      }
+    }
+    final conn = found;
+    if (conn == null) return;
+    setState(() {
+      if (conn.group.isNotEmpty) _collapsedGroups.remove(conn.group);
+      _revealConnName = conn.name;
+      _revealRowIndex = null;
+    });
+    _selectedNode.value = conn.name;
+    // 与单击连接节点同口径:右侧详情面板跟随显示该连接
+    app.detailSelection.value =
+        SelectedNode(NodeKind.connection, conn.name, connection: conn.name);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _scrollToReveal();
+    });
+  }
+
+  /// 把新增连接行滚入视口。两段式:
+  /// 行已构建(在视口或 cacheExtent 内)→ 直接最小滚动露出整行;
+  /// 行未构建(长列表远端,Element 未挂载)→ 先按行号 × 行高估算跳转,
+  /// 行挂载后下一帧精确校正。提示行(24px)造成的估算偏差由第二段兜底。
+  void _scrollToReveal() {
+    if (_revealConnName == null) return;
+    _revealConnName = null;
+    final ctx = _revealRowKey.currentContext;
+    if (ctx != null) {
+      _ensureRowVisible(ctx);
+      return;
+    }
+    if (!_treeScroll.hasClients) return;
+    final index = _revealRowIndex;
+    if (index == null) return; // 行未渲染(被筛选滤除):只选中,不滚动
+    final position = _treeScroll.position;
+    // 目标行以上全是 26px 节点行;先让行进入视口(居中偏上),下一帧精确校正
+    final estimated = index * _kNodeRowHeight - position.viewportDimension / 2;
+    position.jumpTo(estimated.clamp(0.0, position.maxScrollExtent));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final refined = _revealRowKey.currentContext;
+      if (refined != null) _ensureRowVisible(refined);
+    });
+  }
+
+  /// 最小滚动量把 [rowCtx] 的行露出:已在视口内是空操作;在视口上方滚到
+  /// 行顶对齐视口顶,在下方滚到行底对齐视口底(EnsureVisible 语义)。
+  /// 即时跳转不走动画,与全应用的零延迟节奏一致。
+  void _ensureRowVisible(BuildContext rowCtx) {
+    final obj = rowCtx.findRenderObject();
+    final viewport = obj == null ? null : RenderAbstractViewport.maybeOf(obj);
+    final scrollable = Scrollable.maybeOf(rowCtx);
+    if (obj == null || viewport == null || scrollable == null) return;
+    final position = scrollable.position;
+    // 行顶对齐视口顶 / 行底对齐视口底所需的偏移;行可见 ⇔ offset ∈ [bottom, top]
+    final top = viewport.getOffsetToReveal(obj, 0.0).offset;
+    final bottom = viewport.getOffsetToReveal(obj, 1.0).offset;
+    if (position.pixels > top) {
+      position.jumpTo(top.clamp(0.0, position.maxScrollExtent));
+    } else if (position.pixels < bottom) {
+      position.jumpTo(bottom.clamp(0.0, position.maxScrollExtent));
+    }
+  }
+
+  /// 关闭筛选(搜索框 × / 退格删空 / 「清除全部筛选」)后:滚回当前操作的
+  /// 连接位置。筛选一关,全量列表从顶部重新出现,刚操作的连接容易淹没在
+  /// 长列表里。选中的是其下的库 / 模式 / 表节点时同样映射到所属连接行;
+  /// 分组节点(g:)、空选中、或该连接行未渲染(所在分组折叠)时不处理。
+  void _revealSelectedConnection(AppState app) {
+    final key = _selectedNode.value;
+    if (key == null || key.startsWith('g:')) return;
+    final name = key.split('|').first;
+    if (!app.connections.any((c) => c.name == name)) return;
+    setState(() {
+      _revealConnName = name;
+      _revealRowIndex = null;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _scrollToReveal();
+    });
+  }
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -224,8 +336,10 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     }
     if (_listenedApp != app) {
       _listenedApp?.treeNavigate.removeListener(_onTreeNavigate);
+      _listenedApp?.connectionAdded.removeListener(_onConnectionAdded);
       _listenedApp = app;
       app.treeNavigate.addListener(_onTreeNavigate);
+      app.connectionAdded.addListener(_onConnectionAdded);
     }
   }
 
@@ -1135,6 +1249,14 @@ class _DatabaseTreeState extends State<DatabaseTree> {
               initialCategory: ObjectCategory.procedure,
             ),
           ),
+        ] else if (category == ObjectCategory.materializedView) ...[
+          MenuSeparator(),
+          MenuItem(
+            text: l.ctxNewMatView,
+            enabled: isOpen,
+            onPressed: () =>
+                _createMatViewNode(app, conn, database, schema: schema),
+          ),
         ] else if (category == ObjectCategory.user) ...[
           MenuSeparator(),
           MenuItem(
@@ -1177,6 +1299,38 @@ class _DatabaseTreeState extends State<DatabaseTree> {
       if (!names.contains(candidate)) return candidate;
     }
     return 'role_${names.length + 1}';
+  }
+
+  /// 「新建实体化视图」:在当前库 / 模式上下文打开空白设计页。
+  /// 名称同样要在打开页面前定下来(设计页靠它拼 CREATE MATERIALIZED VIEW)。
+  void _createMatViewNode(
+      AppState app, ConnectionInfo conn, String database,
+      {String? schema}) {
+    app.setObjectContext(conn.name, database, schema: schema);
+    app.designRoutine(
+      _defaultMatViewName(app, conn.name, database, schema: schema),
+      connection: conn.name,
+      database: database,
+      category: ObjectCategory.materializedView,
+      schema: schema,
+      isNew: true,
+    );
+  }
+
+  /// 自增默认实体化视图名:`matview_N`(N 取到不与现有对象重号为止)
+  String _defaultMatViewName(
+      AppState app, String connection, String database,
+      {String? schema}) {
+    final existing = schema == null
+        ? app.connectionManager.tableStateOf(connection, database)
+        : app.connectionManager
+            .tableStateOf(connection, database, schema: schema);
+    final names = existing.materializedViews ?? const <String>[];
+    for (var i = 1; i <= names.length + 1; i++) {
+      final candidate = 'matview_$i';
+      if (!names.contains(candidate)) return candidate;
+    }
+    return 'matview_${names.length + 1}';
   }
 
   /// 「新建表」:在当前库 / 模式上下文打开表设计器标签页
@@ -1485,12 +1639,14 @@ class _DatabaseTreeState extends State<DatabaseTree> {
   void dispose() {
     _listenedManager?.removeListener(_onManagerChanged);
     _listenedApp?.treeNavigate.removeListener(_onTreeNavigate);
+    _listenedApp?.connectionAdded.removeListener(_onConnectionAdded);
     for (final timer in _minSpinnerTimers.values) {
       timer.cancel();
     }
     _minSpinnerTimers.clear();
     _selectedNode.dispose();
     _treeFocus.dispose();
+    _treeScroll.dispose();
     _searchController.dispose();
     super.dispose();
   }
@@ -1512,12 +1668,16 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     final rows = <Widget>[];
     // 表节点改名上下文每次重建时重新登记(只登记当前可见的行)
     _tableNodes.clear();
+    // 新增连接定位:行号只对本次 build 有效,先清掉再由装配过程登记
+    _revealRowIndex = null;
     // 顶层分段:一条分组都没有时保持原来的平铺(不给既有配置凭空插入一层),
     // 一旦有分组就按分组渲染,未分组的连接沉底平铺在最后一层
     final sections = _connectionSections(connections, groups, hideEmpty: hasFilter);
     if (sections.isEmpty) {
       for (final conn in connections) {
+        final start = rows.length;
         rows.addAll(_liveConnectionRows(context, app, conn));
+        if (conn.name == _revealConnName) _revealRowIndex = start;
       }
     } else {
       for (final section in sections) {
@@ -1525,9 +1685,11 @@ class _DatabaseTreeState extends State<DatabaseTree> {
         if (group == null) {
           // 未分组段也是放置目标:把分组内连接拖到未分组兄弟上 = 移出分组
           for (final conn in section.connections) {
+            final start = rows.length;
             for (final row in _liveConnectionRows(context, app, conn)) {
               rows.add(_memberDropTarget(context, app, '', row));
             }
+            if (conn.name == _revealConnName) _revealRowIndex = start;
           }
           continue;
         }
@@ -1536,9 +1698,11 @@ class _DatabaseTreeState extends State<DatabaseTree> {
         for (final conn in section.connections) {
           // 组内成员(含其展开的库/表子树)也是放置目标:
           // 拖到兄弟节点上等同拖到分组头上
+          final start = rows.length;
           for (final row in _liveConnectionRows(context, app, conn, base: 1)) {
             rows.add(_memberDropTarget(context, app, group, row));
           }
+          if (conn.name == _revealConnName) _revealRowIndex = start;
         }
       }
     }
@@ -1583,7 +1747,7 @@ class _DatabaseTreeState extends State<DatabaseTree> {
             child: Focus(
               focusNode: _treeFocus,
               onKeyEvent: _onTreeKey,
-              child: ListView(children: rows),
+              child: ListView(controller: _treeScroll, children: rows),
             ),
           ),
           // 拖动分组内连接时:底部出现「移到未分组」放置条
@@ -1872,6 +2036,14 @@ class _DatabaseTreeState extends State<DatabaseTree> {
         onCommitRename: (input) => _commitConnectionRename(conn.name, input),
       ),
     );
+    // 新增连接定位:目标行携带 GlobalKey(post-frame 由 _scrollToReveal 消费)。
+    // key 挂在拖拽层**内侧**:拖动开始的重建(child ↔ childWhenDragging 切换)
+    // 与定位态清除都会换掉这层包裹,包在外侧会连拖拽手势子树一起拆掉,
+    // onDragEnd 不再回访;包在内侧只重建行体,ThresholdDraggable 自身稳定。
+    // key 同一时刻只挂在一行上,新增另一条时旧行先失 key 再上新,同帧内不重号
+    final Widget connRowRevealed = conn.name == _revealConnName
+        ? KeyedSubtree(key: _revealRowKey, child: connRow)
+        : connRow;
     // 按住连接行拖动到分组节点即完成分组;拖到底部「移到未分组」条可移出分组。
     // 改名态不参与拖动。用 ThresholdDraggable 而非 Draggable:后者在本行是竞技场
     // 唯一识别器时,pointer down 就被判接受,onDragStarted 立刻触发——选中 /
@@ -1880,16 +2052,16 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     // ThresholdDraggable 要求位移超过 4px 才起手,选中仍走 _node 内
     // Listener.onPointerDown(按下即选,零延迟),互不干扰。
     rows.add(connEditing
-        ? connRow
+        ? connRowRevealed
         : ThresholdDraggable<ConnectionInfo>(
             data: conn,
             feedback: _dragFeedback(context, conn),
-            childWhenDragging: Opacity(opacity: 0.4, child: connRow),
+            childWhenDragging: Opacity(opacity: 0.4, child: connRowRevealed),
             onDragStarted: () => setState(() => _draggingConn = conn),
             // onDragEnd 覆盖放置与取消两种结局;onDraggableCanceled 兜底
             onDragEnd: (_) => setState(() => _draggingConn = null),
             onDraggableCanceled: (_, __) => setState(() => _draggingConn = null),
-            child: connRow,
+            child: connRowRevealed,
           ));
     if (!_expanded.contains(conn.name)) return rows;
 
@@ -2497,7 +2669,12 @@ class _DatabaseTreeState extends State<DatabaseTree> {
               child: SearchInput(
                 controller: _searchController,
                 hintText: l.searchConnectionsHint,
-                onChanged: app.setTreeSearchText,
+                // 清空搜索(× 内部会补发一次 onChanged('') / 退格删空)视作
+                // 「关闭筛选」:滚回当前操作的连接位置
+                onChanged: (text) {
+                  app.setTreeSearchText(text);
+                  if (text.isEmpty) _revealSelectedConnection(app);
+                },
                 onCleared: () => app.setTreeSearchText(''),
               ),
             ),
@@ -2577,6 +2754,8 @@ class _DatabaseTreeState extends State<DatabaseTree> {
                             onTap: () {
                               _searchController.clear();
                               app.clearTreeFilter();
+                              // controller.clear() 不走 onChanged,这里单独定位
+                              _revealSelectedConnection(app);
                             },
                             child: Text(
                               l.clearAllFilters,

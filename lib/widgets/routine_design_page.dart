@@ -26,6 +26,8 @@ class RoutineDesignPage extends StatefulWidget {
     this.schema,
     this.isNew = false,
     this.params = '',
+    this.options = const RoutineOptions(),
+    this.returnType = '',
     this.comment = '',
   });
 
@@ -47,8 +49,15 @@ class RoutineDesignPage extends StatefulWidget {
   /// 是否为新建(新建=向导采集的参数生成模板,无需加载定义)
   final bool isNew;
 
-  /// 新建模式下的初始参数签名(向导第 2 步采集,如 "IN a INT, IN b VARCHAR(50)")
+  /// 新建模式下的初始参数签名(向导第 2 步采集,如 `IN "a" pg_catalog.bool`)
   final String params;
+
+  /// 新建模式下向导第 3 步选的定义选项(窗口 / 特性 / 防漏 / STRICT / 安全性)
+  final RoutineOptions options;
+
+  /// 新建模式下向导第 2 步采集的返回类型(函数专用,可带类型模式,
+  /// 如 `pg_catalog."char"`;空 = 用方言默认值)
+  final String returnType;
 
   /// 新建模式下的初始注释(向导 / 历史编辑)
   final String comment;
@@ -85,7 +94,7 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
   /// 高级标签字段(解析自当前 SQL;无法解析时保持默认并禁用「应用」)
   String _returnType = '';
   String _language = '';
-  bool _securityDefiner = false;
+  RoutineOptions _options = const RoutineOptions();
 
   /// 最近一次成功解析出的参数签名(用于 COMMENT ON / SQL 预览)
   String _parsedSignature = '';
@@ -115,6 +124,8 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
   void initState() {
     super.initState();
     _appState = context.read<AppState>();
+    _options = widget.options;
+    _returnType = widget.returnType;
     _commentController.text = widget.comment.isNotEmpty
         ? widget.comment
         : _appState!.routineCommentFor(_tabKey);
@@ -157,6 +168,8 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
     _appState?.updateRoutineComment(
         _tabKeyOf(oldWidget), _commentController.text);
     final saved = _appState?.routineTextFor(_tabKey) ?? '';
+    _options = widget.options;
+    _returnType = widget.returnType;
     _controller.text = saved.isNotEmpty
         ? saved
         : (widget.isNew ? _template() : '');
@@ -215,36 +228,10 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
       category: _category,
       name: widget.name,
       schema: widget.schema,
-      params: _paramsFromSignature(widget.params),
+      signature: widget.params,
+      returnType: _returnType,
+      options: _options,
     );
-  }
-
-  /// 把签名文本解析回参数列表(模板生成用;签名来自向导)。
-  /// 简单按 ", " 分段,每段切 模式 / 名称 / 类型 三段
-  List<RoutineParam> _paramsFromSignature(String signature) {
-    if (signature.trim().isEmpty) return const [];
-    final params = <RoutineParam>[];
-    for (final seg in signature.split(RegExp(r',\s*'))) {
-      final tokens = seg.trim().split(RegExp(r'\s+'));
-      if (tokens.isEmpty || tokens.first.isEmpty) continue;
-      if (tokens.length == 1) {
-        params.add(RoutineParam(name: '', type: tokens[0]));
-      } else if (tokens.length == 2) {
-        // SQL Server 风格: @a INT 或 @a INT OUTPUT
-        if (tokens.last.toUpperCase() == 'OUTPUT') {
-          params.add(
-              RoutineParam(mode: 'OUTPUT', name: tokens[0], type: tokens[1]));
-        } else {
-          params.add(RoutineParam(mode: '', name: tokens[0], type: tokens[1]));
-        }
-      } else {
-        params.add(RoutineParam(
-            mode: tokens[0].toUpperCase(),
-            name: tokens[1],
-            type: tokens.sublist(2).join(' ')));
-      }
-    }
-    return params;
   }
 
   String _placeholderTable() {
@@ -276,7 +263,7 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
     _parsedSignature = parsed.signature;
     _returnType = parsed.returnType;
     _language = parsed.language;
-    _securityDefiner = parsed.securityDefiner;
+    _options = parsed.options;
   }
 
   /// 高级标签「应用」:用表单字段 + 当前函数体重建完整 SQL
@@ -302,7 +289,7 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
       body: parsed.body,
       returnType: _returnType,
       language: _language,
-      securityDefiner: _securityDefiner,
+      options: _options,
     );
     _reparseAdvanced();
     setState(() {
@@ -669,16 +656,63 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
               ),
             ),
             const SizedBox(height: 12),
+            // 下面四条子句只有 PG 的 CREATE FUNCTION 接受(见 RoutineOptions),
+            // 所以非 PG 一律不出现,而不是「能改但生成时被丢掉」
             FieldRow(
-              label: '安全:',
+              label: '窗口:',
               child: CheckBox(
-                value: _securityDefiner,
-                onChanged: (v) => setState(() => _securityDefiner = v ?? false),
-                label: 'SECURITY DEFINER(以定义者权限执行)',
+                value: _options.window,
+                onChanged: (v) => setState(
+                    () => _options = _options.copyWith(window: v ?? false)),
+                label: 'WINDOW(声明为窗口函数,仅对 C 语言函数有意义)',
+              ),
+            ),
+            const SizedBox(height: 12),
+            FieldRow(
+              label: '特性:',
+              child: SizedBox(
+                width: 200,
+                child: ComboBox<String>(
+                  items: RoutineSql.volatilityOptions,
+                  value: _options.volatility,
+                  itemToString: RoutineSql.volatilityLabel,
+                  onChanged: (v) => setState(
+                      () => _options = _options.copyWith(volatility: v ?? '')),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            FieldRow(
+              label: '防漏:',
+              child: CheckBox(
+                value: _options.leakProof,
+                onChanged: (v) => setState(
+                    () => _options = _options.copyWith(leakProof: v ?? false)),
+                label: 'LEAKPROOF(不泄露参数,仅超级用户可设)',
+              ),
+            ),
+            const SizedBox(height: 12),
+            FieldRow(
+              label: '严格:',
+              child: CheckBox(
+                value: _options.strict,
+                onChanged: (v) => setState(
+                    () => _options = _options.copyWith(strict: v ?? false)),
+                label: 'STRICT(输入 NULL 时返回 NULL,不执行函数体)',
               ),
             ),
             const SizedBox(height: 12),
           ],
+          FieldRow(
+            label: '安全:',
+            child: CheckBox(
+              value: _options.securityDefiner,
+              onChanged: (v) => setState(() =>
+                  _options = _options.copyWith(securityDefiner: v ?? false)),
+              label: 'DEFINER(以定义者权限执行)',
+            ),
+          ),
+          const SizedBox(height: 12),
           Button(
             text: '应用到 SQL',
             onPressed: _parsedOk ? _applyAdvanced : null,

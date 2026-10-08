@@ -852,6 +852,48 @@ class SqlServerDriver implements DatabaseDriver {
     if (cmtRs.rows.isNotEmpty) {
       design.tableComment = cmtRs.rows.first['V']?.toString() ?? '';
     }
+
+    // ── 触发器 ────────────────────────────────────────────────
+    // 一个触发器可能挂在多个事件上,`sys.trigger_events` 是 1:N,故按
+    // OBJECT_ID 聚合出事件位图,再一行一个触发器。
+    //
+    // 时机:SQL Server 只有 AFTER / INSTEAD OF(无 BEFORE),时机由
+    // `sys.triggers.is_instead_of_trigger` 给出。
+    // 主体:`OBJECT_DEFINITION()` 返回的是整条 `CREATE TRIGGER … AS <body>`,
+    // 而设计器的 [DesignTrigger.body] 只存 `AS` 之后的那段,得切出来。
+    // `is_disabled`:设计器只对 PG 生成 DISABLE(见 DdlBuilder),这里读出来
+    // 仍回填,免得上层把它当成「用户改过」而误判脏。
+    try {
+      final trgRs = await _runSql(
+        'SELECT tr.name AS TNAME, tr.is_instead_of_trigger AS INSTEAD, '
+        'tr.is_disabled AS DISABLED, '
+        "(SELECT STRING_AGG(te.type_desc, ',') FROM ${db}.sys.trigger_events te "
+        'WHERE te.object_id = tr.object_id) AS EVENTS, '
+        'OBJECT_DEFINITION(tr.object_id) AS DEF '
+        'FROM ${db}.sys.triggers tr '
+        'WHERE tr.parent_id = OBJECT_ID($obj) '
+        'AND tr.is_ms_shipped = 0 ORDER BY tr.name',
+      );
+      for (final row in trgRs.rows) {
+        final name = row['TNAME']?.toString() ?? '';
+        if (name.isEmpty) continue;
+        final events = (row['EVENTS']?.toString() ?? '').toUpperCase();
+        design.triggers.add(DesignTrigger(
+          name: name,
+          // SQL Server 触发器是语句级:没有 FOR EACH ROW 子句
+          forEach: '语句',
+          timing: _truthy(row['INSTEAD']) ? 'INSTEAD OF' : 'AFTER',
+          insert: events.contains('INSERT'),
+          update: events.contains('UPDATE'),
+          delete: events.contains('DELETE'),
+          enable: !_truthy(row['DISABLED']),
+          // TRUNCATE 在 SQL Server 里是独立事件类型,设计器不支持 → 忽略
+          body: stripSqlServerTriggerBody(row['DEF']?.toString() ?? ''),
+        ));
+      }
+    } catch (_) {
+      // 触发器读不到(权限 / 旧版本):不预填即可,界面仍可手工新增
+    }
     return design;
   }
 
@@ -931,4 +973,34 @@ class SqlServerDriver implements DatabaseDriver {
     final v = r.rows.first['def'];
     return v?.toString();
   }
+}
+
+/// 从 `CREATE TRIGGER … AS <body>` 的完整定义里切出 `AS` 之后的主体。
+///
+/// `OBJECT_DEFINITION()` 给的是服务端存下的整条语句,含头部与 `AS`;
+/// 设计器只存主体(生成时自己拼 `AS BEGIN … END`)。切不干净的话,
+/// 「反查 → 原样保存」会把头部再套一层。
+///
+/// 取**最后**一个 ` AS ` 而非第一个:触发器名 / 表名里可能自带 `as` 字样
+/// (如 `[as_trg]`、`[gas]`),而真正的 `AS` 在事件列表之后。找不到时原样
+/// 返回 —— 宁可多留一段,也不截断丢掉用户的过程体。
+///
+/// 导出为顶层函数(而非驱动静态方法)便于离线回归,同 MySQL 的
+/// [stripMysqlTriggerBeginEnd]。
+String stripSqlServerTriggerBody(String def) {
+  final s = def.trim();
+  if (s.isEmpty) return s;
+  final m = RegExp(r'\sAS\s', caseSensitive: false).allMatches(s).toList();
+  if (m.isEmpty) return s;
+  final hit = m.last;
+  var body = s.substring(hit.end).trim();
+  // 去一层生成器写的 BEGIN…END 包裹,回到裸语句(与生成器对称)
+  final upper = body.toUpperCase();
+  if (upper.startsWith('BEGIN') && upper.endsWith('END')) {
+    body = body.substring(5, body.length - 3).trim();
+  }
+  while (body.endsWith(';')) {
+    body = body.substring(0, body.length - 1).trimRight();
+  }
+  return body;
 }

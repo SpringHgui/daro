@@ -45,6 +45,9 @@ class _ObjectPanelState extends State<ObjectPanel> {
   /// 新建角色的默认名自增序号(与 _viewNameCounter 同构,各自独立计数)
   static int _roleNameCounter = 0;
 
+  /// 新建实体化视图的默认名自增序号(同上,matview_N)
+  static int _matViewNameCounter = 0;
+
   /// 对象列表的键盘焦点(F2 改名 / Ctrl+C 复制 / Ctrl+V 粘贴)
   final FocusNode _listFocus = FocusNode();
 
@@ -218,10 +221,11 @@ class _ObjectPanelState extends State<ObjectPanel> {
     final c = AppColors.of(context);
     final l = context.l10n;
     final label = category.labelOf(l);
-    // 只有表 / 视图 / 函数 / 过程 / 角色有"设计"语义
+    // 只有表 / 视图 / 实体化视图 / 函数 / 过程 / 角色有"设计"语义
     final canDesign = switch (category) {
       ObjectCategory.table ||
       ObjectCategory.view ||
+      ObjectCategory.materializedView ||
       ObjectCategory.function ||
       ObjectCategory.procedure ||
       ObjectCategory.user => true,
@@ -460,6 +464,22 @@ class _ObjectPanelState extends State<ObjectPanel> {
               isNew: true,
             ),
           )
+        else if (category == ObjectCategory.materializedView)
+          // 新建实体化视图:与「新建视图」同构,先取自增默认名再开设计页。
+          // 只有 PG 家族有该分类(非 PG 连接不列这一组),故不再做类型门控
+          ToolStripButton(
+            icon: Icons.add_circle_outline,
+            iconColor: c.iconSuccess,
+            text: l.actionNew(label),
+            onPressed: () => app.designRoutine(
+              _defaultMatViewName(),
+              connection: connection,
+              database: database,
+              category: ObjectCategory.materializedView,
+              schema: schema,
+              isNew: true,
+            ),
+          )
         else if (category == ObjectCategory.user)
           // 新建角色:直接开一张空的账号设计页,名称先取自增默认名 `role_N`
           // (与「新建视图」同构 —— 设计页靠 widget.name 拼 CREATE USER,
@@ -531,10 +551,11 @@ class _ObjectPanelState extends State<ObjectPanel> {
     final c = AppColors.of(context);
     final l = context.l10n;
     final label = category.labelOf(l);
-    // 与正常工具栏一致:仅表 / 视图 / 函数 / 过程有「设计」语义;导入 / 导出仅对表有意义
+    // 与正常工具栏一致:仅表 / 视图 / 实体化视图 / 函数 / 过程有「设计」语义;导入 / 导出仅对表有意义
     final canDesign = switch (category) {
       ObjectCategory.table ||
       ObjectCategory.view ||
+      ObjectCategory.materializedView ||
       ObjectCategory.function ||
       ObjectCategory.procedure => true,
       _ => false,
@@ -669,6 +690,12 @@ class _ObjectPanelState extends State<ObjectPanel> {
   static String _defaultViewName() {
     _viewNameCounter++;
     return 'view_$_viewNameCounter';
+  }
+
+  /// 新建实体化视图的默认名:matview_N(设计页靠 widget.name 拼 CREATE)
+  static String _defaultMatViewName() {
+    _matViewNameCounter++;
+    return 'matview_$_matViewNameCounter';
   }
 
   /// 新建角色的默认名:role_N(与视图的默认名同风格,各自独立计数)。

@@ -29,6 +29,11 @@ const double _cellPaddingX = 6.0;
 /// 行号列宽
 const double _numberColWidth = 44.0;
 
+/// 结果面板可拖动高度(默认 300;拖顶边分隔条在 [min, max] 间调整)
+const double _kResultPanelDefaultHeight = 300.0;
+const double _kResultPanelMinHeight = 120.0;
+const double _kResultPanelMaxHeight = 600.0;
+
 /// 查询结果行数上限(超出截断并在结果面板提示)
 const int _resultLimit = 1000;
 
@@ -39,6 +44,12 @@ const int _maxAccumulatedRows = 50000;
 
 /// 错误提示色(功能强调色,主题无关,同工具栏「停止」)
 const Color _errorColor = Color(0xffd93025);
+
+/// 运行上下文栏的功能强调色(取色自 Navicat 查询窗口截图,主题无关):
+/// 运行空心三角 #0092FF / 停止空心方块(禁用态)#F79E95 / 解释图标 #50A0F0
+const Color _runBlue = Color(0xff0092ff);
+const Color _stopIdleRed = Color(0xfff79e95);
+const Color _explainBlue = Color(0xff50a0f0);
 
 /// 单条语句的执行结果(结果面板每条语句一个 tab,同 pgAdmin)。
 /// [result] 与 [error] 互斥:成功取结果(写操作结果无列),失败取错误文本
@@ -116,6 +127,9 @@ class _QueryPageState extends State<QueryPage> {
   /// 结果面板当前活动 tab(0 = 消息,i+1 = 结果 i)
   int _panelTabIndex = 0;
 
+  /// 结果面板高度(拖顶边分隔条调整;面板隐藏 / 换 tab 时保留记忆)
+  double _panelHeight = _kResultPanelDefaultHeight;
+
   /// 正在「加载更多」续取的结果 tab 索引(null = 无在途续取)
   int? _loadingMoreIndex;
 
@@ -146,6 +160,9 @@ class _QueryPageState extends State<QueryPage> {
   final OverlayController _connMenu = OverlayController();
   final OverlayController _dbMenu = OverlayController();
   final OverlayController _schemaMenu = OverlayController();
+
+  /// 「运行 ▾」拆分按钮的下拉菜单控制器
+  final OverlayController _runMenu = OverlayController();
 
   /// ConnectionManager 监听:库列表加载状态变化时刷新数据库下拉弹层
   ConnectionManager? _listenedManager;
@@ -201,7 +218,7 @@ class _QueryPageState extends State<QueryPage> {
     if (mounted) setState(() {});
   }
 
-  /// 输入即持久化;选区出现/消失时重建(运行按钮切换「运行/运行已选择的」)
+  /// 输入即持久化;选区出现/消失时重建(「运行已选择的」菜单项可用性跟随)
   void _onEditorChanged() {
     _appState?.updateQueryText(_tabKey, _controller.text);
     final hasSelection = _selectedSql != null;
@@ -247,6 +264,7 @@ class _QueryPageState extends State<QueryPage> {
     _connMenu.dispose();
     _dbMenu.dispose();
     _schemaMenu.dispose();
+    _runMenu.dispose();
     // controller 销毁前再持久化一次当前文本(用 didChangeDependencies 缓存的引用,不可走 context.read)
     _appState?.updateQueryText(_tabKey, _controller.text);
     _controller.dispose();
@@ -538,10 +556,28 @@ class _QueryPageState extends State<QueryPage> {
           _toolbar(t),
           _connectionBar(t),
           Expanded(child: _editor(t)),
-          if (panelVisible) _resultPanel(t),
+          if (panelVisible) ...[
+            // 顶边分隔条:上下拖动改变结果面板高度(编辑区随之伸缩)。
+            // 与表数据页底部单元格编辑器同一套 Splitter 口径:不画自己的
+            // 发丝线 / 不做 hover 高亮,分割线由面板自身的顶边框承担,
+            // 拖动反馈靠 resizeUpDown 光标(Splitter 内部已设)。
+            Splitter(
+              orientation: Axis.vertical,
+              showHairline: false,
+              showHoverHighlight: false,
+              onDrag: _resizeResultPanel,
+            ),
+            _resultPanel(t),
+          ],
         ],
       ),
     );
+  }
+
+  /// 拖动结果面板顶边:面板停靠底部,向上拖(dy<0)增高、向下拖减高。
+  void _resizeResultPanel(double dy) {
+    setState(() => _panelHeight = (_panelHeight - dy)
+        .clamp(_kResultPanelMinHeight, _kResultPanelMaxHeight));
   }
 
   // 顶部工具栏:保存 / 查询创建工具 / 美化SQL / 代码段 / 创建图表
@@ -591,14 +627,16 @@ class _QueryPageState extends State<QueryPage> {
 
   // ── 运行上下文栏 ──────────────────────────────────────────
 
-  // 运行上下文栏:左侧连接/库下拉选择器,右侧运行/停止/解释
+  // 1:1 复刻 Navicat 查询窗口:左侧三个白底定宽下拉(图标+名称左对齐、
+  // 箭头钉在右端),「▷ 运行 ▾ / □ 停止 / 解释」紧随其后左对齐(不推到右端)。
+  // 尺寸取色按参考截图实测:下拉宽 160、间距 4、高 22。
   Widget _connectionBar(AppPalette t) {
     final c = AppColors.of(context);
     final conn = context.read<AppState>().connectionByName(_connection);
     return Container(
       height: 30,
       color: t.secondary,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 6),
       child: Row(
         children: [
           // 连接选择器:类型品牌图标 + 连接名
@@ -612,17 +650,18 @@ class _QueryPageState extends State<QueryPage> {
             maxHeight: 360,
             // 开合由外层 Popover 的 Listener 处理,按钮仅提供视觉态
             trigger: ToolbarButton(
-              iconWidget: _typeIcon(conn?.typeId, t),
+              iconWidget: _typeIcon(conn?.typeId, t, size: 16),
               text: _connection ?? '选择连接',
               showCaret: true,
-              outlined: true,
+              filled: true,
+              caretAtEnd: true,
+              width: 160,
               height: 22,
-              textMaxWidth: 150,
               onTap: () {},
             ),
             content: _connectionMenu(t),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 4),
           // 数据库选择器:圆柱图标 + 库名
           Popover(
             controller: _dbMenu,
@@ -634,12 +673,13 @@ class _QueryPageState extends State<QueryPage> {
             maxHeight: 320,
             onOpenChanged: _onDbMenuOpen,
             trigger: ToolbarButton(
-              iconWidget: Icon(Icons.storage, size: 14, color: c.iconSuccess),
+              iconWidget: Icon(Icons.storage, size: 16, color: c.iconSuccess),
               text: _database ?? '选择数据库',
               showCaret: true,
-              outlined: true,
+              filled: true,
+              caretAtEnd: true,
+              width: 160,
               height: 22,
-              textMaxWidth: 150,
               onTap: () {},
             ),
             content: _databaseMenu(t),
@@ -647,7 +687,7 @@ class _QueryPageState extends State<QueryPage> {
           // 模式选择器:仅支持会话级模式切换的类型(PostgreSQL 家族)显示;
           // 选中模式后运行查询前会先 SET search_path
           if (kUseSchemaTypes.contains(conn?.typeId)) ...[
-            const SizedBox(width: 8),
+            const SizedBox(width: 4),
             Popover(
               controller: _schemaMenu,
               width: 200,
@@ -658,46 +698,113 @@ class _QueryPageState extends State<QueryPage> {
               onOpenChanged: _onSchemaMenuOpen,
               trigger: ToolbarButton(
                 iconWidget: Icon(Icons.account_tree_outlined,
-                    size: 14, color: c.iconPrimary),
+                    size: 16, color: c.iconPrimary),
                 text: _schema ?? '默认模式',
                 showCaret: true,
-                outlined: true,
+                filled: true,
+                caretAtEnd: true,
+                width: 160,
                 height: 22,
-                textMaxWidth: 150,
                 onTap: () {},
               ),
               content: _schemaMenuList(t),
             ),
           ],
-          const Spacer(),
-          // 无下拉:编辑区有选中文本时按钮自动切换为「运行已选择的」(执行时选中文本优先)
-          ToolbarButton(
-            backgroundColor: t.secondary,
-            icon: Icons.play_arrow,
-            text: _hasSelection ? '运行已选择的' : '运行',
-            iconColor: const Color(0xff1f6feb),
-            enabled: !_running,
-            onTap: _onRun,
+          const SizedBox(width: 10),
+          // 运行拆分按钮:主体按下即运行(选中文本优先),尾部 ▾ 开菜单
+          // (同 Navicat「运行 ▾」:菜单含「运行 / 运行已选择的」)
+          Popover(
+            controller: _runMenu,
+            toggleOnTap: false,
+            width: 150,
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            gap: 3,
+            trigger: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ToolbarButton(
+                  backgroundColor: t.secondary,
+                  iconWidget: const _RunTriangleIcon(),
+                  text: '运行',
+                  enabled: !_running,
+                  onTap: _onRun,
+                ),
+                _runCaret(t),
+              ],
+            ),
+            content: _runMenuList(t),
           ),
-          const SizedBox(width: 4),
+          const SizedBox(width: 6),
+          // 停止:Navicat 为空心圆角方块,禁用态仍是浅红描边(文字变灰)
           ToolbarButton(
             backgroundColor: t.secondary,
-            icon: Icons.stop,
+            iconWidget: Icon(Icons.crop_square,
+                size: 16, color: _running ? _errorColor : _stopIdleRed),
             text: '停止',
-            iconColor: _errorColor,
             enabled: _running,
             onTap: _onStop,
           ),
+          const SizedBox(width: 6),
           ToolbarButton(
             backgroundColor: t.secondary,
-            icon: Icons.manage_search_outlined,
-            text: _hasSelection ? '解释已选择的' : '解释',
-            iconColor: const Color(0xff1f6feb),
+            iconWidget: Icon(Icons.account_tree_outlined,
+                size: 15, color: _explainBlue),
+            text: '解释',
             enabled: !_running,
             onTap: _onExplain,
           ),
         ],
       ),
+    );
+  }
+
+  /// 「运行 ▾」拆分按钮的箭头区:独立点击目标(Popover 设了 toggleOnTap:
+  /// false,主体按钮的点击走运行,只有这里开合菜单)
+  Widget _runCaret(AppPalette t) {
+    final enabled = !_running;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: enabled ? _runMenu.toggle : null,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
+        child: Icon(
+          Icons.arrow_drop_down,
+          size: 18,
+          color: enabled ? t.foreground : t.disabledForeground,
+        ),
+      ),
+    );
+  }
+
+  /// 运行下拉菜单:「运行」始终执行全部文本;「运行已选择的」仅在有选区时可用
+  Widget _runMenuList(AppPalette t) {
+    final hasSelection = _selectedSql != null;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        ListItem(
+          height: 24,
+          leading: const SizedBox(width: 16),
+          title: '运行',
+          hoverBase: t.popover,
+          onSelect: () {
+            _runMenu.close();
+            _runSql(_controller.text.trim());
+          },
+        ),
+        ListItem(
+          height: 24,
+          leading: const SizedBox(width: 16),
+          title: '运行已选择的',
+          enabled: hasSelection,
+          hoverBase: t.popover,
+          onSelect: () {
+            _runMenu.close();
+            _runSql(_selectedSql!);
+          },
+        ),
+      ],
     );
   }
 
@@ -723,14 +830,14 @@ class _QueryPageState extends State<QueryPage> {
   }
 
   /// 连接类型品牌图标(未匹配类型时回退连接节点图标)
-  Widget _typeIcon(String? typeId, AppPalette t) {
+  Widget _typeIcon(String? typeId, AppPalette t, {double size = 14}) {
     final c = AppColors.of(context);
     if (typeId != null) {
       for (final type in kAllDbTypes) {
-        if (type.id == typeId) return DbTypeIcon(type: type, size: 14);
+        if (type.id == typeId) return DbTypeIcon(type: type, size: size);
       }
     }
-    return Icon(Icons.dns, size: 14, color: c.iconInfo);
+    return Icon(Icons.dns, size: size, color: c.iconInfo);
   }
 
   /// 连接下拉列表:全部连接,当前项高亮
@@ -964,7 +1071,7 @@ class _QueryPageState extends State<QueryPage> {
   /// 内容区用 IndexedStack 保活,各网格的滚动 / 选中状态切换 tab 不丢失
   Widget _resultPanel(AppPalette t) {
     return Container(
-      height: 300,
+      height: _panelHeight,
       decoration: BoxDecoration(
         color: t.background,
         border: Border(top: BorderSide(color: t.border)),
@@ -1301,6 +1408,47 @@ class _QueryPageState extends State<QueryPage> {
 // ────────────────────────────────────────────────────────────
 // 结果网格(单结果集)
 // ────────────────────────────────────────────────────────────
+
+/// 运行图标的空心三角(▷):Navicat 的运行符号是描边三角形,
+/// Material 图标集没有该字形,自绘(同 TableIcon 先例:图标内容,非控件)
+class _RunTriangleIcon extends StatelessWidget {
+  const _RunTriangleIcon();
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      size: const Size(11, 13),
+      painter: _TriangleOutlinePainter(_runBlue),
+    );
+  }
+}
+
+class _TriangleOutlinePainter extends CustomPainter {
+  _TriangleOutlinePainter(this.color);
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final path = Path()
+      ..moveTo(0, 0)
+      ..lineTo(size.width, size.height / 2)
+      ..lineTo(0, size.height)
+      ..close();
+    canvas.drawPath(
+      path,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.4
+        ..strokeJoin = StrokeJoin.round
+        ..color = color,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_TriangleOutlinePainter oldDelegate) =>
+      oldDelegate.color != color;
+}
 
 /// 单结果集网格:列头 + 行号列 + 数据行,横向滚动 + 纵向懒加载,
 /// 双向滚动条 + 列头拖拽变宽 + 单元格多选(Ctrl+C 复制 / Ctrl+A 全选)。
@@ -1641,11 +1789,18 @@ class _ResultGridState extends State<_ResultGrid> {
       }
       return;
     }
-    final fitted = fillPanelWidth(
-      content,
-      viewportWidth: viewportWidth,
-      leadingWidth: _numberColWidth,
-    );
+    // 多列结果一律按内容定宽:右侧留白,与 Navicat 一致。
+    // 「把空余宽度补给最后一列」只适用于单列结果(如 PG 的 QUERY PLAN,
+    // 一行一条长计划文本,铺满面板才读得完整)。对多列结果套用它,会把
+    // 最后一列(常是窄数值列)整列拉宽、右对齐的值顶到面板最右缘,中间
+    // 空出一大片 —— 正是查询结果列宽异常的根因。
+    final fitted = content.length == 1
+        ? fillPanelWidth(
+            content,
+            viewportWidth: viewportWidth,
+            leadingWidth: _numberColWidth,
+          )
+        : List<double>.of(content);
     final current = _columnWidths;
     if (current == null || !_sameWidths(current, fitted)) {
       _columnWidths = fitted;

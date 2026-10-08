@@ -411,6 +411,99 @@ context.read<AppState>().setThemeMode(ThemeMode.dark);
 - 列内对齐由 `DataGridViewColumn.alignment` 决定：**数值列 `Alignment.centerRight`、其余 `centerLeft`**，组件负责把内容垂直居中（表数据页按列类型判，`columnIsNumeric`；结果网格无类型元数据，按值判）。
 - 编辑器同理：`InlineEditor` 传 `height: 行高` + 与显示态同向的 `textAlign`，进编辑时文字不跳位。
 
+### 设计器密度档（表 / 视图 / 函数等「设计 X」页）
+- 设计器网格与属性面板走 base-ui 的 **`gridCellTokens`**（字号 ≤12 / 控件 ≤20 高 / 水平留白 ≤5），
+  整页包一层 `TokenScope` 下发，**不逐个控件传 `height`**（`ComboBox` 也没有 `height` 形参）。
+- 具体度量集中在 `table_designer_page.dart` 的文件级 `_k*` 常量，每个值都注明了参考工具的实测来源，
+  改之前先复量截图，别凭手感调。
+- 单元格静止态是**扁平**的（`Input.showBorder` / `ComboBox.showBorder` = false）：只有 1px 网格线，
+  没有每格一个框。当前格（锚点行 × 当前列）整格铺 `accent` + 反白文字，行首槽铺淡蓝档
+  （`AppPalette.accentSoftBg`）+ 2px `highlight` 条，焦点列的表头同铺淡蓝档 + 2px 下划线。
+- 勾选框传 `CheckBox.size`（实测 13）：方框是命中目标，不跟行高一起缩。
+- 网格线宽一律用 `DesktopTokens.borderWidth`（宿主已收成 1 **设备**像素），不要写死 `1.0`——
+  参考工具是原生窗口，1 物理像素在 200% 缩放下是 0.5 逻辑像素，写死 1.0 会粗一倍。
+- 工具栏是**纯图标 + tooltip**（`ToolbarButton.paddingX` 收到 5.5 得到实测的 25 宽点击块），
+  文字按钮与说明文字都不留；表名不在页面上填，新建时点「保存」弹窗要，已有表改名走对象树 F2。
+
+### 设计器方言门控（表 / 视图设计器共用原则）
+
+**界面能改、DDL 不生成**是设计器最容易长出来的缺陷类：用户在 MySQL 连接上写了三条规则，
+点保存，库里一条都没有，而界面回「保存成功」。三条硬规矩：
+
+1. **生成侧每个 `if (isPgLike)` 一类的方言门，都要有对应的拦口。**
+   新建走 `DdlBuilder.createUnsupported(design, typeId)`，编辑走 `DdlBuilder.alterUnsupported(...)`。
+   两者都并进 `TableDesignerPage._validation`，于是状态栏直接说清原因、保存键自动灰。
+   只在 `_save()` 里拦是不够的：`_canSave` 依赖 `_dirty`，而 `_dirty` 只看 ALTER 清单，
+   「改了触发器主体」清单为空 → 界面显示「无变更」，用户永远看不到拒绝原因。
+2. **方言用不上的控件一律 `enabled: false`，不给「改了不生效」的入口。**
+   门控条件必须与生成侧**逐字相同**（`isPgLike` / `isMysqlLike` / `isSqlServerLike`），
+   并在 UI 上留注释指明是哪条子句把它挡在外（如「CONCURRENTLY 仅 PG」）。
+   连各方言都不支持的项（触发器注释：没有 `COMMENT ON TRIGGER`）也要灰掉，别留空位。
+3. **差异签名必须覆盖所有参与生成的字段。**
+   漏一个（典型是后加的 `DesignTrigger.body`）就等于「改了但显示无变更」。
+   不参与生成的字段（触发器注释）反过来**不要**进签名，否则会报假变更。
+
+各方言的触发器语法互不相容，各自成函数（`_pgTriggerSql` / `_mysqlTriggerSql` /
+`_sqlServerTriggerSql`），不共享拼装分支：MySQL 一个触发器只能挂一个事件（勾多个 →
+各出一条 `CREATE` 并按事件加后缀，同名会 1359）、只有行级、无 `WHEN`、无 `TRUNCATE`；
+SQL Server 是语句级、无 `BEFORE`（用 `AFTER` / `INSTEAD OF`）、事件用逗号列表、
+触发器是 schema 级对象（名字要带模式前缀）；两者主体都内联（`body`），不像 PG 走独立函数。
+MySQL 的 `BEGIN … END` 里的分号由服务端解析，**不需要也不应该发 `DELIMITER`**（那是 CLI 指令）。
+
+### 触发器编辑（编辑模式）
+
+触发器**支持在「设计表」里增删改**（不再被 `alterUnsupported` 阻断；规则 / 排除约束仍阻断）。
+它是「整条重建」而不是 ALTER：`ALTER TABLE` 表达不了触发器，三种方言也都没有
+`CREATE OR REPLACE TRIGGER`，所以差异清单固定是**先 `DROP` 后 `CREATE`**（见
+`buildAlterStatements` 的 3b 段，复用与索引同一套 `diffByName`，按触发器名配对）。
+
+**前提是驱动必须反查得到触发器 —— 这是这条链路最容易断的地方。**
+若 `readTableDesign` 不回填 `triggers`，基线恒为空，模型会把库里**已有的**触发器
+全当成「用户新增」而重复建（PG 报 42710 已存在，MySQL 直接撞名）。三驱动各一句：
+
+| 驱动 | 取数 | 注意 |
+|---|---|---|
+| PostgreSQL | `pg_trigger` + `pg_get_triggerdef(oid, true)`，`WHERE NOT tgisinternal` | 反解析走 `parsePgTriggerDef`（见下） |
+| MySQL / MariaDB | `information_schema.TRIGGERS` | 主体要过 `stripMysqlTriggerBeginEnd` |
+| SQL Server | `sys.triggers` + `sys.trigger_events` + `OBJECT_DEFINITION()` | 主体要过 `stripSqlServerTriggerBody` |
+
+三条必须记住的约束：
+
+1. **外键的内部触发器不能进设计器**。PG 给每个外键偷偷建 4 个
+   `RI_ConstraintTrigger_*`，靠 `NOT tgisinternal` 滤掉；放进来会变成一堆用户没写过的行，
+   且删约束时它们会跟着消失，反查口径必须与依赖页一致。
+2. **反查的「主体」要还原成设计器存的裸语句**，不能把外层包裹存回去。MySQL 库里存的是
+   `BEGIN … END` 整段、SQL Server 的 `OBJECT_DEFINITION()` 返回整条 `CREATE TRIGGER … AS …`，
+   而 `DesignTrigger.body` 只存裸语句（生成时自己包）。不做这层还原，
+   「反查 → 原样保存」会套成 `BEGIN BEGIN … END; END;` 并逐次叠加。
+   两个剥壳函数都是顶层导出（`stripMysqlTriggerBeginEnd` / `stripSqlServerTriggerBody`）便于离线回归。
+3. **剥壳必须往返幂等**：`strip(gen(x)) == strip(x)`。不幂等的话，打开一张没动过的表
+   `_dirty` 就会是 true，界面凭空显示「已修改」。改动这两个函数后要按这个不变量补用例。
+
+PG 反解析为什么读 `pg_get_triggerdef` 而不是逐列拼 `tgtype` 位掩码：位掩码要自己组合
+`BEFORE/AFTER/INSTEAD OF` 与七个事件位，拼错了不报错、只是静默生成错 DDL；函数给的是
+服务端认定的真实定义。解析失败返回 `null`（宁可少一行让人看见，也不塞半条数据）。
+
+`DROP TRIGGER` 的名字作用域各方言不同，**写错目标会悄悄删不掉或删错对象**：
+
+- PG：`DROP TRIGGER x ON table` —— 表局部作用域，**必须带 `ON`**；
+- SQL Server：`DROP TRIGGER schema.x` —— schema 级，**不带 `ON`**；
+- MySQL：`DROP TRIGGER x` —— 库级，**不带 `ON`**，也没有模式层。
+
+PG 的「禁用」不是建表子句，是建好后的独立动作（`ALTER TABLE … DISABLE TRIGGER`），
+新建与编辑两条路径都要补，别只补一边。
+
+### 设计器测试
+
+- **绝不在 widget 测试里注册真连接**：`initState` 的 `_loadRefTables` / `_ensureCandidates`
+  会真去建驱动连库，`pumpAndSettle` 等不到静止帧；假时钟下它**不会触发测试超时**，
+  实测一个用例独占 10 分钟并带崩同文件其余用例。改走 `TableDesignerPage.dialectOverride`。
+- 同一用例内换方言重开页面，**必须给页面 `ValueKey(typeId)`**：`_typeId` 只在 `initState`
+  里定，缺 key 时走 `didUpdateWidget`，第二次打开仍是上一个方言。
+- 属性面板整体挂在 `SingleChildScrollView` 里 → 子项拿到的是**无界高度**约束。
+  里面的控件不能用 `expands: true` / `SizedBox.expand`（布局自激，同上会挂死 `pumpAndSettle`），
+  多行框走 `Textarea` 固定 `minLines` + `maxLines`，行高由 `_propField(height:)` 预留。
+
 ### 颜色
 - **应用 widget**：通过 `Tokens.of(context)` 取色，不硬编码 `Color(0xff…)`
 - **base-ui-flutter 组件**：通过 `DesktopTokens` 取色，不接受 `Color` 参数
@@ -420,6 +513,15 @@ context.read<AppState>().setThemeMode(ThemeMode.dark);
 - `ObjectPanel` 的 108 表项使用 `ValueListenableBuilder` + 按项通知器，避免全量重建
 - `TableIcon` 按颜色缓存 painter，支持 100+ 图标共享同一 `CustomPainter` 实例
 - 列表使用 `ListView.builder` + `itemExtent` 懒加载
+- **设计器网格禁止「改一个格就整页 `setState`」**（`table_designer_page.dart`）：一屏有 160+ 个常开编辑器，
+  整页重建实测每按一个键 ≈ 110–150ms（约 8fps，肉眼就是卡）。页面按依赖面分四档信号：
+  `_rowRevs[i]`（所在行）/ `_chromeRev`（保存键、工具栏可用性、状态栏）/
+  `_propsRev`（底部属性面板，只有换选中行或改到面板要显示的那个属性才刷）/
+  `_curColRev`（表头当前列）。行与面板一律挂在对应 `ValueListenableBuilder` 上，
+  且**选中态、当前列必须用取值闭包现读**（`anchor: () => _selColumn`），传快照值会显示成上一次的样子。
+  新增单元格时给 `_modelInput` 传 `row:`，自定义控件的 `onChanged` 调 `_touchCell(row)`。
+- 同理，「把整套 DDL 生成出来再看空不空」这类判定只能算一次：`_dirty` / 「SQL 预览」/ 保存确认
+  共用缓存好的 `_alterStatements`，作废口是 `setState` 覆写 + `_touchCell` / `_touchChrome`。
 
 ### 命名
 - 应用 widget：PascalCase，按功能命名（`TopMenu`、`DatabaseTree`）

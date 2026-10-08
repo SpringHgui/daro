@@ -1865,4 +1865,188 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get cliInputHint => '输入 SQL 语句';
+
+  @override
+  String get ctxNewMatView => '新建实体化视图';
+
+  @override
+  String actionRefresh(String label) {
+    return '刷新$label';
+  }
+
+  @override
+  String actionRefreshConcurrently(String label) {
+    return '并发刷新$label';
+  }
+
+  @override
+  String get matvTabDefinition => '定义';
+
+  @override
+  String get matvTabIndexes => '索引';
+
+  @override
+  String get matvTabAdvanced => '高级';
+
+  @override
+  String get matvTabComment => '注释';
+
+  @override
+  String get matvTabSqlPreview => 'SQL 预览';
+
+  @override
+  String get matvPanelMessages => '消息';
+
+  @override
+  String get matvPreview => '预览';
+
+  @override
+  String get matvExplain => '解释';
+
+  @override
+  String get matvBeautifySql => '美化 SQL';
+
+  @override
+  String get matvTabChange => '更改';
+
+  @override
+  String get matvCopy => '复制';
+
+  @override
+  String get matvFullscreen => '全屏';
+
+  @override
+  String get matvExitFullscreen => '退出全屏';
+
+  @override
+  String get matvCommentHint => '输入实体化视图注释(保存时写入 COMMENT ON)';
+
+  @override
+  String get matvAddIndex => '添加索引';
+
+  @override
+  String get matvDropIndex => '删除索引';
+
+  @override
+  String get matvColDefinition => '定义';
+
+  @override
+  String get colUnique => '唯一';
+
+  @override
+  String get matvFieldIndexName => '索引名称:';
+
+  @override
+  String get matvFieldIndexColumns => '索引列:';
+
+  @override
+  String get matvFieldOwner => '所有者:';
+
+  @override
+  String get matvFieldTablespace => '表空间:';
+
+  @override
+  String get matvFieldAccessMethod => '访问方法:';
+
+  @override
+  String get matvFieldStorageParams => '存储参数:';
+
+  @override
+  String get matvWithData => '填充数据(WITH DATA)';
+
+  @override
+  String get matvDefault => '默认';
+
+  @override
+  String matvColumnsHint(String columns) {
+    return '可用列:$columns';
+  }
+
+  @override
+  String get matvSaveTitle => '保存实体化视图';
+
+  @override
+  String get matvDefinitionEmpty => '实体化视图定义不能为空,请在「定义」页输入查询 SQL。';
+
+  @override
+  String matvDefinitionReadFailed(String name, String error) {
+    return '读取实体化视图「$name」定义失败:\n$error';
+  }
+
+  @override
+  String matvRebuildConfirm(String name) {
+    return '保存会重建实体化视图「$name」(先 DROP 再 CREATE)。\n已有索引会自动重建,但对其授予的权限(GRANT)会丢失,数据也会重新填充。\n是否继续?';
+  }
+
+  @override
+  String matvSaveFailed(String error) {
+    return '保存失败:\n$error';
+  }
+
+  @override
+  String matvSaved(String name) {
+    return '已保存实体化视图「$name」';
+  }
+
+  @override
+  String get matvPreviewEmpty => '实体化视图定义为空,无可预览的数据。';
+
+  @override
+  String get matvExplainEmpty => '实体化视图定义为空,无法解释。';
+
+  @override
+  String matvPreviewResult(String rows, String ms) {
+    return '已返回 $rows 行,耗时 $ms ms';
+  }
+
+  @override
+  String get matvRefreshRunning => '正在刷新 ...';
+
+  @override
+  String get matvToolbarRefreshConcurrently => '并发刷新';
+
+  @override
+  String matvRefreshed(String name, String ms) {
+    return '已刷新实体化视图「$name」,耗时 $ms ms';
+  }
+
+  @override
+  String matvRefreshFailed(String error) {
+    return '刷新失败:\n$error';
+  }
+
+  @override
+  String matvPreviewFailed(String error) {
+    return '预览失败:\n$error';
+  }
+
+  @override
+  String matvExplainFailed(String error) {
+    return '解释失败:\n$error';
+  }
+
+  @override
+  String get matvConcurrentlyNeedUnique => '并发刷新需要一个覆盖全部列、且不带 WHERE 条件的唯一索引';
+
+  @override
+  String get matvConcurrentlyOk => '并发刷新可用';
+
+  @override
+  String get matvConcurrentlyAsk => '未检测到满足条件的唯一索引,仍要尝试并发刷新吗?';
+
+  @override
+  String matvNotPopulated(String name) {
+    return '实体化视图「$name」尚未填充数据(WITH NO DATA),需先刷新才能查询。';
+  }
+
+  @override
+  String get matvIndexIncomplete => '请先填写索引名称与索引列。';
+
+  @override
+  String get matvIndexNoSelection => '请先在索引列表中选择要删除的索引。';
+
+  @override
+  String matvIndexDropConfirm(String name) {
+    return '确定删除索引「$name」吗?\n将执行 DROP INDEX,不可恢复。';
+  }
 }

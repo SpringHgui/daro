@@ -256,7 +256,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 先把三平台产物拉到本地：后面生成正文时要读它们算「大小」与 SHA256，
+      # 先把三平台产物拉到本地：后面生成正文时要读它们填表格里的大小与 SHA256 两列，
       # 最终上传 Release 也要用。pattern daro-* 只收三个安装包 job 的产物，
       # 不含 msix-store（商店包，不进 Release）。
       - name: 下载全部平台的产物
@@ -269,13 +269,13 @@ jobs:
       - name: 列出待上传文件
         run: ls -R artifacts
 
-      # Release 正文由脚本生成：开头是各平台安装包下载表格（链接直指本次 Release
-      # 的 asset）+ 大小列，随后是完整 SHA256 校验和表、GitHub 自动生成的源码归档表，
+      # Release 正文由脚本生成：开头是各平台下载表格（一个产物一行，链接文字即源文件名、
+      # 直指本次 Release 的 asset，右侧并进体积与 SHA256 两列），随后是源码归档表，
       # 再后面是全部提交（按 Conventional Commits 分类）+ 关联 PR + Full Changelog 链接。
       # 不再用 action 的 generate_release_notes——它只统计经 PR 合入的变更，本仓库
       # 直接推 master 的提交全会漏掉。
       # --version 传 pubspec 解析出的版本号（安装包文件名用它拼，tag 只决定发不发 Release）；
-      # --artifacts-dir 指向刚下载的产物目录，用于填充大小列与 SHA256 表
+      # --artifacts-dir 指向刚下载的产物目录，用于填表格里的「大小」「SHA256」两列
       # （目录不存在时这两块自动省略，不至于让发布失败）。
       - name: 生成 Release 正文（下载表格 + 提交 + PR）
         env:

@@ -123,8 +123,9 @@ git push origin v0.2.0
 - 打 `v*` tag：构建三平台 → 汇总成一个 **Draft Release**（预填变更说明，人工确认后手动
   Publish，避免误发）。
 - Release 正文由 `tool/gen_release_notes.py` 自动生成，自上而下三块：
-  1. **下载表格**：平台 × 安装包 / 绿色版的矩阵，链接直接指向本次 Release 的 asset
-     （`releases/download/<tag>/<文件名>`），文件名由 `--version` 传入的版本号拼出；
+  1. **下载表格**：一个产物一行（平台 / 架构 / 类型 / 文件），链接文字就是源文件名、
+     指向本次 Release 的 asset（`releases/download/<tag>/<文件名>`），文件名由 `--version`
+     传入的版本号拼出；CI 侧还会把体积与 SHA256 并进同一张表的右侧两列；
   2. 取「上一个 tag → 当前 tag」的全部提交，按 Conventional Commits 前缀
      （feat / fix / chore …）分节，逐个提交反查它归属的 PR 编号与作者；
   3. 末尾补上 `Full Changelog` 比对链接。

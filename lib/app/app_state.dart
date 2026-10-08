@@ -12,6 +12,8 @@ import '../data/db_export.dart';
 import '../data/db_import.dart';
 import '../data/drivers/db_driver.dart';
 import '../data/locale_store.dart';
+import '../data/matview_sql.dart';
+import '../data/routine_sql.dart';
 import '../data/saved_query_store.dart';
 import '../data/sql_file_run.dart';
 import '../data/table_design.dart';
@@ -72,6 +74,8 @@ class OpenTab {
     this.routineCategory,
     this.routineParams,
     this.routineComment,
+    this.routineOptions,
+    this.routineReturnType,
   ]);
 
   final TabType type;
@@ -92,12 +96,19 @@ class OpenTab {
   /// 视图 / 函数设计标签的分类(仅 routine 设计页使用,表设计为空)
   final ObjectCategory? routineCategory;
 
-  /// 例程设计页初始参数签名(向导第 2 步采集,如 "IN a INT, IN b VARCHAR(50)";
+  /// 例程设计页初始参数签名(向导第 2 步采集,如 `IN "a" pg_catalog.bool`;
   /// 仅新建模式携带)
   final String? routineParams;
 
   /// 例程设计页初始注释(向导 / 设计页「注释」标签内容)
   final String? routineComment;
+
+  /// 向导第 3 步的选项(窗口 / 特性 / 防漏 / STRICT / 安全性;仅新建模式携带)
+  final RoutineOptions? routineOptions;
+
+  /// 向导第 2 步采集的返回类型(函数专用,可带类型模式,如
+  /// `pg_catalog."char"`;仅新建模式携带)
+  final String? routineReturnType;
 
   /// 同类 tab 的业务唯一键(同名表在不同库/模式可共存)
   String get key =>
@@ -467,15 +478,25 @@ class AppState extends ChangeNotifier {
     _persist();
   }
 
+  /// 连接树「定位新增连接」信号:连接向导确定 / 复制连接后,树选中该连接
+  /// 并滚动到其所在位置。载荷为 (单调序号, 连接名):序号保证同名连续新增
+  /// 也能触发(ValueNotifier 值相等不通知,与 [treeNavigate] 的计数约定同理)。
+  /// 批量导入 [addConnections] 刻意不触发——一次涌入上百条不该逐条滚动定位。
+  final ValueNotifier<(int, String)> connectionAdded =
+      ValueNotifier<(int, String)>((0, ''));
+
   /// 连接向导「确定」时添加一条新连接、落盘并刷新树。
   /// 同名连接会在名称后追加序号(ConnectionManager 按名称索引驱动,不允许重名)
   void addConnection(ConnectionInfo conn) {
-    _connections.add(_uniqueNamed(conn));
+    final added = _uniqueNamed(conn);
+    _connections.add(added);
     ensureGroup(conn.group);
     _connectionsView = List.unmodifiable(_connections);
     _groupsView = List.unmodifiable(_groups);
     notifyListeners();
     _persist();
+    // 通知树选中并滚动定位到新连接(以重名避让后的最终名为准)
+    connectionAdded.value = (connectionAdded.value.$1 + 1, added.name);
   }
 
   /// 批量添加连接(Navicat 导入这类一次带来上百条的场景)。
@@ -557,6 +578,8 @@ class AppState extends ChangeNotifier {
     _connectionsView = List.unmodifiable(_connections);
     notifyListeners();
     _persist();
+    // 复制同样产出一条新连接实例:树选中并滚动定位(与 addConnection 同口径)
+    connectionAdded.value = (connectionAdded.value.$1 + 1, copy.name);
   }
 
   /// 连接改名后:把打开标签的 connection 引用切到新名,
@@ -577,6 +600,8 @@ class AppState extends ChangeNotifier {
         tab.routineCategory,
         tab.routineParams,
         tab.routineComment,
+        tab.routineOptions,
+        tab.routineReturnType,
       );
       tabs[i] = migrated;
       _moveKeyedState(oldKey, migrated.key);
@@ -1296,6 +1321,8 @@ class AppState extends ChangeNotifier {
         tab.routineCategory,
         tab.routineParams,
         tab.routineComment,
+        tab.routineOptions,
+        tab.routineReturnType,
       );
       if (activeTab == oldTitle) activeTab = newTitle;
       notifyListeners();
@@ -2084,8 +2111,12 @@ class AppState extends ChangeNotifier {
     if (conn == null) return DdlOutcome(false, '连接 "$connection" 不存在');
     design.schema = schema;
 
-    final check = DdlBuilder.validate(design);
+    final check = DdlBuilder.validate(design, typeId: conn.typeId);
     if (!check.ok) return DdlOutcome(false, check.error ?? '设计数据不完整');
+    // 当前方言表达不了的设计项(非 PG 连接上的规则 / 排除 / 索引并发等):
+    // 执行前拦住并说明,不能让它们被 buildStatements 的方言门静默跳过
+    final blocked = DdlBuilder.createUnsupported(design, conn.typeId);
+    if (blocked != null) return DdlOutcome(false, blocked);
 
     final isPg = DdlBuilder.isPgLike(conn.typeId);
     final stmts = DdlBuilder.buildStatements(design, conn.typeId);
@@ -2117,7 +2148,7 @@ class AppState extends ChangeNotifier {
     if (conn == null) return DdlOutcome(false, '连接 "$connection" 不存在');
     target.schema = schema;
 
-    final check = DdlBuilder.validate(target);
+    final check = DdlBuilder.validate(target, typeId: conn.typeId);
     if (!check.ok) return DdlOutcome(false, check.error ?? '设计数据不完整');
     final blocked = DdlBuilder.alterUnsupported(target, original, conn.typeId);
     if (blocked != null) return DdlOutcome(false, blocked);
@@ -2324,8 +2355,11 @@ class AppState extends ChangeNotifier {
   }) async {
     final conn = connectionByName(connection);
     if (conn == null) return null;
-    // 实体化视图暂不支持查看/编辑定义(驱动 getDefinition 仅支持 view/function/procedure)
-    if (category == ObjectCategory.materializedView) return null;
+    // 实体化视图不走驱动 getDefinition(它只认 view/function/procedure):
+    // 定义与存储属性直接由 PG 目录读出,再拼成完整的 CREATE 语句
+    if (category == ObjectCategory.materializedView) {
+      return _matViewDefinition(conn, database, name, schema: schema);
+    }
     final kind = _definitionKind(category);
     try {
       return await connectionManager.getDefinition(
@@ -2335,6 +2369,44 @@ class AppState extends ChangeNotifier {
         kind,
         schema: schema,
       );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// 实体化视图的完整 CREATE 文本(转储与设计页共用)。任一查询读不到即 null。
+  Future<String?> _matViewDefinition(
+    ConnectionInfo conn,
+    String database,
+    String name, {
+    String? schema,
+  }) async {
+    try {
+      final def = await connectionManager.runQuery(
+        conn,
+        MatViewSql.viewDefinitionSql(name, schema: schema),
+        database: database,
+        limit: 1,
+      );
+      final select = MatViewSql.firstCell(def.rows);
+      if (select == null) return null;
+      final props = await connectionManager.runQuery(
+        conn,
+        MatViewSql.propsSql(name, schema: schema),
+        database: database,
+        limit: 1,
+      );
+      final p = props.rows.isEmpty
+          ? const MatViewProps()
+          : MatViewSql.parseProps(props.rows.first);
+      return MatViewSql.createSql(MatViewSpec(
+        name: name,
+        schema: schema,
+        select: select,
+        tablespace: p.tablespace,
+        accessMethod: p.accessMethod,
+        storageOptions: p.storageOptions,
+      ));
     } catch (e) {
       return null;
     }
@@ -2951,8 +3023,8 @@ class AppState extends ChangeNotifier {
 
   /// 打开视图 / 函数 / 过程的设计标签(新建或编辑已有定义)。
   /// [schema] 非空时对象位于该模式下(PostgreSQL / SQL Server 等);
-  /// [params] / [comment] 为新建模式时向导采集的初始参数签名与注释,
-  /// 透传给设计页用于生成模板(编辑模式忽略)
+  /// [params] / [comment] / [options] / [returnType] 为新建模式时向导采集的
+  /// 初始定义,透传给设计页用于生成模板(编辑模式忽略)
   void designRoutine(
     String name, {
     required String connection,
@@ -2962,6 +3034,8 @@ class AppState extends ChangeNotifier {
     bool isNew = false,
     String? params,
     String? comment,
+    RoutineOptions options = const RoutineOptions(),
+    String? returnType,
   }) {
     selectTable(name);
     final tab = OpenTab(
@@ -2974,6 +3048,8 @@ class AppState extends ChangeNotifier {
       category,
       isNew ? params : null,
       isNew ? comment : null,
+      isNew ? options : null,
+      isNew ? returnType : null,
     );
     final exists =
         tabs.any((t) => t.type == TabType.design && t.key == tab.key);

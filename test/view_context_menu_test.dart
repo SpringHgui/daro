@@ -214,7 +214,8 @@ void main() {
     expect(ctx.labels, isNot(contains('转储SQL文件')));
   });
 
-  testWidgets('实体化视图:驱动读不到定义 → 只有「打开」与「删除」', (tester) async {
+  testWidgets('实体化视图:定义由界面侧 SQL 读取 → 设计 / 刷新 / 并发刷新 / 转储都在',
+      (tester) async {
     final ctx = await _openMenu(
       tester,
       typeId: 'postgresql',
@@ -223,8 +224,47 @@ void main() {
 
     expect(ctx.labels, contains('打开实体化视图'));
     expect(ctx.labels, contains('删除实体化视图'));
-    expect(ctx.labels, isNot(contains('设计实体化视图')));
-    expect(ctx.labels, isNot(contains('转储SQL文件')));
+    expect(ctx.labels, contains('设计实体化视图'));
+    expect(ctx.labels, contains('转储SQL文件'));
+    // 刷新是实体化视图独有的一对(视图没有物化内容可刷)
+    expect(ctx.labels, contains('刷新实体化视图'));
+    expect(ctx.labels, contains('并发刷新实体化视图'));
+  });
+
+  testWidgets('普通视图不给「刷新」—— 没有可刷新的物化内容', (tester) async {
+    final ctx = await _openMenu(tester, typeId: 'postgresql');
+    expect(ctx.labels, isNot(contains('刷新视图')));
+    expect(ctx.labels, isNot(contains('并发刷新视图')));
+  });
+
+  testWidgets('刷新:落到 REFRESH MATERIALIZED VIEW,结束后报耗时', (tester) async {
+    final ctx = await _openMenu(
+      tester,
+      typeId: 'postgresql',
+      category: ObjectCategory.materializedView,
+    );
+
+    await tester.tap(find.text('刷新实体化视图'));
+    await _settle(tester);
+    expect(ctx.driver.sqls, contains('REFRESH MATERIALIZED VIEW "public"."v1";'));
+    expect(find.textContaining('已刷新实体化视图「v1」'), findsOneWidget);
+  });
+
+  testWidgets('并发刷新:带 CONCURRENTLY;探测不出唯一索引时放行交给服务端',
+      (tester) async {
+    // 假驱动的 executeQuery 回空集 → 探测读不出 → 不弹二次确认,直接执行
+    final ctx = await _openMenu(
+      tester,
+      typeId: 'postgresql',
+      category: ObjectCategory.materializedView,
+    );
+
+    await tester.tap(find.text('并发刷新实体化视图'));
+    await _settle(tester);
+    expect(
+        ctx.driver.sqls,
+        contains('REFRESH MATERIALIZED VIEW CONCURRENTLY "public"."v1";'));
+    expect(find.text('未检测到满足条件的唯一索引'), findsNothing);
   });
 
   testWidgets('dropObjects 对视图分类直接产出 DROP VIEW(隔离驱动链路)',

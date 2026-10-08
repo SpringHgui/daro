@@ -100,7 +100,10 @@ const String kTabCliTitleSuffix = ' (命令列界面)';
 /// 取代此前依赖 chinese_font_library 提供的 SystemChineseFont.fontFamilyFallback,
 /// 仅保留本项目实际运行平台所需的回退项。
 const List<String> chineseFontFamilyFallback = [
-  '微软雅黑', // Windows
+  // Windows:Skia 按家族名匹配字体,规范英文名比本地化名「微软雅黑」更稳,
+  // 后者在个别系统上可能没命中而悄悄退到默认 sans;两个都留,命中即用。
+  'Microsoft YaHei',
+  '微软雅黑',
   'PingFang SC', // macOS / iOS
 ];
 

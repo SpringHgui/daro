@@ -11,17 +11,30 @@ import '../data/routine_sql.dart';
 import '../theme/app_theme.dart';
 import 'query_page.dart' show formatSql;
 import 'routine_design_page.dart' show sqlLightTheme, sqlDarkTheme;
+import 'view_rule_dialog.dart';
+
+/// 工具栏度量:与「设计表」同一档 —— 纯图标点击块 25 宽(14 图标 + 5.5 × 2)、
+/// 栏高 29、分隔块 17(1px 线 + 两侧 8 留白)。
+const double _kToolbarH = 29;
+const double _kIconPadX = (25 - 14) / 2;
+const double _kToolSepW = 17;
+
+/// 添加 / 删除图标色(与「设计表」工具栏同一对)
+const Color _iconAdd = Color(0xFF45C300);
+const Color _iconDanger = Color(0xFFFF4A37);
 
 /// 视图设计器(按 Navicat 视图设计器 1:1 还原)。
 ///
-/// 工具栏:保存 / 预览 / 解释 / 视图创建工具 / 美化 SQL;
+/// 工具栏:保存 / 预览 / 解释 / 视图创建工具 / 美化 SQL(纯图标 + tooltip);
 /// 「规则」页签追加 添加规则 / 删除规则;右缘全屏按钮收起 / 恢复两侧面板。
-/// 页签:定义(仅 SELECT 查询)/ 规则(PG pg_rewrite 视图规则)/
+/// 页签:定义(仅 SELECT 查询)/ 规则(PG pg_rewrite 视图规则,仅 PG 出现)/
 /// 高级(所有者 / 检查选项 / 安全屏障)/ 注释 / SQL 预览(更改 / DDL 子页)。
 /// 「预览 / 解释」结果输出到定义页底部「消息 / 解释」面板。
 ///
 /// 定义模型与 Navicat 一致:编辑区只存 SELECT,保存时由
-/// CREATE VIEW + 高级选项拼装完整 DDL(见 [_createViewSql])。
+/// CREATE VIEW + 高级选项拼装完整 DDL(见 [_changeStatements])。
+/// 「更改」页与「保存」共用同一份语句清单,DDL 页则拿 [_baseline]
+/// (打开时库里读回的快照)与界面当前值做逐行对比。
 class ViewDesignPage extends StatefulWidget {
   const ViewDesignPage({
     super.key,
@@ -32,6 +45,7 @@ class ViewDesignPage extends StatefulWidget {
     this.schema,
     this.isNew = false,
     this.comment = '',
+    this.dialectOverride,
   });
 
   final String name;
@@ -41,6 +55,11 @@ class ViewDesignPage extends StatefulWidget {
   final ObjectCategory category;
   final bool isNew;
   final String comment;
+
+  /// 只给方言、不给连接的测试入口(与 [TableDesignerPage.dialectOverride]
+  /// 同一条理由):单测里一旦注册真连接,`_load` 就真去建驱动连库,
+  /// 断言永远等不到静止帧。方言门控的分支必须能脱离连接被测。
+  final String? dialectOverride;
 
   @override
   State<ViewDesignPage> createState() => _ViewDesignPageState();
@@ -64,16 +83,37 @@ class _ViewRule {
   final String definition;
 }
 
+/// 生成语句所需的全部输入:定义主体 + 高级页选项 + 注释。
+///
+/// 「更改」页、DDL 对比与「保存」三条路径都读它,谁都不许自己拼一份,
+/// 否则预览和实际执行的语句会分叉(预览说一套、库里落一套)。
+class _ViewState {
+  const _ViewState({
+    this.select = '',
+    this.securityBarrier = false,
+    this.checkOption = '',
+    this.owner,
+    this.comment = '',
+  });
+
+  final String select;
+  final bool securityBarrier;
+
+  /// '' = 不加;否则 LOCAL / CASCADED
+  final String checkOption;
+  final String? owner;
+  final String comment;
+}
+
 class _ViewDesignPageState extends State<ViewDesignPage> {
   final CodeLineEditingController _controller =
       CodeLineEditingController.fromText('');
   final TextEditingController _commentController = TextEditingController();
   final CodeLineEditingController _changeController =
       CodeLineEditingController.fromText('');
-  final CodeLineEditingController _ddlController =
-      CodeLineEditingController.fromText('');
 
-  /// 主页签下标(0 定义 / 1 规则 / 2 高级 / 3 注释 / 4 SQL 预览)
+  /// 主页签下标(0 定义 / 1 规则 / 2 高级 / 3 注释 / 4 SQL 预览;
+  /// 非 PG 没有规则页,下标整体前移一位)
   int _tabIndex = 0;
 
   /// SQL 预览子页(0 更改 / 1 DDL)
@@ -81,6 +121,9 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
 
   bool _saving = false;
   bool _busy = false;
+
+  /// 库里现有定义已读回(未读回之前 DDL 对比的「之前」栏只能留空)
+  bool _loaded = false;
 
   // ── 底部 消息 / 解释 面板 ──
   bool _panelVisible = false;
@@ -101,6 +144,12 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
   String _checkOption = '';
   bool _securityBarrier = false;
 
+  /// 库里现有的注释(与 [_origOwner] 同性质:改动与否的基线)
+  String _origComment = '';
+
+  /// 打开时读到的状态快照 —— DDL 对比的「之前」栏;保存成功后换成新基线
+  _ViewState _baseline = const _ViewState();
+
   /// 全屏(收起左右侧栏)状态与恢复快照
   bool _fullscreen = false;
   bool _wasLeftVisible = true;
@@ -117,8 +166,32 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
   ConnectionInfo? get _conn =>
       _appState?.connectionByName(widget.connection);
 
-  String get _typeId => _conn?.typeId ?? '';
+  String get _typeId => widget.dialectOverride ?? _conn?.typeId ?? '';
   bool get _isPg => _typeId == 'postgresql';
+
+  /// WITH [LOCAL|CASCADED] CHECK OPTION 只有 MySQL / MariaDB 支持:
+  /// PG 没有该子句,SQL Server 只认不带关键字的 `WITH CHECK OPTION`,
+  /// SQLite 完全没有。界面与生成侧用同一个条件,不给「改了不生效」的入口。
+  bool get _checkOptionSupported =>
+      _typeId == 'mysql' || _typeId == 'mariadb';
+
+  /// 规则(pg_rewrite)是 PG 独有对象:其它方言连「规则」页签都不出现
+  bool get _hasRules => _isPg;
+
+  /// 界面当前状态(预览与保存都从这一份生成)
+  _ViewState get _current {
+    var select = _controller.text.trim();
+    while (select.endsWith(';')) {
+      select = select.substring(0, select.length - 1).trimRight();
+    }
+    return _ViewState(
+      select: select,
+      securityBarrier: _securityBarrier,
+      checkOption: _checkOption,
+      owner: _owner,
+      comment: _commentController.text.trim(),
+    );
+  }
 
   @override
   void initState() {
@@ -131,7 +204,11 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     _controller.text = saved;
     _controller.addListener(_onEditorChanged);
     _commentController.addListener(_onCommentChanged);
-    if (!widget.isNew && saved.isEmpty) {
+    if (widget.isNew) {
+      _loaded = true;
+    } else {
+      // 即使编辑区带着未保存的文本也要读库:所有者 / 规则 / 注释以及 DDL 对比
+      // 的「之前」栏都出自这次加载(定义文本不会被它盖掉)
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _load();
       });
@@ -153,7 +230,6 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     _controller.dispose();
     _commentController.dispose();
     _changeController.dispose();
-    _ddlController.dispose();
     _ruleLocation.dispose();
     _ruleDefinition.dispose();
     super.dispose();
@@ -182,19 +258,35 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
         schema: widget.schema,
       );
       if (!mounted) return;
+      final split = (def == null || def.trim().isEmpty)
+          ? null
+          : splitViewDefinition(def);
       setState(() {
-        if (def != null && def.trim().isNotEmpty) {
-          _securityBarrier =
-              RegExp(r'WITH\s*\([^)]*security_barrier', caseSensitive: false)
-                  .hasMatch(def);
-          _controller.text = _extractSelect(def);
-        }
+        if (split == null) return;
+        _checkOption = split.checkOption;
+        _securityBarrier = split.securityBarrier;
+        // 标签页重开时编辑区里可能已有用户改过但没保存的文本,
+        // 不能被库里的旧定义盖掉
+        if (_controller.text.trim().isEmpty) _controller.text = split.select;
       });
       if (_isPg) {
-        await _loadOwner();
+        await _loadPgMeta();
         await _loadRules();
         await _loadOwners();
       }
+      if (!mounted) return;
+      // 基线取**库里读回的值**而不是界面当前值:界面可能带着未保存的改动,
+      // 用它当基线就等于把用户改的东西说成「库里本来就是这样」
+      setState(() {
+        _loaded = true;
+        _baseline = _ViewState(
+          select: split?.select ?? '',
+          securityBarrier: _securityBarrier,
+          checkOption: _checkOption,
+          owner: _origOwner,
+          comment: _origComment,
+        );
+      });
     } catch (e) {
       if (!mounted) return;
       MessageBox.show(
@@ -207,15 +299,36 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     }
   }
 
-  Future<void> _loadOwner() async {
-    final owner = await _scalar(
-        "SELECT pg_get_userbyid(c.relowner) FROM pg_class c "
+  /// PG 一次查回视图的所有者 / 安全屏障 / 注释(三者都在 pg_class +
+  /// pg_description 上,拆成三条语句就是三次驱动往返)。
+  Future<void> _loadPgMeta() async {
+    final rows = await _rows(
+        "SELECT pg_get_userbyid(c.relowner), "
+        "'security_barrier' = ANY(c.reloptions), "
+        "COALESCE(d.description, '') "
+        "FROM pg_class c "
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = 0 "
         "WHERE n.nspname = ${_lit(widget.schema ?? 'public')} "
         "AND c.relname = ${_lit(widget.name)}");
-    if (!mounted) return;
-    setState(() => _owner = _origOwner = owner);
+    if (rows.isEmpty || !mounted) return;
+    final r = rows.first;
+    setState(() {
+      _owner = _origOwner = r[0];
+      // pg_get_viewdef 只给 SELECT 主体,CREATE 头部的 WITH 选项不在其中,
+      // 所以 reloptions 才是安全屏障的权威来源(覆盖定义文本里的兜底判定)
+      _securityBarrier = r.length > 1 && _truthy(r[1]);
+      if (r.length > 2) {
+        _origComment = r[2];
+        if (_commentController.text.trim().isEmpty) {
+          _commentController.text = r[2];
+        }
+      }
+    });
   }
+
+  static bool _truthy(String v) =>
+      v == 'true' || v == 't' || v == '1' || v == 'yes';
 
   Future<void> _loadOwners() async {
     final rows = await _rows(
@@ -272,127 +385,57 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     }
   }
 
-  Future<String?> _scalar(String sql) async {
-    final rows = await _rows(sql);
-    if (rows.isEmpty || rows.first.isEmpty) return null;
-    return rows.first.first;
-  }
-
   static String _lit(String v) => "'${v.replaceAll("'", "''")}'";
-
-  /// 从 CREATE VIEW 语句中取出顶层 AS 之后的 SELECT 主体。
-  /// 非 CREATE VIEW 开头(用户直接写 SELECT)时原样返回。
-  /// 逐字符扫描(跳过引号 / 括号内的关键字)——MySQL 定义头部可含
-  /// ``DEFINER=`root`@`localhost` SQL SECURITY DEFINER`` 等正则难覆盖的形态。
-  /// 尾部 WITH [CASCADED|LOCAL] CHECK OPTION 与分号属于视图选项,归「高级」页。
-  static String _extractSelect(String sql) {
-    final s = sql.trim();
-    final start = RegExp(r'^CREATE(\s+OR\s+REPLACE)?\s+', caseSensitive: false)
-        .matchAsPrefix(s);
-    if (start == null) return s;
-    final viewEnd = _scanKeyword(s, start.end, 'VIEW');
-    if (viewEnd == null) return s;
-    final asEnd = _scanKeyword(s, viewEnd, 'AS');
-    if (asEnd == null) return s;
-    var body = s.substring(asEnd).trim();
-    final check = RegExp(
-            r'\bWITH\s+(CASCADED\s+|LOCAL\s+)?CHECK\s+OPTION\s*;?\s*$',
-            caseSensitive: false)
-        .firstMatch(body);
-    if (check != null) {
-      body = body.substring(0, check.start).trimRight();
-    }
-    if (body.endsWith(';')) body = body.substring(0, body.length - 1);
-    return body.trim();
-  }
-
-  /// 从 [from] 起在引号 / 括号之外找到关键字 [word](完整单词,大小写不敏感),
-  /// 返回该单词结束后的下标;未找到返回 null
-  static int? _scanKeyword(String s, int from, String word) {
-    var depth = 0;
-    String? quote;
-    var i = from;
-    while (i < s.length) {
-      final ch = s[i];
-      if (quote != null) {
-        if (ch == quote) {
-          // SQL 单引号翻倍转义不退出转义态
-          if (quote == "'" && i + 1 < s.length && s[i + 1] == "'") {
-            i += 2;
-            continue;
-          }
-          quote = null;
-        }
-      } else if (ch == '"' || ch == "'" || ch == '`') {
-        quote = ch;
-      } else if (ch == '(' || ch == '[') {
-        depth++;
-      } else if (ch == ')' || ch == ']') {
-        depth--;
-      } else if (depth == 0) {
-        final hit = _wordAt(s, i, word);
-        if (hit != null) return hit;
-      }
-      i++;
-    }
-    return null;
-  }
-
-  /// 若 [s] 在 [i] 处正好是完整单词 [word](大小写不敏感,前后非字母数字下划线),
-  /// 返回单词结束后的下标,否则返回 null
-  static int? _wordAt(String s, int i, String word) {
-    final end = i + word.length;
-    if (end > s.length) return null;
-    if (s.substring(i, end).toUpperCase() != word) return null;
-    if (i > 0 && _isIdentChar(s.codeUnitAt(i - 1))) return null;
-    if (end < s.length && _isIdentChar(s.codeUnitAt(end))) return null;
-    return end;
-  }
-
-  static bool _isIdentChar(int r) =>
-      (r >= 0x61 && r <= 0x7a) || // a-z
-      (r >= 0x41 && r <= 0x5a) || // A-Z
-      (r >= 0x30 && r <= 0x39) || // 0-9
-      r == 0x5f; // _
+  static String _dq(String v) => '"${v.replaceAll('"', '""')}"';
 
   // ── SQL 拼装 ────────────────────────────────────────────
 
-  /// CREATE VIEW 语句;[withOptions] 时并入高级页的
-  /// 安全屏障(PG WITH 选项)与检查选项(WITH CHECK OPTION)
-  String _createViewSql({bool withOptions = true}) {
+  /// CREATE VIEW 语句:安全屏障(PG 的 WITH 选项)与检查选项并入同一句
+  String _createViewSql(_ViewState s) {
     final q =
         RoutineSql.qualifiedName(_typeId, widget.name, schema: widget.schema);
-    var select = _controller.text.trim();
-    while (select.endsWith(';')) {
-      select = select.substring(0, select.length - 1).trimRight();
-    }
     final buf = StringBuffer('CREATE VIEW $q');
-    if (withOptions && _isPg && _securityBarrier) {
-      buf.write(' WITH (security_barrier)');
-    }
-    buf.write(' AS $select');
-    if (withOptions && _checkOption.isNotEmpty) {
-      buf.write(' WITH $_checkOption CHECK OPTION');
+    if (_isPg && s.securityBarrier) buf.write(' WITH (security_barrier)');
+    buf.write(' AS ${s.select}');
+    if (_checkOptionSupported && s.checkOption.isNotEmpty) {
+      buf.write(' WITH ${s.checkOption} CHECK OPTION');
     }
     buf.write(';');
     return buf.toString();
   }
 
-  String _ddlSql() {
-    final buf = StringBuffer(_createViewSql());
+  /// 「保存」将执行的语句清单 —— 「更改」页与 [_onSave] 共用这一份,
+  /// 预览即所见:界面说什么,库里就落什么。
+  ///
+  /// 编辑模式先 DROP 再 CREATE(视图没有可改的列定义,只能整条替换);
+  /// 所有者 / 注释只在相对基线变了才补,且**清空注释要显式写 IS NULL**,
+  /// 否则「删掉注释」这件事永远传不到库里。
+  List<String> _changeStatements(_ViewState s) {
     final q =
         RoutineSql.qualifiedName(_typeId, widget.name, schema: widget.schema);
-    if (_isPg && _owner != null && _owner!.isNotEmpty && _owner != _origOwner) {
-      buf.writeln();
-      buf.writeln('ALTER VIEW $q OWNER TO "${_owner!}"');
-    }
-    final comment = _commentController.text.trim();
-    if (_isPg && comment.isNotEmpty) {
-      buf.writeln();
-      buf.writeln(
-          "COMMENT ON VIEW $q IS '${comment.replaceAll("'", "''")}';");
-    }
-    return buf.toString().trimRight();
+    return [
+      if (!widget.isNew) 'DROP VIEW IF EXISTS $q;',
+      _createViewSql(s),
+      if (_isPg && s.owner != null && s.owner!.isNotEmpty && s.owner != _origOwner)
+        'ALTER VIEW $q OWNER TO ${_dq(s.owner!)};',
+      if (_isPg && s.comment != _origComment)
+        'COMMENT ON VIEW $q IS ${s.comment.isEmpty ? 'NULL' : _lit(s.comment)};',
+    ];
+  }
+
+  /// 对象自身的完整定义(DDL 对比用):不带「相对基线是否有变」的门,
+  /// 所有者与注释按该状态有什么就写什么 —— 「之前」栏要照实反映库里的现状,
+  /// 否则两边都不输出 ALTER/COMMENT,差异就无从对比。
+  String _fullDdl(_ViewState s) {
+    final q =
+        RoutineSql.qualifiedName(_typeId, widget.name, schema: widget.schema);
+    return [
+      _createViewSql(s),
+      if (_isPg && s.owner != null && s.owner!.isNotEmpty)
+        'ALTER VIEW $q OWNER TO ${_dq(s.owner!)};',
+      if (_isPg && s.comment.isNotEmpty)
+        'COMMENT ON VIEW $q IS ${_lit(s.comment)};',
+    ].join('\n\n');
   }
 
   // ── 工具栏动作 ──────────────────────────────────────────
@@ -412,16 +455,20 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     final conn = _conn;
     if (conn == null) return;
     setState(() => _saving = true);
-    final sql = _createViewSql();
+    // 与「更改」页同一份清单:首条 CREATE(编辑模式前面还有一条 DROP)走
+    // 原有的替换路径,其后的所有者 / 注释按语句顺序补执行
+    final stmts = _changeStatements(_current);
+    final createIdx = widget.isNew ? 0 : 1;
+    final extras = stmts.sublist(createIdx + 1);
     final outcome = widget.isNew
-        ? await app.runDdl(sql,
+        ? await app.runDdl(stmts[createIdx],
             connection: widget.connection,
             database: widget.database,
             schema: widget.schema)
         : await app.replaceRoutine(
             widget.category,
             widget.name,
-            createSql: sql,
+            createSql: stmts[createIdx],
             connection: widget.connection,
             database: widget.database,
             schema: widget.schema,
@@ -438,22 +485,7 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
       );
       return;
     }
-    // 高级页的归属变更与注释:PG 以独立语句补执行
     final extraErrs = <String>[];
-    final extras = <String>[];
-    if (_isPg && _owner != null && _owner!.isNotEmpty && _owner != _origOwner) {
-      final q = RoutineSql.qualifiedName(
-          _typeId, widget.name, schema: widget.schema);
-      extras.add(
-          'ALTER VIEW $q OWNER TO "${_owner!.replaceAll('"', '""')}";');
-    }
-    final comment = _commentController.text.trim();
-    if (_isPg && comment.isNotEmpty) {
-      final q = RoutineSql.qualifiedName(
-          _typeId, widget.name, schema: widget.schema);
-      extras.add(
-          "COMMENT ON VIEW $q IS '${comment.replaceAll("'", "''")}';");
-    }
     for (final stmt in extras) {
       final err = await _runDdlQuiet(stmt);
       if (err.isNotEmpty) extraErrs.add(err);
@@ -462,7 +494,11 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     if (!mounted) return;
     setState(() {
       _saving = false;
+      // 基线跟着前移:否则保存后 DDL 对比仍显示刚才那批变更,
+      // 且再点一次保存会把同一批 ALTER 重复执行
       _origOwner = _owner;
+      _origComment = _current.comment;
+      _baseline = _current;
       _panelVisible = true;
       _panelTab = 0;
       _messages = '已保存视图「${widget.name}」'
@@ -486,7 +522,7 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
 
   /// 预览:执行定义 SELECT,行数 / 错误写入「消息」页
   Future<void> _onPreview() async {
-    final select = _previewSelect();
+    final select = _current.select;
     if (select.isEmpty) {
       setState(() {
         _panelVisible = true;
@@ -526,7 +562,7 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
 
   /// 解释:EXPLAIN 定义 SELECT,执行计划写入「解释」页
   Future<void> _onExplain() async {
-    final select = _previewSelect();
+    final select = _current.select;
     if (select.isEmpty) {
       setState(() {
         _panelVisible = true;
@@ -574,30 +610,45 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     }
   }
 
-  /// 预览 / 解释用主体:去掉尾部分号(驱动按单条语句执行)
-  String _previewSelect() {
-    var s = _controller.text.trim();
-    while (s.endsWith(';')) {
-      s = s.substring(0, s.length - 1).trimRight();
-    }
-    return s;
-  }
-
   /// 美化 SQL:与查询页共用 formatSql
   void _onFormat() {
     if (_controller.text.trim().isEmpty) return;
     _controller.text = formatSql(_controller.text);
   }
 
-  void _onAddRule() {
-    MessageBox.show(
-      context,
-      title: '添加规则',
-      message: '「添加规则」功能尚未开发,敬请期待。',
-      type: MessageBoxType.info,
-      okText: '知道了',
+  /// 添加规则:对话框只回语句,执行与刷新在这里(报错能带着上下文落到底部面板)
+  Future<void> _onAddRule() async {
+    final q =
+        RoutineSql.qualifiedName(_typeId, widget.name, schema: widget.schema);
+    final sql = await showDialog<String>(
+      context: context,
+      builder: (_) => ViewRuleDialog(target: q),
     );
+    if (sql == null || !mounted) return;
+    final app = _appState ?? context.read<AppState>();
+    final conn = _conn;
+    if (conn == null) {
+      await _ruleFailed('连接「${widget.connection}」当前不可用,规则未创建。');
+      return;
+    }
+    try {
+      await app.connectionManager.runQuery(conn, sql,
+          database: widget.database, limit: 1);
+    } catch (e) {
+      await _ruleFailed('创建失败:\n$e');
+      return;
+    }
+    if (!mounted) return;
+    await _loadRules();
   }
+
+  Future<void> _ruleFailed(String message) => MessageBox.show(
+        context,
+        title: '添加规则',
+        message: message,
+        type: MessageBoxType.error,
+        okText: '知道了',
+      );
 
   Future<void> _onDeleteRule() async {
     final rule =
@@ -695,7 +746,9 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
               onChanged: (i) => setState(() => _tabIndex = i),
               tabs: [
                 TabItem(label: '定义', child: _definitionTab(t)),
-                TabItem(label: '规则', child: _rulesTab(t)),
+                // 规则是 PG 独有对象(pg_rewrite):其它方言不出现这一页,
+                // 免得在一个永远没有内容的表格里空转
+                if (_hasRules) TabItem(label: '规则', child: _rulesTab(t)),
                 TabItem(label: '高级', child: _advancedTab(t)),
                 TabItem(label: '注释', child: _commentTab(t)),
                 TabItem(label: 'SQL 预览', child: _previewTab(t)),
@@ -707,94 +760,116 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     );
   }
 
+  /// 规则页在主页签里的下标(非 PG 没有这一页,返回 -1)
+  int get _rulesIdx => _hasRules ? 1 : -1;
+
   /// 工具栏:保存 | 预览 解释 视图创建工具 美化 SQL [规则页:添加/删除规则] … 全屏
+  ///
+  /// 纯图标 + tooltip,度量与「设计表」同一档(点击块 25 宽、栏高 29):
+  /// 参考工具的图标栏上没有一个文字按钮。
   ///
   /// 底色取 secondary(栏底灰),与文档标签条里**选中标签**的底色一致 ——
   /// 本行紧贴标签条、选中的标签底边开放,同色才能连成一整块,不留接缝。
   Widget _toolbar(AppPalette t) {
-    const blue = Color(0xff1f6feb);
+    final blue = AppColors.of(context).iconPrimary;
+    final onRules = _tabIndex == _rulesIdx;
     return Container(
-      height: 34,
+      height: _kToolbarH,
       color: t.secondary,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(
         children: [
           ToolbarButton(
             icon: Icons.save_outlined,
             iconColor: blue,
-            text: '保存',
+            tooltip: widget.isNew ? '保存并创建视图' : '保存变更',
             enabled: !_saving && !_busy,
+            paddingX: _kIconPadX,
             onTap: _onSave,
           ),
-          _divider(t),
-          ToolbarButton(
-            icon: Icons.visibility_outlined,
-            iconColor: blue,
-            text: '预览',
-            enabled: !_busy && !_saving,
-            onTap: _onPreview,
-          ),
-          ToolbarButton(
-            icon: Icons.account_tree_outlined,
-            iconColor: blue,
-            text: '解释',
-            enabled: !_busy && !_saving,
-            onTap: _onExplain,
-          ),
-          ToolbarButton(
-            icon: Icons.construction_outlined,
-            iconColor: blue,
-            text: '视图创建工具',
-            onTap: () => MessageBox.show(
-              context,
-              title: '视图创建工具',
-              message: '「视图创建工具」功能尚未开发,敬请期待。',
-              type: MessageBoxType.info,
-              okText: '知道了',
+          _toolSep(t),
+          // 窄窗口下按钮可能多于可用宽:横向滚动而非 RenderFlex 溢出
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  ToolbarButton(
+                    icon: Icons.visibility_outlined,
+                    iconColor: blue,
+                    tooltip: '预览数据(执行定义查询)',
+                    enabled: !_busy && !_saving,
+                    paddingX: _kIconPadX,
+                    onTap: _onPreview,
+                  ),
+                  ToolbarButton(
+                    icon: Icons.account_tree_outlined,
+                    iconColor: blue,
+                    tooltip: '解释执行计划',
+                    enabled: !_busy && !_saving,
+                    paddingX: _kIconPadX,
+                    onTap: _onExplain,
+                  ),
+                  ToolbarButton(
+                    icon: Icons.construction_outlined,
+                    iconColor: blue,
+                    tooltip: '视图创建工具',
+                    paddingX: _kIconPadX,
+                    onTap: () => MessageBox.show(
+                      context,
+                      title: '视图创建工具',
+                      message: '「视图创建工具」功能尚未开发,敬请期待。',
+                      type: MessageBoxType.info,
+                      okText: '知道了',
+                    ),
+                  ),
+                  ToolbarButton(
+                    icon: Icons.auto_fix_high_outlined,
+                    iconColor: blue,
+                    tooltip: '美化 SQL',
+                    paddingX: _kIconPadX,
+                    onTap: _onFormat,
+                  ),
+                  if (onRules) ...[
+                    SizedBox(width: _kToolSepW),
+                    ToolbarButton(
+                      icon: Icons.add_circle_outline,
+                      iconColor: _iconAdd,
+                      // 新建模式下视图还不存在,CREATE RULE 必然报错,不给入口
+                      tooltip: widget.isNew ? '保存视图后才能添加规则' : '添加规则',
+                      enabled: !widget.isNew,
+                      paddingX: _kIconPadX,
+                      onTap: _onAddRule,
+                    ),
+                    ToolbarButton(
+                      icon: Icons.remove_circle_outline,
+                      iconColor: _iconDanger,
+                      tooltip: '删除规则',
+                      enabled: _selectedRule != null,
+                      paddingX: _kIconPadX,
+                      onTap: _onDeleteRule,
+                    ),
+                  ],
+                ],
+              ),
             ),
           ),
-          ToolbarButton(
-            icon: Icons.auto_fix_high_outlined,
-            text: '美化 SQL',
-            onTap: _onFormat,
-          ),
-          if (_tabIndex == 1) ...[
-            const SizedBox(width: 18),
-            ToolbarButton(
-              icon: Icons.add_circle_outline,
-              iconColor: const Color(0xff188038),
-              text: '添加规则',
-              onTap: _onAddRule,
-            ),
-            ToolbarButton(
-              icon: Icons.remove_circle_outline,
-              iconColor: const Color(0xffd93025),
-              text: '删除规则',
-              enabled: _selectedRule != null,
-              onTap: _onDeleteRule,
-            ),
-          ],
-          const Spacer(),
           IconBtn(
             icon: _fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
             iconSize: 16,
             tooltip: _fullscreen ? '退出全屏' : '全屏',
             onTap: _onFullscreen,
           ),
+          const SizedBox(width: 4),
         ],
       ),
     );
   }
 
-  Widget _divider(AppPalette t) => SizedBox(
-        width: 6,
-        height: 16,
+  /// 工具栏分隔块:1px 竖线 + 两侧留白(与「设计表」同档)
+  Widget _toolSep(AppPalette t) => SizedBox(
+        width: _kToolSepW,
         child: Center(
-          child: Separator(
-            orientation: Axis.vertical,
-            thickness: 1,
-            color: t.divider,
-          ),
+          child: Container(width: 1, height: 23, color: t.border),
         ),
       );
 
@@ -964,15 +1039,24 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
 
   // ── 高级 ──
 
+  /// 三项各自按方言门控:**生成侧不产出的选项就不给改**。
+  /// 界面能改、DDL 不生成是最坏的一种「保存成功」—— 用户点了保存,库里一条没变。
+  /// 禁用时挂 tooltip 说清是哪条子句把它挡在外。
   Widget _advancedTab(AppPalette t) {
+    Widget field(String label, {required bool ok, String why = '', required Widget child}) {
+      final w = FieldRow(label: label, labelWidth: 120, child: child);
+      return ok ? w : WinToolTip(message: why, child: w);
+    }
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 18, 8, 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          FieldRow(
-            label: '所有者:',
-            labelWidth: 120,
+          field(
+            '所有者:',
+            ok: _isPg,
+            why: '仅 PostgreSQL 支持改视图所有者(ALTER VIEW … OWNER TO)',
             child: SizedBox(
               width: 240,
               child: ComboBox<String>(
@@ -985,27 +1069,31 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
             ),
           ),
           const SizedBox(height: 14),
-          FieldRow(
-            label: '检查选项:',
-            labelWidth: 120,
+          field(
+            '检查选项:',
+            ok: _checkOptionSupported,
+            why: '仅 MySQL / MariaDB 支持 WITH [CASCADED|LOCAL] CHECK OPTION'
+                '(PostgreSQL 没有该子句)',
             child: SizedBox(
               width: 240,
               child: ComboBox<String>(
                 items: const ['LOCAL', 'CASCADED'],
                 value: _checkOption.isEmpty ? null : _checkOption,
+                enabled: _checkOptionSupported,
                 itemToString: (v) => v,
-                onChanged: (v) =>
-                    setState(() => _checkOption = v ?? ''),
+                onChanged: (v) => setState(() => _checkOption = v ?? ''),
               ),
             ),
           ),
           const SizedBox(height: 14),
-          FieldRow(
-            label: '',
+          field(
+            '',
+            ok: _isPg,
+            why: '仅 PostgreSQL 支持 WITH (security_barrier)',
             child: CheckBox(
               value: _securityBarrier,
-              onChanged: (v) =>
-                  setState(() => _securityBarrier = v ?? false),
+              enabled: _isPg,
+              onChanged: (v) => setState(() => _securityBarrier = v ?? false),
               label: '安全屏障',
             ),
           ),
@@ -1016,14 +1104,17 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
 
   // ── 注释 ──
 
+  /// 只有 PG 有存放视图注释的地方(`COMMENT ON VIEW`);MySQL / SQLite /
+  /// SQL Server 上这一页整块禁用 —— 能打字却存不下去的输入框比没有更糟。
   Widget _commentTab(AppPalette t) {
     return Padding(
       padding: const EdgeInsets.all(8),
       child: Textarea(
         controller: _commentController,
         expands: true,
+        enabled: _isPg,
         showBorder: false,
-        hint: '输入视图注释${_isPg ? '(保存时写入 COMMENT ON)' : ''}',
+        hint: _isPg ? '输入视图注释(保存时写入 COMMENT ON VIEW)' : '当前数据库类型不支持视图注释',
         style: TextStyle(
           fontSize: 13.5,
           height: 20 / 13.5,
@@ -1035,15 +1126,18 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
 
   // ── SQL 预览 ──
 
+  /// 「更改」= 保存要执行的完整语句清单(与 [_onSave] 同一份);
+  /// 「DDL」= 对象定义的之前 / 之后逐行对比。
   Widget _previewTab(AppPalette t) {
     return ListenableBuilder(
       listenable: Listenable.merge([_controller, _commentController]),
       builder: (context, _) {
-        final change = _createViewSql(withOptions: false);
-        final ddl = _ddlSql();
+        final stmts = _changeStatements(_current);
+        final change = stmts.join('\n\n');
         if (_changeController.text != change) _changeController.text = change;
-        if (_ddlController.text != ddl) _ddlController.text = ddl;
-        final text = _previewSub == 0 ? change : ddl;
+        final before =
+            widget.isNew || !_loaded ? '' : _fullDdl(_baseline);
+        final after = _fullDdl(_current);
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -1055,38 +1149,78 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
               onChanged: (i) => setState(() => _previewSub = i),
             ),
             Expanded(
-              child: Stack(
-                children: [
-                  Positioned.fill(
-                    child: _sqlEditor(
-                      t,
-                      controller: _previewSub == 0
-                          ? _changeController
-                          : _ddlController,
-                      readOnly: true,
-                      showLineNumbers: false,
-                      hint: null,
+              child: _previewSub == 0
+                  ? Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _previewHint(
+                          t,
+                          widget.isNew
+                              ? '「保存」将按以下顺序执行这些语句'
+                              : '「保存」将按以下顺序执行这些语句(先删后建,依赖该视图的对象会一并失效)',
+                        ),
+                        Expanded(
+                          child: Stack(
+                            children: [
+                              Positioned.fill(
+                                child: _sqlEditor(
+                                  t,
+                                  controller: _changeController,
+                                  readOnly: true,
+                                  showLineNumbers: false,
+                                  hint: null,
+                                ),
+                              ),
+                              Positioned(
+                                top: 6,
+                                right: 10,
+                                child: IconBtn(
+                                  icon: Icons.copy_outlined,
+                                  iconSize: 15,
+                                  tooltip: '复制',
+                                  onTap: () => Clipboard.setData(
+                                      ClipboardData(text: change)),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    )
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _previewHint(t, '左:库里当前的定义;右:保存后的定义。'),
+                        Expanded(
+                          child: TextDiffView(
+                            before: before,
+                            after: after,
+                            beforeLabel: '之前:',
+                            afterLabel: '之后:',
+                            fontSize: 13,
+                            lineHeight: 20,
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                  Positioned(
-                    top: 6,
-                    right: 10,
-                    child: IconBtn(
-                      icon: Icons.copy_outlined,
-                      iconSize: 15,
-                      tooltip: '复制',
-                      onTap: () =>
-                          Clipboard.setData(ClipboardData(text: text)),
-                    ),
-                  ),
-                ],
-              ),
             ),
           ],
         );
       },
     );
   }
+
+  /// 预览页顶部的灰底说明条(与「设计表」的 SQL 预览同款式)
+  Widget _previewHint(AppPalette t, String text) => Container(
+        height: 26,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        alignment: Alignment.centerLeft,
+        color: t.secondary,
+        child: Text(
+          text,
+          style: TextStyle(fontSize: 11.5, color: t.mutedForeground),
+        ),
+      );
 
   // ── 代码编辑器(定义 / 预览共用)──
 
@@ -1141,3 +1275,101 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     );
   }
 }
+
+/// 从驱动读回的 CREATE VIEW 文本里拆出「定义页要显示的 SELECT」与
+/// 属于「高级」页的三个选项。
+///
+/// 拆走的一律要记下来:旧实现只剥 `WITH … CHECK OPTION` 却不回填界面,
+/// 于是打开一个带检查选项的视图 → 界面显示空 → 保存 → 选项静默消失。
+///
+/// 逐字符扫描(跳过引号 / 括号内的关键字)找顶层 `AS`:MySQL 的定义头部可含
+/// ``DEFINER=`root`@`localhost` SQL SECURITY DEFINER`` 等正则难覆盖的形态。
+({String select, String checkOption, bool securityBarrier})
+    splitViewDefinition(String sql) {
+  final s = sql.trim();
+  final start =
+      RegExp(r'^CREATE(\s+OR\s+REPLACE)?\s+', caseSensitive: false)
+          .matchAsPrefix(s);
+  final barrier = RegExp(r'WITH\s*\([^)]*security_barrier', caseSensitive: false)
+      .hasMatch(s);
+  if (start == null) {
+    // 用户直接写 SELECT 存进来的(非 CREATE VIEW 开头):原样回显
+    return (select: _stripTail(s), checkOption: '', securityBarrier: barrier);
+  }
+  final viewEnd = _scanKeyword(s, start.end, 'VIEW');
+  final asEnd = viewEnd == null ? null : _scanKeyword(s, viewEnd, 'AS');
+  if (asEnd == null) {
+    return (select: _stripTail(s), checkOption: '', securityBarrier: barrier);
+  }
+  var body = s.substring(asEnd).trim();
+  var checkOption = '';
+  final check = RegExp(
+          r'\bWITH\s+(CASCADED\s+|LOCAL\s+)?CHECK\s+OPTION\s*;?\s*$',
+          caseSensitive: false)
+      .firstMatch(body);
+  if (check != null) {
+    // 不写关键字时 MySQL 按 CASCADED 处理,回填成显式的才能原样往返
+    final kw = check.group(1)?.trim().toUpperCase();
+    checkOption = (kw == null || kw.isEmpty) ? 'CASCADED' : kw;
+    body = body.substring(0, check.start).trimRight();
+  }
+  return (
+    select: _stripTail(body),
+    checkOption: checkOption,
+    securityBarrier: barrier,
+  );
+}
+
+/// 去掉语句尾的分号(与 [_ViewState] 里 SELECT 主体的形态一致)
+String _stripTail(String sql) =>
+    sql.endsWith(';') ? sql.substring(0, sql.length - 1).trimRight() : sql;
+
+/// 从 [from] 起在引号 / 括号之外找到关键字 [word](完整单词,大小写不敏感),
+/// 返回该单词结束后的下标;未找到返回 null
+int? _scanKeyword(String s, int from, String word) {
+  var depth = 0;
+  String? quote;
+  var i = from;
+  while (i < s.length) {
+    final ch = s[i];
+    if (quote != null) {
+      if (ch == quote) {
+        // SQL 单引号翻倍转义不退出转义态
+        if (quote == "'" && i + 1 < s.length && s[i + 1] == "'") {
+          i += 2;
+          continue;
+        }
+        quote = null;
+      }
+    } else if (ch == '"' || ch == "'" || ch == '`') {
+      quote = ch;
+    } else if (ch == '(' || ch == '[') {
+      depth++;
+    } else if (ch == ')' || ch == ']') {
+      depth--;
+    } else if (depth == 0) {
+      final hit = _wordAt(s, i, word);
+      if (hit != null) return hit;
+    }
+    i++;
+  }
+  return null;
+}
+
+/// 若 [s] 在 [i] 处正好是完整单词 [word](大小写不敏感,前后非字母数字下划线),
+/// 返回单词结束后的下标,否则返回 null
+int? _wordAt(String s, int i, String word) {
+  final end = i + word.length;
+  if (end > s.length) return null;
+  if (s.substring(i, end).toUpperCase() != word) return null;
+  if (i > 0 && _isIdentChar(s.codeUnitAt(i - 1))) return null;
+  if (end < s.length && _isIdentChar(s.codeUnitAt(end))) return null;
+  return end;
+}
+
+bool _isIdentChar(int r) =>
+    (r >= 0x61 && r <= 0x7a) || // a-z
+    (r >= 0x41 && r <= 0x5a) || // A-Z
+    (r >= 0x30 && r <= 0x39) || // 0-9
+    r == 0x5f; // _
+

@@ -1887,4 +1887,195 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get cliInputHint => 'Enter a SQL statement';
+
+  @override
+  String get ctxNewMatView => 'New Materialized View';
+
+  @override
+  String actionRefresh(String label) {
+    return 'Refresh $label';
+  }
+
+  @override
+  String actionRefreshConcurrently(String label) {
+    return 'Refresh $label Concurrently';
+  }
+
+  @override
+  String get matvTabDefinition => 'Definition';
+
+  @override
+  String get matvTabIndexes => 'Indexes';
+
+  @override
+  String get matvTabAdvanced => 'Advanced';
+
+  @override
+  String get matvTabComment => 'Comments';
+
+  @override
+  String get matvTabSqlPreview => 'SQL Preview';
+
+  @override
+  String get matvPanelMessages => 'Messages';
+
+  @override
+  String get matvPreview => 'Preview';
+
+  @override
+  String get matvExplain => 'Explain';
+
+  @override
+  String get matvBeautifySql => 'Beautify SQL';
+
+  @override
+  String get matvTabChange => 'Changes';
+
+  @override
+  String get matvCopy => 'Copy';
+
+  @override
+  String get matvFullscreen => 'Fullscreen';
+
+  @override
+  String get matvExitFullscreen => 'Exit fullscreen';
+
+  @override
+  String get matvCommentHint =>
+      'Comment for this materialized view (written as COMMENT ON on save)';
+
+  @override
+  String get matvAddIndex => 'Add Index';
+
+  @override
+  String get matvDropIndex => 'Drop Index';
+
+  @override
+  String get matvColDefinition => 'Definition';
+
+  @override
+  String get colUnique => 'Unique';
+
+  @override
+  String get matvFieldIndexName => 'Index name:';
+
+  @override
+  String get matvFieldIndexColumns => 'Columns:';
+
+  @override
+  String get matvFieldOwner => 'Owner:';
+
+  @override
+  String get matvFieldTablespace => 'Tablespace:';
+
+  @override
+  String get matvFieldAccessMethod => 'Access method:';
+
+  @override
+  String get matvFieldStorageParams => 'Storage parameters:';
+
+  @override
+  String get matvWithData => 'Populate data (WITH DATA)';
+
+  @override
+  String get matvDefault => 'Default';
+
+  @override
+  String matvColumnsHint(String columns) {
+    return 'Available columns: $columns';
+  }
+
+  @override
+  String get matvSaveTitle => 'Save Materialized View';
+
+  @override
+  String get matvDefinitionEmpty =>
+      'The definition is empty. Enter a query on the Definition tab.';
+
+  @override
+  String matvDefinitionReadFailed(String name, String error) {
+    return 'Failed to read the definition of materialized view \"$name\":\n$error';
+  }
+
+  @override
+  String matvRebuildConfirm(String name) {
+    return 'Saving rebuilds materialized view \"$name\" (DROP, then CREATE).\nIts indexes are recreated automatically, but grants on it are lost and the data is repopulated.\nContinue?';
+  }
+
+  @override
+  String matvSaveFailed(String error) {
+    return 'Save failed:\n$error';
+  }
+
+  @override
+  String matvSaved(String name) {
+    return 'Saved materialized view \"$name\"';
+  }
+
+  @override
+  String get matvPreviewEmpty =>
+      'The definition is empty; there is nothing to preview.';
+
+  @override
+  String get matvExplainEmpty =>
+      'The definition is empty; it cannot be explained.';
+
+  @override
+  String matvPreviewResult(String rows, String ms) {
+    return 'Returned $rows rows in $ms ms';
+  }
+
+  @override
+  String get matvRefreshRunning => 'Refreshing ...';
+
+  @override
+  String get matvToolbarRefreshConcurrently => 'Concurrent Refresh';
+
+  @override
+  String matvRefreshed(String name, String ms) {
+    return 'Refreshed materialized view \"$name\" in $ms ms';
+  }
+
+  @override
+  String matvRefreshFailed(String error) {
+    return 'Refresh failed:\n$error';
+  }
+
+  @override
+  String matvPreviewFailed(String error) {
+    return 'Preview failed:\n$error';
+  }
+
+  @override
+  String matvExplainFailed(String error) {
+    return 'Explain failed:\n$error';
+  }
+
+  @override
+  String get matvConcurrentlyNeedUnique =>
+      'A concurrent refresh requires a unique index that covers every column and has no WHERE clause';
+
+  @override
+  String get matvConcurrentlyOk => 'Concurrent refresh available';
+
+  @override
+  String get matvConcurrentlyAsk =>
+      'No qualifying unique index was found. Try a concurrent refresh anyway?';
+
+  @override
+  String matvNotPopulated(String name) {
+    return 'Materialized view \"$name\" has no data (WITH NO DATA). Refresh it before querying.';
+  }
+
+  @override
+  String get matvIndexIncomplete =>
+      'Enter an index name and at least one column.';
+
+  @override
+  String get matvIndexNoSelection => 'Select an index in the list first.';
+
+  @override
+  String matvIndexDropConfirm(String name) {
+    return 'Drop index \"$name\"?\nThis runs DROP INDEX and cannot be undone.';
+  }
 }

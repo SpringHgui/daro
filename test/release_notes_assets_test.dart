@@ -50,8 +50,9 @@ void main() {
   final py = File('tool/gen_release_notes.py').readAsStringSync();
   final yml = File('.github/workflows/release.yml').readAsStringSync();
 
-  // 抓 DOWNLOAD_PLATFORMS 里 ("EXE", "daro-{ver}-windows-x64.exe") 这种二元组。
-  final declared = RegExp(r'\("([A-Z][A-Z.]*)",\s*"(' +
+  // 抓 DOWNLOAD_PLATFORMS 里 ("安装包", "daro-{ver}-windows-x64.exe") 这种二元组。
+  // 类型标签是中文（安装包 / 便携 / 免安装），故不限定字符集，只钉住产物名那一半。
+  final declared = RegExp(r'\("([^"]+)",\s*"(' +
           RegExp.escape(_prefix) +
           r'[^"]+)"\)')
       .allMatches(py)
@@ -128,11 +129,13 @@ void main() {
   });
 
   test('下载表格补全了源码包 / 校验和 / MSIX 说明这三块', () {
-    // 红框里的完整下载区 = 三平台两档 + 源码归档 + 完整 SHA256 + 商店说明。
+    // 完整下载区 = 三平台两档(一个产物一行) + 并入主表的大小/SHA256 + 源码归档 + 商店说明。
     expect(py, contains('SOURCE_ARCHIVES'),
         reason: 'gen_release_notes.py 缺少 SOURCE_ARCHIVES(源码归档)声明');
-    expect(py, contains('### 🔐 校验和 (SHA256)'),
-        reason: 'render_downloads 缺少完整 SHA256 校验和表');
+    expect(py, contains('DOWNLOAD_STAT_COLUMNS = ("大小", "SHA256")'),
+        reason: '大小与 SHA256 必须并入主表，而不是另起一张校验和表');
+    expect(py, isNot(contains('### 🔐 校验和')),
+        reason: '校验和已并入下载表，不应再有独立的校验和表标题');
     expect(py, contains('MSIX_NOTE'),
         reason: '缺少 Microsoft Store / MSIX 说明常量');
     // 源码用 archive/refs/tags 链接(永远可用、不进 artifacts、不参与 releases/download 校验)
@@ -140,7 +143,21 @@ void main() {
         reason: '源码归档链接应走 archive/refs/tags/ 而非 releases/download/');
   });
 
-  test('release.yml 先下载产物、再生成正文(否则算不出大小/SHA256)', () {
+  test('下载表一个产物一行:链接文字是源文件名,大小/SHA256 并进同一张表', () {
+    // 链接文字用源文件名,用户下载后落盘的就是它,不必对着 EXE / ZIP 这类缩写猜;
+    // 「安装包 / 便携」的区分挪到「类型」列,不再各占一列。
+    expect(
+      py,
+      contains('DOWNLOAD_COLUMNS = ("平台", "架构", "类型", "文件")'),
+      reason: '固定列应保持 平台 / 架构 / 类型 / 文件;「文件」列放源文件名',
+    );
+    expect(py, contains('"[{}]({})".format(name, url)'),
+        reason: '下载链接的文字应用源文件名,而不是 EXE / ZIP 这类缩写');
+    expect(py, contains('DOWNLOAD_STAT_COLUMNS = ("大小", "SHA256")'),
+        reason: '大小 / SHA256 应作为右侧两列并入主表');
+  });
+
+  test('release.yml 先下载产物、再生成正文(否则算不出体积/SHA256)', () {
     final downloadStep = yml.indexOf('下载全部平台的产物');
     final genStep = yml.indexOf('生成 Release 正文');
     expect(downloadStep, greaterThanOrEqualTo(0), reason: '找不到下载产物步骤');

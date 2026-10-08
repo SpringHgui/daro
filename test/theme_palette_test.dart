@@ -61,6 +61,25 @@ void main() {
       expect(AppTheme.isBuiltInDefault(AppTheme.light), isTrue);
       expect(AppTheme.isBuiltInDefault(AppTheme.dark), isTrue);
       expect(AppTheme.isBuiltInDefault(AppTheme.lightLegacy), isTrue);
+      // 0.9 把内置强调色从 #2196F3 换成桌面蓝 #0078D4:上一版的明 / 暗默认值
+      // 必须继续被认成"伪定制",否则老用户永远看不到新强调色。
+      expect(AppTheme.isBuiltInDefault(AppTheme.lightLegacy08), isTrue);
+      expect(AppTheme.isBuiltInDefault(AppTheme.darkLegacy08), isTrue);
+    });
+
+    test('强调色确实换到了桌面蓝,且旧档只作为历史值存在', () {
+      expect(AppTheme.light.accent, const Color(0xFF0078D4));
+      expect(AppTheme.light.highlight, const Color(0xFF4DA0E1));
+      expect(AppTheme.dark.accent, const Color(0xFF0078D4));
+      // 淡蓝档 = accent 20% 压白,实测参考工具的焦点列表头 / 行首槽就是这个值
+      // (比较用 toARGB32:alphaBlend 产出的是 float 分量色,与 8 位常量直接 == 不可靠)
+      expect(AppTheme.light.accentSoftBg.toARGB32(), 0xFFCCE4F6);
+      expect(AppTheme.lightLegacy08.accent, const Color(0xFF2196F3));
+      expect(
+        AppTheme.isBuiltInDefault(AppTheme.light.copyWith(accent: const Color(0xFF2196F3))),
+        isFalse,
+        reason: '只把新默认换成旧强调色 = 真定制,不能被当成历史默认丢掉',
+      );
     });
 
     test('动过任何一个字段就不算内置默认', () {

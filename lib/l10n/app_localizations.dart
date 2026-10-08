@@ -3345,6 +3345,318 @@ abstract class AppLocalizations {
   /// In zh, this message translates to:
   /// **'输入 SQL 语句'**
   String get cliInputHint;
+
+  /// 连接树分组头 / 对象面板工具栏:新建实体化视图(仅 PostgreSQL 家族)
+  ///
+  /// In zh, this message translates to:
+  /// **'新建实体化视图'**
+  String get ctxNewMatView;
+
+  /// No description provided for @actionRefresh.
+  ///
+  /// In zh, this message translates to:
+  /// **'刷新{label}'**
+  String actionRefresh(String label);
+
+  /// No description provided for @actionRefreshConcurrently.
+  ///
+  /// In zh, this message translates to:
+  /// **'并发刷新{label}'**
+  String actionRefreshConcurrently(String label);
+
+  /// No description provided for @matvTabDefinition.
+  ///
+  /// In zh, this message translates to:
+  /// **'定义'**
+  String get matvTabDefinition;
+
+  /// No description provided for @matvTabIndexes.
+  ///
+  /// In zh, this message translates to:
+  /// **'索引'**
+  String get matvTabIndexes;
+
+  /// No description provided for @matvTabAdvanced.
+  ///
+  /// In zh, this message translates to:
+  /// **'高级'**
+  String get matvTabAdvanced;
+
+  /// No description provided for @matvTabComment.
+  ///
+  /// In zh, this message translates to:
+  /// **'注释'**
+  String get matvTabComment;
+
+  /// No description provided for @matvTabSqlPreview.
+  ///
+  /// In zh, this message translates to:
+  /// **'SQL 预览'**
+  String get matvTabSqlPreview;
+
+  /// No description provided for @matvPanelMessages.
+  ///
+  /// In zh, this message translates to:
+  /// **'消息'**
+  String get matvPanelMessages;
+
+  /// No description provided for @matvPreview.
+  ///
+  /// In zh, this message translates to:
+  /// **'预览'**
+  String get matvPreview;
+
+  /// No description provided for @matvExplain.
+  ///
+  /// In zh, this message translates to:
+  /// **'解释'**
+  String get matvExplain;
+
+  /// No description provided for @matvBeautifySql.
+  ///
+  /// In zh, this message translates to:
+  /// **'美化 SQL'**
+  String get matvBeautifySql;
+
+  /// No description provided for @matvTabChange.
+  ///
+  /// In zh, this message translates to:
+  /// **'更改'**
+  String get matvTabChange;
+
+  /// No description provided for @matvCopy.
+  ///
+  /// In zh, this message translates to:
+  /// **'复制'**
+  String get matvCopy;
+
+  /// No description provided for @matvFullscreen.
+  ///
+  /// In zh, this message translates to:
+  /// **'全屏'**
+  String get matvFullscreen;
+
+  /// No description provided for @matvExitFullscreen.
+  ///
+  /// In zh, this message translates to:
+  /// **'退出全屏'**
+  String get matvExitFullscreen;
+
+  /// No description provided for @matvCommentHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'输入实体化视图注释(保存时写入 COMMENT ON)'**
+  String get matvCommentHint;
+
+  /// No description provided for @matvAddIndex.
+  ///
+  /// In zh, this message translates to:
+  /// **'添加索引'**
+  String get matvAddIndex;
+
+  /// No description provided for @matvDropIndex.
+  ///
+  /// In zh, this message translates to:
+  /// **'删除索引'**
+  String get matvDropIndex;
+
+  /// No description provided for @matvColDefinition.
+  ///
+  /// In zh, this message translates to:
+  /// **'定义'**
+  String get matvColDefinition;
+
+  /// No description provided for @colUnique.
+  ///
+  /// In zh, this message translates to:
+  /// **'唯一'**
+  String get colUnique;
+
+  /// No description provided for @matvFieldIndexName.
+  ///
+  /// In zh, this message translates to:
+  /// **'索引名称:'**
+  String get matvFieldIndexName;
+
+  /// No description provided for @matvFieldIndexColumns.
+  ///
+  /// In zh, this message translates to:
+  /// **'索引列:'**
+  String get matvFieldIndexColumns;
+
+  /// No description provided for @matvFieldOwner.
+  ///
+  /// In zh, this message translates to:
+  /// **'所有者:'**
+  String get matvFieldOwner;
+
+  /// No description provided for @matvFieldTablespace.
+  ///
+  /// In zh, this message translates to:
+  /// **'表空间:'**
+  String get matvFieldTablespace;
+
+  /// No description provided for @matvFieldAccessMethod.
+  ///
+  /// In zh, this message translates to:
+  /// **'访问方法:'**
+  String get matvFieldAccessMethod;
+
+  /// No description provided for @matvFieldStorageParams.
+  ///
+  /// In zh, this message translates to:
+  /// **'存储参数:'**
+  String get matvFieldStorageParams;
+
+  /// No description provided for @matvWithData.
+  ///
+  /// In zh, this message translates to:
+  /// **'填充数据(WITH DATA)'**
+  String get matvWithData;
+
+  /// No description provided for @matvDefault.
+  ///
+  /// In zh, this message translates to:
+  /// **'默认'**
+  String get matvDefault;
+
+  /// No description provided for @matvColumnsHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'可用列:{columns}'**
+  String matvColumnsHint(String columns);
+
+  /// No description provided for @matvSaveTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'保存实体化视图'**
+  String get matvSaveTitle;
+
+  /// No description provided for @matvDefinitionEmpty.
+  ///
+  /// In zh, this message translates to:
+  /// **'实体化视图定义不能为空,请在「定义」页输入查询 SQL。'**
+  String get matvDefinitionEmpty;
+
+  /// No description provided for @matvDefinitionReadFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'读取实体化视图「{name}」定义失败:\n{error}'**
+  String matvDefinitionReadFailed(String name, String error);
+
+  /// No description provided for @matvRebuildConfirm.
+  ///
+  /// In zh, this message translates to:
+  /// **'保存会重建实体化视图「{name}」(先 DROP 再 CREATE)。\n已有索引会自动重建,但对其授予的权限(GRANT)会丢失,数据也会重新填充。\n是否继续?'**
+  String matvRebuildConfirm(String name);
+
+  /// No description provided for @matvSaveFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'保存失败:\n{error}'**
+  String matvSaveFailed(String error);
+
+  /// No description provided for @matvSaved.
+  ///
+  /// In zh, this message translates to:
+  /// **'已保存实体化视图「{name}」'**
+  String matvSaved(String name);
+
+  /// No description provided for @matvPreviewEmpty.
+  ///
+  /// In zh, this message translates to:
+  /// **'实体化视图定义为空,无可预览的数据。'**
+  String get matvPreviewEmpty;
+
+  /// No description provided for @matvExplainEmpty.
+  ///
+  /// In zh, this message translates to:
+  /// **'实体化视图定义为空,无法解释。'**
+  String get matvExplainEmpty;
+
+  /// No description provided for @matvPreviewResult.
+  ///
+  /// In zh, this message translates to:
+  /// **'已返回 {rows} 行,耗时 {ms} ms'**
+  String matvPreviewResult(String rows, String ms);
+
+  /// No description provided for @matvRefreshRunning.
+  ///
+  /// In zh, this message translates to:
+  /// **'正在刷新 ...'**
+  String get matvRefreshRunning;
+
+  /// No description provided for @matvToolbarRefreshConcurrently.
+  ///
+  /// In zh, this message translates to:
+  /// **'并发刷新'**
+  String get matvToolbarRefreshConcurrently;
+
+  /// No description provided for @matvRefreshed.
+  ///
+  /// In zh, this message translates to:
+  /// **'已刷新实体化视图「{name}」,耗时 {ms} ms'**
+  String matvRefreshed(String name, String ms);
+
+  /// No description provided for @matvRefreshFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'刷新失败:\n{error}'**
+  String matvRefreshFailed(String error);
+
+  /// No description provided for @matvPreviewFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'预览失败:\n{error}'**
+  String matvPreviewFailed(String error);
+
+  /// No description provided for @matvExplainFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'解释失败:\n{error}'**
+  String matvExplainFailed(String error);
+
+  /// No description provided for @matvConcurrentlyNeedUnique.
+  ///
+  /// In zh, this message translates to:
+  /// **'并发刷新需要一个覆盖全部列、且不带 WHERE 条件的唯一索引'**
+  String get matvConcurrentlyNeedUnique;
+
+  /// No description provided for @matvConcurrentlyOk.
+  ///
+  /// In zh, this message translates to:
+  /// **'并发刷新可用'**
+  String get matvConcurrentlyOk;
+
+  /// No description provided for @matvConcurrentlyAsk.
+  ///
+  /// In zh, this message translates to:
+  /// **'未检测到满足条件的唯一索引,仍要尝试并发刷新吗?'**
+  String get matvConcurrentlyAsk;
+
+  /// No description provided for @matvNotPopulated.
+  ///
+  /// In zh, this message translates to:
+  /// **'实体化视图「{name}」尚未填充数据(WITH NO DATA),需先刷新才能查询。'**
+  String matvNotPopulated(String name);
+
+  /// No description provided for @matvIndexIncomplete.
+  ///
+  /// In zh, this message translates to:
+  /// **'请先填写索引名称与索引列。'**
+  String get matvIndexIncomplete;
+
+  /// No description provided for @matvIndexNoSelection.
+  ///
+  /// In zh, this message translates to:
+  /// **'请先在索引列表中选择要删除的索引。'**
+  String get matvIndexNoSelection;
+
+  /// No description provided for @matvIndexDropConfirm.
+  ///
+  /// In zh, this message translates to:
+  /// **'确定删除索引「{name}」吗?\n将执行 DROP INDEX,不可恢复。'**
+  String matvIndexDropConfirm(String name);
 }
 
 class _AppLocalizationsDelegate

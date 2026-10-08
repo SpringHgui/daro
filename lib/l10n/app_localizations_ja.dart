@@ -1873,4 +1873,189 @@ class AppLocalizationsJa extends AppLocalizations {
 
   @override
   String get cliInputHint => 'SQL 文を入力';
+
+  @override
+  String get ctxNewMatView => 'マテリアライズドビューを新規作成';
+
+  @override
+  String actionRefresh(String label) {
+    return '$labelを更新';
+  }
+
+  @override
+  String actionRefreshConcurrently(String label) {
+    return '$labelを並列更新';
+  }
+
+  @override
+  String get matvTabDefinition => '定義';
+
+  @override
+  String get matvTabIndexes => 'インデックス';
+
+  @override
+  String get matvTabAdvanced => '詳細';
+
+  @override
+  String get matvTabComment => 'コメント';
+
+  @override
+  String get matvTabSqlPreview => 'SQL プレビュー';
+
+  @override
+  String get matvPanelMessages => 'メッセージ';
+
+  @override
+  String get matvPreview => 'プレビュー';
+
+  @override
+  String get matvExplain => '実行計画';
+
+  @override
+  String get matvBeautifySql => 'SQL を整形';
+
+  @override
+  String get matvTabChange => '変更';
+
+  @override
+  String get matvCopy => 'コピー';
+
+  @override
+  String get matvFullscreen => '全画面';
+
+  @override
+  String get matvExitFullscreen => '全画面を終了';
+
+  @override
+  String get matvCommentHint => 'このマテリアライズドビューのコメント (保存時に COMMENT ON)';
+
+  @override
+  String get matvAddIndex => 'インデックスを追加';
+
+  @override
+  String get matvDropIndex => 'インデックスを削除';
+
+  @override
+  String get matvColDefinition => '定義';
+
+  @override
+  String get colUnique => '一意';
+
+  @override
+  String get matvFieldIndexName => 'インデックス名:';
+
+  @override
+  String get matvFieldIndexColumns => '列:';
+
+  @override
+  String get matvFieldOwner => '所有者:';
+
+  @override
+  String get matvFieldTablespace => 'テーブルスペース:';
+
+  @override
+  String get matvFieldAccessMethod => 'アクセス方法:';
+
+  @override
+  String get matvFieldStorageParams => 'ストレージパラメータ:';
+
+  @override
+  String get matvWithData => 'データを格納 (WITH DATA)';
+
+  @override
+  String get matvDefault => '既定';
+
+  @override
+  String matvColumnsHint(String columns) {
+    return '利用可能な列: $columns';
+  }
+
+  @override
+  String get matvSaveTitle => 'マテリアライズドビューを保存';
+
+  @override
+  String get matvDefinitionEmpty => '定義が空です。「定義」タブでクエリを入力してください。';
+
+  @override
+  String matvDefinitionReadFailed(String name, String error) {
+    return 'マテリアライズドビュー「$name」の定義を読み込めませんでした:\n$error';
+  }
+
+  @override
+  String matvRebuildConfirm(String name) {
+    return '保存するとマテリアライズドビュー「$name」を再作成します (DROP → CREATE)。\n既存のインデックスは自動的に再作成されますが、付与された権限 (GRANT) は失われ、データも再格納されます。\n続行しますか?';
+  }
+
+  @override
+  String matvSaveFailed(String error) {
+    return '保存に失敗しました:\n$error';
+  }
+
+  @override
+  String matvSaved(String name) {
+    return 'マテリアライズドビュー「$name」を保存しました';
+  }
+
+  @override
+  String get matvPreviewEmpty => '定義が空のため、プレビューできません。';
+
+  @override
+  String get matvExplainEmpty => '定義が空のため、実行計画を取得できません。';
+
+  @override
+  String matvPreviewResult(String rows, String ms) {
+    return '$rows 行を $ms ms で返しました';
+  }
+
+  @override
+  String get matvRefreshRunning => '更新中 ...';
+
+  @override
+  String get matvToolbarRefreshConcurrently => '並行更新';
+
+  @override
+  String matvRefreshed(String name, String ms) {
+    return 'マテリアライズドビュー「$name」を $ms ms で更新しました';
+  }
+
+  @override
+  String matvRefreshFailed(String error) {
+    return '更新に失敗しました:\n$error';
+  }
+
+  @override
+  String matvPreviewFailed(String error) {
+    return 'プレビューに失敗しました:\n$error';
+  }
+
+  @override
+  String matvExplainFailed(String error) {
+    return '実行計画の取得に失敗しました:\n$error';
+  }
+
+  @override
+  String get matvConcurrentlyNeedUnique =>
+      '並列更新には、全列をカバーし WHERE 条件を持たない一意インデックスが必要です';
+
+  @override
+  String get matvConcurrentlyOk => '並列更新可能';
+
+  @override
+  String get matvConcurrentlyAsk => '条件を満たす一意インデックスが見つかりません。並列更新を続けますか?';
+
+  @override
+  String matvNotPopulated(String name) {
+    return 'マテリアライズドビュー「$name」はデータが未格納です (WITH NO DATA)。更新してから照会してください。';
+  }
+
+  @override
+  String get matvIndexIncomplete => 'インデックス名と列を入力してください。';
+
+  @override
+  String get matvIndexNoSelection => '一覧から削除するインデックスを選択してください。';
+
+  @override
+  String matvIndexDropConfirm(String name) {
+    return 'インデックス「$name」を削除しますか?\nDROP INDEX を実行し、元に戻せません。';
+  }
 }

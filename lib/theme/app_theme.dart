@@ -91,6 +91,14 @@ class AppPalette {
   Color get textSelectionBg =>
       Color.alphaBlend(accent.withValues(alpha: 0.30), background);
 
+  /// 淡蓝档(20%):比 [treeSelectedBg] 实一档、比 [textSelectionBg] 淡一档。
+  ///
+  /// 给「同一屏里要同时出现三种选中强度」的场合用 —— 表设计器的焦点列表头与
+  /// 行首当前行槽都是这一档(参考工具实测 #CCE4F6,即 #0078D4 按 20% 压白),
+  /// 再淡就成了「看不出哪一列是当前列」。
+  Color get accentSoftBg =>
+      Color.alphaBlend(accent.withValues(alpha: 0.20), background);
+
   /// 拷贝并覆盖指定字段,用于主题定制时逐项修改。
   AppPalette copyWith({
     Color? background,
@@ -441,6 +449,9 @@ class AppTheme {
   /// 历史坑:0.5 及更早版本用 `#F3F3F3` 做铬件、`#E7E7E7` 做状态栏、
   /// `#E0E0E0` 做分割线,同一屏里叠了 5 档互不相同的灰,整窗观感发灰发脏。
   /// 调整时请保持"层级数少、档位浅"这两条,不要为单个组件单独加深。
+  ///
+  /// 强调色取 Windows 桌面蓝 `#0078D4`(参考工具实测的选中底色),
+  /// [highlight] 取同族更亮一档的 `#4DA0E1`(实测的 2px 强调条 / 焦点列下划线)。
   static const light = AppPalette(
     background: Color(0xffffffff),
     surface: Color(0xfff8f8f8),
@@ -452,8 +463,8 @@ class AppTheme {
     mutedForeground: Color(0xff5f6368),
     disabledForeground: Color(0xff9aa0a6),
     accentForeground: Color(0xffffffff),
-    accent: Color(0xff2196F3),
-    highlight: Color(0xff42A5F5),
+    accent: Color(0xff0078D4),
+    highlight: Color(0xff4DA0E1),
     border: Color(0xffe7e7e7),
     divider: Color(0xffefefef),
     gridLine: Color(0xffefefef),
@@ -485,12 +496,62 @@ class AppTheme {
     muted: Color(0xfff3f3f3),
   );
 
+  /// 明亮主题的历史默认值(0.6 ~ 0.8.1 的「纸白」那一版)。
+  ///
+  /// 不参与任何渲染,只给 [isBuiltInDefault] 做判定用:这一版内置的强调色还是
+  /// `#2196F3`,而 0.9 起内置改成桌面蓝 `#0078D4`;老用户若在主题弹窗里点过
+  /// "应用"(哪怕什么都没改),不识别出这份"伪定制"就永远看不到新强调色。
+  static const lightLegacy08 = AppPalette(
+    background: Color(0xffffffff),
+    surface: Color(0xfff8f8f8),
+    control: Color(0xfff8f8f8),
+    secondary: Color(0xfff1f1f1),
+    statusBar: Color(0xfff4f4f4),
+    popover: Color(0xffffffff),
+    foreground: Color(0xff1f1f1f),
+    mutedForeground: Color(0xff5f6368),
+    disabledForeground: Color(0xff9aa0a6),
+    accentForeground: Color(0xffffffff),
+    accent: Color(0xff2196F3),
+    highlight: Color(0xff42A5F5),
+    border: Color(0xffe7e7e7),
+    divider: Color(0xffefefef),
+    gridLine: Color(0xffefefef),
+    muted: Color(0xfff4f4f4),
+  );
+
+  /// 暗黑主题的历史默认值(0.8.1 及更早,自 0.5 起一直没动过,直到强调色改档)。
+  ///
+  /// 同 [lightLegacy08]:只用于识别"伪定制",不参与渲染。
+  static const darkLegacy08 = AppPalette(
+    background: Color(0xff252526),
+    surface: Color(0xff383838),
+    control: Color(0xff383838),
+    secondary: Color(0xff2d2d2d),
+    statusBar: Color(0xff303030),
+    popover: Color(0xff2d2d2d),
+    foreground: Color(0xffc8cdd4),
+    mutedForeground: Color(0xff9aa0a6),
+    disabledForeground: Color(0xff6f7479),
+    accentForeground: Color(0xffffffff),
+    accent: Color(0xff2196F3),
+    highlight: Color(0xff42A5F5),
+    border: Color(0xff3c3c3c),
+    divider: Color(0xff4a4a4a),
+    gridLine: Color(0xff3c3c3c),
+    muted: Color(0xff2a2a2a),
+  );
+
   /// [p] 是否就是某一版内置默认色板(当前版或历史版)。
   ///
   /// 命中的含义是"用户其实没定制过",加载时应丢弃、跟随 [light] / [dark]
   /// 的内置值,否则内置配色升级将不会生效。
   static bool isBuiltInDefault(AppPalette p) =>
-      p == light || p == dark || p == lightLegacy;
+      p == light ||
+      p == dark ||
+      p == lightLegacy ||
+      p == lightLegacy08 ||
+      p == darkLegacy08;
 
   /// 暗黑主题:沿用原版深色配色,与设计稿一致
   static const dark = AppPalette(
@@ -506,8 +567,8 @@ class AppTheme {
     mutedForeground: Color(0xff9aa0a6),
     disabledForeground: Color(0xff6f7479),
     accentForeground: Color(0xffffffff),
-    accent: Color(0xff2196F3),
-    highlight: Color(0xff42A5F5),
+    accent: Color(0xff0078D4),
+    highlight: Color(0xff4DA0E1),
     // 边框色需比背景(background 0xff252526)亮,否则暗色下控件边框不可见
     border: Color(0xff3c3c3c),
     divider: Color(0xff4a4a4a),

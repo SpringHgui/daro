@@ -834,7 +834,78 @@ Future<DesignTable?> mysqlReadTableDesign(MySQLConnection conn,
   );
   if (tabRs.rows.isNotEmpty) design.tableComment = tabRs.rows.first.colAt(0) ?? '';
 
+  // ── 触发器 ─────────────────────────────────────────────────
+  // `information_schema.TRIGGERS` 一个触发器一行,ACTION_TIMING /
+  // EVENT_MANIPULATION / ACTION_STATEMENT / ACTION_ORDER 全都现成,
+  // 不需要像 PG 那样反解析 DDL。
+  //
+  // 主体形态:MySQL 存在库里的是 `BEGIN … END` 包裹后的完整过程体,而设计器的
+  // [DesignTrigger.body] 存的是**不带包裹的语句**(生成时恒用 BEGIN…END 包,
+  // 见 DdlBuilder._mysqlTriggerSql)。所以这里要去掉外层包裹还原成裸语句,
+  // 否则「读回来 → 原样保存」会变成 `BEGIN BEGIN … END; END;` 双层嵌套。
+  try {
+    final trgRs = await conn.execute(
+      'SELECT TRIGGER_NAME, ACTION_TIMING, EVENT_MANIPULATION, '
+      'ACTION_STATEMENT, ACTION_ORIENTATION '
+      'FROM information_schema.TRIGGERS '
+      'WHERE EVENT_OBJECT_SCHEMA = $db AND EVENT_OBJECT_TABLE = $tbl '
+      'ORDER BY TRIGGER_NAME',
+    );
+    for (final row in trgRs.rows) {
+      final name = row.colAt(0) ?? '';
+      final event = (row.colAt(2) ?? '').toUpperCase();
+      if (name.isEmpty || event.isEmpty) continue;
+      design.triggers.add(DesignTrigger(
+        name: name,
+        // MySQL 只有行级触发器,ACTION_ORIENTATION 恒为 ROW;设计器的
+        // 「给每个」候选在该方言下也只有「行」,写死即可
+        forEach: '行',
+        timing: (row.colAt(1) ?? 'BEFORE').toUpperCase(),
+        insert: event == 'INSERT',
+        update: event == 'UPDATE',
+        delete: event == 'DELETE',
+        body: stripMysqlTriggerBeginEnd(row.colAt(3) ?? ''),
+      ));
+    }
+  } catch (_) {
+    // 触发器读不到(权限 / 旧版服务端无该视图):不预填即可,界面仍可手工新增。
+    // 与表注释之外的附加信息同一取舍:不牵连整次反查。
+  }
   return design;
+}
+
+/// 去掉 MySQL 触发器主体的 `BEGIN … END` 外壳,还原成设计器里存的裸语句。
+///
+/// 服务端把 `CREATE TRIGGER … BEGIN <body>; END` 整体存进 `ACTION_STATEMENT`
+/// (含外层 BEGIN/END),而设计器只在最外层包一次。不做这层还原的话:
+/// 「反查 → 原样保存」会生成 `BEGIN BEGIN … END; END;`,再存进去又叠一层。
+///
+/// 只在**最外层**确实是 BEGIN…END 时剥壳;单语句 / 已带 IF…END IF 这类
+/// 内层结构的主体原样返回。缩进按生成器写回的 `\n  ` 反推,尽量保持幂等。
+String stripMysqlTriggerBeginEnd(String raw) {
+  var s = raw.trim();
+  if (s.isEmpty) return s;
+  // 去掉整体末尾分号(服务端通常不带,手工建的库可能带)
+  while (s.endsWith(';')) {
+    s = s.substring(0, s.length - 1).trimRight();
+  }
+  final upper = s.toUpperCase();
+  if (!upper.startsWith('BEGIN')) return s;
+  // BEGIN 之后必须是语句边界(空格 / 换行),排除 `BEGINNING` 之类的误判
+  if (s.length > 5 && !RegExp(r'[\s]').hasMatch(s[5])) return s;
+  if (!upper.endsWith('END')) return s;
+  // `END IF` / `END WHILE` / `END LOOP` / `END CASE` 结尾的不是最外层包裹
+  if (RegExp(r'END\s+(IF|WHILE|LOOP|CASE|REPEAT)\s*$', caseSensitive: false)
+      .hasMatch(upper)) {
+    return s;
+  }
+  final inner = s.substring(5, s.length - 3).trim();
+  // 内层末尾分号同样剥掉:生成器写回时会补
+  var body = inner;
+  while (body.endsWith(';')) {
+    body = body.substring(0, body.length - 1).trimRight();
+  }
+  return body;
 }
 
 /// [parseMysqlKeyColumnUsage] 的归组结果。

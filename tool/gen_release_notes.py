@@ -9,8 +9,9 @@ GitHub 自带的 `generate_release_notes` 只统计「经由 PR 合入的变更�
 空无一物（见 0.3.1 Draft）。
 
 本脚本改为以 git 提交为唯一准绳：
-  1. 正文开头先给一张「平台 × 安装包/绿色版」的下载表格（链接直指本 Release 的
-     asset，文件名由版本号拼出，见 DOWNLOAD_PLATFORMS）；
+  1. 正文开头先给一张下载表格：一个产物一行，链接文字即**源文件名**、直指本
+     Release 的 asset（文件名由版本号拼出，见 DOWNLOAD_PLATFORMS）；CI 侧还会
+     把体积与 SHA256 并进同一张表的右侧两列，省得另起一张表；
   2. 取上一个 tag → 当前 tag 的全部提交（默认排除 merge commit）；
   3. 按 Conventional Commits 前缀（feat/fix/chore…）归类成分节；
   4. 逐个提交反查 GitHub API，把它归属的 PR 编号 / 标题 / 作者补进来；
@@ -85,26 +86,34 @@ OTHER_HEADING = "📌 其它变更"
 #      installer/linux/package_linux.sh        → -linux-amd64.deb / -linux-x64.tar.xz
 #    改产物名时这里必须同步，否则 Release 里的链接会 404。
 #    release.yml 的「校验正文里的下载链接」步骤会拿实际 artifacts 逐个比对兜底。
-DOWNLOAD_COLUMNS = ("平台", "架构", "安装包", "便携 / 免安装")
+#
+# 一个产物一行：链接文字直接用**源文件名**（下载下来存的就是这个名，省得用户
+# 对着「EXE」猜自己拿到的是什么），"安装包 / 便携" 的区分挪到「类型」列。
+# 体积与 SHA256 不再另起一张表，而是作为右侧两列并进同一张表 —— 校验和贴着
+# 文件名看，复制起来也顺手（见 DOWNLOAD_STAT_COLUMNS）。
+DOWNLOAD_COLUMNS = ("平台", "架构", "类型", "文件")
+
+# 有 artifacts 时追加的两列；仅本地预览（无产物可比对）时省略
+DOWNLOAD_STAT_COLUMNS = ("大小", "SHA256")
 
 DOWNLOAD_PLATFORMS = [
     (
         "Windows",
         "x64 (64-bit)",
-        ("EXE", "daro-{ver}-windows-x64.exe"),
-        ("ZIP", "daro-{ver}-windows-x64-portable.zip"),
+        ("安装包", "daro-{ver}-windows-x64.exe"),
+        ("便携 / 免安装", "daro-{ver}-windows-x64-portable.zip"),
     ),
     (
         "macOS",
         "universal (x64 + arm64)",
-        ("DMG", "daro-{ver}-macos-universal.dmg"),
-        ("ZIP", "daro-{ver}-macos-universal.zip"),
+        ("安装包", "daro-{ver}-macos-universal.dmg"),
+        ("便携 / 免安装", "daro-{ver}-macos-universal.zip"),
     ),
     (
         "Linux",
         "x64 (amd64)",
-        ("DEB", "daro-{ver}-linux-amd64.deb"),
-        ("TAR.XZ", "daro-{ver}-linux-x64.tar.xz"),
+        ("安装包", "daro-{ver}-linux-amd64.deb"),
+        ("便携 / 免安装", "daro-{ver}-linux-x64.tar.xz"),
     ),
 ]
 
@@ -345,64 +354,52 @@ def _artifact_stats(filename: str, artifacts_dir: str) -> Tuple[str, str]:
         return ("—", "—")
 
 
-def _join2(a: str, b: str) -> str:
-    return "<br>".join(x for x in (a, b) if x and x != "—") or "—"
-
-
 def render_downloads(
     version: str, tag: str, repo: str, artifacts_dir: str = ""
 ) -> List[str]:
-    """渲染「各平台安装包」表格 + 校验和表 + 源码表。
+    """渲染「各平台安装包」表格 + 源码表。
 
-    - repo 为空时退化为纯文件名（不带链接）；
-    - artifacts_dir 存在且有文件时，主表加「大小」列，并额外渲染一张完整 SHA256 表；
-      本地预览（无 artifacts）则省略这两块，只给链接。
+    一个产物一行，四列固定（平台 / 架构 / 类型 / 文件）：
+    - 链接文字就是**源文件名**——用户下载后落盘的就是这个名字，
+      不必对着「EXE」「ZIP」这种缩写猜；
+    - 类型列承担「安装包 vs 便携 / 免安装」的区分。
+
+    artifacts_dir 存在时，右侧再并进「大小」「SHA256」两列（见 DOWNLOAD_STAT_COLUMNS）：
+    校验和紧贴文件名，既好看好复制，也省掉正文末尾再重复一遍文件名的第二张表。
+    本地预览（无 artifacts）退化为四列；repo 为空时文件名退化成行内代码。
     """
 
-    def cell(label: str, filename: str) -> str:
+    def cell(filename: str) -> str:
+        """链接文字 = 源文件名；无 repo 时退化成行内代码。"""
         name = filename.format(ver=version)
         if not repo:
             return "`{}`".format(name)
         url = "https://github.com/{}/releases/download/{}/{}".format(repo, tag, name)
-        if artifacts_dir and os.path.isdir(artifacts_dir):
-            size, _sha = _artifact_stats(name, artifacts_dir)
-            suffix = "<br><sub>{}</sub>".format(size) if size != "—" else ""
-            return "[{}]({}){}".format(label, url, suffix)
-        return "[{}]({})".format(label, url)
+        return "[{}]({})".format(name, url)
 
     has_artifacts = bool(artifacts_dir) and os.path.isdir(artifacts_dir)
 
     columns = list(DOWNLOAD_COLUMNS)
     if has_artifacts:
-        columns = columns + ["大小"]
+        columns += list(DOWNLOAD_STAT_COLUMNS)
 
     lines = ["### 📦 下载", ""]
     lines.append("| " + " | ".join(columns) + " |")
     lines.append("|" + "---|" * len(columns))
     for platform, arch, installer, portable in DOWNLOAD_PLATFORMS:
-        row = [platform, arch, cell(*installer), cell(*portable)]
-        if has_artifacts:
-            s1, _ = _artifact_stats(installer[1].format(ver=version), artifacts_dir)
-            s2, _ = _artifact_stats(portable[1].format(ver=version), artifacts_dir)
-            row.append(_join2(s1, s2))
-        lines.append("| " + " | ".join(row) + " |")
+        for kind, fname in (installer, portable):
+            name = fname.format(ver=version)
+            row = [platform, arch, kind, cell(fname)]
+            if has_artifacts:
+                size, sha = _artifact_stats(name, artifacts_dir)
+                row.append(size if size != "—" else "")
+                row.append("`{}`".format(sha) if sha != "—" else "")
+            lines.append("| " + " | ".join(row) + " |")
     lines.append("")
     for note in DOWNLOAD_NOTES:
         lines.append("> - " + note)
     lines.append("> - " + MSIX_NOTE)
     lines.append("")
-
-    if has_artifacts:
-        lines.append("### 🔐 校验和 (SHA256)")
-        lines.append("")
-        lines.append("| 文件 | SHA256 |")
-        lines.append("|---|---|")
-        for _platform, _arch, installer, portable in DOWNLOAD_PLATFORMS:
-            for _label, fname in (installer, portable):
-                name = fname.format(ver=version)
-                _size, sha = _artifact_stats(name, artifacts_dir)
-                lines.append("| `{}` | `{}` |".format(name, sha if sha != "—" else ""))
-        lines.append("")
 
     # 源码归档：GitHub 自动生成，永远可用，单独成表（链接走 archive/refs/tags/）。
     if repo:
@@ -544,8 +541,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument(
         "--artifacts-dir",
         default="artifacts",
-        help="产物目录（CI 下载 artifacts 后传入），用于填充「大小」列与 SHA256 表；"
-        "目录不存在时这两块自动省略（本地预览常见）",
+        help="产物目录（CI 下载 artifacts 后传入），用于填表格里的「大小」「SHA256」两列；"
+        "目录不存在时退化为 4 列（本地预览常见）",
     )
     return p.parse_args(argv)
 

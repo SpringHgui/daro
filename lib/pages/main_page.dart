@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:base_ui_flutter/base_ui_flutter.dart' show Splitter;
 import '../app/app_state.dart';
+import '../data/routine_sql.dart';
 import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
 import '../widgets/top_menu.dart';
@@ -19,6 +20,7 @@ import '../widgets/table_designer_page.dart';
 import '../widgets/routine_design_page.dart';
 import '../widgets/user_design_page.dart';
 import '../widgets/view_design_page.dart';
+import '../widgets/matview_design_page.dart';
 
 class MainPage extends StatefulWidget {
   const MainPage({super.key});
@@ -104,9 +106,21 @@ class _MainPageState extends State<MainPage> {
                                       );
                                     }
                                     // 例程(过程 / 函数 / 视图)设计页
+                                    if (category ==
+                                        ObjectCategory.materializedView) {
+                                      // 实体化视图设计页(定义 / 索引 / 高级 / 注释 / SQL 预览)。
+                                      // 与视图不同:保存是 DROP + CREATE 重建,故单独成页
+                                      return MatViewDesignPage(
+                                        name: name,
+                                        connection: tab.connection!,
+                                        database: tab.database!,
+                                        schema: tab.schema,
+                                        isNew: isNew,
+                                        comment: tab.routineComment ?? '',
+                                      );
+                                    }
                                     if (category == ObjectCategory.view) {
                                       // 视图设计页(Navicat 风格:定义 / 规则 / 高级 / 注释 / SQL 预览)
-                                      // 实体化视图不走此页:驱动无定义可读,且保存会误 DROP/CREATE
                                       return ViewDesignPage(
                                         name: name,
                                         connection: tab.connection!,
@@ -125,6 +139,10 @@ class _MainPageState extends State<MainPage> {
                                       schema: tab.schema,
                                       isNew: isNew,
                                       params: tab.routineParams ?? '',
+                                      options:
+                                          tab.routineOptions ??
+                                          const RoutineOptions(),
+                                      returnType: tab.routineReturnType ?? '',
                                       comment: tab.routineComment ?? '',
                                     );
                                   }
