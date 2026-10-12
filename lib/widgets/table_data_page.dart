@@ -109,7 +109,7 @@ enum _ToolPanel {
 
 final _numericTypeRe = RegExp(
     r'\b(int|integer|bigint|smallint|tinyint|mediumint|serial|decimal|'
-    r'numeric|float|double|real|money|smallmoney|number|fixed|bool)\w*\b');
+    r'numeric|float|double|real|money|smallmoney|number|fixed|bool|bit)\w*\b');
 final _textTypeRe = RegExp(
     r'\b(char|varchar|nchar|nvarchar|character|text|tinytext|mediumtext|'
     r'longtext|ntext|citext|clob|enum|set|string|uuid)\w*\b');
@@ -401,6 +401,11 @@ class _TableDataPageState extends State<TableDataPage> {
   /// 纵向供 DataGridView 内部 ListView 浏览多行;二者各挂一条可见 ScrollBar
   final ScrollController _hScrollController = ScrollController();
   final ScrollController _vScrollController = ScrollController();
+
+  /// 横向滚动视口宽(逻辑像素),由 [ScrollMetricsNotification] 维护:
+  /// 窗口最大化 / 拖动分隔条只改布局、不触发本 State 重建,build 里现读
+  /// `position.viewportDimension` 拿到的仍是旧宽度。
+  double? _hViewportWidth;
 
   @override
   void initState() {
@@ -3447,12 +3452,10 @@ class _TableDataPageState extends State<TableDataPage> {
       verticalScrollController: _vScrollController,
       // 横向虚拟化:把外层横向滚动控制器 + 视口宽交给网格,数据行只渲染与
       // 视口相交的列,把勾选列 / 选择 / 缩放的重建量从「可见行 × 全部列」降到
-      // 「可见行 × 视口内列」。首帧横向滚动尚未布局(viewportDimension 不可得)
-      // 时传 null → 整行渲染,之后每次重建都走虚拟化。
+      // 「可见行 × 视口内列」。首帧视口宽尚未布局出来时传 null → 整行渲染,
+      // 随后由 ScrollMetricsNotification 补上宽度(见下方监听)。
       horizontalScrollController: _hScrollController,
-      horizontalViewportWidth: _hScrollController.hasClients
-          ? _hScrollController.position.viewportDimension
-          : null,
+      horizontalViewportWidth: _hViewportWidth,
       // 网格行号即当前页内行号
       onRowSelected: _selectRow,
       // 传入 onCellsSelected 即开启框选模式:按下只选中(含框选 / Ctrl / Shift),
@@ -3515,23 +3518,36 @@ class _TableDataPageState extends State<TableDataPage> {
     // scrollbars:false 关掉桌面端为每个 Scrollable 自动补的隐式条,只留这两条。
     return ScrollConfiguration(
       behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
-      child: ScrollBar(
-        controller: _vScrollController,
-        thumbVisibility: true,
-        // 纵向条在横向滚动区外面,内层 ListView 的通知到这儿 depth==1,
-        // Material 默认的 depth==0 过滤会把它整条拒掉(纵向条消失的根因),改按轴过滤。
-        notificationPredicate: (n) => n.metrics.axis == Axis.vertical,
+      // 视口宽只能从这里拿:窗口最大化、拖动分隔条都只走布局,不会让本 State
+      // 重建,而虚拟化的列窗口是 build 时按视口宽算的 —— 不补这一刀,放大后
+      // 右侧列会一直留白(表头整行渲染,于是表现成「表头有列、数据是空的」)。
+      // 通知只当触发器用,宽度一律回自己的控制器读:就地编辑器的 TextField
+      // 等内层横向滚动区的通知同样会冒泡到这里,拿通知里的值会串台。
+      child: NotificationListener<ScrollMetricsNotification>(
+        onNotification: (_) {
+          if (!_hScrollController.hasClients) return false;
+          final w = _hScrollController.position.viewportDimension;
+          if (w != _hViewportWidth) setState(() => _hViewportWidth = w);
+          return false;
+        },
         child: ScrollBar(
-          controller: _hScrollController,
-          orientation: ScrollBarOrientation.horizontal,
+          controller: _vScrollController,
           thumbVisibility: true,
-          child: SingleChildScrollView(
+          // 纵向条在横向滚动区外面,内层 ListView 的通知到这儿 depth==1,
+          // Material 默认的 depth==0 过滤会把它整条拒掉(纵向条消失的根因),改按轴过滤。
+          notificationPredicate: (n) => n.metrics.axis == Axis.vertical,
+          child: ScrollBar(
             controller: _hScrollController,
-            scrollDirection: Axis.horizontal,
-            child: SizedBox(
-              width: _numberColWidth +
-                  gridWidths.fold<double>(0, (a, b) => a + b),
-              child: grid,
+            orientation: ScrollBarOrientation.horizontal,
+            thumbVisibility: true,
+            child: SingleChildScrollView(
+              controller: _hScrollController,
+              scrollDirection: Axis.horizontal,
+              child: SizedBox(
+                width: _numberColWidth +
+                    gridWidths.fold<double>(0, (a, b) => a + b),
+                child: grid,
+              ),
             ),
           ),
         ),

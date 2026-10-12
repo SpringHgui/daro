@@ -125,6 +125,24 @@ void main() {
     });
   });
 
+  group('窗口变宽', () {
+    testWidgets('最大化后右侧列要跟着显形,不能留白', (tester) async {
+      await _pumpPage(tester, _driver(_tallPage()));
+      addTearDown(tester.view.reset);
+
+      expect(find.text('r0-c11'), findsNothing, reason: '前提:800 宽时末列在视口外');
+
+      // 整窗内容宽 1822,放大到 2400 逻辑像素后全部列都该可见
+      tester.view.devicePixelRatio = 1.0;
+      tester.view.physicalSize = const Size(2400, 600);
+      await _settle(tester);
+
+      expect(find.text('r0-c11'), findsOneWidget,
+          reason: '视口变宽只走布局不触发重建,横向虚拟化的列窗口没跟上,'
+              '右侧列一直空白(表头却是整行渲染的)');
+    });
+  });
+
   group('新增行', () {
     testWidgets('自动滚到新行,选中箭头落在可视区内', (tester) async {
       await _pumpPage(tester, _driver(_tallPage()));
