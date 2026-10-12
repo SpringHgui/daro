@@ -12,6 +12,8 @@ void main() {
         'decimal(10,2)',
         'double precision',
         'tinyint(1)',
+        'bit(1)',
+        'bit(8)',
         'serial',
       ]) {
         expect(columnTypeMarker(t).glyph, '#', reason: t);

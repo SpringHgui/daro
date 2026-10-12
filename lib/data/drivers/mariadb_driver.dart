@@ -7,7 +7,10 @@ import '../user_sql.dart';
 import 'db_driver.dart';
 import 'mysql_driver.dart'
     show
+        mysqlBitProjection,
+        mysqlCellText,
         mysqlCollationNames,
+        mysqlIsBitColumn,
         mysqlReadDatabaseDetail,
         mysqlReadTableDesign,
         mysqlReadTableDetail,
@@ -295,14 +298,30 @@ class MariadbDriver implements DatabaseDriver {
     String? where,
     String? orderBy,
   }) async {
-    final conn = await _get();
-    final rs = await conn.execute(
-      'SELECT * FROM ${_quoted(database)}.${_quoted(table)}'
-      '${whereClauseSql(where)}${orderByClauseSql(orderBy)}'
-      ' LIMIT $limit OFFSET $offset',
-    );
+    var conn = await _get();
+    final fromSql = ' FROM ${_quoted(database)}.${_quoted(table)}'
+        '${whereClauseSql(where)}${orderByClauseSql(orderBy)}'
+        ' LIMIT $limit OFFSET $offset';
+    late final IResultSet rs;
+    try {
+      rs = await conn.execute('SELECT *$fromSql');
+    } on FormatException {
+      // 多半是 BIT 列的裸字节在包内 UTF-8 解码时就炸了(见 mysql_driver.dart 的
+      // mysqlBitProjection),只能让服务端改发整数重试一次;取不到投影说明另有原因
+      //
+      // 解码失败时 mysql_client 已把这条连接强关(_forceClose),必须换一条再试,
+      // 顺带忘掉 USE 状态——新会话停在连接的默认库上
+      _currentDatabase = null;
+      conn = await _get();
+      final projection = await mysqlBitProjection(conn, database, table);
+      if (projection == null) rethrow;
+      rs = await conn.execute('SELECT $projection$fromSql');
+    }
 
-    final columns = [for (final col in rs.cols) col.name];
+    final colDefs = rs.cols.toList();
+    final columns = [for (final col in colDefs) col.name];
+    // BIT 列的原始值是裸字节,见 mysql_driver.dart 的 mysqlBitAsInt
+    final isBit = [for (final col in colDefs) mysqlIsBitColumn(col)];
     final rows = <List<String>>[];
     // nullMask 记录每格的原始 null 判定:展示层里真 NULL 与字符串 "NULL"
     // 都是 "NULL",导出 / 导入必须靠它区分
@@ -312,7 +331,7 @@ class MariadbDriver implements DatabaseDriver {
       final nulls = <bool>[];
       for (var i = 0; i < columns.length; i++) {
         final v = row.colAt(i);
-        cells.add(v ?? 'NULL');
+        cells.add(mysqlCellText(v, isBit[i]));
         nulls.add(v == null);
       }
       rows.add(cells);
@@ -357,7 +376,8 @@ class MariadbDriver implements DatabaseDriver {
     final capped = capSelectSql(sql, maxRows: limit + 1, offset: offset);
     final rs = await conn.execute(capped ?? sql);
 
-    final columns = [for (final col in rs.cols) col.name];
+    final colDefs = rs.cols.toList();
+    final columns = [for (final col in colDefs) col.name];
     if (columns.isEmpty) {
       // 写操作:无结果集,返回受影响行数
       return QueryResult(
@@ -369,11 +389,14 @@ class MariadbDriver implements DatabaseDriver {
       );
     }
 
+    // BIT 列的原始值是裸字节,见 mysql_driver.dart 的 mysqlBitAsInt
+    final isBit = [for (final col in colDefs) mysqlIsBitColumn(col)];
     final rows = <List<String>>[];
     for (final row in rs.rows) {
       if (rows.length >= limit) break;
       rows.add([
-        for (var i = 0; i < columns.length; i++) row.colAt(i) ?? 'NULL',
+        for (var i = 0; i < columns.length; i++)
+          mysqlCellText(row.colAt(i), isBit[i]),
       ]);
     }
     return QueryResult(

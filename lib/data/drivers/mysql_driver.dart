@@ -376,24 +376,40 @@ class MysqlDriver implements DatabaseDriver {
     String? where,
     String? orderBy,
   }) async {
-    final conn = await _get();
-    final rs = await conn.execute(
-      'SELECT * FROM ${_quoted(database)}.${_quoted(table)}'
-      '${whereClauseSql(where)}${orderByClauseSql(orderBy)}'
-      ' LIMIT $limit OFFSET $offset',
-    );
+    var conn = await _get();
+    final fromSql = ' FROM ${_quoted(database)}.${_quoted(table)}'
+        '${whereClauseSql(where)}${orderByClauseSql(orderBy)}'
+        ' LIMIT $limit OFFSET $offset';
+    late final IResultSet rs;
+    try {
+      rs = await conn.execute('SELECT *$fromSql');
+    } on FormatException {
+      // 多半是 BIT 列的裸字节在包内 UTF-8 解码时就炸了(见 [mysqlBitProjection]),
+      // 只能让服务端改发整数重试一次;取不到投影说明另有原因,原样抛出
+      //
+      // 解码失败时 mysql_client 已把这条连接强关(_forceClose),必须换一条再试,
+      // 顺带忘掉 USE 状态——新会话停在连接的默认库上
+      _currentDatabase = null;
+      conn = await _get();
+      final projection = await mysqlBitProjection(conn, database, table);
+      if (projection == null) rethrow;
+      rs = await conn.execute('SELECT $projection$fromSql');
+    }
 
-    final columns = [for (final col in rs.cols) col.name];
-    final rows = <List<String>>[];
+    final colDefs = rs.cols.toList();
+    final columns = [for (final col in colDefs) col.name];
+    // BIT 列的原始值是裸字节,见 [mysqlBitAsInt]
+    final isBit = [for (final col in colDefs) mysqlIsBitColumn(col)];
     // nullMask 记录每格的原始 null 判定:展示层里真 NULL 与字符串 "NULL"
     // 都是 "NULL",导出 / 导入必须靠它区分
     final nullMask = <List<bool>>[];
+    final rows = <List<String>>[];
     for (final row in rs.rows) {
       final cells = <String>[];
       final nulls = <bool>[];
       for (var i = 0; i < columns.length; i++) {
         final v = row.colAt(i);
-        cells.add(v ?? 'NULL');
+        cells.add(mysqlCellText(v, isBit[i]));
         nulls.add(v == null);
       }
       rows.add(cells);
@@ -438,7 +454,8 @@ class MysqlDriver implements DatabaseDriver {
     final capped = capSelectSql(sql, maxRows: limit + 1, offset: offset);
     final rs = await conn.execute(capped ?? sql);
 
-    final columns = [for (final col in rs.cols) col.name];
+    final colDefs = rs.cols.toList();
+    final columns = [for (final col in colDefs) col.name];
     if (columns.isEmpty) {
       // 写操作:无结果集,返回受影响行数
       return QueryResult(
@@ -450,11 +467,14 @@ class MysqlDriver implements DatabaseDriver {
       );
     }
 
+    // BIT 列的原始值是裸字节,见 [mysqlBitAsInt]
+    final isBit = [for (final col in colDefs) mysqlIsBitColumn(col)];
     final rows = <List<String>>[];
     for (final row in rs.rows) {
       if (rows.length >= limit) break;
       rows.add([
-        for (var i = 0; i < columns.length; i++) row.colAt(i) ?? 'NULL',
+        for (var i = 0; i < columns.length; i++)
+          mysqlCellText(row.colAt(i), isBit[i]),
       ]);
     }
     return QueryResult(
@@ -548,6 +568,83 @@ class MysqlDriver implements DatabaseDriver {
     if (idx < 0) return null;
     return row.colAt(idx);
   }
+}
+
+/// `MYSQL_TYPE_BIT`(协议常量 0x10),见 [mysqlIsBitColumn]。
+const int kMysqlTypeBit = 0x10;
+
+/// 该结果集列是否为 `BIT` 类型。
+bool mysqlIsBitColumn(ResultSetColumn col) => col.type.intVal == kMysqlTypeBit;
+
+/// 把 `BIT` 列的原始报文值(按列宽度大端打包的裸字节)转成十进制整数字符串。
+///
+/// 为什么必须转:`mysql_client` 把 bit 归进 String 族、对文本协议的字段一律按
+/// UTF-8 解码(`mysql_protocol/mysql_column_type.dart`),于是 `bit(1)` 的 0 / 1
+/// 变成 `\u0000` / `\u0001` 两个不可打印字符,表格里渲染成豆腐块、复制出来是乱码。
+/// 解码后的每个码元恰好等于原字节(0x00–0x7F 单字节区),按大端折回去就与
+/// `CAST(col AS UNSIGNED)` 同值。
+///
+/// 已知边界:字节 ≥ 0x80 时(如 `bit(8)` 存 128–255)在包内 UTF-8 解码阶段就抛
+/// `FormatException`,值到不了这里——那条只能靠 [mysqlBitProjection] 换服务端编码。
+String mysqlBitAsInt(String raw) {
+  if (raw.isEmpty) return raw;
+  var value = BigInt.zero;
+  for (final byte in raw.codeUnits) {
+    value = (value << 8) | BigInt.from(byte & 0xff);
+  }
+  return '$value';
+}
+
+/// 单元格文本:`BIT` 列把原始字节换成整数,其余列原样返回。
+///
+/// null 先归一成 `NULL` 再返回——真 NULL 绝不能喂给 [mysqlBitAsInt],
+/// 否则字符串 `'NULL'` 的四个码元会被折成 `1296247884`。
+String mysqlCellText(String? raw, bool isBit) {
+  if (raw == null) return 'NULL';
+  return isBit ? mysqlBitAsInt(raw) : raw;
+}
+
+/// 由「列名 + DATA_TYPE」清单生成把 `BIT` 换成整数的 SELECT 投影;
+/// 清单里没有 `BIT` 列时返回 null(调用方据此保持 `SELECT *`)。
+///
+/// 为什么需要投影:服务端把 `BIT` 按裸字节发,而 mysql_client 对文本协议字段
+/// 一律按 UTF-8 解码——含 ≥ 0x80 的字节(如 `bit(8)` 存 128–255)直接抛
+/// `FormatException`,整条查询失败,[mysqlBitAsInt] 那样的事后转换根本拿不到值。
+/// 唯一出路是让服务端别发裸字节:`CAST(col AS UNSIGNED)`。
+///
+/// 纯函数,便于离线回归。
+@visibleForTesting
+String? mysqlBitProjectionOf(List<({String name, String type})> cols) {
+  bool isBit(({String name, String type}) c) => c.type == 'bit';
+  if (!cols.any(isBit)) return null;
+  String quote(String id) => '`${id.replaceAll('`', '``')}`';
+  return [
+    for (final c in cols)
+      if (isBit(c))
+        'CAST(${quote(c.name)} AS UNSIGNED) AS ${quote(c.name)}'
+      else
+        quote(c.name),
+  ].join(', ');
+}
+
+/// 读表(或视图)的列清单并生成安全投影,见 [mysqlBitProjectionOf]。
+///
+/// 只在 `SELECT *` 已经抛 FormatException 之后调用,正常表不付这次元数据查询的代价。
+/// 已知边界:列清单来自 `information_schema.COLUMNS`,MySQL 8.0.23+ 的 INVISIBLE 列
+/// 也在其中而 `SELECT *` 不返回它们——同时有 BIT 列和隐藏列的表会多出一列,
+/// 这类表极罕见,不值得为它探测服务端版本。
+Future<String?> mysqlBitProjection(
+    MySQLConnection conn, String database, String table) async {
+  String lit(String v) => "'${v.replaceAll("'", "''")}'";
+  final rs = await conn.execute(
+    'SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS '
+    'WHERE TABLE_SCHEMA = ${lit(database)} AND TABLE_NAME = ${lit(table)} '
+    'ORDER BY ORDINAL_POSITION',
+  );
+  return mysqlBitProjectionOf([
+    for (final row in rs.rows)
+      (name: row.colAt(0) ?? '', type: (row.colAt(1) ?? '').toLowerCase()),
+  ]);
 }
 
 /// MySQL / MariaDB 共用的库级详情(`information_schema.SCHEMATA`)。
