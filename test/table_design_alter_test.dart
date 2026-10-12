@@ -253,11 +253,13 @@ void main() {
       t.uniqueKeys.first.comment = '名字唯一';
       t.checks.first.comment = '名非空';
       t.excludes.first.comment = '排重';
+      // 排除约束的注释由「排除约束」那一段自己补(它可能整条重建,注释要跟着走),
+      // 故排在索引 / 唯一键 / 检查之前——后面那段是纯注释变更的共用出口
       expect(DdlBuilder.buildAlterStatements(t, original, pg), [
+        'COMMENT ON CONSTRAINT "ex_name" ON "public"."t" IS \'排重\';',
         'COMMENT ON INDEX "public"."idx_name" IS \'名字索引\';',
         'COMMENT ON CONSTRAINT "uq_name" ON "public"."t" IS \'名字唯一\';',
         'COMMENT ON CONSTRAINT "ck_name" ON "public"."t" IS \'名非空\';',
-        'COMMENT ON CONSTRAINT "ex_name" ON "public"."t" IS \'排重\';',
       ]);
     });
 
@@ -482,33 +484,61 @@ void main() {
       );
     });
 
-    test('触发器 / 规则 / 排除约束', () {
+    test('触发器三方言放行;规则 / 排除约束仅 PG 放行', () {
+      // 触发器是「整条重建」(DROP + CREATE,见 buildAlterStatements 3b),
+      // 三方言都有语法且驱动能反查回基线 → 不该再拦
       final original = base()..triggers.add(DesignTrigger(name: 'trg'));
       final changed = target(original)..triggers.add(DesignTrigger(name: 'trg2'));
+      expect(DdlBuilder.alterUnsupported(changed, original, pg), isNull);
+      final mysqlOriginal = base(schema: null)
+        ..triggers.add(DesignTrigger(name: 'trg'));
       expect(
-        DdlBuilder.alterUnsupported(changed, original, pg),
-        '触发器 / 规则 / 排除约束暂不支持在「设计表」中修改',
+        DdlBuilder.alterUnsupported(
+            target(mysqlOriginal)..triggers.add(DesignTrigger(name: 'trg2')),
+            mysqlOriginal,
+            my),
+        isNull,
       );
-      final rule = target(original)..rules.add(DesignRule(name: 'r1', statement: 'NOTHING'));
+
+      // 规则与排除约束只有 PG 有语法(其余方言连反查都读不回来,基线恒空,
+      // 放过去就是静默丢弃)
+      final rule =
+          target(original)..rules.add(DesignRule(name: 'r1', statement: 'NOTHING'));
+      expect(DdlBuilder.alterUnsupported(rule, original, pg), isNull);
+      final mysqlRule = target(base(schema: null))
+        ..rules.add(DesignRule(name: 'r1', statement: 'NOTHING'));
       expect(
-        DdlBuilder.alterUnsupported(rule, original, pg),
-        '触发器 / 规则 / 排除约束暂不支持在「设计表」中修改',
+        DdlBuilder.alterUnsupported(
+            mysqlRule, base(schema: null), my),
+        '规则 / 排除约束仅 PostgreSQL 支持,当前数据库类型无法修改',
       );
       final ex = target(original)..excludes.add(DesignExclude(columns: 'a WITH ='));
+      expect(DdlBuilder.alterUnsupported(ex, original, pg), isNull);
+      final ssExclude = target(base(schema: null))
+        ..excludes.add(DesignExclude(columns: 'a WITH ='));
       expect(
-        DdlBuilder.alterUnsupported(ex, original, pg),
-        '触发器 / 规则 / 排除约束暂不支持在「设计表」中修改',
+        DdlBuilder.alterUnsupported(
+            ssExclude, base(schema: null), ss),
+        '规则 / 排除约束仅 PostgreSQL 支持,当前数据库类型无法修改',
       );
       // 原样保留(反查后不动)不阻断
       expect(DdlBuilder.alterUnsupported(target(original), original, pg), isNull);
     });
 
-    test('表空间 / 填充因子', () {
+    test('表空间 / 存储参数:PG 生成 ALTER,非 PG 阻断', () {
       final original = base()..tablespace = 'ts_fast';
       final t = target(original)..tablespace = '';
+      // PG 有 ALTER TABLE … SET TABLESPACE(清空即回 pg_default),不再是拦口
+      expect(DdlBuilder.alterUnsupported(t, original, pg), isNull);
+      expect(DdlBuilder.buildAlterStatements(t, original, pg),
+          ['ALTER TABLE "public"."t" SET TABLESPACE "pg_default";']);
+
+      // SQL Server 改填充因子要重建表、MySQL 无表级 reloption → 只能拦
+      final mysqlOriginal = base(schema: null)..tablespace = 'ts_fast';
       expect(
-        DdlBuilder.alterUnsupported(t, original, pg),
-        '表空间 / 填充因子暂不支持在「设计表」中修改',
+        DdlBuilder.alterUnsupported(
+            target(mysqlOriginal)..tablespace = '', mysqlOriginal, my),
+        '表空间 / 存储参数仅 PostgreSQL 支持在「设计表」中修改',
       );
     });
 
