@@ -323,6 +323,7 @@ class AppState extends ChangeNotifier {
   void dispose() {
     // 关掉 MCP 监听 + 丢弃专用驱动实例:热重启与测试收尾都不该留端口占用。
     mcp.dispose();
+    objectSearchController.dispose();
     super.dispose();
   }
 
@@ -726,6 +727,15 @@ class AppState extends ChangeNotifier {
 
   /// 对象面板布局:true = 多列网格(详细布局), false = 单列列表
   bool objectGridLayout = true;
+
+  /// 对象面板工具栏搜索框的输入控制器。状态放在 AppState 而不是面板里:
+  /// 打开一张表会让面板整棵子树销毁,回到「对象」标签时是全新实例;
+  /// 且搜索是全局口径——换连接 / 库 / 分类都沿用同一份过滤词。
+  final TextEditingController objectSearchController = TextEditingController();
+
+  /// [objectSearchController] 内容的规范化副本(小写,供子串匹配)。
+  /// 由面板在 onChanged 里回写并 setState 重画列表,故不再另设通知。
+  String objectSearchText = '';
 
   // ── 对象浏览上下文 ─────────────────────────────
 

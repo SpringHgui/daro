@@ -68,12 +68,6 @@ class _ObjectPanelState extends State<ObjectPanel> {
   int _gridCols = 1;
   int _gridRows = 1;
 
-  /// 工具栏搜索框输入文本(小写),用于过滤当前分类的对象列表
-  String _objectSearchText = '';
-
-  /// 上一次对象浏览上下文键,用于检测切换时重置搜索
-  String _lastContextKey = '';
-
   void _onManagerChanged() {
     if (mounted) setState(() {});
   }
@@ -120,14 +114,6 @@ class _ObjectPanelState extends State<ObjectPanel> {
           Expanded(child: _blank(t)),
         ],
       );
-    }
-
-    // 切换连接 / 库 / 模式 / 分类时重置搜索文本(_ToolbarSearch 通过 Key 重建,
-    // 其内部 controller / 展开态随之清空,与此处重置保持一致)
-    final contextKey = '$connection|$database|$schema|$category';
-    if (contextKey != _lastContextKey) {
-      _lastContextKey = contextKey;
-      _objectSearchText = '';
     }
 
     final app = context.read<AppState>();
@@ -255,9 +241,11 @@ class _ObjectPanelState extends State<ObjectPanel> {
     return ToolStrip(
       tokens: stripTokens,
       trailing: ExpandableSearch(
-        key: ValueKey('$connection|$database|$category'),
+        // 无 Key:过滤词是全局状态,切连接 / 库 / 分类都沿用同一份,
+        // 不能因为上下文变化就把它重建回收起态
+        controller: app.objectSearchController,
         tokens: searchTokens,
-        onChanged: (v) => setState(() => _objectSearchText = v.toLowerCase()),
+        onChanged: (v) => setState(() => app.objectSearchText = v.toLowerCase()),
       ),
       items: [
         // 打开:表 / 视图 / 实体化视图打开数据页;函数 / 过程打开设计页;
@@ -563,8 +551,18 @@ class _ObjectPanelState extends State<ObjectPanel> {
     final canImportExport = category == ObjectCategory.table;
     final newText =
         category == ObjectCategory.query ? l.actionNew(l.catQuery) : l.actionNew(label);
+    final app = context.read<AppState>();
+    final stripTokens = _toolbarTokens(t);
     return ToolStrip(
-      tokens: _toolbarTokens(t),
+      tokens: stripTokens,
+      // 「禁用操作栏」禁的是对当前对象动手的按钮,搜索框照常可编辑:
+      // 换连接时只要没打开库就藏起搜索框,全局过滤词会看着像被清空了
+      trailing: ExpandableSearch(
+        controller: app.objectSearchController,
+        tokens: stripTokens.copyWith(surfaceColor: t.secondary),
+        onChanged: (v) =>
+            setState(() => app.objectSearchText = v.toLowerCase()),
+      ),
       items: [
         ToolStripButton(
           icon: Icons.folder_open_outlined,
@@ -901,12 +899,11 @@ class _ObjectPanelState extends State<ObjectPanel> {
     bool grid, {
     TableListState? state,
   }) {
-    // 应用搜索过滤(_objectSearchText 已小写,子串匹配)
-    final items = _objectSearchText.isEmpty
+    // 应用搜索过滤(app.objectSearchText 已小写,子串匹配)
+    final filter = app.objectSearchText;
+    final items = filter.isEmpty
         ? rawItems
-        : rawItems
-            .where((n) => n.toLowerCase().contains(_objectSearchText))
-            .toList();
+        : rawItems.where((n) => n.toLowerCase().contains(filter)).toList();
     if (items.isEmpty) {
       // 无匹配(或分类为空):留白,不展示空态提示
       return _blank(t);
