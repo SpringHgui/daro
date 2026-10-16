@@ -28,10 +28,25 @@ class AccessDriver implements DatabaseDriver {
       throw Exception('未指定 Access 数据库文件路径');
     }
     final odbc = DartOdbc();
-    await odbc.connectWithConnectionString(
-      'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=$path;',
-    );
+    await odbc.connectWithConnectionString(_connectionString());
     _odbc = odbc;
+  }
+
+  /// 构造 ODBC 连接字符串。
+  ///
+  /// 在 Access 里用「文件 → 信息 → 用密码进行加密」设过**数据库密码**的
+  /// .mdb/.accdb,必须带 `PWD=<密码>` 才能打开;未设密码时留空,行为不变。
+  ///
+  /// 注:仅覆盖数据库密码这一常见场景。用户级安全(工作分组 .mdw)需要
+  /// `SystemDB` + `UID`/`PWD`,当前连接模型没有承载 .mdw 路径的字段,暂不支持。
+  String _connectionString() {
+    final sb = StringBuffer(
+      'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=${_conn.host};',
+    );
+    if (_conn.password.isNotEmpty) {
+      sb.write('PWD=${_conn.password};');
+    }
+    return sb.toString();
   }
 
   @override

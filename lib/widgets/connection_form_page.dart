@@ -145,7 +145,8 @@ class _ConnectionFormPageState extends State<ConnectionFormPage> {
           : _hostController.text.trim(),
       port: (_isFileBased || _isSqlServer) ? '' : _portController.text.trim(),
       username: _isFileBased ? '' : _userController.text.trim(),
-      password: _isFileBased ? '' : _passController.text,
+      // Access 的文件级数据库密码走 password;SQLite 无密码概念恒为空
+      password: (_isAccess || !_isFileBased) ? _passController.text : '',
       database: _isFileBased ? _dbFileController.text.trim() : '',
       authMethod: _isSqlServer ? _authMethod : '',
     ));
@@ -358,6 +359,7 @@ class _ConnectionFormPageState extends State<ConnectionFormPage> {
           savePassword: _savePassword,
           onSavePasswordChanged: (v) => setState(() => _savePassword = v),
           isSqlite: _isFileBased,
+          isAccess: _isAccess,
           isSqlServer: _isSqlServer,
           authMethod: _authMethod,
           onAuthMethodChanged: (v) => setState(() => _authMethod = v),
@@ -429,7 +431,8 @@ class _ConnectionFormPageState extends State<ConnectionFormPage> {
                     ? ''
                     : _portController.text.trim(),
                 username: _isFileBased ? '' : _userController.text.trim(),
-                password: _isFileBased
+                // SQLite(文件型但非 Access)无密码;Access 数据库密码按「保存密码」勾选落盘
+                password: (_isFileBased && !_isAccess)
                     ? ''
                     : (_savePassword ? _passController.text : ''),
                 database: _isFileBased ? _dbFileController.text.trim() : '',
@@ -484,6 +487,9 @@ class _ConnectionFormPageState extends State<ConnectionFormPage> {
 /// SQLite 为文件型数据库,仅展示「连接名称」与「数据库文件」两个字段,
 /// 其余 C/S 字段(host/port/user/pass)隐藏。
 ///
+/// Access 同为文件型,但额外支持「数据库密码」(在 Access 里加密过的文件),
+/// 故在文件路径下再补密码 + 保存密码字段。
+///
 /// SQL Server 隐藏端口(固定 1433),增加验证方式下拉:
 /// SQL Server 身份验证 → 显示用户名/密码;
 /// Windows 身份验证 → 隐藏用户名/密码。
@@ -498,6 +504,7 @@ class _GeneralForm extends StatelessWidget {
     required this.savePassword,
     required this.onSavePasswordChanged,
     required this.isSqlite,
+    required this.isAccess,
     required this.isSqlServer,
     required this.authMethod,
     required this.onAuthMethodChanged,
@@ -516,6 +523,7 @@ class _GeneralForm extends StatelessWidget {
   final bool savePassword;
   final ValueChanged<bool> onSavePasswordChanged;
   final bool isSqlite;
+  final bool isAccess;
   final bool isSqlServer;
   final String authMethod;
   final ValueChanged<String> onAuthMethodChanged;
@@ -572,6 +580,27 @@ class _GeneralForm extends StatelessWidget {
                 ],
               ),
             ),
+            // Access 支持「数据库密码」(在 Access 里用密码加密过的文件);
+            // SQLite 无此概念,故仅 Access 显示密码相关字段
+            if (isAccess) ...[
+              const SizedBox(height: 14),
+              FieldRow(
+                label: '数据库密码:',
+                child: SizedBox(
+                  width: 240,
+                  child: Input(
+                      controller: pass, obscureText: true, obscureToggle: true),
+                ),
+              ),
+              const SizedBox(height: 14),
+              FieldRow(
+                child: CheckBox(
+                  value: savePassword,
+                  onChanged: (v) => onSavePasswordChanged(v ?? false),
+                  label: '保存密码',
+                ),
+              ),
+            ],
           ] else ...[
             const SizedBox(height: 14),
             // 主机
