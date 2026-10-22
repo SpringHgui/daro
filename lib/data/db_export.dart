@@ -298,6 +298,7 @@ TablePreview _project(TablePreview page, List<String>? want) {
   }
   if (identity) return page;
   final mask = page.nullMask;
+  final hex = page.hexColumns;
   return TablePreview(
     limit: page.limit,
     columns: [for (final i in idx) page.columns[i]],
@@ -310,6 +311,13 @@ TablePreview _project(TablePreview page, List<String>? want) {
         : [
             for (final m in mask) [for (final i in idx) i < m.length && m[i]]
           ],
+    // 十六进制化的列要跟着列子集走,否则 SQL 写器会把它当普通文本导出
+    hexColumns: hex == null
+        ? null
+        : {
+            for (final i in idx)
+              if (hex.contains(page.columns[i])) page.columns[i],
+          },
   );
 }
 
@@ -446,12 +454,24 @@ class _SqlWriter implements _FormatWriter {
       final buf = StringBuffer('(');
       for (var c = 0; c < cells.length; c++) {
         if (c > 0) buf.write(', ');
-        buf.write(page.isNullAt(r, c) ? 'NULL' : DdlBuilder.lit(cells[c]));
+        buf.write(_cellLiteral(page, r, c));
       }
       buf.write(')');
       _tuples.add(buf.toString());
       if (_tuples.length >= _batchSize) _flush(sink);
     }
+  }
+
+  /// 单元格 → VALUES 里的字面量。
+  ///
+  /// 被驱动换成十六进制文本取回的二进制列(源库是 MySQL / MariaDB 的 BLOB 等,
+  /// 见 [TablePreview.hexColumns])必须还原成二进制字面量,否则导出的 SQL 会把
+  /// 十六进制字符本身写进列里(5 字节变 10 字节)。
+  String _cellLiteral(TablePreview page, int row, int col) {
+    if (page.isNullAt(row, col)) return 'NULL';
+    final value = page.rows[row][col];
+    if (!page.isHexColumn(col)) return DdlBuilder.lit(value);
+    return _binaryLiteralFor(_target.typeId, value) ?? DdlBuilder.lit(value);
   }
 
   void _flush(IOSink sink) {
@@ -462,6 +482,20 @@ class _SqlWriter implements _FormatWriter {
 
   @override
   void end(IOSink sink) => _flush(sink);
+}
+
+/// 十六进制转储 → 目标方言的二进制字面量。
+///
+/// 值不是纯十六进制(用户在源端网格里手改成了文本),或目标方言没有对应的
+/// 二进制字面量写法时返回 null,调用方按普通文本字面量导出。
+/// 十六进制转储只可能来自 MySQL / MariaDB 源(见 mysql_driver.dart 的
+/// `mysqlSafeProjection`),同方言回迁是主路径。
+String? _binaryLiteralFor(String typeId, String hex) {
+  if (TablePreview.binaryLiteralFromHex(hex) == null) return null;
+  if (DdlBuilder.isMysqlLike(typeId)) return "X'$hex'";
+  if (DdlBuilder.isSqlServerLike(typeId)) return '0x$hex';
+  if (DdlBuilder.isPgLike(typeId)) return "'\\x$hex'::bytea";
+  return null;
 }
 
 class _JsonWriter implements _FormatWriter {

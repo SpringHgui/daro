@@ -381,19 +381,23 @@ class MysqlDriver implements DatabaseDriver {
         '${whereClauseSql(where)}${orderByClauseSql(orderBy)}'
         ' LIMIT $limit OFFSET $offset';
     late final IResultSet rs;
+    // 被驱动换成十六进制文本取回的二进制列,交回上层决定回写形式
+    Set<String> hexColumns = const {};
     try {
       rs = await conn.execute('SELECT *$fromSql');
     } on FormatException {
-      // 多半是 BIT 列的裸字节在包内 UTF-8 解码时就炸了(见 [mysqlBitProjection]),
-      // 只能让服务端改发整数重试一次;取不到投影说明另有原因,原样抛出
+      // 多半是 BIT / BLOB 列的裸字节在包内 UTF-8 解码时就炸了
+      // (见 [mysqlSafeProjection]),只能让服务端改发整数 / 十六进制重试一次;
+      // 取不到投影说明另有原因,原样抛出
       //
       // 解码失败时 mysql_client 已把这条连接强关(_forceClose),必须换一条再试,
       // 顺带忘掉 USE 状态——新会话停在连接的默认库上
       _currentDatabase = null;
       conn = await _get();
-      final projection = await mysqlBitProjection(conn, database, table);
-      if (projection == null) rethrow;
-      rs = await conn.execute('SELECT $projection$fromSql');
+      final plan = await mysqlSafeProjection(conn, database, table);
+      if (plan == null) rethrow;
+      hexColumns = plan.hexColumns;
+      rs = await conn.execute('SELECT ${plan.select}$fromSql');
     }
 
     final colDefs = rs.cols.toList();
@@ -416,7 +420,11 @@ class MysqlDriver implements DatabaseDriver {
       nullMask.add(nulls);
     }
     return TablePreview(
-        columns: columns, rows: rows, limit: limit, nullMask: nullMask);
+        columns: columns,
+        rows: rows,
+        limit: limit,
+        nullMask: nullMask,
+        hexColumns: hexColumns);
   }
 
   @override
@@ -452,7 +460,7 @@ class MysqlDriver implements DatabaseDriver {
     // 封顶必须下推到服务端:mysql_client 会把整棵结果集读进内存才交回,
     // 在调用方 break 救不回来(详见 sql_row_cap.dart);offset 同理由服务端跳过
     final capped = capSelectSql(sql, maxRows: limit + 1, offset: offset);
-    final rs = await conn.execute(capped ?? sql);
+    final rs = await mysqlExecute(conn, capped ?? sql);
 
     final colDefs = rs.cols.toList();
     final columns = [for (final col in colDefs) col.name];
@@ -570,6 +578,27 @@ class MysqlDriver implements DatabaseDriver {
   }
 }
 
+/// 执行一条查询,并把「包内 UTF-8 解码失败」换成人能看懂的处置建议。
+///
+/// 服务端在文本协议里对 `BIT` / `BLOB` / 几何列发的是裸字节,而 mysql_client
+/// 对每个字段一律按 UTF-8 解码(见 [mysqlSafeProjectionOf])。表浏览能自动换
+/// 安全投影重试,用户手写的 SQL 换不了——只能提示他自己把该列写成
+/// `HEX(col)` / `CAST(col AS UNSIGNED)`。
+///
+/// 解码失败时该连接已被强关,调用方下次 `_get()` 会自动重连(与表浏览同路)。
+Future<IResultSet> mysqlExecute(MySQLConnection conn, String sql) async {
+  try {
+    return await conn.execute(sql);
+  } on FormatException catch (e) {
+    throw MySQLClientException(
+      '结果集里有无法按 UTF-8 解码的裸字节:服务端在文本协议里把 BIT / BLOB / '
+      '几何列按原始字节发送。请在 SQL 里把该列改写成 HEX(col) 或 '
+      'CAST(col AS UNSIGNED) 再查询(表数据页会自动这样处理)。'
+      '(原始错误:$e)',
+    );
+  }
+}
+
 /// `MYSQL_TYPE_BIT`(协议常量 0x10),见 [mysqlIsBitColumn]。
 const int kMysqlTypeBit = 0x10;
 
@@ -585,7 +614,8 @@ bool mysqlIsBitColumn(ResultSetColumn col) => col.type.intVal == kMysqlTypeBit;
 /// `CAST(col AS UNSIGNED)` 同值。
 ///
 /// 已知边界:字节 ≥ 0x80 时(如 `bit(8)` 存 128–255)在包内 UTF-8 解码阶段就抛
-/// `FormatException`,值到不了这里——那条只能靠 [mysqlBitProjection] 换服务端编码。
+/// `FormatException`,值到不了这里——那条与 BLOB / 几何列一样,只能靠
+/// [mysqlSafeProjection] 换服务端编码。
 String mysqlBitAsInt(String raw) {
   if (raw.isEmpty) return raw;
   var value = BigInt.zero;
@@ -604,36 +634,82 @@ String mysqlCellText(String? raw, bool isBit) {
   return isBit ? mysqlBitAsInt(raw) : raw;
 }
 
-/// 由「列名 + DATA_TYPE」清单生成把 `BIT` 换成整数的 SELECT 投影;
-/// 清单里没有 `BIT` 列时返回 null(调用方据此保持 `SELECT *`)。
+/// 服务端按**裸字节**发送、必须换编码才能取回的列类型(`DATA_TYPE` 小写)。
 ///
-/// 为什么需要投影:服务端把 `BIT` 按裸字节发,而 mysql_client 对文本协议字段
-/// 一律按 UTF-8 解码——含 ≥ 0x80 的字节(如 `bit(8)` 存 128–255)直接抛
-/// `FormatException`,整条查询失败,[mysqlBitAsInt] 那样的事后转换根本拿不到值。
-/// 唯一出路是让服务端别发裸字节:`CAST(col AS UNSIGNED)`。
+/// `BIT` 走 `CAST(… AS UNSIGNED)`;其余二进制族与几何族走 `HEX(…)`:它们没有
+/// 「整数」这一层语义,而十六进制文本既能原样展示,也能用 `X'…'` 字面量精确写回。
+/// 几何列服务端发的是内部二进制格式,与 BLOB 同属一个崩溃类。
+const Set<String> kMysqlBinaryDataTypes = {
+  'binary',
+  'varbinary',
+  'tinyblob',
+  'blob',
+  'mediumblob',
+  'longblob',
+  'geometry',
+  'point',
+  'linestring',
+  'polygon',
+  'multipoint',
+  'multilinestring',
+  'multipolygon',
+  'geometrycollection',
+};
+
+/// [mysqlSafeProjectionOf] 的结果。
+class MysqlSafeProjection {
+  const MysqlSafeProjection(this.select, this.hexColumns);
+
+  /// 可直接拼进 `SELECT … FROM` 的投影列表(列名与顺序保持不变)
+  final String select;
+
+  /// 其中被换成十六进制文本的二进制列名。上层回写时必须还原成 `X'…'`
+  /// 二进制字面量,否则会把十六进制字符本身存进列里(5 字节变 10 字节)——
+  /// 见 table_data_page.dart 的 `sqlValueLiteral`。
+  final Set<String> hexColumns;
+}
+
+/// 由「列名 + DATA_TYPE」清单生成把裸字节换成可打印文本的 SELECT 投影;
+/// 清单里没有需要换编码的列时返回 null(调用方据此保持 `SELECT *`)。
+///
+/// 为什么需要投影:mysql_client 对文本协议的**每个**字段一律按 UTF-8 解码
+/// (`packet/packet_result_set_row.dart` 直接调 `getUtf8LengthEncodedString`),
+/// 而服务端把 `BIT` / `BLOB` / 几何列按裸字节发(结果集字符集只转码文本列)。
+/// 只要字节序列不是合法 UTF-8(含 ≥ 0x80 的字节,如 `bit(8)` 存 128–255、
+/// 或 BLOB 里的一段 DER 证书),解码就抛 `FormatException`,整条查询失败——
+/// [mysqlBitAsInt] 那样的事后转换根本拿不到值。
+/// 唯一出路是让服务端别发裸字节:`CAST(col AS UNSIGNED)` / `HEX(col)`。
 ///
 /// 纯函数,便于离线回归。
 @visibleForTesting
-String? mysqlBitProjectionOf(List<({String name, String type})> cols) {
-  bool isBit(({String name, String type}) c) => c.type == 'bit';
-  if (!cols.any(isBit)) return null;
+MysqlSafeProjection? mysqlSafeProjectionOf(
+    List<({String name, String type})> cols) {
+  String norm(String type) => type.toLowerCase();
+  bool isBinary(String type) => kMysqlBinaryDataTypes.contains(norm(type));
+  bool needsText(String type) => norm(type) == 'bit' || isBinary(type);
+  if (!cols.any((c) => needsText(c.type))) return null;
   String quote(String id) => '`${id.replaceAll('`', '``')}`';
-  return [
-    for (final c in cols)
-      if (isBit(c))
-        'CAST(${quote(c.name)} AS UNSIGNED) AS ${quote(c.name)}'
-      else
-        quote(c.name),
-  ].join(', ');
+  return MysqlSafeProjection(
+    [
+      for (final c in cols)
+        if (norm(c.type) == 'bit')
+          'CAST(${quote(c.name)} AS UNSIGNED) AS ${quote(c.name)}'
+        else if (isBinary(c.type))
+          'HEX(${quote(c.name)}) AS ${quote(c.name)}'
+        else
+          quote(c.name),
+    ].join(', '),
+    {for (final c in cols) if (isBinary(c.type)) c.name},
+  );
 }
 
-/// 读表(或视图)的列清单并生成安全投影,见 [mysqlBitProjectionOf]。
+/// 读表(或视图)的列清单并生成安全投影,见 [mysqlSafeProjectionOf]。
 ///
 /// 只在 `SELECT *` 已经抛 FormatException 之后调用,正常表不付这次元数据查询的代价。
 /// 已知边界:列清单来自 `information_schema.COLUMNS`,MySQL 8.0.23+ 的 INVISIBLE 列
-/// 也在其中而 `SELECT *` 不返回它们——同时有 BIT 列和隐藏列的表会多出一列,
+/// 也在其中而 `SELECT *` 不返回它们——同时有裸字节列和隐藏列的表会多出一列,
 /// 这类表极罕见,不值得为它探测服务端版本。
-Future<String?> mysqlBitProjection(
+Future<MysqlSafeProjection?> mysqlSafeProjection(
     MySQLConnection conn, String database, String table) async {
   String lit(String v) => "'${v.replaceAll("'", "''")}'";
   final rs = await conn.execute(
@@ -641,7 +717,7 @@ Future<String?> mysqlBitProjection(
     'WHERE TABLE_SCHEMA = ${lit(database)} AND TABLE_NAME = ${lit(table)} '
     'ORDER BY ORDINAL_POSITION',
   );
-  return mysqlBitProjectionOf([
+  return mysqlSafeProjectionOf([
     for (final row in rs.rows)
       (name: row.colAt(0) ?? '', type: (row.colAt(1) ?? '').toLowerCase()),
   ]);

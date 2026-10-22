@@ -15,6 +15,7 @@ class TablePreview {
     required this.rows,
     this.limit = 100,
     this.nullMask,
+    this.hexColumns,
   });
 
   /// 列名(按结果集顺序)
@@ -31,6 +32,29 @@ class TablePreview {
   /// 空值语义,故由驱动在取数时一并记录原始 null 判定;
   /// 为 null 表示驱动未提供(此时按展示约定把值 "NULL" 当作空)。
   final List<List<bool>>? nullMask;
+
+  /// 被驱动换成**十六进制文本**取回的二进制列名(MySQL / MariaDB 的 BLOB /
+  /// VARBINARY / 几何列在文本协议里是裸字节,无法按 UTF-8 解码,只能让服务端
+  /// 发 `HEX(col)`;没有此类列时为 null)。
+  ///
+  /// 回写这些列时必须把文本还原成二进制字面量(`X'…'`,见
+  /// [binaryLiteralFromHex]),否则会把十六进制字符本身存进列里,
+  /// 且 WHERE 里的文本比较根本匹配不到行。
+  /// 取数侧见 mysql_driver.dart 的 `mysqlSafeProjection`。
+  final Set<String>? hexColumns;
+
+  /// 该列的值是否是被驱动十六进制化的二进制值([hexColumns] 的便捷查询)
+  bool isHexColumn(int col) =>
+      col < columns.length && (hexColumns?.contains(columns[col]) ?? false);
+
+  /// 十六进制转储 → 二进制字面量 `X'…'`(MySQL / MariaDB 语法)。
+  ///
+  /// 值不是纯十六进制、或长度是奇数(用户在单元格里手改过,`X'…'` 要求成对),
+  /// 返回 null,调用方按普通字符串字面量处理。空串是合法的零长二进制值,返回 `X''`。
+  static String? binaryLiteralFromHex(String value) =>
+      value.length.isEven && RegExp(r'^[0-9a-fA-F]*$').hasMatch(value)
+          ? "X'$value'"
+          : null;
 
   /// 是否达到上限(可能还有更多行)
   bool get truncated => rows.length >= limit;

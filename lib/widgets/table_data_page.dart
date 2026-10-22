@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../app/app_state.dart';
 import '../data/cell_value_view.dart';
 import '../data/db_data.dart';
+import '../data/drivers/db_driver.dart';
 import '../data/table_view.dart';
 import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
@@ -147,6 +148,26 @@ final _dateTimeCompoundRe = RegExp(r'datetime|timestamp|date\s*/\s*time');
 final _dateOnlyTypeRe = RegExp(r'^\s*date\b');
 final _timeOnlyTypeRe = RegExp(r'^\s*(time|timetz)\b');
 
+/// 单元格文本 → 回写用的 SQL 字面量。
+///
+/// `NULL` 是展示层里真 NULL 的写法,还原成 SQL NULL 关键字。
+/// [hex] 为真表示该列是驱动用 `HEX(col)` 取回的二进制列(MySQL 的 BLOB 等在
+/// 文本协议里是裸字节,见 `TablePreview.hexColumns`):格里的文本是十六进制转储,
+/// 必须还原成二进制字面量 `X'…'`(共用 [TablePreview.binaryLiteralFromHex])。
+/// 按文本回写会把十六进制字符本身存进列里(5 字节变 10 字节),而 WHERE 里的
+/// 文本比较更是根本匹配不到行——表现成「回『保存成功』,库里一条没变」。
+/// 用户在单元格里把它改成非十六进制的串时按普通文本回写
+/// (等价于往该列存这段 ASCII,与驱动没换投影时一致)。
+@visibleForTesting
+String sqlValueLiteral(String value, {bool hex = false}) {
+  if (value == 'NULL') return 'NULL';
+  if (hex) {
+    final binary = TablePreview.binaryLiteralFromHex(value);
+    if (binary != null) return binary;
+  }
+  return "'${value.replaceAll("'", "''")}'";
+}
+
 /// 日期时间选择弹窗的文案（base-ui 默认英文，宿主按当前界面语言自带一份）。
 /// 文案随语言变化，故由调用方在 build 里现取。
 ///
@@ -245,6 +266,11 @@ class _TableDataPageState extends State<TableDataPage> {
   /// 列名 → 数据类型文本(如 `varchar(20)`),供表头第二行展示;
   /// null = 尚未取得,空 map = 该表无可读类型信息(视图 / 权限不足等)
   Map<String, String>? _columnTypes;
+
+  /// 本次取数时被驱动换成**十六进制文本**的二进制列(MySQL 的 BLOB 等,
+  /// 见 `TablePreview.hexColumns`):回写必须还原成 `X'…'` 二进制字面量,
+  /// 否则会把十六进制字符本身存进列里,且 WHERE 里的文本比较根本匹配不到行
+  Set<String> _hexCols = const {};
 
   /// 列宽(拖表头边框调整;列数变化时重置为默认宽度)
   List<double>? _columnWidths;
@@ -519,6 +545,7 @@ class _TableDataPageState extends State<TableDataPage> {
       setState(() {
         _columns = null;
         _columnTypes = null;
+        _hexCols = const {};
         _columnWidths = null;
         _totalRows = null;
         _typeId = '';
@@ -681,6 +708,7 @@ class _TableDataPageState extends State<TableDataPage> {
       app.recordSql(_tabKey, _buildSelectSql(conn.typeId, limit: _pageSize, offset: 0));
       setState(() {
         _columns = preview.columns;
+        _hexCols = preview.hexColumns ?? const {};
         // 首页不足一页 → 总数精确 = 行数;满页 → 保持原已知总数或未知
         if (preview.rows.length < _pageSize) {
           _totalRows = preview.rows.length;
@@ -770,6 +798,7 @@ class _TableDataPageState extends State<TableDataPage> {
       final count = preview.rows.length;
       if (count > 0) {
         setState(() {
+          _hexCols = preview.hexColumns ?? const {};
           // 页内行数不足页大小 → 该页为末页,总数精确 = offset + 行数
           if (count < _pageSize) {
             _totalRows = page * _pageSize + count;
@@ -1144,6 +1173,10 @@ class _TableDataPageState extends State<TableDataPage> {
     });
   }
 
+  /// 单元格值 → 回写字面量:被驱动十六进制化的二进制列走 `X'…'`,其余按文本
+  String _valueLiteral(String column, String value) =>
+      sqlValueLiteral(value, hex: _hexCols.contains(column));
+
   /// 确认修改:组装 DELETE / UPDATE / INSERT SQL 并执行,写回数据库。
   /// 遍历所有访问过的页(当前页 + 缓存页)对比原始行,保证翻页后的修改不遗漏
   Future<void> _applyEdits() async {
@@ -1184,7 +1217,8 @@ class _TableDataPageState extends State<TableDataPage> {
         if (original[c] == 'NULL') {
           conditions.add('$colIdent IS NULL');
         } else {
-          conditions.add('$colIdent = \'${_literal(original[c])}\'');
+          conditions.add(
+              '$colIdent = ${_valueLiteral(columns[c], original[c])}');
         }
       }
       return conditions.join(' AND ');
@@ -1222,9 +1256,10 @@ class _TableDataPageState extends State<TableDataPage> {
           final current = p.rows[i];
           if (current.every((v) => v.isEmpty)) continue;
           final cols = columns.map((c) => _ident(_typeId, c)).join(', ');
-          final vals = current
-              .map((v) => v == 'NULL' ? 'NULL' : '\'${_literal(v)}\'')
-              .join(', ');
+          final vals = [
+            for (var c = 0; c < current.length; c++)
+              _valueLiteral(c < columns.length ? columns[c] : '', current[c])
+          ].join(', ');
           final sql = 'INSERT INTO $tableIdent ($cols) VALUES ($vals)';
           try {
             await run(sql);
@@ -1241,10 +1276,8 @@ class _TableDataPageState extends State<TableDataPage> {
           for (var c = 0; c < columns.length; c++) {
             if (current[c] != original[c]) {
               // 值为 'NULL' 时写 SQL NULL 关键字(与 INSERT / WHERE 语义一致)
-              final v = current[c] == 'NULL'
-                  ? 'NULL'
-                  : '\'${_literal(current[c])}\'';
-              sets.add('${_ident(_typeId, columns[c])} = $v');
+              sets.add(
+                  '${_ident(_typeId, columns[c])} = ${_valueLiteral(columns[c], current[c])}');
             }
           }
           if (sets.isEmpty) continue;
@@ -3586,9 +3619,6 @@ class _TableDataPageState extends State<TableDataPage> {
         return ident;
     }
   }
-
-  /// 转义字符串字面量中的单引号(翻倍)
-  String _literal(String value) => value.replaceAll("'", "''");
 }
 
 // ── 工具面板图标(16x16 自绘线稿,黑色线稿 + 蓝色强调) ──────

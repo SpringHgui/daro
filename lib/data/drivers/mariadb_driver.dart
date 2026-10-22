@@ -7,13 +7,14 @@ import '../user_sql.dart';
 import 'db_driver.dart';
 import 'mysql_driver.dart'
     show
-        mysqlBitProjection,
         mysqlCellText,
         mysqlCollationNames,
+        mysqlExecute,
         mysqlIsBitColumn,
         mysqlReadDatabaseDetail,
         mysqlReadTableDesign,
         mysqlReadTableDetail,
+        mysqlSafeProjection,
         openMysqlConnection;
 import 'mysql_user_metadata.dart';
 
@@ -303,19 +304,23 @@ class MariadbDriver implements DatabaseDriver {
         '${whereClauseSql(where)}${orderByClauseSql(orderBy)}'
         ' LIMIT $limit OFFSET $offset';
     late final IResultSet rs;
+    // 被驱动换成十六进制文本取回的二进制列,交回上层决定回写形式
+    Set<String> hexColumns = const {};
     try {
       rs = await conn.execute('SELECT *$fromSql');
     } on FormatException {
-      // 多半是 BIT 列的裸字节在包内 UTF-8 解码时就炸了(见 mysql_driver.dart 的
-      // mysqlBitProjection),只能让服务端改发整数重试一次;取不到投影说明另有原因
+      // 多半是 BIT / BLOB 列的裸字节在包内 UTF-8 解码时就炸了(见 mysql_driver.dart
+      // 的 mysqlSafeProjection),只能让服务端改发整数 / 十六进制重试一次;
+      // 取不到投影说明另有原因
       //
       // 解码失败时 mysql_client 已把这条连接强关(_forceClose),必须换一条再试,
       // 顺带忘掉 USE 状态——新会话停在连接的默认库上
       _currentDatabase = null;
       conn = await _get();
-      final projection = await mysqlBitProjection(conn, database, table);
-      if (projection == null) rethrow;
-      rs = await conn.execute('SELECT $projection$fromSql');
+      final plan = await mysqlSafeProjection(conn, database, table);
+      if (plan == null) rethrow;
+      hexColumns = plan.hexColumns;
+      rs = await conn.execute('SELECT ${plan.select}$fromSql');
     }
 
     final colDefs = rs.cols.toList();
@@ -338,7 +343,11 @@ class MariadbDriver implements DatabaseDriver {
       nullMask.add(nulls);
     }
     return TablePreview(
-        columns: columns, rows: rows, limit: limit, nullMask: nullMask);
+        columns: columns,
+        rows: rows,
+        limit: limit,
+        nullMask: nullMask,
+        hexColumns: hexColumns);
   }
 
   @override
@@ -374,7 +383,7 @@ class MariadbDriver implements DatabaseDriver {
     // 封顶必须下推到服务端:mysql_client 会把整棵结果集读进内存才交回,
     // 在调用方 break 救不回来(详见 sql_row_cap.dart);offset 同理由服务端跳过
     final capped = capSelectSql(sql, maxRows: limit + 1, offset: offset);
-    final rs = await conn.execute(capped ?? sql);
+    final rs = await mysqlExecute(conn, capped ?? sql);
 
     final colDefs = rs.cols.toList();
     final columns = [for (final col in colDefs) col.name];

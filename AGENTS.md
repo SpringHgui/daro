@@ -504,6 +504,24 @@ PG 的「禁用」不是建表子句，是建好后的独立动作（`ALTER TABL
   里面的控件不能用 `expands: true` / `SizedBox.expand`（布局自激，同上会挂死 `pumpAndSettle`），
   多行框走 `Textarea` 固定 `minLines` + `maxLines`，行高由 `_propField(height:)` 预留。
 
+### 裸字节列（MySQL 系：BIT / BLOB / 几何）
+
+`mysql_client` 对文本协议的**每个**字段一律按 UTF-8 解码
+（`packet/packet_result_set_row.dart` 直接 `getUtf8LengthEncodedString`），而服务端把
+`bit` / `blob` 族 / `binary` / 几何列按**裸字节**发（结果集字符集只转码文本列）。
+字节序列不是合法 UTF-8 时（证书、图片、`bit(8)` 存 128–255）解码就抛 `FormatException`，
+**整条查询失败、整张表打不开**（实测 `bx11.bx_wxcoupon_mch.cert_file`）。
+
+| 环节 | 口径 |
+|---|---|
+| 取数 | `previewTable` 捕获 `FormatException` → 换一条连接（旧的已被强关）→ 查 `information_schema.COLUMNS` → 按 `mysqlSafeProjectionOf` 重发一次：`bit` 走 `CAST(col AS UNSIGNED)`、二进制族走 `HEX(col)`。正常表不付这次元数据查询的代价 |
+| 回报 | 被 `HEX()` 的列名必须经 `TablePreview.hexColumns` 交回上层（`bit` 已折成十进制，不算） |
+| 回写 | 网格的 INSERT / UPDATE / **WHERE** 与 SQL 导出遇到这些列必须还原成二进制字面量（共用 `TablePreview.binaryLiteralFromHex`）。按文本回写会把十六进制字符本身存进列里（5 字节变 10 字节），而 WHERE 里的文本比较根本匹配不到行——表现成「回『保存成功』，库里一条没变」 |
+| SQL 页 | 用户手写的 SQL 改不了投影，`mysqlExecute` 把解码失败换成能自解释的中文提示（让他自己写 `HEX(col)`） |
+
+守护：`test/mysql_binary_column_test.dart`（离线，纯函数）+ `test/mysql_binary_column_live_test.dart`（实连，`DARO_LIVE_DB=1` 才跑，只读；它先实测 `SELECT *` 确认真的会炸，再验恢复投影）。
+新增二进制类型时改 `kMysqlBinaryDataTypes` 一处即可，取数与回写两侧同源。
+
 ### 颜色
 - **应用 widget**：通过 `Tokens.of(context)` 取色，不硬编码 `Color(0xff…)`
 - **base-ui-flutter 组件**：通过 `DesktopTokens` 取色，不接受 `Color` 参数
