@@ -42,6 +42,8 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
+# 密码框关输入法:daro/ime 通道用 ImmAssociateContext 解绑 / 恢复 IMC(flutter_window.cpp)。
+target_link_libraries(${BINARY_NAME} PRIVATE "imm32.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

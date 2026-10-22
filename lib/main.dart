@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 import 'app/app_state.dart';
+import 'app/ime_suppressor.dart';
 import 'app/mcp_service.dart';
 import 'app/sub_window.dart';
 import 'l10n/locale_config.dart';
@@ -11,6 +12,10 @@ import 'theme/app_theme.dart';
 
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 密码框获焦关输入法(见 app/ime_suppressor.dart)。主窗口与子窗口都走这个
+  // main(),各自引擎装一次即可;原生通道按视图 HWND 分窗口注册,互不干扰。
+  installImeSuppression();
 
   // desktop_multi_window 起的子窗口(如「连接密码」)自带入口
   // 参数,走各自的 App,不加载主窗口与 AppState。

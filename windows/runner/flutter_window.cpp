@@ -3,7 +3,10 @@
 #include <flutter/method_channel.h>
 #include <flutter/standard_method_codec.h>
 
+#include <imm.h>
 #include <optional>
+#include <string>
+#include <vector>
 #include <windowsx.h>
 
 #include "flutter/generated_plugin_registrant.h"
@@ -37,6 +40,54 @@ void NotifyHoverToDart(int button) {
   g_hover_channel->InvokeMethod(
       "onHoverChange",
       std::make_unique<flutter::EncodableValue>(flutter::EncodableValue(button)));
+}
+
+// ── 密码框关输入法(daro/ime 通道) ──────────────────────────────────────────
+// Flutter 在 Windows 上没有「按字段禁用系统输入法」的 API(见 open issue
+// flutter/flutter#181487)。密码框(obscureText)因此会被中文输入法劫持:打 bx
+// 时未上屏的拼音也被算进圆点数,回车上屏后数字又变,误导用户(实测反馈)。
+// 原生做法:字段获焦时把该窗口的 IME 上下文解绑,窗口即不再收到 WM_IME_* 组字
+// 消息,输入法彻底不参与,打字就是裸字符;失焦再绑回原来的上下文。
+//
+// 通道按「视图 HWND」注册:主窗口一份,desktop_multi_window 起的每个子窗口
+// 各一份(子窗口是独立引擎、独立 messenger,主窗口的通道够不着)。这里持有
+// shared_ptr 让 handler 在窗口存活期内有效;窗口销毁后 Dart 端不再调用,泄漏量
+// 以「开过的子窗口数」为界,可忽略。
+std::vector<std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>>>
+    g_ime_channels;
+
+void InstallImeChannel(flutter::BinaryMessenger* messenger, HWND view_hwnd) {
+  if (!messenger || !view_hwnd) return;
+  auto channel = std::make_shared<flutter::MethodChannel<flutter::EncodableValue>>(
+      messenger, "daro/ime", &flutter::StandardMethodCodec::GetInstance());
+  // 每个通道自带一份「已保存的旧 IMC + 是否已抑制」状态,主 / 子窗口互不干扰。
+  auto saved = std::make_shared<HIMC>(nullptr);
+  auto suppressed = std::make_shared<bool>(false);
+  channel->SetMethodCallHandler(
+      [view_hwnd, saved, suppressed](
+          const flutter::MethodCall<flutter::EncodableValue>& call,
+          std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+              result) {
+        const std::string& m = call.method_name();
+        if (m == "suppress") {
+          if (!*suppressed) {
+            // ImmAssociateContext 返回解绑前的上下文,存下来供 restore 用。
+            *saved = ImmAssociateContext(view_hwnd, nullptr);
+            *suppressed = true;
+          }
+          result->Success(flutter::EncodableValue(true));
+        } else if (m == "restore") {
+          if (*suppressed) {
+            ImmAssociateContext(view_hwnd, *saved);
+            *saved = nullptr;
+            *suppressed = false;
+          }
+          result->Success(flutter::EncodableValue(true));
+        } else {
+          result->NotImplemented();
+        }
+      });
+  g_ime_channels.push_back(channel);
 }
 
 int DipToPx(int dip, HWND hWnd) {
@@ -164,6 +215,12 @@ bool FlutterWindow::OnCreate() {
         reinterpret_cast<flutter::FlutterViewController*>(controller);
     if (sub_controller && sub_controller->engine()) {
       RegisterPlugins(sub_controller->engine());
+      // 子窗口(如「连接密码」独立窗口)自带密码框:给它自己的视图 HWND 与
+      // messenger 也装一份 daro/ime 通道,否则子窗口里关输入法会 MissingPlugin。
+      if (sub_controller->view()) {
+        InstallImeChannel(sub_controller->engine()->messenger(),
+                          sub_controller->view()->GetNativeWindow());
+      }
     }
   });
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
@@ -212,6 +269,9 @@ bool FlutterWindow::OnCreate() {
   g_view_hwnd = flutter_controller_->view()->GetNativeWindow();
   g_orig_view_wndproc = reinterpret_cast<WNDPROC>(SetWindowLongPtr(
       g_view_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ViewWndProc)));
+
+  // 主窗口的密码框关输入法通道(见文件顶部 InstallImeChannel 注释)。
+  InstallImeChannel(flutter_controller_->engine()->messenger(), g_view_hwnd);
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
