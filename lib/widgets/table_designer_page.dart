@@ -72,6 +72,7 @@ class TableDesignerPage extends StatefulWidget {
   const TableDesignerPage({
     super.key,
     required this.title,
+    this.tabKey = '',
     required this.connection,
     required this.database,
     this.schema,
@@ -81,8 +82,12 @@ class TableDesignerPage extends StatefulWidget {
     this.dialectOverride,
   });
 
-  /// 标签标题(保存成功后关闭本标签用)
+  /// 标签标题(显示与表名解析用)
   final String title;
+
+  /// 本标签的业务唯一键([OpenTab.key]):关闭 / 重命名标签时据此精确定位,
+  /// 避免同名表在设计器里误伤另一个库 / 模式的同名标签。独立测试页可不传。
+  final String tabKey;
 
   /// 所属连接名
   final String connection;
@@ -851,7 +856,7 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
     }
     if (!_isEdit) {
       // 成功后关闭设计器标签;对象列表已由 createTableDesign 刷新
-      app.closeTab(widget.title);
+      app.closeTab(widget.tabKey);
       return;
     }
     // 编辑成功后不关标签(可继续改),只把基线前移到当前设计
@@ -863,7 +868,7 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
       _note = '已保存 ${stmts.length} 条变更';
     });
     // 表被重命名:同步换标签标题,否则下次打开会错配到旧表名
-    if (newTitle != oldTitle) app.renameTab(oldTitle, newTitle);
+    if (newTitle != oldTitle) app.renameTab(widget.tabKey, newTitle);
   }
 
   // ── 主布局 ────────────────────────────────────────────────

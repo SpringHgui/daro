@@ -607,6 +607,8 @@ class AppState extends ChangeNotifier {
       tabs[i] = migrated;
       _moveKeyedState(oldKey, migrated.key);
       _moveKeyedState(oldQk, queryTabKey(newConn, tab.database, tab.title));
+      // 活动标签身份是 key:改名后迁移到新的 key,否则选中态会丢失
+      if (activeTab == oldKey) activeTab = migrated.key;
     }
   }
 
@@ -940,13 +942,14 @@ class AppState extends ChangeNotifier {
 
   /// 「对象」首页标签的**身份标识**。
   ///
-  /// 标签身份一直是标题字符串([activeTab] 与 [OpenTab.title] 比对),但固定首页
-  /// 的标题要随界面语言显示成「对象 / Objects / オブジェクト」—— 拿译文当身份,
-  /// 切一次语言活动标签就找不到自己了。故这里存一个不可能与表名撞车的哨兵,
-  /// 显示文案由 [OpenTab] 之外按词条取。
+  /// 活动标签存的是 [OpenTab.key]（业务唯一键：类型|连接|库|模式|标题|分类），
+  /// 而非标题字符串 —— 不同库 / 模式下的同名表标题相同，用标题当身份会让
+  /// [activeTabModel] 永远命中第一个同名标签，切换第二个时界面毫无变化。
+  /// 固定首页的标题要随界面语言显示成「对象 / Objects / オブジェクト」，
+  /// 拿译文当身份更不行，故这里存一个不可能与任何 [OpenTab.key] 撞车的哨兵。
   static const String objectsTabKey = '@@objects';
 
-  /// 当前活动标签标题,[objectsTabKey] 表示对象浏览页
+  /// 当前活动标签的 [OpenTab.key]，[objectsTabKey] 表示对象浏览页
   String activeTab = objectsTabKey;
 
   String selectedTable = '';
@@ -1052,7 +1055,7 @@ class AppState extends ChangeNotifier {
 
   OpenTab? get activeTabModel {
     for (final tab in tabs) {
-      if (tab.title == activeTab) return tab;
+      if (tab.key == activeTab) return tab;
     }
     return null;
   }
@@ -1082,10 +1085,10 @@ class AppState extends ChangeNotifier {
       schema,
     );
 
-    // 按业务键去重:不同库/模式的同名表各自成 tab,但激活标题相同
+    // 按业务键去重:不同库/模式的同名表各自成 tab，激活身份用唯一键而非标题
     final exists =
         tabs.any((t) => t.type == TabType.table && t.key == tab.key);
-    activeTab = name;
+    activeTab = tab.key;
     if (!exists) {
       tabs.add(tab);
     }
@@ -1114,7 +1117,7 @@ class AppState extends ChangeNotifier {
 
     final exists =
         tabs.any((t) => t.type == TabType.design && t.key == tab.key);
-    activeTab = '$name$kTabDesignTitleSuffix';
+    activeTab = tab.key;
     if (!exists) {
       tabs.add(tab);
     }
@@ -1127,15 +1130,16 @@ class AppState extends ChangeNotifier {
   void newQuery() {
     _queryCount++;
     final title = '无标题-查询 $_queryCount';
-    tabs.add(OpenTab(
+    final tab = OpenTab(
       TabType.query,
       title,
       null,
       objectConnection,
       objectDatabase,
       objectSchema,
-    ));
-    activeTab = title;
+    );
+    tabs.add(tab);
+    activeTab = tab.key;
     notifyListeners();
   }
 
@@ -1177,11 +1181,13 @@ class AppState extends ChangeNotifier {
     required String database,
   }) {
     final title = cliTabTitle(connection, database);
-    if (!tabs.any((tab) => tab.title == title)) {
-      tabs.add(OpenTab(TabType.commandLine, title, null, connection, database));
+    final tab =
+        OpenTab(TabType.commandLine, title, null, connection, database);
+    if (!tabs.any((t) => t.title == title)) {
+      tabs.add(tab);
     }
     setObjectContext(connection, database);
-    activeTab = title;
+    activeTab = tab.key;
     notifyListeners();
   }
 
@@ -1198,15 +1204,16 @@ class AppState extends ChangeNotifier {
   }) {
     _tableDesignCount++;
     final title = '新建表' + (_tableDesignCount > 1 ? ' $_tableDesignCount' : '');
-    tabs.add(OpenTab(
+    final tab = OpenTab(
       TabType.createTable,
       title,
       null,
       connection,
       database,
       schema,
-    ));
-    activeTab = title;
+    );
+    tabs.add(tab);
+    activeTab = tab.key;
     notifyListeners();
   }
 
@@ -1272,27 +1279,25 @@ class AppState extends ChangeNotifier {
   /// 打开已保存查询:已有同名同上下文的查询 tab 则直接激活,
   /// 否则新建 tab 并预填该查询的 SQL 文本
   void openSavedQuery(SavedQuery query) {
-    final exists = tabs.any((t) =>
-        t.type == TabType.query &&
-        t.title == query.name &&
-        t.connection == query.connection &&
-        t.database == query.database);
+    final tab = OpenTab(
+      TabType.query,
+      query.name,
+      null,
+      query.connection,
+      query.database,
+    );
+    final exists = tabs.any((t) => t.key == tab.key);
     if (!exists) {
-      tabs.add(OpenTab(
-        TabType.query,
-        query.name,
-        null,
-        query.connection,
-        query.database,
-      ));
+      tabs.add(tab);
       _queryTexts[
           queryTabKey(query.connection, query.database, query.name)] = query.sql;
     }
-    activeTab = query.name;
+    activeTab = tab.key;
     notifyListeners();
   }
 
-  /// 查询 tab 重命名(保存命名后调用):迁移编辑文本与 SQL 历史
+  /// 查询 tab 重命名(保存命名后调用):迁移编辑文本与 SQL 历史。
+  /// 标题变了 → [OpenTab.key] 也变，活动标签身份一并切到新 key。
   void _renameQueryTab(
       String oldTitle, String newTitle, String? connection, String? database) {
     for (var i = 0; i < tabs.length; i++) {
@@ -1307,21 +1312,24 @@ class AppState extends ChangeNotifier {
         if (text != null) _queryTexts[newKey] = text;
         final history = _tabSqlHistory.remove(oldKey);
         if (history != null) _tabSqlHistory[newKey] = history;
-        tabs[i] = OpenTab(TabType.query, newTitle, null, connection, database);
-        if (activeTab == oldTitle) activeTab = newTitle;
+        final renamed =
+            OpenTab(TabType.query, newTitle, null, connection, database);
+        tabs[i] = renamed;
+        if (activeTab == tab.key) activeTab = renamed.key;
         break;
       }
     }
   }
 
   /// 标签重命名(「设计表」保存后表被重命名时同步标题)。
-  /// 标题在 [OpenTab] 中是 final,故原位重建实例;激活项同步。
-  void renameTab(String oldTitle, String newTitle) {
-    if (oldTitle == newTitle) return;
+  /// [oldKey] 为该标签的 [OpenTab.key]（标题是 key 的一部分，改名后 key 随之变，
+  /// 故这里以旧 key 精确定位，避免误伤同名标签）。标题在 [OpenTab] 中是 final,
+  /// 原位重建实例;激活项、按 key 缓存的编辑状态一并迁移。
+  void renameTab(String oldKey, String newTitle) {
     for (var i = 0; i < tabs.length; i++) {
       final tab = tabs[i];
-      if (tab.title != oldTitle) continue;
-      tabs[i] = OpenTab(
+      if (tab.key != oldKey) continue;
+      final renamed = OpenTab(
         tab.type,
         newTitle,
         tab.typeId,
@@ -1334,15 +1342,17 @@ class AppState extends ChangeNotifier {
         tab.routineOptions,
         tab.routineReturnType,
       );
-      if (activeTab == oldTitle) activeTab = newTitle;
+      tabs[i] = renamed;
+      _moveKeyedState(oldKey, renamed.key);
+      if (activeTab == oldKey) activeTab = renamed.key;
       notifyListeners();
       return;
     }
   }
 
-  void closeTab(String title) {
-    final closing = tabs.where((tab) => tab.title == title).toList();
-    tabs.removeWhere((tab) => tab.title == title);
+  void closeTab(String key) {
+    final closing = tabs.where((tab) => tab.key == key).toList();
+    tabs.removeWhere((tab) => tab.key == key);
     // 清理被关闭标签的 SQL 历史、分页状态与查询/例程文本、注释。
     // 查询编辑页的文本 / 历史按 [queryTabKey] 存(不含 [OpenTab.key]
     // 末尾的 routineCategory 段),需换算后再清,否则会一直残留
@@ -1360,7 +1370,7 @@ class AppState extends ChangeNotifier {
       _tableStatus.remove(tab.key);
     }
     _releaseCliConsoles(closing);
-    if (activeTab == title) activeTab = objectsTabKey;
+    if (activeTab == key) activeTab = objectsTabKey;
     notifyListeners();
   }
 
@@ -1373,24 +1383,24 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// 关闭除 [title] 外的所有标签,并激活该标签
-  void closeOtherTabs(String title) {
-    final closing = tabs.where((tab) => tab.title != title).toList();
-    tabs.removeWhere((tab) => tab.title != title);
+  /// 关闭除 [key] 外的所有标签,并激活该标签
+  void closeOtherTabs(String key) {
+    final closing = tabs.where((tab) => tab.key != key).toList();
+    tabs.removeWhere((tab) => tab.key != key);
     _releaseCliConsoles(closing);
-    activeTab = title;
+    activeTab = key;
     notifyListeners();
   }
 
-  /// 关闭 [title] 右侧的所有标签;活动标签被关闭时改为激活 [title]
-  void closeTabsToRight(String title) {
-    final index = tabs.indexWhere((tab) => tab.title == title);
+  /// 关闭 [key] 右侧的所有标签;活动标签被关闭时改为激活 [key]
+  void closeTabsToRight(String key) {
+    final index = tabs.indexWhere((tab) => tab.key == key);
     if (index < 0) return;
     final closingTabs = tabs.sublist(index + 1);
-    final closing = closingTabs.map((tab) => tab.title).toSet();
+    final closingKeys = closingTabs.map((tab) => tab.key).toSet();
     tabs.removeRange(index + 1, tabs.length);
     _releaseCliConsoles(closingTabs);
-    if (closing.contains(activeTab)) activeTab = title;
+    if (closingKeys.contains(activeTab)) activeTab = key;
     notifyListeners();
   }
 
@@ -1403,8 +1413,8 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  void activateTab(String title) {
-    activeTab = title;
+  void activateTab(String key) {
+    activeTab = key;
     notifyListeners();
   }
 
@@ -3026,7 +3036,7 @@ class AppState extends ChangeNotifier {
     );
     final exists =
         tabs.any((t) => t.type == TabType.design && t.key == tab.key);
-    activeTab = tab.title;
+    activeTab = tab.key;
     if (!exists) tabs.add(tab);
     notifyListeners();
   }
@@ -3063,7 +3073,7 @@ class AppState extends ChangeNotifier {
     );
     final exists =
         tabs.any((t) => t.type == TabType.design && t.key == tab.key);
-    activeTab = tab.title;
+    activeTab = tab.key;
     if (!exists) tabs.add(tab);
     notifyListeners();
   }

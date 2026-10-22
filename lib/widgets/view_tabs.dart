@@ -25,10 +25,11 @@ class ViewTabs extends StatelessWidget {
     final t = Tokens.of(context);
     final l = context.l10n;
 
-    // 活动标签在完整标签列表(含固定"对象"页)中的位置;未找到时回到 0
+    // 活动标签在完整标签列表(含固定"对象"页)中的位置;未找到时回到 0。
+    // 身份用 OpenTab.key(同名表在不同库/模式下 key 不同),不能用 title。
     final activeIndex = activeTab == AppState.objectsTabKey
         ? 0
-        : app.tabs.indexWhere((tab) => tab.title == activeTab) + 1;
+        : app.tabs.indexWhere((tab) => tab.key == activeTab) + 1;
 
     // 文档标签条:条高固定 26(比对话框标签略高,好容纳 16px 图标),
     // 标签宽度交由 TabControl 按标题自适应 —— 不再平分撑满整条,
@@ -70,6 +71,7 @@ class ViewTabs extends StatelessWidget {
           for (final tab in app.tabs)
             TabItem(
               label: _tabLabel(context, tab),
+              tooltip: _tabTooltip(context, tab),
               // 与连接树分组同一套图标,保证标签图标与分组一致:
               // 查询 → 查询图;表数据 / 新建表 → 表图;设计页按对象分类取图;
               // 命令列界面 → 自绘终端图(它不是对象分类,不走 ObjectCategoryIcon)
@@ -79,8 +81,8 @@ class ViewTabs extends StatelessWidget {
                       category: _tabCategory(tab),
                       size: 16,
                     ),
-              onClose: () => context.read<AppState>().closeTab(tab.title),
-              contextMenuItems: _tabMenuItems(context, tab.title),
+              onClose: () => context.read<AppState>().closeTab(tab.key),
+              contextMenuItems: _tabMenuItems(context, tab.key),
             ),
         ],
       ),
@@ -103,6 +105,24 @@ class ViewTabs extends StatelessWidget {
         : '${split.name}${l.tabDesignSuffix}';
   }
 
+  /// 标签悬浮提示:「对象名 @ 库名（连接名）- 分类」。
+  /// 名字取标题去掉语言无关令牌后缀后的真实对象名;命令列标签没有对象分类,
+  /// 退到「连接名 - 命令列界面」。
+  String _tabTooltip(BuildContext context, OpenTab tab) {
+    final l = context.l10n;
+    if (tab.type == TabType.commandLine) {
+      return '${tab.connection} - ${l.tabCommandLine}';
+    }
+    final name = splitTabTitle(tab.title).name;
+    final db = tab.database ?? '';
+    final conn = tab.connection ?? '';
+    final category = _tabCategory(tab).labelOf(l);
+    final loc = db.isEmpty
+        ? '（$conn）'
+        : ' @ $db（$conn）';
+    return '$name$loc - $category';
+  }
+
   /// 标签图标分类:与连接树分组图标同源。
   /// 查询 → 查询;表数据页 / 新建表 → 表;设计页按
   /// [OpenTab.routineCategory] 区分视图 / 函数等(routineCategory 为空即表设计)。
@@ -113,36 +133,38 @@ class ViewTabs extends StatelessWidget {
         _ => ObjectCategory.table,
       };
 
-  /// 点击标签:0 = "对象"页,其余映射到打开标签列表
+  /// 点击标签:0 = "对象"页,其余映射到打开标签列表。
+  /// 传 [OpenTab.key] 而非标题 —— 同名表的标题相同,标题无法唯一定位标签。
   void _activate(BuildContext context, int index) {
     final app = context.read<AppState>();
     if (index == 0) {
       app.activateTab(AppState.objectsTabKey);
     } else if (index - 1 < app.tabs.length) {
-      app.activateTab(app.tabs[index - 1].title);
+      app.activateTab(app.tabs[index - 1].key);
     }
   }
 
-  /// 标签右键菜单:关闭 / 关闭其他 / 关闭右侧 / 全部关闭(仿 DBeaver)
-  List<MenuModel> _tabMenuItems(BuildContext context, String title) {
+  /// 标签右键菜单:关闭 / 关闭其他 / 关闭右侧 / 全部关闭(仿 DBeaver)。
+  /// [key] 为该标签的 [OpenTab.key]。
+  List<MenuModel> _tabMenuItems(BuildContext context, String key) {
     final app = context.read<AppState>();
     final l = context.l10n;
-    final index = app.tabs.indexWhere((tab) => tab.title == title);
+    final index = app.tabs.indexWhere((tab) => tab.key == key);
     return [
       MenuItem(
         text: l.tabCtxClose,
         shortcut: 'Ctrl+W',
-        onPressed: () => app.closeTab(title),
+        onPressed: () => app.closeTab(key),
       ),
       MenuItem(
         text: l.tabCtxCloseOthers,
         enabled: app.tabs.length > 1,
-        onPressed: () => app.closeOtherTabs(title),
+        onPressed: () => app.closeOtherTabs(key),
       ),
       MenuItem(
         text: l.tabCtxCloseRight,
         enabled: index >= 0 && index < app.tabs.length - 1,
-        onPressed: () => app.closeTabsToRight(title),
+        onPressed: () => app.closeTabsToRight(key),
       ),
       const MenuSeparator(),
       MenuItem(

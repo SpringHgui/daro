@@ -150,6 +150,7 @@ class _MainPageState extends State<MainPage> {
                                   // existingTable 非空 = 编辑模式(反查结构 + 保存 ALTER)
                                   return TableDesignerPage(
                                     title: tab.title,
+                                    tabKey: tab.key,
                                     connection: tab.connection!,
                                     database: tab.database!,
                                     schema: tab.schema,
@@ -171,6 +172,7 @@ class _MainPageState extends State<MainPage> {
                                 if (tab.type == TabType.createTable)
                                   return TableDesignerPage(
                                     title: tab.title,
+                                    tabKey: tab.key,
                                     connection: tab.connection!,
                                     database: tab.database!,
                                     schema: tab.schema,

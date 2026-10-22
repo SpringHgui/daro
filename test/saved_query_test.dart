@@ -71,7 +71,7 @@ void main() {
       expect(app.tabs.single.title, '报表');
       expect(app.tabs.single.connection, 'c1');
       expect(app.tabs.single.database, 'db1');
-      expect(app.activeTab, '报表');
+      expect(app.activeTab, app.tabs.single.key);
       final key = AppState.queryTabKey('c1', 'db1', '报表');
       expect(app.queryTextFor(key), 'SELECT 1');
 
@@ -102,7 +102,7 @@ void main() {
       );
 
       expect(app.tabs.single.title, '我的查询');
-      expect(app.activeTab, '我的查询');
+      expect(app.activeTab, app.tabs.single.key);
       final newKey = AppState.queryTabKey(null, null, '我的查询');
       expect(app.queryTextFor(newKey), 'SELECT x');
       expect(app.queryTextFor(oldKey), '');
@@ -123,7 +123,7 @@ void main() {
       app.updateQueryText(key, 'SELECT 9');
       app.recordSql(key, 'SELECT 9');
 
-      app.closeTab('报表');
+      app.closeTab(app.tabs.single.key);
       expect(app.tabs, isEmpty);
       expect(app.activeTab, AppState.objectsTabKey);
       expect(app.queryTextFor(key), '');
