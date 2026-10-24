@@ -33,7 +33,8 @@ const _ncxFixture = '''
 </Connections>
 ''';
 
-/// Navicat 在 Redis 模型下导出的 `.ano`:整份文件是 base64 的 JSON 数组。
+/// `.ano` 的**裸数组形**(Another Redis Desktop Manager 旧版「导出连接」):
+/// 整份文件是 base64 的 JSON 数组。
 ///
 /// 结构照本机真实导出文件(`host / port / auth / username / name / separator /
 /// cluster / connectionReadOnly / key / order / connectionName`)复刻,
@@ -105,6 +106,48 @@ final String _anoFixture = base64Encode(utf8.encode(jsonEncode([
     'connectionName': 'cluster_node',
   },
 ])));
+
+/// `.ano` 的**新版形**:ARDM 的 `storage.exportConnectionsBundle()` 写出
+/// `{connections: [...], groups: [{id, name}]}`,连接靠 `groupId` 挂到分组上。
+/// 分组名与连接名同样是假值。
+final String _anoBundleFixture = base64Encode(utf8.encode(jsonEncode({
+  'connections': [
+    {
+      'host': 'prod.redis.example.com',
+      'port': 6379,
+      'auth': 'Test@1234',
+      'name': '生产主节点',
+      'connectionName': '生产主节点',
+      'groupId': 'g_prod',
+      'key': '1680846449382_eeee5',
+      'order': 0,
+    },
+    {
+      'host': 'local.redis.example.com',
+      'port': 6379,
+      'auth': '',
+      'name': '本机',
+      'connectionName': '本机',
+      'groupId': null,
+      'key': '1680846449382_ffff6',
+      'order': 1,
+    },
+    {
+      'host': 'orphan.redis.example.com',
+      'port': 6379,
+      'auth': 'Test@1234',
+      'name': '分组已被删',
+      'connectionName': '分组已被删',
+      'groupId': 'g_gone',
+      'key': '1680846449382_gggg7',
+      'order': 2,
+    },
+  ],
+  'groups': [
+    {'id': 'g_prod', 'name': '生产集群'},
+    {'id': 'g_test', 'name': '测试'},
+  ],
+})));
 
 void main() {
   group('AES-128-CBC 原语', () {    test('与 FIPS-197 官方向量一致(零 IV 单块即 ECB 解密)', () {
@@ -338,10 +381,57 @@ void main() {
     });
   });
 
+  group('.ano 新版根对象 {connections, groups}', () {
+    final ano = NavicatNcx.parse(_anoBundleFixture);
+    NavicatConnection entry(String name) =>
+        ano.connections.firstWhere((e) => e.name == name);
+
+    test('connections 列表照单全收,与裸数组形走同一套映射', () {
+      expect(ano.connections.length, 3);
+      final e = entry('生产主节点');
+      expect(e.typeId, 'redis');
+      expect(e.isSupported, isTrue);
+      expect(e.passwordState, NavicatPasswordState.decrypted);
+      expect(e.toConnection().host, 'prod.redis.example.com');
+    });
+
+    test('groupId 反查 groups 得到分组名,并随连接一起落到 ConnectionInfo.group', () {
+      expect(entry('生产主节点').group, '生产集群');
+      expect(entry('生产主节点').toConnection().group, '生产集群');
+    });
+
+    test('无 groupId / 分组已被删的连接按「未分组」处理,不编出分组名', () {
+      expect(entry('本机').group, '');
+      expect(entry('分组已被删').group, '');
+    });
+
+    test('groups 缺失或为空时仍能解(旧文件与空分组表同一条路径)', () {
+      List<Object?> conns() =>
+          (jsonDecode(utf8.decode(base64Decode(_anoBundleFixture)))
+                  as Map<String, Object?>)['connections']!
+              as List<Object?>;
+      for (final body in [
+        {'connections': conns()},
+        {'connections': conns(), 'groups': []},
+      ]) {
+        expect(NavicatNcx.parse(base64Encode(utf8.encode(jsonEncode(body))))
+            .connections
+            .length, 3);
+      }
+    });
+
+    test('JSON 根对象没有 connections 列表时给中文原因,不静默产出空列表', () {
+      expect(
+        () => NavicatNcx.parse(base64Encode(utf8.encode('{"groups":[]}'))),
+        throwsA(isA<FormatException>()),
+      );
+    });
+  });
+
   // 真实导出文件的抽样回归:开关口径与实连数据库测试一致 —— 只有显式给出路径
   // 才跑(默认跳过,不依赖任何人的个人目录)。
   // 断言只看条数 / 类型 / 端口 / 密码「可得性」这些形状,**不打印也不比对口令值**。
-  group('真实 Navicat .ano 抽样(按需)', () {
+  group('真实 .ano 抽样(按需)', () {
     final path = Platform.environment['DARO_NAVICAT_ANO'] ?? '';
     final skip = path.isEmpty ? '未给出导出文件路径(DARO_NAVICAT_ANO)' : null;
 

@@ -8,19 +8,23 @@ import 'package:xml/xml.dart';
 import 'db_data.dart';
 import 'db_types.dart';
 
-/// Navicat 导出的连接配置导入:格式识别 + 密码还原 + 映射为 daro 的
-/// [ConnectionInfo]。
+/// Navicat / Another Redis Desktop Manager 导出的连接配置导入:
+/// 格式识别 + 密码还原 + 映射为 daro 的 [ConnectionInfo]。
 ///
-/// ── 两种导出格式(实测本机 Navicat Premium 16/17) ──
-/// * **`.ncx` = XML**。关系型与文件型连接走这条,`<Connection>` 属性平铺,
+/// ── 两种导出格式 ──
+/// * **`.ncx` = XML**。Navicat 的关系型与文件型连接走这条,`<Connection>` 属性平铺,
 ///   `Password` 是**大写十六进制**密文(见下)。
-/// * **`.ano` = base64 的 JSON 数组**。Redis 这类非关系型连接用它导出,字段是
+/// * **`.ano` = base64 的 JSON**。这是 Another Redis Desktop Manager 的
+///   「设置 → 导出连接」产物(它写死的文件名就是 `connections.ano`),字段是
 ///   `host / port / auth / username / name / connectionName / separator /
-///   cluster / connectionReadOnly / key / order`。
+///   cluster / connectionReadOnly / key / order / groupId`。
+///   根节点有两种形:**新版是 `{connections: [...], groups: [...]}`**,
+///   groups 里 `{id, name}` 与连接的 `groupId` 配对(见 [NavicatNcx.parse]);
+///   **旧版是裸数组**,没有分组(实测手上的样本文件即此形)。
 ///   这里 `auth` 是**明文口令**,不存在解密环节 —— 所以它绝不进
 ///   [decryptNavicatPassword] 那条 AES 分支(十六进制形状的口令会解出垃圾)。
 ///   `separator`(键名前缀分层符)与 `connectionReadOnly` 在 daro 的
-///   [ConnectionInfo] 里没有对应字段:前者是 Navicat 的树形显示糖,后者当前
+///   [ConnectionInfo] 里没有对应字段:前者是该工具的树形显示糖,后者当前
 ///   恒等于驱动口径(Redis 首版只读),导入时丢弃。`cluster=true` 会被挡掉。
 ///
 /// 格式靠内容识别,不看后缀:根元素是 `<` 走 XML,否则按 base64 JSON 试。
@@ -113,24 +117,30 @@ class NavicatConnection {
 
   String attr(String key) => attributes[key] ?? '';
 
-  /// 从 `.ano`(base64 JSON 数组)的一个条目建出连接。
+  /// 从 `.ano`(base64 JSON)的一个条目建出连接。
   ///
-  /// Navicat 的 Redis 导出把配置平铺成 JSON 键,这里映射到与 `.ncx` 同名的属性
-  /// 键上;`port` 在真实文件里数字与字符串都出现过(实测 6379 与 "9099" 同存),
+  /// 该导出把配置平铺成 JSON 键,这里映射到与 `.ncx` 同名的属性键上;
+  /// `port` 在真实文件里数字与字符串都出现过(实测 6379 与 "9099" 同存),
   /// 一律按字符串收下。
+  ///
+  /// [groupName] 由调用方按 `groupId` 从 bundles 的 `groups` 里查好传进来
+  /// (裸数组形的旧导出没有 groups,传空串即「未分组」);落到 `Group` 属性上,
+  /// 与 `.ncx` 走同一个 [group] 取值口。
   ///
   /// `auth` 是**明文**,直接进 [NavicatPasswordState.decrypted],不试 AES;
   /// 空 `auth` 记 [NavicatPasswordState.noPassword](Redis 未设 requirepass)。
-  factory NavicatConnection.fromAnoEntry(Map<String, Object?> json) {
+  factory NavicatConnection.fromAnoEntry(Map<String, Object?> json,
+      {String groupName = ''}) {
     final auth = '${json['auth'] ?? ''}';
     return NavicatConnection(
       attributes: {
-        // 这份文件没有类型字段:它是 Navicat 在 Redis 模型下「导出连接」的产物
+        // 这份文件没有类型字段:它是 Redis 连接管理器的导出,只可能指向 Redis
         'ConnType': 'REDIS',
         'ConnectionName': '${json['connectionName'] ?? json['name'] ?? ''}',
         'Host': '${json['host'] ?? ''}',
         'Port': '${json['port'] ?? ''}',
         'UserName': '${json['username'] ?? ''}',
+        if (groupName.trim().isNotEmpty) 'Group': groupName.trim(),
       },
       passwordState:
           auth.isEmpty ? NavicatPasswordState.noPassword : NavicatPasswordState.decrypted,
@@ -226,7 +236,7 @@ class NavicatConnection {
   }
 }
 
-/// 一个 Navicat 导出文件的解析结果(`.ncx` 与 `.ano` 共用)。
+/// 一个导出文件的解析结果(`.ncx` 与 `.ano` 共用)。
 class NavicatNcx {
   NavicatNcx({required this.connections, this.formatVersion = ''});
 
@@ -253,28 +263,48 @@ class NavicatNcx {
 
   /// 解析导出文件文本,按**内容**认格式(后缀不可信,用户常手改扩展名)。
   ///
+  /// 非 XML 那条走 `.ano`:base64 → UTF-8 → JSON,根节点接受**裸数组**(旧版)与
+  /// `{connections: [...], groups: [...]}`(新版)两种形;后者的 `groups` 按
+  /// `id → name` 建表,再用每条连接的 `groupId` 反查成分组名。
+  ///
   /// 格式不符时抛 [FormatException](带中文原因,供 UI 直接展示)。
   static NavicatNcx parse(String text) {
     final trimmed = text.trimLeft();
     if (trimmed.startsWith('<')) return _parseNcx(text);
-    // 不是 XML 就按 `.ano` 试:base64 → UTF-8 → JSON 数组
-    List<Object?> list;
+    final Object? root;
     try {
-      final raw = utf8.decode(base64Decode(_stripWhitespace(text)));
-      list = jsonDecode(raw) as List<Object?>;
+      root = jsonDecode(utf8.decode(base64Decode(_stripWhitespace(text))));
     } catch (_) {
       throw FormatException(
           '无法识别的文件格式:既不是 XML 导出(.ncx),也不是 base64 JSON 导出(.ano)');
     }
+    final Object? rawList = root is List
+        ? root
+        : root is Map
+            ? root['connections']
+            : null;
+    if (rawList is! List) {
+      throw const FormatException('.ano 的 JSON 根节点既不是数组也没有 connections 列表');
+    }
+    final groupNames = <String, String>{
+      // 没有 id 的分组条目直接丢:否则它会在查不到时冒充「未分组」的连接的目标
+      for (final g in root is Map ? _asList(root['groups']) : const [])
+        if (g is Map && g['id'] != null && '${g['id']}'.isNotEmpty)
+          '${g['id']}': '${g['name'] ?? ''}'.trim(),
+    };
     final connections = <NavicatConnection>[
-      for (final item in list)
-        if (item is Map<String, Object?>) NavicatConnection.fromAnoEntry(item),
+      for (final item in rawList)
+        if (item is Map<String, Object?>)
+          NavicatConnection.fromAnoEntry(item,
+              groupName: groupNames['${item['groupId']}'] ?? ''),
     ];
     if (connections.isEmpty) {
       throw FormatException('文件里没有任何连接条目');
     }
     return NavicatNcx(connections: connections);
   }
+
+  static List<Object?> _asList(Object? v) => v is List ? v : const [];
 
   /// 解析 NCX(XML)文本。格式不符时抛 [FormatException]。
   static NavicatNcx _parseNcx(String text) {

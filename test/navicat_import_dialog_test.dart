@@ -26,7 +26,7 @@ const _ncx = '''
 </Connections>
 ''';
 
-/// Navicat 在 Redis 模型下导出的 `.ano`(base64 的 JSON 数组)。
+/// `.ano`(Another Redis Desktop Manager 的「设置 → 导出连接」,base64 的 JSON 数组)。
 /// 主机与口令都是假值;`auth` 在这份文件里是**明文**,不经 AES。
 final _ano = base64Encode(utf8.encode(jsonEncode([
   {
@@ -69,6 +69,35 @@ final _ano = base64Encode(utf8.encode(jsonEncode([
     'connectionName': '集群版',
   },
 ])));
+
+/// `.ano` 的新版形:`{connections, groups}`,连接靠 `groupId` 挂分组。
+final _anoBundle = base64Encode(utf8.encode(jsonEncode({
+  'connections': [
+    {
+      'host': '10.0.0.41',
+      'port': 6379,
+      'auth': 'Test@1234',
+      'name': '会话缓存',
+      'connectionName': '会话缓存',
+      'groupId': 'g1',
+      'key': '1680846449382_hhhh8',
+      'order': 0,
+    },
+    {
+      'host': '10.0.0.42',
+      'port': 6379,
+      'auth': '',
+      'name': '本机调试',
+      'connectionName': '本机调试',
+      'groupId': null,
+      'key': '1680846449382_iiii9',
+      'order': 1,
+    },
+  ],
+  'groups': [
+    {'id': 'g1', 'name': '缓存集群'},
+  ],
+})));
 
 /// 与 main.dart 同层级:Provider 必须在 MaterialApp 之上,否则 showDialog 的
 /// 弹层路由拿不到 AppState(Tokens.of 依赖它)
@@ -118,7 +147,10 @@ void main() {
     await tester.tap(find.text('打开导入向导'));
     await tester.pumpAndSettle();
 
-    expect(find.text('请先选择 Navicat 导出的连接文件(.ncx / .ano)。'), findsOneWidget);
+    expect(find.text('请先选择导出文件(.ncx / .ano)。'), findsOneWidget);
+    // 「支持的导出来源」两枚厂商标识:未解析时摆明能吃什么文件
+    expect(find.text('Navicat'), findsOneWidget);
+    expect(find.text('Another Redis Desktop Manager'), findsOneWidget);
     // 「解析」按钮已删除:选文件、回车、失焦都会自动读取
     expect(find.text('解析'), findsNothing);
     // 未解析时「导入选中」不可用,避免空列表点出个 0 条的假成功
@@ -127,6 +159,9 @@ void main() {
     await _pasteAndBlur(tester, ncxFile.path);
 
     expect(find.textContaining('已解析 3 条连接'), findsOneWidget);
+    // 解析成功后让位给连接列表,来源卡片不再出现
+    expect(find.text('支持的导出来源'), findsNothing);
+    expect(find.text('Another Redis Desktop Manager'), findsNothing);
     // 同一路径再次失焦不重复解析:默认勾选不会被抹掉
     await tester.tap(find.byType(Input));
     await tester.pump();
@@ -186,6 +221,30 @@ void main() {
     expect(cache.database, '', reason: '库号在连接树的 db0..db15 上选,不落默认库');
     // 落进 AppState 之后就走的 KV 链:isKvStoreConnection 认它,树给命名空间叶子
     expect(isKvStoreConnection(cache), isTrue);
+  });
+
+  testWidgets('ARDM 新版导出 {connections, groups}:分组随连接一起还原',
+      (tester) async {
+    final bundle = File('${supportDir.path}${Platform.pathSeparator}connections.ano')
+      ..writeAsStringSync(_anoBundle, flush: true);
+    await tester.pumpWidget(harness(app, entryPage(app)));
+    await tester.tap(find.text('打开导入向导'));
+    await tester.pumpAndSettle();
+    await _pasteAndBlur(tester, bundle.path);
+
+    expect(find.textContaining('已解析 2 条连接'), findsOneWidget);
+    // 分组列:本地没有的分组标「·新建」,无 groupId 的那条仍是 '-'
+    expect(find.text('缓存集群 ·新建'), findsOneWidget);
+    expect(find.textContaining('分组 1'), findsOneWidget);
+
+    await tester.tap(find.text('导入选中'));
+    await tester.pumpAndSettle();
+
+    final byName = {for (final c in app.connections) c.name: c};
+    expect(byName['会话缓存']!.group, '缓存集群');
+    expect(byName['本机调试']!.group, '');
+    // 分组条目本身也要落地(允许空分组存在,树里才有可拖入的目标)
+    expect(app.groupNames, contains('缓存集群'));
   });
 
   testWidgets('再次导入同一文件:全部标为已存在同名,默认不勾选', (tester) async {

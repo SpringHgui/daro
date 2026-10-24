@@ -1,6 +1,7 @@
 import 'package:base_ui_flutter/base_ui_flutter.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 
 import '../app/app_state.dart';
 import '../data/db_data.dart';
@@ -123,9 +124,9 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
   Future<void> _pickFile() async {
     final file = await openFile(
       acceptedTypeGroups: const [
-        // .ncx = XML 导出;.ano = Navicat 在 Redis 等模型下导出的 base64 JSON。
-        // 解析按内容认格式,后缀只影响这里能不能选中文件。
-        XTypeGroup(label: 'Navicat 连接文件', extensions: ['ncx', 'ano', 'xml']),
+        // .ncx = XML 导出(Navicat);.ano = base64 JSON 导出(Another Redis
+        // Desktop Manager)。解析按内容认格式,后缀只影响这里能不能选中文件。
+        XTypeGroup(label: '连接导出文件', extensions: ['ncx', 'ano', 'xml']),
         XTypeGroup(label: '所有文件'),
       ],
       confirmButtonText: '打开',
@@ -262,8 +263,9 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
                     child: Input(
                       controller: _pathController,
                       focusNode: _pathFocus,
-                      hint: r'选择 Navicat 导出的连接文件(路径也可直接粘贴),'
-                          r'如 C:\Users\你\Desktop\connections.ncx 或 Redis 的 connections.ano',
+                      hint: r'选择 Navicat / Another Redis Desktop Manager 导出的连接文件'
+                          r'(路径也可直接粘贴),'
+                          r'如 C:\Users\你\Desktop\connections.ncx 或 connections.ano',
                       onChanged: (v) => setState(() => _filePath = v),
                       onSubmitted: (_) => _parse(),
                     ),
@@ -313,7 +315,7 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
     }
     if (!_parsedOk) {
       return Text(
-        _hasPath ? '路径已填:按回车或点到别处即读取该文件。' : '请先选择 Navicat 导出的连接文件(.ncx / .ano)。',
+        _hasPath ? '路径已填:按回车或点到别处即读取该文件。' : '请先选择导出文件(.ncx / .ano)。',
         style: _style(t, color: t.mutedForeground),
       );
     }
@@ -492,21 +494,52 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
     return DbTypeIcon(type: type, size: 18);
   }
 
-  /// 未解析成功时的引导区。失败原因由上方状态行给出,这里不重复罗列。
+  /// 未解析成功时的引导区:先摆明「支持哪些工具的导出文件」,再给操作说明。
+  /// 解析成功后整块让位给连接列表(见 build 的 `_parsedOk` 分支)。
   Widget _placeholder(AppPalette t) {
     return Center(
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 480),
-        child: Text(
-          '在 Navicat 里用「文件 → 导出连接设置…」并勾选「导出密码」导出,'
-          '然后在这里选择该文件。\n'
-          '关系型连接导成 .ncx;Redis 这类连接导成 .ano(内容是 base64 的 JSON),'
-          '两种都支持,后缀不必手工对齐。\n'
-          '.ncx 里保存的密码按 Navicat 内置算法解密后带过来,.ano 里的 auth 本就是明文。\n'
-          'daro 导出的文件带 Group 属性,导入时本地没有的分组会自动新建;'
-          'Navicat 自身导出的文件没有分组信息,连接会落在「未分组」。',
-          textAlign: TextAlign.center,
-          style: _style(t, color: t.mutedForeground, size: 12.5),
+        constraints: const BoxConstraints(maxWidth: 620),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('支持的导出来源',
+                textAlign: TextAlign.center,
+                style: _style(t, color: t.mutedForeground, size: 11.5)),
+            const SizedBox(height: 8),
+            const Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _SourceCard(
+                  icon: 'assets/icons/tools/navicat.svg',
+                  name: 'Navicat',
+                  howto: '文件 → 导出连接设置…',
+                  files: '.ncx / .xml',
+                ),
+                SizedBox(width: 12),
+                _SourceCard(
+                  icon: 'assets/icons/tools/another-redis-desktop-manager.svg',
+                  name: 'Another Redis Desktop Manager',
+                  howto: '设置 → 导出连接',
+                  files: 'connections.ano',
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Text(
+              '在上面的工具里导出连接配置,然后回到这里选择该文件。\n'
+              '两种容器按内容识别,后缀不必手工对齐:'
+              '.ncx 是 XML,.ano 是 base64 的 JSON。\n'
+              '.ncx 里保存的密码按 Navicat 内置算法解密后带过来;'
+              '.ano 里的 auth 本就是明文。\n'
+              '分组:Navicat 原生导出没有分组信息,连接会落在「未分组」;'
+              'ARDM 新版导出带的 groups 会一并还原,'
+              'daro 自己导出的文件按 Group 属性恢复。',
+              textAlign: TextAlign.center,
+              style: _style(t, color: t.mutedForeground, size: 12.5),
+            ),
+          ],
         ),
       ),
     );
@@ -518,4 +551,76 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
         decoration: TextDecoration.none,
         fontWeight: FontWeight.w400,
       );
+}
+
+/// 「支持的导出来源」卡片:厂商官方标识(统一瓦片,见 assets/icons/tools/)+
+/// 软件名 + 导出入口与文件后缀。
+///
+/// 只做本对话框的排版,不是可复用控件;底色用 `surface`,在明暗两套主题下
+/// 都比外层 `background` 深一档,把瓦片与背景分开。
+class _SourceCard extends StatelessWidget {
+  const _SourceCard({
+    required this.icon,
+    required this.name,
+    required this.howto,
+    required this.files,
+  });
+
+  final String icon;
+  final String name;
+  final String howto;
+  final String files;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Tokens.of(context);
+    return Container(
+      width: 286,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: t.surface,
+        border: Border.all(color: t.border),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Row(
+        children: [
+          SvgPicture.asset(icon, width: 38, height: 38),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: t.foreground,
+                      decoration: TextDecoration.none,
+                      fontWeight: FontWeight.w600,
+                    )),
+                const SizedBox(height: 2),
+                Text(howto,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: t.mutedForeground,
+                      decoration: TextDecoration.none,
+                      fontWeight: FontWeight.w400,
+                    )),
+                Text(files,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: t.mutedForeground,
+                      decoration: TextDecoration.none,
+                      fontWeight: FontWeight.w400,
+                    )),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
