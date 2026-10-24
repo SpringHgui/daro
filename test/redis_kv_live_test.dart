@@ -41,24 +41,22 @@ void main() {
 
   late KvStoreDriver driver;
   late KvNamespace db0;
-
-  setUpAll(() async {
-    driver = createKvDriver(conn)!;
-    await driver.connect();
-    final ns = await driver.listNamespaces();
-    db0 = ns.firstWhere((n) => n.id == '0');
-  });
-
-  tearDownAll(() async => driver.close());
+  /// 写回环全部打在 **db1**(探针库里是空库):种在 db0 的 2000+ 样本数据
+  /// 一条都不碰,跑完还能验回 0。
+  late KvNamespace db1;
 
   /// 把带过滤的扫描翻到底:SCAN 的空页只代表「这一轮没命中」,
   /// 只有 [KvKeyPage.done] 之后才能断定命中了什么(或什么都没命中)。
-  Future<List<KvKeyEntry>> _drain({KvBytes? pattern, String? type}) async {
+  Future<List<KvKeyEntry>> _drainIn(
+    KvNamespace ns, {
+    KvBytes? pattern,
+    String? type,
+  }) async {
     final all = <KvKeyEntry>[];
     String? cursor;
     for (var i = 0; i < 200; i++) {
       final page = await driver.scanKeys(KvKeyScan(
-        namespace: db0,
+        namespace: ns,
         cursor: cursor,
         pattern: pattern,
         type: type,
@@ -71,12 +69,34 @@ void main() {
     throw StateError('过滤扫描在 200 页内没有收敛(游标始终不为零)');
   }
 
+  Future<List<KvKeyEntry>> _drain({KvBytes? pattern, String? type}) =>
+      _drainIn(db0, pattern: pattern, type: type);
+
+  setUpAll(() async {
+    driver = createKvDriver(conn)!;
+    await driver.connect();
+    final ns = await driver.listNamespaces();
+    db0 = ns.firstWhere((n) => n.id == '0');
+    db1 = ns.firstWhere((n) => n.id == '1');
+  });
+
+  tearDownAll(() async {
+    // 探针键都在 `daro:ui_probe:` 前缀下:整批复删,不依赖用例自己收尾
+    final left = await _drainIn(db1, pattern: KvBytes.text('daro:ui_probe:*'));
+    if (left.isNotEmpty) {
+      await driver.deleteKeys(db1, [for (final e in left) e.key]);
+    }
+    expect(await driver.keyCount(db1), 0, reason: '写回环必须把探针库清干净');
+    await driver.close();
+  });
+
   test('工厂与能力门:redis 走 KV 抽象而不是 SQL 驱动', () {
     expect(isKvStoreConnection(conn), isTrue);
     expect(driver.isConnected, isTrue);
     expect(driver.capabilities.multipleNamespaces, isTrue);
     expect(driver.capabilities.cursorScan, isTrue);
-    expect(driver.capabilities.readOnlyFirstVersion, isTrue);
+    expect(driver.capabilities.writable(KvKeyType.string), isTrue);
+    expect(driver.capabilities.writable(KvKeyType.stream), isFalse);
     expect(driver.capabilities.supports(KvKeyType.stream), isTrue);
   });
 
@@ -310,12 +330,214 @@ void main() {
   });
 
   test('空库与不存在的键:回空集合而不是报错', () async {
-    final db1 = (await driver.listNamespaces()).firstWhere((n) => n.id == '1');
     final page = await driver.scanKeys(KvKeyScan(namespace: db1, count: 100));
     expect(page.entries, isEmpty);
     expect(await driver.keyCount(db1), 0);
     final missing = await driver.readValue(db1, KvBytes.text('nope'));
     expect(missing.type, KvKeyType.none);
     expect(missing.rows, isEmpty);
+  });
+
+  // ─────────────────────────────────────── 写回环(全部打在 db1 探针库)
+
+  /// 本文件写路径专用键名前缀:`tearDownAll` 按它整批清场
+  KvBytes probe(String name) => KvBytes.text('daro:ui_probe:$name');
+
+  test('写回环 · 字符串:新建即落库,改值保 TTL,显式 TTL 重算起算点', () async {
+    final k = probe('str');
+    await driver.setStringValue(db1, k, KvBytes.text('v1'));
+    var read = await driver.readValue(db1, k);
+    expect(read.type, KvKeyType.string);
+    expect(read.rows.single.value.text, 'v1');
+    expect(read.ttlSeconds, -1, reason: '新建裸键没有过期时间');
+
+    // 先给一个 TTL,再只改值 —— 裸 SET 会把过期时间清掉,UI 上就是「改个值,
+    // 键变成了永久」,所以驱动必须发 KEEPTTL。这条断言只有真服务端能验。
+    expect(await driver.setTtl(db1, [k], 300), 1);
+    await driver.setStringValue(db1, k, KvBytes.text('v2'));
+    read = await driver.readValue(db1, k);
+    expect(read.rows.single.value.text, 'v2');
+    expect(read.ttlSeconds, greaterThan(0), reason: 'SET KEEPTTL 必须保住 TTL');
+    expect(read.ttlSeconds, lessThanOrEqualTo(300));
+
+    // 显式传 TTL 时改用 EX:从此刻起算,不是保留旧值
+    await driver.setStringValue(db1, k, KvBytes.text('v3'), ttlSeconds: 60);
+    read = await driver.readValue(db1, k);
+    expect(read.rows.single.value.text, 'v3');
+    expect(read.ttlSeconds, lessThanOrEqualTo(60));
+
+    // 过期时间能清:PERSIST 之后 TTL 回 -1
+    expect(await driver.setTtl(db1, [k], null), 1);
+    read = await driver.readValue(db1, k);
+    expect(read.ttlSeconds, -1);
+  });
+
+  test('写回环 · 字符串:二进制值整段往返,不经过 UTF-8 也不被截断', () async {
+    final k = probe('strbin');
+    final raw = KvBytes([0, 255, 128, 0xC3, 0x28, 1, 254]);
+    await driver.setStringValue(db1, k, raw);
+    final read = await driver.readValue(db1, k);
+    expect(read.rows.single.value.isBinary, isTrue);
+    expect(read.rows.single.value.hex, '00FF80C32801FE');
+    expect(read.totalLength, raw.bytes.length);
+  });
+
+  test('写回环 · 二进制键名:能写进去、扫得出来、也删得掉', () async {
+    final k = KvBytes([0xff, 0xfe, 0x00, 0x41]);
+    await driver.setStringValue(db1, k, KvBytes.text('binary key name'));
+    final found = await _drainIn(db1);
+    expect(found.map((e) => e.key.bytes).any((b) =>
+        b.length == 4 && b[0] == 0xff && b[1] == 0xfe && b[2] == 0 && b[3] == 0x41),
+        isTrue,
+        reason: 'SCAN 不能按字符串解码键名,否则字节键名会消失');
+    expect(await driver.deleteKeys(db1, [k]), 1);
+  });
+
+  test('写回环 · 哈希:一句 HSET 同时改旧字段与加新字段,HDEL 只删点名的', () async {
+    final k = probe('hash');
+    await driver.hashWrite(db1, k, set: [
+      (KvBytes.text('name'), KvBytes.text('daro')),
+      (KvBytes.text('role'), KvBytes.text('tool')),
+    ]);
+    var read = await driver.readValue(db1, k);
+    expect(read.type, KvKeyType.hash);
+    expect(read.totalCount, 2);
+    expect(read.rows.map((r) => r.field!.text).toList(), ['name', 'role']);
+
+    // 改值 + 新增走同一条 HSET:服务端自己区分覆盖/插入,回包只是计数
+    await driver.hashWrite(db1, k, set: [
+      (KvBytes.text('name'), KvBytes.text('daro-desktop')),
+      (KvBytes.text('extra'), KvBytes.text('1')),
+    ]);
+    read = await driver.readValue(db1, k);
+    expect(read.totalCount, 3);
+    expect(read.rows.first.value.text, 'daro-desktop');
+
+    await driver.hashWrite(db1, k, removeFields: [KvBytes.text('role')]);
+    read = await driver.readValue(db1, k);
+    expect(read.rows.map((r) => r.field!.text).toList(), ['name', 'extra']);
+    // 字段值可以为空串(种子数据里就有 empty=),不能被判成「没内容」而漏掉
+    await driver.hashWrite(
+        db1, k, set: [(KvBytes.text('empty'), KvBytes.text(''))]);
+    read = await driver.readValue(db1, k);
+    expect(read.rows.last.field!.text, 'empty');
+    expect(read.rows.last.value.text, '');
+  });
+
+  test('写回环 · 列表:下标增删改都按位置生效,重复值不会删错行', () async {
+    final k = probe('list');
+    // RPUSH / LPUSH 各自建键与追加,顺序即断言
+    await driver.listWrite(db1, k, append: KvBytes.text('a'));
+    await driver.listWrite(db1, k, append: KvBytes.text('dup'));
+    await driver.listWrite(db1, k, prepend: KvBytes.text('head'));
+    await driver.listWrite(db1, k, append: KvBytes.text('b'));
+    await driver.listWrite(db1, k, append: KvBytes.text('dup'));
+    Future<List<String>> shown() async {
+      final r = await driver.readValue(db1, k);
+      return [for (final row in r.rows) row.value.text ?? row.value.display];
+    }
+
+    expect(await shown(), ['head', 'a', 'dup', 'b', 'dup']);
+
+    await driver.listWrite(db1, k, set: [(2, KvBytes.text('x'))]);
+    expect(await shown(), ['head', 'a', 'x', 'b', 'dup']);
+
+    // 关键:LREM 按值删。若直接对下标 2 发 LREM,删掉的会是「dup」而不是
+    // 用户点中的那一行。哨兵替换法必须让末尾的 dup 活下来。
+    await driver.listWrite(db1, k, removeIndexes: [2]);
+    expect(await shown(), ['head', 'a', 'b', 'dup']);
+
+    // 多行连删(先全部替换再逐个删,中途不位移)
+    await driver.listWrite(db1, k, removeIndexes: [0, 2]);
+    expect(await shown(), ['a', 'dup']);
+
+    // 越界下标是服务端错误,原样上抛而不是静默少删
+    await expectLater(
+      driver.listWrite(db1, k, removeIndexes: [99]),
+      throwsA(isA<KvServerException>()),
+    );
+  });
+
+  test('写回环 · 集合与有序集:成员去重、分数覆盖、ZREM/SREM 精确删除', () async {
+    final s = probe('set');
+    await driver.setWrite(db1, s, add: [
+      KvBytes.text('hot'),
+      KvBytes.text('daro'),
+      KvBytes.text('hot'), // 重复成员:SADD 去重,不应变成两条
+    ]);
+    var read = await driver.readValue(db1, s);
+    expect(read.totalCount, 2);
+    expect(read.rows.map((r) => r.value.text).toSet(), {'hot', 'daro'});
+
+    await driver.setWrite(db1, s, removeMembers: [KvBytes.text('hot')]);
+    read = await driver.readValue(db1, s);
+    expect(read.rows.map((r) => r.value.text).toList(), ['daro']);
+
+    final z = probe('zset');
+    await driver.zsetWrite(db1, z, add: [
+      (KvBytes.text('alice'), 100),
+      (KvBytes.text('bob'), 92.5),
+    ]);
+    read = await driver.readValue(db1, z);
+    // ZRANGE WITHSCORES:低分在前
+    expect(read.rows.map((r) => r.value.text).toList(), ['bob', 'alice']);
+    expect(read.rows.map((r) => r.score).toList(), [92.5, 100.0]);
+
+    // 改分数与加成员同一句 ZADD:负分与小数都要原样落库
+    await driver.zsetWrite(db1, z, add: [
+      (KvBytes.text('alice'), -3.25),
+      (KvBytes.text('carol'), 1),
+    ]);
+    read = await driver.readValue(db1, z);
+    expect(read.rows.map((r) => r.value.text).toList(), ['alice', 'carol', 'bob']);
+    expect(read.rows.first.score, -3.25);
+
+    await driver.zsetWrite(db1, z, removeMembers: [KvBytes.text('carol')]);
+    read = await driver.readValue(db1, z);
+    expect(read.rows.map((r) => r.value.text).toList(), ['alice', 'bob']);
+  });
+
+  test('写回环 · DEL 批量:只数真正删掉的,不存在的键不计且不报错', () async {
+    final keys = [probe('del1'), probe('del2'), probe('ghost')];
+    await driver.setStringValue(db1, keys[0], KvBytes.text('1'));
+    await driver.setStringValue(db1, keys[1], KvBytes.text('2'));
+    expect(await driver.deleteKeys(db1, keys), 2);
+    expect(await driver.deleteKeys(db1, keys), 0, reason: '再删一次全都不存在');
+    expect(await driver.deleteKeys(db1, const []), 0);
+  });
+
+  test('写回环 · setTtl 如实报数:键在两次点击之间过期了不算失败', () async {
+    final k = probe('ttlcount');
+    await driver.setStringValue(db1, k, KvBytes.text('v'));
+    expect(
+      await driver.setTtl(db1, [k, probe('nope-ttl')], 120),
+      1,
+      reason: '不存在的键 EXPIRE 回 0,生效数小于选中数是正常结果',
+    );
+    expect(await driver.setTtl(db1, [k], null), 1);
+  });
+
+  test('写回环 · 类型不符:服务端 WRONGTYPE 原文上抛,连接之后照常用', () async {
+    final k = probe('wrongtype');
+    await driver.setStringValue(db1, k, KvBytes.text('not a hash'));
+    await expectLater(
+      driver.hashWrite(db1, k, set: [(KvBytes.text('f'), KvBytes.text('v'))]),
+      throwsA(isA<KvServerException>()
+          .having((e) => e.message, 'message', contains('WRONGTYPE'))),
+    );
+    // 错误不能让解析链错位:同一会话下一次读必须对得上
+    expect((await driver.readValue(db1, k)).rows.single.value.text,
+        'not a hash');
+    expect((await driver.runCommand(db1, ['PING'])).summary, 'PONG');
+    await driver.deleteKeys(db1, [k]);
+  });
+
+  test('写回环 · 能力表外类型不给入口:stream 只读', () async {
+    expect(driver.capabilities.writable(KvKeyType.stream), isFalse);
+    final k = probe('stream');
+    await driver.runCommand(db1, ['XADD', k.text!, '*', 'note', 'seed']);
+    expect(await _drainIn(db1, type: 'stream'), isNotEmpty);
+    // 页面对只读类型压根不发写命令;驱动层也不为 stream 提供写方法(编译期就挡了)
+    await driver.deleteKeys(db1, [k]);
   });
 }

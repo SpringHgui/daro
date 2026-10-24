@@ -2093,16 +2093,13 @@ class AppLocalizationsJa extends AppLocalizations {
   String get kvTabCategory => 'キー参照';
 
   @override
-  String get kvPatternHint => 'キー名のパターンで絞り込み(glob、例 scan:*)';
+  String get kvPatternHint => 'キー名を検索(既定は部分一致、glob 例 scan:*)';
 
   @override
   String get kvTypeAll => 'すべての型';
 
   @override
   String get kvActionRefresh => '更新';
-
-  @override
-  String get kvActionLoadMore => 'さらに読み込む';
 
   @override
   String get kvActionReadMore => '続きを読む';
@@ -2177,7 +2174,10 @@ class AppLocalizationsJa extends AppLocalizations {
   String get kvScanComplete => '走査完了';
 
   @override
-  String get kvRoundCapHint => '今回のラウンドで該当なし、続けて読み込めます';
+  String get kvScanContinue => '走査未完了。クリックで続行';
+
+  @override
+  String get kvRoundCapHint => '今回のラウンドで該当なし、続けてスキャンできます';
 
   @override
   String kvLoadedCount(String loaded) {
@@ -2193,7 +2193,7 @@ class AppLocalizationsJa extends AppLocalizations {
   String get kvNoMatch => '条件に一致するキーはありません';
 
   @override
-  String get kvNoMatchYet => 'まだ一致するキーは見つかっていません。「さらに読み込む」で続行できます';
+  String get kvNoMatchYet => 'まだ一致するキーは見つかっていません。クリックでスキャンを続行できます';
 
   @override
   String kvLoadFailed(String error) {
@@ -2227,8 +2227,268 @@ class AppLocalizationsJa extends AppLocalizations {
   }
 
   @override
+  String get kvFormatText => 'テキスト';
+
+  @override
+  String get kvFormatJson => 'JSON';
+
+  @override
+  String get kvFormatHex => '16進';
+
+  @override
+  String get kvFormatNotJson => '有効な JSON ではないため原文表示';
+
+  @override
+  String get kvFormatBinary => 'バイナリ値のため JSON 表示不可';
+
+  @override
+  String kvFormatTooBig(String count) {
+    return '整形表示は先頭 $count バイトのみ';
+  }
+
+  @override
+  String get kvFormatReadOnly => '整形ビューは読み取り専用です。編集は「テキスト」に戻ってください';
+
+  @override
   String get kvConnectionGone => 'この接続は存在しないためキーを読めません';
 
   @override
   String get kvScanUnsupported => 'このエンジンキー列挙には対応していません';
+
+  @override
+  String get kvActionNewKey => 'キーを作成';
+
+  @override
+  String get kvActionAdd => '追加';
+
+  @override
+  String get kvActionSetTtl => '有効期限を設定...';
+
+  @override
+  String get kvActionClearTtl => '有効期限を解除';
+
+  @override
+  String get kvMenuCopyKeyName => 'キー名をコピー';
+
+  @override
+  String get kvMenuDeleteKeyOne => 'キーを削除';
+
+  @override
+  String kvMenuDeleteKeys(String count) {
+    return '$count 個のキーを削除';
+  }
+
+  @override
+  String get kvMenuEdit => '編集';
+
+  @override
+  String get kvMenuCopyValue => '値をコピー';
+
+  @override
+  String get kvMenuDeleteItemOne => 'この項目を削除';
+
+  @override
+  String kvMenuDeleteItems(String count) {
+    return '$count 項目を削除';
+  }
+
+  @override
+  String get kvNotWritable => 'このエンジンは書き込みに対応していません';
+
+  @override
+  String get kvStreamReadOnly => 'ストリームは項目の追記のみ可能なため、ここでは編集できません';
+
+  @override
+  String get kvBigStringReadOnly => '値を最後まで読み込んでいないため編集できません(先に続きをお読みください)';
+
+  @override
+  String kvDeleteConfirmOne(String name) {
+    return 'キー「$name」を削除しますか?削除すると元に戻せません。';
+  }
+
+  @override
+  String kvDeleteConfirmMany(String count) {
+    return '選択した $count 個のキーを削除しますか?削除すると元に戻せません。';
+  }
+
+  @override
+  String get kvDeleteDoneOne => 'キー 1 個を削除しました';
+
+  @override
+  String kvDeleteDone(String count) {
+    return 'キー $count 個を削除しました';
+  }
+
+  @override
+  String get kvTtlSetDoneOne => 'キー 1 個の有効期限を設定しました';
+
+  @override
+  String kvTtlSetDone(String count) {
+    return 'キー $count 個の有効期限を設定しました';
+  }
+
+  @override
+  String get kvTtlClearedDoneOne => 'キー 1 個の有効期限を解除しました';
+
+  @override
+  String kvTtlClearedDone(String count) {
+    return 'キー $count 個の有効期限を解除しました';
+  }
+
+  @override
+  String kvWritePartial(String ok, String total) {
+    return '$ok / $total 個のキーに適用しました。残りは既に存在しません';
+  }
+
+  @override
+  String kvExpiresAt(String time) {
+    return '失効時刻:$time';
+  }
+
+  @override
+  String kvWriteFailed(String error) {
+    return '書き込みに失敗:$error';
+  }
+
+  @override
+  String get kvSaveDone => '保存しました';
+
+  @override
+  String get kvNewKeyTitle => 'キーを作成';
+
+  @override
+  String get kvKeyNameEmpty => 'キー名は空にできません';
+
+  @override
+  String get kvKeyNameTaken => 'このキーは既に存在します。名前を変えるか、「追加」で内容を追記してください';
+
+  @override
+  String get kvFieldTtl => '有効期限';
+
+  @override
+  String get kvTtlHint => '未入力 = 無期限';
+
+  @override
+  String get kvTtlSetTitle => '有効期限を設定';
+
+  @override
+  String get kvTtlInvalid => '有効期限は 0 より大きい数値を入力してください';
+
+  @override
+  String get kvTtlUnitSeconds => '秒';
+
+  @override
+  String get kvTtlUnitMinutes => '分';
+
+  @override
+  String get kvTtlUnitHours => '時間';
+
+  @override
+  String get kvTtlUnitDays => '日';
+
+  @override
+  String get kvAddFieldTitle => 'フィールドを追加';
+
+  @override
+  String get kvAddElementTitle => '要素を追加';
+
+  @override
+  String get kvAddMemberTitle => 'メンバーを追加';
+
+  @override
+  String get kvPosition => '挿入位置';
+
+  @override
+  String get kvPositionHead => '先頭';
+
+  @override
+  String get kvPositionTail => '末尾';
+
+  @override
+  String get kvScoreInvalid => 'スコアは数値を入力してください';
+
+  @override
+  String get kvHexHint => 'HEX: で始めると 16 進表記のバイト値として書き込みます';
+
+  @override
+  String get kvHexInvalid => '16 進表記が不正です:0-9A-F の文字が偶数個必要です';
+
+  @override
+  String get kvValueRequired => '値は空にできません';
+
+  @override
+  String kvCopiedNames(String count) {
+    return 'キー名を $count 件クリップボードにコピーしました';
+  }
+
+  @override
+  String get kvTtlAlreadyNone => 'これらのキーには元々有効期限がありません';
+
+  @override
+  String kvDeletePartial(String ok, String total) {
+    return '$ok / $total 件を削除しました。残りは読み出し範囲外か既に存在しません';
+  }
+
+  @override
+  String kvAddWindowOnly(String total, String shown) {
+    return 'この値は $total 件中 $shown 件だけ読み出されているため、新規項目はその範囲外に追加されます';
+  }
+
+  @override
+  String get kvDeleteItemConfirmOne => 'この項目を削除しますか?\n削除すると復元できません。';
+
+  @override
+  String kvDeleteItemConfirm(String count) {
+    return '選択した $count 項目を削除しますか?\n削除すると復元できません。';
+  }
+
+  @override
+  String get kvItemsDeletedOne => '1 項目を削除しました';
+
+  @override
+  String kvItemsDeleted(String count) {
+    return '$count 項目を削除しました';
+  }
+
+  @override
+  String get kvIndexReadOnly =>
+      'インデックスは要素の位置を示すため編集できません。内容を変えるには右側の値を編集してください';
+
+  @override
+  String get findHint => '検索';
+
+  @override
+  String get findReplaceHint => '置換';
+
+  @override
+  String get findNoMatches => '一致なし';
+
+  @override
+  String findMatchPosition(String current, String total) {
+    return '$current / $total 件目';
+  }
+
+  @override
+  String get findSearching => '検索中…';
+
+  @override
+  String get findPrev => '前へ';
+
+  @override
+  String get findNext => '次へ';
+
+  @override
+  String get findCaseSensitive => '大文字と小文字を区別';
+
+  @override
+  String get findRegex => '正規表現を使用';
+
+  @override
+  String get findBtnReplace => '置換';
+
+  @override
+  String get findBtnReplaceAll => 'すべて置換';
+
+  @override
+  String get findClose => '閉じる';
 }

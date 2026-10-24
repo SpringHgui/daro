@@ -2084,16 +2084,13 @@ class AppLocalizationsZh extends AppLocalizations {
   String get kvTabCategory => '键浏览';
 
   @override
-  String get kvPatternHint => '按键名模式过滤(glob,如 scan:*)';
+  String get kvPatternHint => '搜索键名(默认包含匹配,glob 如 scan:*)';
 
   @override
   String get kvTypeAll => '全部类型';
 
   @override
   String get kvActionRefresh => '刷新';
-
-  @override
-  String get kvActionLoadMore => '加载更多';
 
   @override
   String get kvActionReadMore => '读取后续内容';
@@ -2168,7 +2165,10 @@ class AppLocalizationsZh extends AppLocalizations {
   String get kvScanComplete => '已遍历完';
 
   @override
-  String get kvRoundCapHint => '本轮未命中,可继续加载';
+  String get kvScanContinue => '未扫完,点此继续扫描';
+
+  @override
+  String get kvRoundCapHint => '本轮未命中,可继续扫描';
 
   @override
   String kvLoadedCount(String loaded) {
@@ -2184,7 +2184,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get kvNoMatch => '没有符合条件的键';
 
   @override
-  String get kvNoMatchYet => '尚未扫到符合条件的键,可点「加载更多」继续';
+  String get kvNoMatchYet => '尚未扫到符合条件的键,点此继续扫描';
 
   @override
   String kvLoadFailed(String error) {
@@ -2218,8 +2218,267 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
+  String get kvFormatText => '文本';
+
+  @override
+  String get kvFormatJson => 'JSON';
+
+  @override
+  String get kvFormatHex => '十六进制';
+
+  @override
+  String get kvFormatNotJson => '不是合法 JSON,已按原文显示';
+
+  @override
+  String get kvFormatBinary => '值是二进制,无法按 JSON 显示';
+
+  @override
+  String kvFormatTooBig(String count) {
+    return '格式视图只渲染前 $count 字节';
+  }
+
+  @override
+  String get kvFormatReadOnly => '格式化视图只读,编辑请切回「文本」';
+
+  @override
   String get kvConnectionGone => '该连接已不存在,无法读取键';
 
   @override
   String get kvScanUnsupported => '该引擎不支持枚举键';
+
+  @override
+  String get kvActionNewKey => '新建键';
+
+  @override
+  String get kvActionAdd => '添加';
+
+  @override
+  String get kvActionSetTtl => '设置过期时间…';
+
+  @override
+  String get kvActionClearTtl => '清除过期时间';
+
+  @override
+  String get kvMenuCopyKeyName => '复制键名';
+
+  @override
+  String get kvMenuDeleteKeyOne => '删除键';
+
+  @override
+  String kvMenuDeleteKeys(String count) {
+    return '删除 $count 个键';
+  }
+
+  @override
+  String get kvMenuEdit => '编辑';
+
+  @override
+  String get kvMenuCopyValue => '复制值';
+
+  @override
+  String get kvMenuDeleteItemOne => '删除此项';
+
+  @override
+  String kvMenuDeleteItems(String count) {
+    return '删除 $count 项';
+  }
+
+  @override
+  String get kvNotWritable => '该引擎不支持写操作';
+
+  @override
+  String get kvStreamReadOnly => '流只能追加条目,不支持在此编辑';
+
+  @override
+  String get kvBigStringReadOnly => '值未完整读出,不能在此编辑(先点「读取后续内容」读全)';
+
+  @override
+  String kvDeleteConfirmOne(String name) {
+    return '确定要删除键「$name」吗?\n删除后不可恢复。';
+  }
+
+  @override
+  String kvDeleteConfirmMany(String count) {
+    return '确定要删除选中的 $count 个键吗?\n删除后不可恢复。';
+  }
+
+  @override
+  String get kvDeleteDoneOne => '已删除 1 个键';
+
+  @override
+  String kvDeleteDone(String count) {
+    return '已删除 $count 个键';
+  }
+
+  @override
+  String get kvTtlSetDoneOne => '已设置 1 个键的过期时间';
+
+  @override
+  String kvTtlSetDone(String count) {
+    return '已设置 $count 个键的过期时间';
+  }
+
+  @override
+  String get kvTtlClearedDoneOne => '已清除 1 个键的过期时间';
+
+  @override
+  String kvTtlClearedDone(String count) {
+    return '已清除 $count 个键的过期时间';
+  }
+
+  @override
+  String kvWritePartial(String ok, String total) {
+    return '$ok / $total 个键已生效,其余键已不存在';
+  }
+
+  @override
+  String kvExpiresAt(String time) {
+    return '过期于 $time';
+  }
+
+  @override
+  String kvWriteFailed(String error) {
+    return '写入失败:$error';
+  }
+
+  @override
+  String get kvSaveDone => '已保存';
+
+  @override
+  String get kvNewKeyTitle => '新建键';
+
+  @override
+  String get kvKeyNameEmpty => '键名不能为空';
+
+  @override
+  String get kvKeyNameTaken => '该键已存在,请换键名,或用「添加」向它追加内容';
+
+  @override
+  String get kvFieldTtl => '过期时间';
+
+  @override
+  String get kvTtlHint => '留空 = 不过期';
+
+  @override
+  String get kvTtlSetTitle => '设置过期时间';
+
+  @override
+  String get kvTtlInvalid => '过期时长要填大于 0 的数字';
+
+  @override
+  String get kvTtlUnitSeconds => '秒';
+
+  @override
+  String get kvTtlUnitMinutes => '分钟';
+
+  @override
+  String get kvTtlUnitHours => '小时';
+
+  @override
+  String get kvTtlUnitDays => '天';
+
+  @override
+  String get kvAddFieldTitle => '添加字段';
+
+  @override
+  String get kvAddElementTitle => '添加元素';
+
+  @override
+  String get kvAddMemberTitle => '添加成员';
+
+  @override
+  String get kvPosition => '插入位置';
+
+  @override
+  String get kvPositionHead => '头部';
+
+  @override
+  String get kvPositionTail => '尾部';
+
+  @override
+  String get kvScoreInvalid => '分数要填数字';
+
+  @override
+  String get kvHexHint => '以 HEX: 开头即按十六进制写入裸字节';
+
+  @override
+  String get kvHexInvalid => '十六进制格式不对:需要偶数个 0-9A-F 字符';
+
+  @override
+  String get kvValueRequired => '值不能为空';
+
+  @override
+  String kvCopiedNames(String count) {
+    return '已复制 $count 个键名到剪贴板';
+  }
+
+  @override
+  String get kvTtlAlreadyNone => '这些键本来就没有过期时间';
+
+  @override
+  String kvDeletePartial(String ok, String total) {
+    return '$ok / $total 项已删除,其余项不在已读出的窗口里或已不存在';
+  }
+
+  @override
+  String kvAddWindowOnly(String total, String shown) {
+    return '该值共 $total 项,当前只读出 $shown 项,新内容落在已读出范围之外';
+  }
+
+  @override
+  String get kvDeleteItemConfirmOne => '确定要删除这一项吗?\n删除后不可恢复。';
+
+  @override
+  String kvDeleteItemConfirm(String count) {
+    return '确定要删除选中的 $count 项吗?\n删除后不可恢复。';
+  }
+
+  @override
+  String get kvItemsDeletedOne => '已删除 1 项';
+
+  @override
+  String kvItemsDeleted(String count) {
+    return '已删除 $count 项';
+  }
+
+  @override
+  String get kvIndexReadOnly => '下标表示元素的位置,不能编辑;要改内容请编辑右侧的值';
+
+  @override
+  String get findHint => '查找';
+
+  @override
+  String get findReplaceHint => '替换';
+
+  @override
+  String get findNoMatches => '无匹配';
+
+  @override
+  String findMatchPosition(String current, String total) {
+    return '第 $current/$total 处';
+  }
+
+  @override
+  String get findSearching => '搜索中…';
+
+  @override
+  String get findPrev => '上一个';
+
+  @override
+  String get findNext => '下一个';
+
+  @override
+  String get findCaseSensitive => '区分大小写';
+
+  @override
+  String get findRegex => '使用正则表达式';
+
+  @override
+  String get findBtnReplace => '替换';
+
+  @override
+  String get findBtnReplaceAll => '全部替换';
+
+  @override
+  String get findClose => '关闭';
 }

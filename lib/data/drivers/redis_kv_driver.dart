@@ -1,14 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:redis/redis.dart' as redis;
 
 import '../db_data.dart';
 import 'kv_driver.dart';
 
-/// Redis 的 [KvStoreDriver] 实现 —— **只读阶段**。
+/// Redis 的 [KvStoreDriver] 实现。
 ///
-/// 形状由真 Redis 8.10.2 的实测结论决定(`.redis_probe/SELECTION.md`),四条硬约束:
+/// 形状由真 Redis 8.10.2 的实测结论决定(`.redis_probe/SELECTION.md`),五条硬约束:
 ///
 /// 1. **每个库一条连接。** `SELECT` 改的是连接上的共享状态,同一条连接并发操作
 ///    会打到互错的库上,只能整体串行 —— 那等于自废流水线。改成按库号惰性持有
@@ -25,6 +26,9 @@ import 'kv_driver.dart';
 ///    返回而响应仍被链上吃掉 —— 协议不错位,但**队头阻塞**(实测被弃的 BLPOP 3s
 ///    让后续 PING 等了 2829ms)。所以阻塞类命令不进本驱动,连接建立之外的超时
 ///    也不假装能实现。
+/// 5. **写没有事务可用,所以一次调用只打一个键。** 跨键的「批量」(删键、批量
+///    EXPIRE、列表按下标删)都是连发,中途失败前面几条已经落库。界面因此不许
+///    把两个键的写合成一句「要么都成」的操作,报错也必须把服务端原文整条给出。
 class RedisKvDriver implements KvStoreDriver {
   RedisKvDriver(this._conn);
 
@@ -58,8 +62,14 @@ class RedisKvDriver implements KvStoreDriver {
         valueOffsetRead: true,
         idleTime: true,
         commandConsole: true,
-        // 首版只读:写命令由 runCommand 的调用方拦(门控是产品口径,不在协议层)
-        readOnlyFirstVersion: true,
+        // stream 不进集合:XADD 只能追加,改已有条目不是常规操作,界面不给入口
+        writableTypes: {
+          KvKeyType.string,
+          KvKeyType.list,
+          KvKeyType.set,
+          KvKeyType.zset,
+          KvKeyType.hash,
+        },
         maxValuePreviewBytes: _kValuePreviewBytes,
       );
 
@@ -169,11 +179,19 @@ class RedisKvDriver implements KvStoreDriver {
   Future<KvValueRead> readValue(KvNamespace namespace, KvBytes key,
       {int offset = 0, int? limit}) async {
     final s = await _sessionFor(namespace.id);
-    final type = kvKeyTypeOf(await _str1(s, ['TYPE', key]));
+    // TYPE 与 TTL 一次往返取齐:TTL 只进 [KvValueRead.ttlSeconds],
+    // 供值面板算「过期于几点」。键列表那列 TTL 是扫页时的旧值,不能拿来算绝对时刻。
+    final head = await Future.wait<Object?>([
+      _exec(s, ['TYPE', key]),
+      _attempt(s, ['TTL', key]),
+    ]);
+    final type = kvKeyTypeOf(_str(head[0]));
+    final ttl = _nullableInt(head[1]);
     final cap = limit ?? _kValuePreviewBytes;
     switch (type) {
       case KvKeyType.none:
-        return KvValueRead(key: key, type: type, rows: const []);
+        return KvValueRead(
+            key: key, type: type, rows: const [], ttlSeconds: ttl);
       case KvKeyType.string:
         final total = await _int(s, ['STRLEN', key]);
         // 按窗口取:大值不至于整段进内存(实测 200KB 整取 3ms / 窗口 0ms)
@@ -189,6 +207,7 @@ class RedisKvDriver implements KvStoreDriver {
             totalCount: total,
             truncated: (total ?? 0) > offset,
             rangeStart: offset,
+            ttlSeconds: ttl,
           );
         }
         final bytes = _bytes(
@@ -201,6 +220,7 @@ class RedisKvDriver implements KvStoreDriver {
           totalCount: total,
           truncated: (total ?? 0) > offset + bytes.byteLength,
           rangeStart: offset,
+          ttlSeconds: ttl,
         );
       case KvKeyType.list:
         final count = await _int(s, ['LLEN', key]);
@@ -209,6 +229,7 @@ class RedisKvDriver implements KvStoreDriver {
           key: key,
           type: type,
           count: count,
+          ttl: ttl,
           raw: await _exec(s, ['LRANGE', key, '$offset', '$end']),
           rowOf: (i, e) => KvValueRow(value: _bytes(e), index: offset + i),
         );
@@ -231,6 +252,7 @@ class RedisKvDriver implements KvStoreDriver {
           rows: rows,
           totalCount: count,
           truncated: count != null && count > rows.length,
+          ttlSeconds: ttl,
         );
       case KvKeyType.hash:
         return _pagedContainer(
@@ -242,6 +264,7 @@ class RedisKvDriver implements KvStoreDriver {
           scanCommand: const ['HSCAN'],
           rowsOf: _hashRows,
           cap: cap,
+          ttl: ttl,
         );
       case KvKeyType.set:
         return _pagedContainer(
@@ -253,6 +276,7 @@ class RedisKvDriver implements KvStoreDriver {
           scanCommand: const ['SSCAN'],
           rowsOf: _setRows,
           cap: cap,
+          ttl: ttl,
         );
       case KvKeyType.stream:
         final count = await _int(s, ['XLEN', key]);
@@ -279,9 +303,11 @@ class RedisKvDriver implements KvStoreDriver {
           rows: rows,
           totalCount: count,
           truncated: count != null && count > rows.length,
+          ttlSeconds: ttl,
         );
       case KvKeyType.unknown:
-        return KvValueRead(key: key, type: type, rows: const []);
+        return KvValueRead(
+            key: key, type: type, rows: const [], ttlSeconds: ttl);
     }
   }
 
@@ -292,6 +318,131 @@ class RedisKvDriver implements KvStoreDriver {
     final raw = await _exec(s, [for (final a in arguments) a]);
     return _replyOf(raw);
   }
+
+  // ────────────────────────────────────────────── 写
+
+  @override
+  Future<void> setStringValue(KvNamespace namespace, KvBytes key, KvBytes value,
+      {int? ttlSeconds}) async {
+    final s = await _sessionFor(namespace.id);
+    // KEEPTTL 是必须的:裸 SET 会连过期时间一起清掉,而用户改的只是值。
+    // 需要 Redis ≥6.0(2020),更低版本服务端回 `ERR syntax error` 原样上抛 ——
+    // 不做「先读 TTL 再 SET 再 EXPIRE」的兜底,那条路会把精度损失成整秒且非原子。
+    await _exec(s, ttlSeconds == null
+        ? ['SET', key, value, 'KEEPTTL']
+        : ['SET', key, value, 'EX', '$ttlSeconds']);
+  }
+
+  @override
+  Future<int> deleteKeys(KvNamespace namespace, List<KvBytes> keys) async {
+    if (keys.isEmpty) return 0;
+    final s = await _sessionFor(namespace.id);
+    // 一条 DEL 删多个键:Redis 保证逐键删除,但不保证与并发读者之间的原子性
+    final deleted = await _int(s, ['DEL', ...keys]);
+    return deleted ?? 0;
+  }
+
+  @override
+  Future<int> setTtl(
+      KvNamespace namespace, List<KvBytes> keys, int? ttlSeconds) async {
+    if (keys.isEmpty) return 0;
+    final s = await _sessionFor(namespace.id);
+    // 没有批量 EXPIRE,只能一键一句连发一次等齐(与 readKeyMeta 同一理由:
+    // 逐键 await 实测慢 4 倍)。用 _exec 而不是 _attempt:_attempt 会把服务端
+    // 错误吞成 null,写路径吞错就等于回「没生效」而不说为什么。
+    final replies = await Future.wait<Object?>([
+      for (final k in keys)
+        _exec(s, ttlSeconds == null
+            ? ['PERSIST', k]
+            : ['EXPIRE', k, '$ttlSeconds']),
+    ]);
+    // EXPIRE/PERSIST 对不存在的键回 0 而不是报错,所以「生效数 < 选中数」是
+    // 正常结果(键刚好在两次点击之间过期了),由调用方如实报数。
+    return replies.where((r) => (_nullableInt(r) ?? 0) > 0).length;
+  }
+
+  @override
+  Future<void> hashWrite(KvNamespace namespace, KvBytes key,
+      {List<(KvBytes field, KvBytes value)> set = const [],
+      List<KvBytes> removeFields = const []}) async {
+    final s = await _sessionFor(namespace.id);
+    // 改值与加字段是同一句 HSET(服务端自己区分新增/覆盖,回包只是计数),
+    // 多字段一次发完;空 HSET 会被服务端拒,调用方不给「一条内容都没有」的入口。
+    if (set.isNotEmpty) {
+      await _exec(s, ['HSET', key, for (final (f, v) in set) ...[f, v]]);
+    }
+    if (removeFields.isNotEmpty) {
+      await _exec(s, ['HDEL', key, ...removeFields]);
+    }
+  }
+
+  @override
+  Future<void> listWrite(KvNamespace namespace, KvBytes key,
+      {List<(int index, KvBytes value)> set = const [],
+      List<int> removeIndexes = const [],
+      KvBytes? prepend,
+      KvBytes? append}) async {
+    final s = await _sessionFor(namespace.id);
+    if (prepend != null) await _exec(s, ['LPUSH', key, prepend]);
+    if (append != null) await _exec(s, ['RPUSH', key, append]);
+    if (set.isNotEmpty) {
+      // LSET 一次只改一格;下标由调用方按同一份快照给出,互不重复,连发才不位移
+      await Future.wait<Object?>([
+        for (final (i, v) in set) _exec(s, ['LSET', key, '$i', v]),
+      ]);
+    }
+    if (removeIndexes.isEmpty) return;
+    // LREM 按**值**删,列表有重复元素时直接用它删的不是用户点中的那一行。
+    // 所以:先把每个目标下标 LSET 成一个随机哨兵,**全部替换完**再逐个 LREM ——
+    // 中途删除会让后面目标左移,先替换就没这件事。哨兵撞车的概率可忽略,
+    // 代价是这几步非原子:并发读者可能短暂看见一格哨兵值。
+    final targets = <int, KvBytes>{
+      for (final i in removeIndexes.toSet()) i: _sentinel(),
+    };
+    await Future.wait<Object?>([
+      for (final e in targets.entries) _exec(s, ['LSET', key, '${e.key}', e.value]),
+    ]);
+    await Future.wait<Object?>([
+      for (final v in targets.values) _exec(s, ['LREM', key, '1', v]),
+    ]);
+  }
+
+  @override
+  Future<void> setWrite(KvNamespace namespace, KvBytes key,
+      {List<KvBytes> add = const [],
+      List<KvBytes> removeMembers = const []}) async {
+    final s = await _sessionFor(namespace.id);
+    if (add.isNotEmpty) await _exec(s, ['SADD', key, ...add]);
+    if (removeMembers.isNotEmpty) {
+      await _exec(s, ['SREM', key, ...removeMembers]);
+    }
+  }
+
+  @override
+  Future<void> zsetWrite(KvNamespace namespace, KvBytes key,
+      {List<(KvBytes member, double score)> add = const [],
+      List<KvBytes> removeMembers = const []}) async {
+    final s = await _sessionFor(namespace.id);
+    if (add.isNotEmpty) {
+      // 改分数与加成员同一句 ZADD。'${double}' 出的文本(含 1e+21)服务端都能解析;
+      // NaN / Infinity 会被拒成「value is not a valid float」,原样上抛。
+      await _exec(s, [
+        'ZADD',
+        key,
+        for (final (m, score) in add) ...['$score', m],
+      ]);
+    }
+    if (removeMembers.isNotEmpty) {
+      await _exec(s, ['ZREM', key, ...removeMembers]);
+    }
+  }
+
+  /// 删列表元素用的临时哨兵值(见 [listWrite])。16 随机字节:撞车概率可忽略,
+  /// 而且几乎必然不是合法 UTF-8 —— 即便被并发读者瞥见也是 `HEX:…`,不会冒充正常文本。
+  static KvBytes _sentinel() =>
+      KvBytes([for (var i = 0; i < 16; i++) _random.nextInt(256)]);
+
+  static final math.Random _random = math.Random.secure();
 
   @override
   Future<KvServerInfo?> readServerInfo() async {
@@ -340,6 +491,7 @@ class RedisKvDriver implements KvStoreDriver {
     required KvBytes key,
     required KvKeyType type,
     required int? count,
+    required int? ttl,
     required Object? raw,
     required KvValueRow Function(int index, Object? element) rowOf,
   }) {
@@ -350,6 +502,7 @@ class RedisKvDriver implements KvStoreDriver {
       rows: [for (var i = 0; i < items.length; i++) rowOf(i, items[i])],
       totalCount: count,
       truncated: count != null && count > items.length,
+      ttlSeconds: ttl,
     );
   }
 
@@ -369,6 +522,7 @@ class RedisKvDriver implements KvStoreDriver {
     required List<Object> scanCommand,
     required List<KvValueRow> Function(List<Object?> items) rowsOf,
     required int cap,
+    required int? ttl,
   }) async {
     final count = await _int(s, [...countCommand, key]);
     if (count != null && count <= cap) {
@@ -377,7 +531,8 @@ class RedisKvDriver implements KvStoreDriver {
           type: type,
           rows: rowsOf(_list(await _exec(s, [...wholeCommand, key]))),
           totalCount: count,
-          truncated: false);
+          truncated: false,
+          ttlSeconds: ttl);
     }
     var cursor = '0';
     final collected = <Object?>[];
@@ -394,6 +549,7 @@ class RedisKvDriver implements KvStoreDriver {
       rows: rowsOf(collected.take(cap).toList()),
       totalCount: count,
       truncated: true,
+      ttlSeconds: ttl,
     );
   }
 
@@ -496,9 +652,6 @@ class RedisKvDriver implements KvStoreDriver {
       rethrow;
     }
   }
-
-  Future<String> _str1(_Session s, List<Object> args) async =>
-      _str(await _exec(s, args));
 
   Future<int?> _int(_Session s, List<Object> args) async =>
       _nullableInt(await _exec(s, args));

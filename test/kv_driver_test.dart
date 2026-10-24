@@ -49,6 +49,48 @@ void main() {
     });
   });
 
+  group('kvBytesFromInput:编辑框文本 → 要写回的字节', () {
+    test('不带 HEX: 前缀就是文本(包括用户删掉了前缀的情况)', () {
+      expect(kvBytesFromInput('中文'), KvBytes.text('中文'));
+      // 显示态把裸字节渲染成 HEX:41FF,去掉前缀 = 明说「我要写这几个字符本身」
+      expect(kvBytesFromInput('HEX:41FF'), KvBytes([0x41, 0xff]));
+      expect(kvBytesFromInput('41FF'), KvBytes.text('41FF'));
+      expect(kvBytesFromInput(''), KvBytes.text(''));
+    });
+
+    test('十六进制数字大小写都行,但 HEX: 前缀本身必须原样', () {
+      expect(kvBytesFromInput('HEX:41 ff'), KvBytes([0x41, 0xff]));
+      expect(kvBytesFromInput('HEX:abcd'), KvBytes([0xab, 0xcd]));
+      // 前缀按大小写敏感处理:想写「hex:...」这段文本的用户仍有路可走
+      expect(kvBytesFromInput('hex:41FF'), KvBytes.text('hex:41FF'));
+    });
+
+    test('`HEX:` 空正文 = 零字节值,不是非法', () {
+      final empty = kvBytesFromInput('HEX:');
+      expect(empty, isNotNull);
+      expect(empty!.byteLength, 0);
+      expect(empty.isBinary, isFalse);
+    });
+
+    test('非法十六进制返回 null,让调用方拦在写之前', () {
+      // 硬写一半字节进库比拒绝写入更难排查
+      expect(kvBytesFromInput('HEX:41F'), isNull, reason: '长度必须是偶数');
+      expect(kvBytesFromInput('HEX:ZZ'), isNull);
+      expect(kvBytesFromInput('HEX:41 4G'), isNull);
+    });
+
+    test('往返自洽:显示串再读回来还是同一批字节', () {
+      for (final bytes in [
+        KvBytes.text('hello'),
+        KvBytes([0x00, 0xff, 0x80, 0xc3, 0x28, 0x1a, 0x04]),
+        KvBytes(const []),
+      ]) {
+        expect(kvBytesFromInput(bytes.display), bytes,
+            reason: '${bytes.display} 显示出来就必须能原样写回');
+      }
+    });
+  });
+
   group('类型与注册表', () {
     test('kvKeyTypeOf 覆盖服务端可能回的每一个名字', () {
       expect(kvKeyTypeOf('string'), KvKeyType.string);
@@ -83,9 +125,8 @@ void main() {
       expect(isKvStoreConnection(_conn('memcached')), isFalse);
     });
 
-    test('Redis 能力表:首版只读,但枚举/编码/偏移读都开着', () {
+    test('Redis 能力表:枚举/编码/偏移读都开着,五种容器可写、流只读', () {
       final cap = RedisKvDriver(_conn('redis')).capabilities;
-      expect(cap.readOnlyFirstVersion, isTrue);
       expect(cap.commandConsole, isTrue);
       expect(cap.multipleNamespaces, isTrue);
       expect(cap.cursorScan, isTrue);
@@ -93,6 +134,18 @@ void main() {
       expect(cap.supports(KvKeyType.stream), isTrue);
       expect(cap.supports(KvKeyType.unknown), isFalse);
       expect(cap.maxValuePreviewBytes, greaterThan(0));
+      // 写门控只看这张表:界面按它决定按钮显隐,不做「能点但没效果」的入口
+      expect(cap.writableTypes, {
+        KvKeyType.string,
+        KvKeyType.list,
+        KvKeyType.set,
+        KvKeyType.zset,
+        KvKeyType.hash,
+      });
+      expect(cap.writable(KvKeyType.zset), isTrue);
+      // stream 不在内:XADD 只能追加,改历史条目不是常规操作
+      expect(cap.writable(KvKeyType.stream), isFalse);
+      expect(cap.writable(KvKeyType.none), isFalse);
     });
   });
 

@@ -40,6 +40,12 @@ class KvConnectionManager extends ChangeNotifier {
   bool isConnected(String connection) =>
       _drivers[connection]?.isConnected ?? false;
 
+  /// 在用驱动的能力表;还没建过驱动时 null。
+  /// 调用方据此门控写入口 —— 门控必须跟着**真正在用的那个驱动**,
+  /// 而不是按连接类型现造一个驱动去读静态表(测试注入的假驱动就门不住)
+  KvCapabilities? capabilitiesOf(String connection) =>
+      _drivers[connection]?.capabilities;
+
   /// 取(或建立)连接的活跃驱动。驱动内部按库号惰性开会话,
   /// 因此这里返回成功不代表已经握过手 —— 第一条命令才是。
   Future<KvStoreDriver> driverFor(ConnectionInfo conn) async {

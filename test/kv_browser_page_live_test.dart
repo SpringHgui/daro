@@ -3,8 +3,10 @@ import 'dart:io';
 import 'package:base_ui_flutter/base_ui_flutter.dart';
 import 'package:daro/app/app_state.dart';
 import 'package:daro/data/db_data.dart';
+import 'package:daro/data/drivers/kv_driver.dart';
 import 'package:daro/l10n/locale_config.dart';
 import 'package:daro/widgets/kv_browser_page.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -39,6 +41,7 @@ void main() {
   }
 
   late AppState app;
+  late ConnectionInfo connInfo;
 
   /// 让真实时钟走 [ms] 并推一帧:fake 时钟区域里 socket 回调不会被投递
   Future<void> tick(WidgetTester tester, [int ms = 50]) async {
@@ -64,6 +67,25 @@ void main() {
     for (var i = 0; i < 200 && target.evaluate().isEmpty; i++) {
       await tick(tester);
     }
+  }
+
+  /// 等某个目标消失:用在提交就地编辑之后(见 [commitCell])
+  Future<void> untilGone(WidgetTester tester, Finder target) async {
+    for (var i = 0; i < 200 && target.evaluate().isNotEmpty; i++) {
+      await tick(tester);
+    }
+  }
+
+  /// 就地编辑:改文本 → Enter → **等编辑器关掉** → 等刷出来的新值。
+  /// 只等「那段文本出现」不算提交完成:编辑框里本来就写着它,会在写还在途时
+  /// 就返回,下一个动作因此打在过期布局上(实测:紧接着点另一格,刚出现的
+  /// 「删除此项」被随后落地的重取清掉)。
+  Future<void> commitCell(WidgetTester tester, String value) async {
+    await untilFound(tester, find.byType(InlineEditor));
+    await tester.enterText(find.byType(InlineEditor), value);
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await untilGone(tester, find.byType(InlineEditor));
+    await untilFound(tester, find.text(value));
   }
 
   /// 开页 + 等首轮扫描落地
@@ -100,22 +122,31 @@ void main() {
     await scanIdle(tester);
   }
 
-  /// 键名列在表格里;过滤输入框里留着同一段文本,`find.text` 会同时命中两者,
-  /// 所以点击前必须把范围收到 DataGridView 之内(键网格是 SplitContainer 的第一段)
+  /// 键名列在表格里;过滤输入框里留着同一段文本,所以范围收到 DataGridView 之内。
+  /// **不要**加 `.first`:空库时页面还没有任何网格,`.first` 在 `evaluate` 里
+  /// 直接抛 `Bad state: No element`,而不是回「没找到」。
   Finder keyRow(String name) => find.descendant(
-      of: find.byType(DataGridView).first, matching: find.text(name));
+      of: find.byType(DataGridView), matching: find.text(name));
 
-  /// 点一次「加载更多」按游标续扫;按钮已禁用(游标扫完)时返回 false
+  /// 触发一次续扫:列表滚得动就滚到底让页面自动续扫,滚不动就点兜底行。
+  /// 返回 false = 没有游标可续了(页脚报「已遍历完」或「没有符合条件的键」)
   Future<bool> loadMoreOnce(WidgetTester tester) async {
-    final more = find.widgetWithText(Button, '加载更多');
-    if (more.evaluate().isEmpty) return false;
-    if (tester.widget<Button>(more).onPressed == null) return false;
-    await tester.tap(more);
+    if (find.textContaining('已遍历完').evaluate().isNotEmpty ||
+        find.text('没有符合条件的键').evaluate().isNotEmpty) {
+      return false;
+    }
+    final fallback = find.textContaining('点此继续扫描').first;
+    if (fallback.evaluate().isNotEmpty) {
+      await tester.tap(fallback);
+    } else {
+      await tester.drag(
+          find.byType(DataGridView).first, const Offset(0, -2000));
+    }
     await scanIdle(tester);
     return true;
   }
 
-  /// 命中稀少的 glob:一轮动作只取到游标上第一段,必要时续点「加载更多」
+  /// 命中稀少的 glob:一轮动作只取到游标上第一段,必要时接着续扫
   Future<void> untilKey(WidgetTester tester, String name) async {
     for (var i = 0; i < 12; i++) {
       await scanIdle(tester);
@@ -133,17 +164,16 @@ void main() {
       (call) async => dir.path,
     );
     app = AppState();
-    app.addConnections([
-      ConnectionInfo(
-        name: 'Redis 探针',
-        typeId: 'redis',
-        host: '127.0.0.1',
-        port: '6379',
-        username: '',
-        password: pwd,
-        isLive: true,
-      ),
-    ]);
+    connInfo = ConnectionInfo(
+      name: 'Redis 探针',
+      typeId: 'redis',
+      host: '127.0.0.1',
+      port: '6379',
+      username: '',
+      password: pwd,
+      isLive: true,
+    );
+    app.addConnections([connInfo]);
   });
 
   testWidgets('打开即连上服务端:未过滤也能扫出键', (tester) async {
@@ -159,7 +189,7 @@ void main() {
     });
   });
 
-  testWidgets('glob 过滤下推 MATCH,命中稀少时用「加载更多」续扫补齐',
+  testWidgets('glob 过滤下推 MATCH,命中稀少时靠续扫补齐',
       (tester) async {
     const hits = ['app:user:1001', 'app:config:version', 'app:session:s1'];
     bool gotAll() => hits.every((n) => keyRow(n).evaluate().isNotEmpty);
@@ -229,6 +259,306 @@ void main() {
       expect(find.textContaining('键列表读取失败'), findsNothing);
       // 全库扫完、一条没命中:页脚是「已加载 0 个键」,「已遍历完」只在有命中时才说
       expect(find.textContaining('已加载 0 个键'), findsOneWidget);
+    });
+  });
+
+  // ─────────────────────────────── 写链路实连(全部打在探针空库 db1)
+  //
+  // 分工:夹具与真值校验走**独立驱动**,页面只负责被点。让被测对象同时当裁判,
+  // 「界面回已保存、库里一条没变」这类缺陷就永远测不出来。
+
+  const probePrefix = 'daro:ui-live:';
+
+  Future<KvStoreDriver> probeDriver() async {
+    final d = createKvDriver(connInfo)!;
+    await d.connect();
+    return d;
+  }
+
+  Future<KvNamespace> probeDb1(KvStoreDriver d) async =>
+      (await d.listNamespaces()).firstWhere((n) => n.id == '1');
+
+  /// 把探针库里的 `daro:ui-live:*` 整批删掉。
+  ///
+  /// 只在 `runAsync` 内调用(用例首尾各一次):`addTearDown` 的回调跑在 fake
+  /// 时钟区域,那条 socket 往返永远等不到回调,整条用例就挂死在那儿。
+  Future<void> clearLiveKeys() async {
+    final d = await probeDriver();
+    final db1 = await probeDb1(d);
+    final keys = <KvBytes>[];
+    String? cursor;
+    for (var i = 0; i < 50; i++) {
+      final page = await d.scanKeys(KvKeyScan(
+          namespace: db1,
+          cursor: cursor,
+          pattern: KvBytes.text('$probePrefix*'),
+          count: 200));
+      keys.addAll([for (final e in page.entries) e.key]);
+      cursor = page.nextCursor;
+      if (cursor == null) break;
+    }
+    if (keys.isNotEmpty) await d.deleteKeys(db1, keys);
+    await d.close();
+  }
+
+  /// 弹窗里按字段标签定位输入框(`_row` 把冒号拼在标签上,所以匹配「值:」)
+  Finder dialogInput(String label) => find.descendant(
+        of: find.ancestor(
+            of: find.descendant(
+                of: find.byType(DialogBox), matching: find.text('$label:')),
+            matching: find.byType(FieldRow)),
+        matching: find.byType(Input),
+      );
+
+  Finder dialogButton(String text) => find.descendant(
+      of: find.byType(DialogBox), matching: find.text(text));
+
+  Finder menuitem(String text) => find.descendant(
+      of: find.byType(ContextMenuPanel), matching: find.text(text));
+
+  Future<void> rightClick(WidgetTester tester, Finder target) async {
+    await tester.tap(target, buttons: kSecondaryMouseButton);
+    await tick(tester);
+  }
+
+  /// 点确认框里的动作键。
+  ///
+  /// 两条实连专有的坑,都在这:
+  /// 1. `MessageBox.show` 先插一层 entry(里面那个 `MessageBox` 的 build 只回
+  ///    `SizedBox.shrink()`),`controller.open()` 之后 `ModalOverlay` 才插入
+  ///    **第二层** entry 渲染面板 —— 一帧 pump 不够,而且面板**不是**
+  ///    `find.byType(MessageBox)` 的后代,拿它当范围永远命中 0 个。
+  /// 2. 面板弹出前那次点击可能被 `ContextMenuStrip` 的收手 barrier 再过一遍,
+  ///    所以先推几帧再找按钮。
+  Future<void> tapMessageBoxOk(WidgetTester tester, String action) async {
+    final ok = find.widgetWithText(Button, action);
+    for (var i = 0; i < 20 && ok.evaluate().isEmpty; i++) {
+      await tick(tester);
+    }
+    expect(ok, findsOneWidget, reason: '确认框没弹出动作键「$action」');
+    // 标题与动作键同词,所以必须按 Button 找;漏了 okText 会露出英文兜底
+    expect(find.widgetWithText(Button, 'OK'), findsNothing,
+        reason: '确认框按钮漏了本地化就会露出 base-ui 的英文兜底 OK / Cancel');
+    await tester.tap(ok);
+    await tick(tester);
+  }
+
+  /// 推 [n] 帧,每帧之间给真实时钟留 50ms。
+  ///
+  /// 浮层的进/出场都比「内容出现 / 消失」慢几帧:`tick(tester, 300)` 只是
+  /// 一次 delay + **一**帧 pump,既走不到 `MessageBox.show` 插入的第二层 entry,
+  /// 也等不到弹层的 ModalBarrier 消失 —— 这期间点到网格的那一下会被 barrier 吞掉。
+  Future<void> frames(WidgetTester tester, [int n = 6]) async {
+    for (var i = 0; i < n; i++) {
+      await tick(tester);
+    }
+  }
+
+  /// 关弹窗后等它真的收干净(表单弹窗 + 确认框两种载体都覆盖)
+  Future<void> closeOverlays(WidgetTester tester) async {
+    for (var i = 0;
+        i < 20 &&
+            (find.byType(DialogBox).evaluate().isNotEmpty ||
+                find.widgetWithText(Button, '删除').evaluate().isNotEmpty);
+        i++) {
+      await tick(tester);
+    }
+    await frames(tester);
+  }
+
+  testWidgets('实连写链路 · 字符串:新建 → 改值 → 设过期 → 清除 → 删除',
+      (tester) async {
+    const name = '${probePrefix}str';
+    late KvStoreDriver d;
+    late KvNamespace db1;
+    final probe = KvBytes.text(name);
+
+    await tester.runAsync(() async {
+      await clearLiveKeys();
+      d = await probeDriver();
+      db1 = await probeDb1(d);
+      await open(tester, namespaceId: '1', namespaceLabel: 'db1');
+      // 探针库此时应为空:用页脚计数确认,不用 `keyRow(...)` + `findsNothing`
+      // —— 空网格上「descendant(of: DataGridView.first)」会让 findsNothing 的
+      // 失配描述走到 `Finder.found`,直接抛「No results have been found yet」
+      expect(find.textContaining('已加载 0 个键'), findsOneWidget);
+
+      // 1) 新建键:表单收下后必须真的落到服务端
+      await tester.tap(find.text('新建键').first);
+      await untilFound(tester, find.byType(DialogBox));
+      await tester.enterText(dialogInput('键名'), name);
+      await tester.enterText(dialogInput('值'), 'hello');
+      await tester.tap(dialogButton('保存'));
+      await closeOverlays(tester);
+      await untilFound(tester, keyRow(name));
+      expect(await d.readKeyMeta(db1, [probe]), isNotEmpty);
+      expect((await d.readValue(db1, probe)).rows.single.value.text, 'hello');
+
+      // 2) 改值:单击值格就地编辑,提交后界面与服务端都得是新值
+      await untilFound(tester, find.text('hello'));
+      await tester.tap(find.text('hello'));
+      await commitCell(tester, 'world');
+      expect(find.textContaining('已保存'), findsWidgets);
+      expect((await d.readValue(db1, probe)).rows.single.value.text, 'world');
+
+      // 3) 设过期时间:键网格的 TTL 列必须从「不过期」变成倒计时
+      expect(keyRow('不过期'), findsOneWidget);
+      await rightClick(tester, keyRow(name));
+      await tester.tap(menuitem('设置过期时间…'));
+      await untilFound(tester, dialogInput('过期时间'));
+      await tester.enterText(dialogInput('过期时间'), '300');
+      // 确定键的可用性是 `_seconds != null`,而 `_seconds` 在 build 时算:
+      // enterText 后必须推一帧,否则点到的还是上一帧的禁用态(tap 自己不重绘)
+      await tick(tester);
+      await tester.tap(dialogButton('确定'));
+      await closeOverlays(tester);
+      await untilFound(
+          tester,
+          find.descendant(
+              of: find.byType(DataGridView).first,
+              matching: find.textContaining(
+                  RegExp(r'^\d+(天 )?\d\d:\d\d:\d\d$'))));
+      expect((await d.readKeyMeta(db1, [probe])).single.hasTtl, isTrue);
+
+      // 4) 改值不能把 TTL 洗掉(SET 必须带 KEEPTTL)
+      await tester.tap(find.text('world'));
+      await commitCell(tester, 'world2');
+      expect((await d.readKeyMeta(db1, [probe])).single.hasTtl, isTrue,
+          reason: '改值走 SET KEEPTTL:过期时间不能被清成永久');
+
+      // 5) 清除过期时间
+      await rightClick(tester, keyRow(name));
+      await tester.tap(menuitem('清除过期时间'));
+      await untilFound(tester, keyRow('不过期'));
+      expect((await d.readKeyMeta(db1, [probe])).single.hasTtl, isFalse);
+
+      // 6) 删除:确认框的按钮写的是动作本身(「删除」),不是 base-ui 的英文兜底
+      await rightClick(tester, keyRow(name));
+      await tester.tap(menuitem('删除键'));
+      await tapMessageBoxOk(tester, '删除');
+      await tick(tester, 200);
+      expect(keyRow(name), findsNothing);
+      expect(find.textContaining('已加载 0 个键'), findsOneWidget);
+      expect((await d.readKeyMeta(db1, [probe])).single.type, KvKeyType.none);
+      await d.close();
+    });
+  });
+
+  testWidgets('实连写链路 · 哈希:加字段 / 改字段值 / 删字段都落库', (tester) async {
+    const name = '${probePrefix}hash';
+    final probe = KvBytes.text(name);
+
+    await tester.runAsync(() async {
+      await clearLiveKeys();
+      final d = await probeDriver();
+      final db1 = await probeDb1(d);
+      await d.hashWrite(db1, probe, set: [
+        (KvBytes.text('one'), KvBytes.text('1'))
+      ]);
+
+      await open(tester, namespaceId: '1', namespaceLabel: 'db1');
+      await untilFound(tester, keyRow(name));
+      await tester.tap(keyRow(name));
+      await untilFound(tester, find.text('one'));
+
+      // 加字段:「添加」开表单,字段名 + 值,保存即 HSET
+      await tester.tap(find.text('添加'));
+      await untilFound(tester, dialogInput('字段'));
+      await tester.enterText(dialogInput('字段'), 'two');
+      await tester.enterText(dialogInput('值'), '2');
+      await tester.tap(dialogButton('保存'));
+      await closeOverlays(tester);
+      await untilFound(tester, find.text('two'));
+      var read = await d.readValue(db1, probe);
+      expect(read.rows.map((r) => r.field!.text).toList(), ['one', 'two']);
+
+      // 改字段值:只动值列,字段名不能被写花
+      await tester.tap(find.text('1'));
+      await commitCell(tester, '11');
+      read = await d.readValue(db1, probe);
+      expect(read.rows.first.value.text, '11');
+      expect(read.rows.first.field!.text, 'one');
+
+      // 删字段:选中值行 → 工具栏「删除此项」→ 确认
+      await tester.tap(find.text('two'));
+      await frames(tester);
+      await tester.tap(find.text('删除此项'));
+      await tapMessageBoxOk(tester, '删除');
+      await closeOverlays(tester);
+      await untilFound(tester, find.textContaining('共 1 项'));
+      read = await d.readValue(db1, probe);
+      expect(read.rows.map((r) => r.field!.text).toList(), ['one']);
+      await clearLiveKeys();
+      await d.close();
+    });
+  });
+
+  testWidgets('实连写链路 · 列表 / 集合 / 有序集:加一项、删一项各自落库',
+      (tester) async {
+    const listKey = '${probePrefix}list';
+    const setKey = '${probePrefix}set';
+    const zsetKey = '${probePrefix}zset';
+
+    await tester.runAsync(() async {
+      await clearLiveKeys();
+      final d = await probeDriver();
+      final db1 = await probeDb1(d);
+      await d.listWrite(db1, KvBytes.text(listKey), append: KvBytes.text('a'));
+      await d.setWrite(db1, KvBytes.text(setKey), add: [KvBytes.text('x')]);
+      await d.zsetWrite(db1, KvBytes.text(zsetKey), add: [
+        (KvBytes.text('m1'), 1)
+      ]);
+
+      await open(tester, namespaceId: '1', namespaceLabel: 'db1');
+      await untilFound(tester, keyRow(listKey));
+
+      // list:追加元素(RPUSH),再删掉刚加的那一行
+      await tester.tap(keyRow(listKey));
+      await untilFound(tester, find.text('a'));
+      await tester.tap(find.text('添加'));
+      await untilFound(tester, dialogInput('值'));
+      await tester.enterText(dialogInput('值'), 'b');
+      await tester.tap(dialogButton('保存'));
+      await closeOverlays(tester);
+      await untilFound(tester, find.text('b'));
+      expect((await d.readValue(db1, KvBytes.text(listKey))).rows.length, 2);
+
+      await tester.tap(find.text('b'));
+      await frames(tester);
+      await tester.tap(find.text('删除此项'));
+      await tapMessageBoxOk(tester, '删除');
+      await closeOverlays(tester);
+      await untilFound(tester, find.textContaining('共 1 项'));
+      expect((await d.readValue(db1, KvBytes.text(listKey))).rows.single.value.text,
+          'a');
+
+      // set:加成员再删成员
+      await tester.tap(keyRow(setKey));
+      await untilFound(tester, find.text('x'));
+      await tester.tap(find.text('添加'));
+      await untilFound(tester, dialogInput('值'));
+      await tester.enterText(dialogInput('值'), 'y');
+      await tester.tap(dialogButton('保存'));
+      await closeOverlays(tester);
+      await untilFound(tester, find.text('y'));
+      expect((await d.readValue(db1, KvBytes.text(setKey))).totalCount, 2);
+
+      // zset:加成员带分数,成员与分数都要真的在服务端
+      await tester.tap(keyRow(zsetKey));
+      await untilFound(tester, find.text('m1'));
+      await tester.tap(find.text('添加'));
+      await untilFound(tester, dialogInput('分数'));
+      await tester.enterText(dialogInput('分数'), '2.5');
+      await tester.enterText(dialogInput('值'), 'm2');
+      await tester.tap(dialogButton('保存'));
+      await closeOverlays(tester);
+      await untilFound(tester, find.text('m2'));
+      final z = await d.readValue(db1, KvBytes.text(zsetKey));
+      expect(z.rows.map((r) => r.value.text).toList(), ['m1', 'm2']);
+      expect(z.rows.last.score, 2.5);
+
+      await clearLiveKeys();
+      await d.close();
     });
   });
 }

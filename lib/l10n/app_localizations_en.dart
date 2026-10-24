@@ -2114,16 +2114,14 @@ class AppLocalizationsEn extends AppLocalizations {
   String get kvTabCategory => 'Key browser';
 
   @override
-  String get kvPatternHint => 'Filter by key name pattern (glob, e.g. scan:*)';
+  String get kvPatternHint =>
+      'Search key names (substring by default; glob, e.g. scan:*)';
 
   @override
   String get kvTypeAll => 'All types';
 
   @override
   String get kvActionRefresh => 'Refresh';
-
-  @override
-  String get kvActionLoadMore => 'Load More';
 
   @override
   String get kvActionReadMore => 'Read rest';
@@ -2198,7 +2196,10 @@ class AppLocalizationsEn extends AppLocalizations {
   String get kvScanComplete => 'Fully scanned';
 
   @override
-  String get kvRoundCapHint => 'No hit in this round, keep loading';
+  String get kvScanContinue => 'Scan not finished — click to keep scanning';
+
+  @override
+  String get kvRoundCapHint => 'No hit in this round, keep scanning';
 
   @override
   String kvLoadedCount(String loaded) {
@@ -2215,7 +2216,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get kvNoMatchYet =>
-      'No matching key found yet — use Load More to keep scanning';
+      'No matching key found yet — click to keep scanning';
 
   @override
   String kvLoadFailed(String error) {
@@ -2249,8 +2250,274 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String get kvFormatText => 'Text';
+
+  @override
+  String get kvFormatJson => 'JSON';
+
+  @override
+  String get kvFormatHex => 'Hex';
+
+  @override
+  String get kvFormatNotJson => 'Not valid JSON — showing as-is';
+
+  @override
+  String get kvFormatBinary => 'Binary value — cannot be shown as JSON';
+
+  @override
+  String kvFormatTooBig(String count) {
+    return 'Formatted view renders only the first $count bytes';
+  }
+
+  @override
+  String get kvFormatReadOnly =>
+      'Formatted view is read-only — switch back to Text to edit';
+
+  @override
   String get kvConnectionGone => 'This connection no longer exists';
 
   @override
   String get kvScanUnsupported => 'This engine cannot enumerate keys';
+
+  @override
+  String get kvActionNewKey => 'New Key';
+
+  @override
+  String get kvActionAdd => 'Add';
+
+  @override
+  String get kvActionSetTtl => 'Set Expiration...';
+
+  @override
+  String get kvActionClearTtl => 'Clear Expiration';
+
+  @override
+  String get kvMenuCopyKeyName => 'Copy Key Name';
+
+  @override
+  String get kvMenuDeleteKeyOne => 'Delete Key';
+
+  @override
+  String kvMenuDeleteKeys(String count) {
+    return 'Delete $count Keys';
+  }
+
+  @override
+  String get kvMenuEdit => 'Edit';
+
+  @override
+  String get kvMenuCopyValue => 'Copy Value';
+
+  @override
+  String get kvMenuDeleteItemOne => 'Delete Item';
+
+  @override
+  String kvMenuDeleteItems(String count) {
+    return 'Delete $count Items';
+  }
+
+  @override
+  String get kvNotWritable => 'This engine does not support writes';
+
+  @override
+  String get kvStreamReadOnly =>
+      'Streams only accept appended entries, so they cannot be edited here';
+
+  @override
+  String get kvBigStringReadOnly =>
+      'The value is not fully loaded and cannot be edited here (load the rest first)';
+
+  @override
+  String kvDeleteConfirmOne(String name) {
+    return 'Delete key $name? This cannot be undone.';
+  }
+
+  @override
+  String kvDeleteConfirmMany(String count) {
+    return 'Delete the $count selected keys? This cannot be undone.';
+  }
+
+  @override
+  String get kvDeleteDoneOne => 'Deleted 1 key';
+
+  @override
+  String kvDeleteDone(String count) {
+    return 'Deleted $count keys';
+  }
+
+  @override
+  String get kvTtlSetDoneOne => 'Set expiration for 1 key';
+
+  @override
+  String kvTtlSetDone(String count) {
+    return 'Set expiration for $count keys';
+  }
+
+  @override
+  String get kvTtlClearedDoneOne => 'Cleared expiration for 1 key';
+
+  @override
+  String kvTtlClearedDone(String count) {
+    return 'Cleared expiration for $count keys';
+  }
+
+  @override
+  String kvWritePartial(String ok, String total) {
+    return '$ok of $total keys updated; the rest no longer exist';
+  }
+
+  @override
+  String kvExpiresAt(String time) {
+    return 'Expires at $time';
+  }
+
+  @override
+  String kvWriteFailed(String error) {
+    return 'Write failed: $error';
+  }
+
+  @override
+  String get kvSaveDone => 'Saved';
+
+  @override
+  String get kvNewKeyTitle => 'New Key';
+
+  @override
+  String get kvKeyNameEmpty => 'Key name cannot be empty';
+
+  @override
+  String get kvKeyNameTaken =>
+      'This key already exists. Use another name, or use Add to append to it';
+
+  @override
+  String get kvFieldTtl => 'Expiration';
+
+  @override
+  String get kvTtlHint => 'Empty = no expiration';
+
+  @override
+  String get kvTtlSetTitle => 'Set Expiration';
+
+  @override
+  String get kvTtlInvalid => 'Expiration must be a number greater than 0';
+
+  @override
+  String get kvTtlUnitSeconds => 'Seconds';
+
+  @override
+  String get kvTtlUnitMinutes => 'Minutes';
+
+  @override
+  String get kvTtlUnitHours => 'Hours';
+
+  @override
+  String get kvTtlUnitDays => 'Days';
+
+  @override
+  String get kvAddFieldTitle => 'Add Field';
+
+  @override
+  String get kvAddElementTitle => 'Add Element';
+
+  @override
+  String get kvAddMemberTitle => 'Add Member';
+
+  @override
+  String get kvPosition => 'Insert position';
+
+  @override
+  String get kvPositionHead => 'Head';
+
+  @override
+  String get kvPositionTail => 'Tail';
+
+  @override
+  String get kvScoreInvalid => 'Score must be a number';
+
+  @override
+  String get kvHexHint => 'Start with HEX: to write raw bytes as hex';
+
+  @override
+  String get kvHexInvalid =>
+      'Invalid hex: needs an even number of 0-9A-F characters';
+
+  @override
+  String get kvValueRequired => 'Value cannot be empty';
+
+  @override
+  String kvCopiedNames(String count) {
+    return 'Copied $count key name(s) to clipboard';
+  }
+
+  @override
+  String get kvTtlAlreadyNone => 'These keys already had no expiry';
+
+  @override
+  String kvDeletePartial(String ok, String total) {
+    return 'Deleted $ok of $total item(s); the rest are outside the loaded window or already gone';
+  }
+
+  @override
+  String kvAddWindowOnly(String total, String shown) {
+    return 'This value has $total item(s) but only $shown are loaded, so the new entry lands outside that range';
+  }
+
+  @override
+  String get kvDeleteItemConfirmOne =>
+      'Delete this item?\nIt cannot be recovered.';
+
+  @override
+  String kvDeleteItemConfirm(String count) {
+    return 'Delete the $count selected items?\nThey cannot be recovered.';
+  }
+
+  @override
+  String get kvItemsDeletedOne => 'Deleted 1 item';
+
+  @override
+  String kvItemsDeleted(String count) {
+    return 'Deleted $count item(s)';
+  }
+
+  @override
+  String get kvIndexReadOnly =>
+      'The index marks an element\'s position, so it cannot be edited; edit the value on the right instead';
+
+  @override
+  String get findHint => 'Find';
+
+  @override
+  String get findReplaceHint => 'Replace';
+
+  @override
+  String get findNoMatches => 'No matches';
+
+  @override
+  String findMatchPosition(String current, String total) {
+    return '$current of $total';
+  }
+
+  @override
+  String get findSearching => 'Searching…';
+
+  @override
+  String get findPrev => 'Previous';
+
+  @override
+  String get findNext => 'Next';
+
+  @override
+  String get findCaseSensitive => 'Match case';
+
+  @override
+  String get findRegex => 'Use regular expression';
+
+  @override
+  String get findBtnReplace => 'Replace';
+
+  @override
+  String get findBtnReplaceAll => 'Replace All';
+
+  @override
+  String get findClose => 'Close';
 }

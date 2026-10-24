@@ -61,6 +61,60 @@ abstract class KvStoreDriver {
   /// 因为「哪些命令算写」是产品口径,不是协议口径。
   Future<KvReply> runCommand(KvNamespace namespace, List<String> arguments);
 
+  // ───────────────────────────────────────────────────────── 写
+  //
+  // 三条口径贯穿下面所有方法,别在调用方绕过:
+  //
+  //  * **键名 / 字段名 / 值一律是 [KvBytes]。** 裸字节键名实测可 SET 可 GET,
+  //    按 String 发会在二进制键上静默写错对象(与读侧同一判据)。
+  //  * **失败只抛异常,不返回 false。** 服务端原文包成 [KvServerException]
+  //    上抛,界面把它原样给用户看(WRONGTYPE / value is not an integer 之类
+  //    本身就是最有用的提示)。
+  //  * **一次调用只打一个键**(只有 [deleteKeys] / [setTtl] 批量)。这里的
+  //    批量都是「连发 + 一次等齐」,不是事务,中途失败前面几条已经落库 ——
+  //    所以别把两个键的写合成一个「应当原子」的方法。
+
+  /// 写字符串值。默认带 `KEEPTTL`:裸 `SET` 会把原有的过期时间清掉,
+  /// 而用户改的只是值(需要 Redis ≥6.0,更低版本服务端会直接报错原文)。
+  /// 显式传 [ttlSeconds] 时改用 `EX n`,新过期时间从此刻起算。
+  Future<void> setStringValue(KvNamespace namespace, KvBytes key, KvBytes value,
+      {int? ttlSeconds});
+
+  /// 删键:一条 `DEL` 批量删。返回真正被删掉的数量(不存在的键不计)。
+  Future<int> deleteKeys(KvNamespace namespace, List<KvBytes> keys);
+
+  /// 设 / 清过期时间。[ttlSeconds] = null 表示 `PERSIST`(改为不过期)。
+  /// 返回收到肯定回包的键数(`EXPIRE`/`PERSIST` 对不存在的键回 0)。
+  Future<int> setTtl(KvNamespace namespace, List<KvBytes> keys, int? ttlSeconds);
+
+  /// hash:[set] 一次 `HSET` 多字段(改值与新增同一条命令),[removeFields] 一次 `HDEL`。
+  Future<void> hashWrite(KvNamespace namespace, KvBytes key,
+      {List<(KvBytes field, KvBytes value)> set = const [],
+      List<KvBytes> removeFields = const []});
+
+  /// list:[set] 按**当前下标** `LSET`,[prepend] / [append] 各推一个元素,
+  /// [removeIndexes] 按下标删。
+  ///
+  /// 按下标删是这里唯一不是一句命令的事:`LREM` 按**值**删,列表里有重复元素时
+  /// 直接用它就会删错行(删掉的不是用户选中的那个)。所以实现成
+  /// 「先把每个目标下标 `LSET` 成一个随机哨兵,再逐个 `LREM count=1`」——
+  /// 先全部替换、后删除,余下元素的下标就不会在中途位移。
+  /// 代价:这一步**非原子**,并发读者可能短暂看见哨兵值。
+  Future<void> listWrite(KvNamespace namespace, KvBytes key,
+      {List<(int index, KvBytes value)> set = const [],
+      List<int> removeIndexes = const [],
+      KvBytes? prepend,
+      KvBytes? append});
+
+  /// set:[add] 一次 `SADD`,[removeMembers] 一次 `SREM`。
+  Future<void> setWrite(KvNamespace namespace, KvBytes key,
+      {List<KvBytes> add = const [], List<KvBytes> removeMembers = const []});
+
+  /// zset:[add] 一次 `ZADD` 多成员(改分数与新增同一条命令),[removeMembers] 一次 `ZREM`。
+  Future<void> zsetWrite(KvNamespace namespace, KvBytes key,
+      {List<(KvBytes member, double score)> add = const [],
+      List<KvBytes> removeMembers = const []});
+
   /// 服务端概览(INFO 一类),用于连接节点详情;没有则返回 null。
   Future<KvServerInfo?> readServerInfo();
 }
@@ -117,6 +171,96 @@ class KvBytes {
 
   @override
   String toString() => 'KvBytes(${display.length > 40 ? '${display.substring(0, 40)}…' : display})';
+}
+
+/// `HEX:` 前缀 —— 编辑框与展示串共用的裸字节写法(见 [KvBytes.display])。
+const String kKvHexPrefix = 'HEX:';
+
+/// 编辑框文本 → 要写回的字节。
+///
+/// 判据只看前缀,不看单元格原来是不是二进制:[KvBytes.display] 把裸字节渲染成
+/// `HEX:41FF`,用户在编辑框里保留这个前缀就是「要写这批字节」,去掉前缀就是
+/// 写文本。往返自洽(写进去的字节再显示仍是 `HEX:`)。
+///
+/// 返回 null = 十六进制部分非法(长度不是偶数、含非十六进制字符);
+/// 调用方据此报错,而不是硬写一半字节进库。
+KvBytes? kvBytesFromInput(String input) {
+  if (!input.startsWith(kKvHexPrefix)) return KvBytes.text(input);
+  final body = input.substring(kKvHexPrefix.length).replaceAll(' ', '');
+  if (body.isEmpty) return KvBytes(const []);
+  if (body.length.isOdd || !RegExp(r'^[0-9a-fA-F]+$').hasMatch(body)) {
+    return null;
+  }
+  final out = <int>[];
+  for (var i = 0; i < body.length; i += 2) {
+    out.add(int.parse(body.substring(i, i + 2), radix: 16));
+  }
+  return KvBytes(out);
+}
+
+/// 值面板的显示格式。只有 [text] 是可编辑视图(与 [KvBytes.display] /
+/// [kvBytesFromInput] 同一往返口径);[json] 与 [hex] 是派生视图,只读 ——
+/// 把缩进或空格原样写回就等于改了存的内容,而截断渲染的部分写回更是直接丢数据。
+enum KvValueFormat { text, json, hex }
+
+/// 派生视图单次渲染的字节上限。驱动的预览本身就到 64KB,而十六进制展开是
+/// 3 倍、缩进 JSON 更多,一屏十几万字符的行内文本框每敲一下都要重排。
+const int kKvFormatViewBytes = 8 * 1024;
+
+/// 格式套不上这个值的原因(页面据此取文案,数据层不碰本地化)。
+enum KvFormatNote { none, notJson, binary, tooBig }
+
+/// 一个值按某种格式渲染出来的文本
+class KvValueView {
+  const KvValueView(this.text, [this.note = KvFormatNote.none]);
+
+  final String text;
+  final KvFormatNote note;
+}
+
+/// 按格式渲染一个原始字节值。
+///
+/// [KvValueFormat.text] 就是 [KvBytes.display](裸字节给 `HEX:`),永不带 note;
+/// JSON 解析失败仍然给原文 + [KvFormatNote.notJson](宁可少格式化,不给空白视图);
+/// 二进制值按 JSON 无意义,给 `HEX:` + [KvFormatNote.binary]。
+KvValueView kvRenderValue(KvBytes value, KvValueFormat format) {
+  switch (format) {
+    case KvValueFormat.text:
+      return KvValueView(value.display);
+    case KvValueFormat.hex:
+      // 超出上限只渲染前一段(页脚说明);整串的 `display` 不能当十六进制用 ——
+      // 文本值的 display 是原文,不是字节
+      return KvValueView(
+        '$kKvHexPrefix${kvHexSpaced(value.bytes, kKvFormatViewBytes)}',
+        value.byteLength > kKvFormatViewBytes
+            ? KvFormatNote.tooBig
+            : KvFormatNote.none,
+      );
+    case KvValueFormat.json:
+      final raw = value.text;
+      if (raw == null) return KvValueView(value.display, KvFormatNote.binary);
+      if (value.byteLength > kKvFormatViewBytes) {
+        return KvValueView(raw, KvFormatNote.tooBig);
+      }
+      try {
+        return KvValueView(const JsonEncoder.withIndent('  ').convert(
+          jsonDecode(raw),
+        ));
+      } on FormatException {
+        return KvValueView(raw, KvFormatNote.notJson);
+      }
+  }
+}
+
+/// 大写、空格分隔的十六进制(截到 [max] 字节)
+String kvHexSpaced(List<int> bytes, int max) {
+  final buf = StringBuffer();
+  final n = bytes.length < max ? bytes.length : max;
+  for (var i = 0; i < n; i++) {
+    if (i > 0) buf.write(' ');
+    buf.write(bytes[i].toRadixString(16).toUpperCase().padLeft(2, '0'));
+  }
+  return buf.toString();
 }
 
 /// 键的容器类型。[none] = 键不存在,[unknown] = 引擎返回了不认识的类型名。
@@ -257,6 +401,7 @@ class KvValueRead {
     this.totalCount,
     this.truncated = false,
     this.rangeStart,
+    this.ttlSeconds,
   });
 
   final KvBytes key;
@@ -274,6 +419,11 @@ class KvValueRead {
 
   /// 字符串值的起始偏移(非字符串为 null)
   final int? rangeStart;
+
+  /// 取值**当时**的剩余秒数(-1 = 永不过期,-2 = 键已不存在,null = 引擎不给)。
+  /// 键列表那列 TTL 是扫页时批量读的,可能已经隔了几分钟;值面板要显示
+  /// 「过期于几点」必须用这个新鲜值,否则算出来的时刻是过去的。
+  final int? ttlSeconds;
 }
 
 class KvValueRow {
@@ -418,7 +568,7 @@ class KvCapabilities {
     required this.internalEncoding,
     required this.memoryUsage,
     required this.commandConsole,
-    required this.readOnlyFirstVersion,
+    required this.writableTypes,
     this.valueOffsetRead = false,
     this.idleTime = false,
     this.maxValuePreviewBytes,
@@ -452,13 +602,17 @@ class KvCapabilities {
   /// 是否有命令控制台标签
   final bool commandConsole;
 
-  /// 首版只读:true 时写命令在门控层拒绝,不给「改了不生效」的入口
-  final bool readOnlyFirstVersion;
+  /// 可写的容器类型。不在集合里的类型,界面**不给**编辑/删除/添加入口
+  /// (Redis 的 stream 只读:XADD 只能追加,改历史条目不是常规操作)。
+  /// 空集合 = 该引擎当前完全只读。
+  final Set<KvKeyType> writableTypes;
 
   /// 值预览的字节上限(超出只取前一段并标 truncated);null = 不额外限
   final int? maxValuePreviewBytes;
 
   bool supports(KvKeyType type) => keyTypes.contains(type);
+
+  bool writable(KvKeyType type) => writableTypes.contains(type);
 }
 
 /// 服务端返回的错误(WRONGTYPE / NOAUTH / ERR unknown command …)。

@@ -3727,7 +3727,7 @@ abstract class AppLocalizations {
   /// No description provided for @kvPatternHint.
   ///
   /// In zh, this message translates to:
-  /// **'按键名模式过滤(glob,如 scan:*)'**
+  /// **'搜索键名(默认包含匹配,glob 如 scan:*)'**
   String get kvPatternHint;
 
   /// No description provided for @kvTypeAll.
@@ -3741,12 +3741,6 @@ abstract class AppLocalizations {
   /// In zh, this message translates to:
   /// **'刷新'**
   String get kvActionRefresh;
-
-  /// No description provided for @kvActionLoadMore.
-  ///
-  /// In zh, this message translates to:
-  /// **'加载更多'**
-  String get kvActionLoadMore;
 
   /// No description provided for @kvActionReadMore.
   ///
@@ -3892,10 +3886,16 @@ abstract class AppLocalizations {
   /// **'已遍历完'**
   String get kvScanComplete;
 
+  /// No description provided for @kvScanContinue.
+  ///
+  /// In zh, this message translates to:
+  /// **'未扫完,点此继续扫描'**
+  String get kvScanContinue;
+
   /// No description provided for @kvRoundCapHint.
   ///
   /// In zh, this message translates to:
-  /// **'本轮未命中,可继续加载'**
+  /// **'本轮未命中,可继续扫描'**
   String get kvRoundCapHint;
 
   /// No description provided for @kvLoadedCount.
@@ -3919,7 +3919,7 @@ abstract class AppLocalizations {
   /// No description provided for @kvNoMatchYet.
   ///
   /// In zh, this message translates to:
-  /// **'尚未扫到符合条件的键,可点「加载更多」继续'**
+  /// **'尚未扫到符合条件的键,点此继续扫描'**
   String get kvNoMatchYet;
 
   /// No description provided for @kvLoadFailed.
@@ -3964,6 +3964,48 @@ abstract class AppLocalizations {
   /// **'值较大,已显示前 {shown} / {total} 字节'**
   String kvValueTruncated(String shown, String total);
 
+  /// No description provided for @kvFormatText.
+  ///
+  /// In zh, this message translates to:
+  /// **'文本'**
+  String get kvFormatText;
+
+  /// No description provided for @kvFormatJson.
+  ///
+  /// In zh, this message translates to:
+  /// **'JSON'**
+  String get kvFormatJson;
+
+  /// No description provided for @kvFormatHex.
+  ///
+  /// In zh, this message translates to:
+  /// **'十六进制'**
+  String get kvFormatHex;
+
+  /// No description provided for @kvFormatNotJson.
+  ///
+  /// In zh, this message translates to:
+  /// **'不是合法 JSON,已按原文显示'**
+  String get kvFormatNotJson;
+
+  /// No description provided for @kvFormatBinary.
+  ///
+  /// In zh, this message translates to:
+  /// **'值是二进制,无法按 JSON 显示'**
+  String get kvFormatBinary;
+
+  /// No description provided for @kvFormatTooBig.
+  ///
+  /// In zh, this message translates to:
+  /// **'格式视图只渲染前 {count} 字节'**
+  String kvFormatTooBig(String count);
+
+  /// No description provided for @kvFormatReadOnly.
+  ///
+  /// In zh, this message translates to:
+  /// **'格式化视图只读,编辑请切回「文本」'**
+  String get kvFormatReadOnly;
+
   /// No description provided for @kvConnectionGone.
   ///
   /// In zh, this message translates to:
@@ -3975,6 +4017,414 @@ abstract class AppLocalizations {
   /// In zh, this message translates to:
   /// **'该引擎不支持枚举键'**
   String get kvScanUnsupported;
+
+  /// No description provided for @kvActionNewKey.
+  ///
+  /// In zh, this message translates to:
+  /// **'新建键'**
+  String get kvActionNewKey;
+
+  /// No description provided for @kvActionAdd.
+  ///
+  /// In zh, this message translates to:
+  /// **'添加'**
+  String get kvActionAdd;
+
+  /// No description provided for @kvActionSetTtl.
+  ///
+  /// In zh, this message translates to:
+  /// **'设置过期时间…'**
+  String get kvActionSetTtl;
+
+  /// No description provided for @kvActionClearTtl.
+  ///
+  /// In zh, this message translates to:
+  /// **'清除过期时间'**
+  String get kvActionClearTtl;
+
+  /// No description provided for @kvMenuCopyKeyName.
+  ///
+  /// In zh, this message translates to:
+  /// **'复制键名'**
+  String get kvMenuCopyKeyName;
+
+  /// No description provided for @kvMenuDeleteKeyOne.
+  ///
+  /// In zh, this message translates to:
+  /// **'删除键'**
+  String get kvMenuDeleteKeyOne;
+
+  /// No description provided for @kvMenuDeleteKeys.
+  ///
+  /// In zh, this message translates to:
+  /// **'删除 {count} 个键'**
+  String kvMenuDeleteKeys(String count);
+
+  /// No description provided for @kvMenuEdit.
+  ///
+  /// In zh, this message translates to:
+  /// **'编辑'**
+  String get kvMenuEdit;
+
+  /// No description provided for @kvMenuCopyValue.
+  ///
+  /// In zh, this message translates to:
+  /// **'复制值'**
+  String get kvMenuCopyValue;
+
+  /// No description provided for @kvMenuDeleteItemOne.
+  ///
+  /// In zh, this message translates to:
+  /// **'删除此项'**
+  String get kvMenuDeleteItemOne;
+
+  /// No description provided for @kvMenuDeleteItems.
+  ///
+  /// In zh, this message translates to:
+  /// **'删除 {count} 项'**
+  String kvMenuDeleteItems(String count);
+
+  /// No description provided for @kvNotWritable.
+  ///
+  /// In zh, this message translates to:
+  /// **'该引擎不支持写操作'**
+  String get kvNotWritable;
+
+  /// No description provided for @kvStreamReadOnly.
+  ///
+  /// In zh, this message translates to:
+  /// **'流只能追加条目,不支持在此编辑'**
+  String get kvStreamReadOnly;
+
+  /// No description provided for @kvBigStringReadOnly.
+  ///
+  /// In zh, this message translates to:
+  /// **'值未完整读出,不能在此编辑(先点「读取后续内容」读全)'**
+  String get kvBigStringReadOnly;
+
+  /// No description provided for @kvDeleteConfirmOne.
+  ///
+  /// In zh, this message translates to:
+  /// **'确定要删除键「{name}」吗?\n删除后不可恢复。'**
+  String kvDeleteConfirmOne(String name);
+
+  /// No description provided for @kvDeleteConfirmMany.
+  ///
+  /// In zh, this message translates to:
+  /// **'确定要删除选中的 {count} 个键吗?\n删除后不可恢复。'**
+  String kvDeleteConfirmMany(String count);
+
+  /// No description provided for @kvDeleteDoneOne.
+  ///
+  /// In zh, this message translates to:
+  /// **'已删除 1 个键'**
+  String get kvDeleteDoneOne;
+
+  /// No description provided for @kvDeleteDone.
+  ///
+  /// In zh, this message translates to:
+  /// **'已删除 {count} 个键'**
+  String kvDeleteDone(String count);
+
+  /// No description provided for @kvTtlSetDoneOne.
+  ///
+  /// In zh, this message translates to:
+  /// **'已设置 1 个键的过期时间'**
+  String get kvTtlSetDoneOne;
+
+  /// No description provided for @kvTtlSetDone.
+  ///
+  /// In zh, this message translates to:
+  /// **'已设置 {count} 个键的过期时间'**
+  String kvTtlSetDone(String count);
+
+  /// No description provided for @kvTtlClearedDoneOne.
+  ///
+  /// In zh, this message translates to:
+  /// **'已清除 1 个键的过期时间'**
+  String get kvTtlClearedDoneOne;
+
+  /// No description provided for @kvTtlClearedDone.
+  ///
+  /// In zh, this message translates to:
+  /// **'已清除 {count} 个键的过期时间'**
+  String kvTtlClearedDone(String count);
+
+  /// No description provided for @kvWritePartial.
+  ///
+  /// In zh, this message translates to:
+  /// **'{ok} / {total} 个键已生效,其余键已不存在'**
+  String kvWritePartial(String ok, String total);
+
+  /// No description provided for @kvExpiresAt.
+  ///
+  /// In zh, this message translates to:
+  /// **'过期于 {time}'**
+  String kvExpiresAt(String time);
+
+  /// No description provided for @kvWriteFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'写入失败:{error}'**
+  String kvWriteFailed(String error);
+
+  /// No description provided for @kvSaveDone.
+  ///
+  /// In zh, this message translates to:
+  /// **'已保存'**
+  String get kvSaveDone;
+
+  /// No description provided for @kvNewKeyTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'新建键'**
+  String get kvNewKeyTitle;
+
+  /// No description provided for @kvKeyNameEmpty.
+  ///
+  /// In zh, this message translates to:
+  /// **'键名不能为空'**
+  String get kvKeyNameEmpty;
+
+  /// No description provided for @kvKeyNameTaken.
+  ///
+  /// In zh, this message translates to:
+  /// **'该键已存在,请换键名,或用「添加」向它追加内容'**
+  String get kvKeyNameTaken;
+
+  /// No description provided for @kvFieldTtl.
+  ///
+  /// In zh, this message translates to:
+  /// **'过期时间'**
+  String get kvFieldTtl;
+
+  /// No description provided for @kvTtlHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'留空 = 不过期'**
+  String get kvTtlHint;
+
+  /// No description provided for @kvTtlSetTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'设置过期时间'**
+  String get kvTtlSetTitle;
+
+  /// No description provided for @kvTtlInvalid.
+  ///
+  /// In zh, this message translates to:
+  /// **'过期时长要填大于 0 的数字'**
+  String get kvTtlInvalid;
+
+  /// No description provided for @kvTtlUnitSeconds.
+  ///
+  /// In zh, this message translates to:
+  /// **'秒'**
+  String get kvTtlUnitSeconds;
+
+  /// No description provided for @kvTtlUnitMinutes.
+  ///
+  /// In zh, this message translates to:
+  /// **'分钟'**
+  String get kvTtlUnitMinutes;
+
+  /// No description provided for @kvTtlUnitHours.
+  ///
+  /// In zh, this message translates to:
+  /// **'小时'**
+  String get kvTtlUnitHours;
+
+  /// No description provided for @kvTtlUnitDays.
+  ///
+  /// In zh, this message translates to:
+  /// **'天'**
+  String get kvTtlUnitDays;
+
+  /// No description provided for @kvAddFieldTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'添加字段'**
+  String get kvAddFieldTitle;
+
+  /// No description provided for @kvAddElementTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'添加元素'**
+  String get kvAddElementTitle;
+
+  /// No description provided for @kvAddMemberTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'添加成员'**
+  String get kvAddMemberTitle;
+
+  /// No description provided for @kvPosition.
+  ///
+  /// In zh, this message translates to:
+  /// **'插入位置'**
+  String get kvPosition;
+
+  /// No description provided for @kvPositionHead.
+  ///
+  /// In zh, this message translates to:
+  /// **'头部'**
+  String get kvPositionHead;
+
+  /// No description provided for @kvPositionTail.
+  ///
+  /// In zh, this message translates to:
+  /// **'尾部'**
+  String get kvPositionTail;
+
+  /// No description provided for @kvScoreInvalid.
+  ///
+  /// In zh, this message translates to:
+  /// **'分数要填数字'**
+  String get kvScoreInvalid;
+
+  /// No description provided for @kvHexHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'以 HEX: 开头即按十六进制写入裸字节'**
+  String get kvHexHint;
+
+  /// No description provided for @kvHexInvalid.
+  ///
+  /// In zh, this message translates to:
+  /// **'十六进制格式不对:需要偶数个 0-9A-F 字符'**
+  String get kvHexInvalid;
+
+  /// No description provided for @kvValueRequired.
+  ///
+  /// In zh, this message translates to:
+  /// **'值不能为空'**
+  String get kvValueRequired;
+
+  /// No description provided for @kvCopiedNames.
+  ///
+  /// In zh, this message translates to:
+  /// **'已复制 {count} 个键名到剪贴板'**
+  String kvCopiedNames(String count);
+
+  /// No description provided for @kvTtlAlreadyNone.
+  ///
+  /// In zh, this message translates to:
+  /// **'这些键本来就没有过期时间'**
+  String get kvTtlAlreadyNone;
+
+  /// No description provided for @kvDeletePartial.
+  ///
+  /// In zh, this message translates to:
+  /// **'{ok} / {total} 项已删除,其余项不在已读出的窗口里或已不存在'**
+  String kvDeletePartial(String ok, String total);
+
+  /// No description provided for @kvAddWindowOnly.
+  ///
+  /// In zh, this message translates to:
+  /// **'该值共 {total} 项,当前只读出 {shown} 项,新内容落在已读出范围之外'**
+  String kvAddWindowOnly(String total, String shown);
+
+  /// No description provided for @kvDeleteItemConfirmOne.
+  ///
+  /// In zh, this message translates to:
+  /// **'确定要删除这一项吗?\n删除后不可恢复。'**
+  String get kvDeleteItemConfirmOne;
+
+  /// No description provided for @kvDeleteItemConfirm.
+  ///
+  /// In zh, this message translates to:
+  /// **'确定要删除选中的 {count} 项吗?\n删除后不可恢复。'**
+  String kvDeleteItemConfirm(String count);
+
+  /// No description provided for @kvItemsDeletedOne.
+  ///
+  /// In zh, this message translates to:
+  /// **'已删除 1 项'**
+  String get kvItemsDeletedOne;
+
+  /// No description provided for @kvItemsDeleted.
+  ///
+  /// In zh, this message translates to:
+  /// **'已删除 {count} 项'**
+  String kvItemsDeleted(String count);
+
+  /// No description provided for @kvIndexReadOnly.
+  ///
+  /// In zh, this message translates to:
+  /// **'下标表示元素的位置,不能编辑;要改内容请编辑右侧的值'**
+  String get kvIndexReadOnly;
+
+  /// No description provided for @findHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'查找'**
+  String get findHint;
+
+  /// No description provided for @findReplaceHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'替换'**
+  String get findReplaceHint;
+
+  /// No description provided for @findNoMatches.
+  ///
+  /// In zh, this message translates to:
+  /// **'无匹配'**
+  String get findNoMatches;
+
+  /// No description provided for @findMatchPosition.
+  ///
+  /// In zh, this message translates to:
+  /// **'第 {current}/{total} 处'**
+  String findMatchPosition(String current, String total);
+
+  /// No description provided for @findSearching.
+  ///
+  /// In zh, this message translates to:
+  /// **'搜索中…'**
+  String get findSearching;
+
+  /// No description provided for @findPrev.
+  ///
+  /// In zh, this message translates to:
+  /// **'上一个'**
+  String get findPrev;
+
+  /// No description provided for @findNext.
+  ///
+  /// In zh, this message translates to:
+  /// **'下一个'**
+  String get findNext;
+
+  /// No description provided for @findCaseSensitive.
+  ///
+  /// In zh, this message translates to:
+  /// **'区分大小写'**
+  String get findCaseSensitive;
+
+  /// No description provided for @findRegex.
+  ///
+  /// In zh, this message translates to:
+  /// **'使用正则表达式'**
+  String get findRegex;
+
+  /// No description provided for @findBtnReplace.
+  ///
+  /// In zh, this message translates to:
+  /// **'替换'**
+  String get findBtnReplace;
+
+  /// No description provided for @findBtnReplaceAll.
+  ///
+  /// In zh, this message translates to:
+  /// **'全部替换'**
+  String get findBtnReplaceAll;
+
+  /// No description provided for @findClose.
+  ///
+  /// In zh, this message translates to:
+  /// **'关闭'**
+  String get findClose;
 }
 
 class _AppLocalizationsDelegate
