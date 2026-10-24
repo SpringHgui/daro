@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:base_ui_flutter/base_ui_flutter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -284,6 +286,11 @@ class _TableDataPageState extends State<TableDataPage> {
   /// 当前连接的类型 id(驱动标识符引用规则)
   String _typeId = '';
 
+  /// 只读网格:文档型库(当前仅 MongoDB)的驱动不生成写回语句,
+  /// 编辑 / 增删行 / 保存的入口一律关闭 —— 留着就是「能改、点了保存、
+  /// 执行时才抛不支持」,用户已经白改了。
+  bool get _readOnly => kDocumentDbTypes.contains(_typeId);
+
   /// 分页状态:_page 为 0-based;_pageData 为当前页数据;
   /// _selected 为当前页内的视图行号(0-based),_selectedCol 为选中列
   /// (null 表示整行选中,非 null 表示单元格选中)
@@ -466,6 +473,12 @@ class _TableDataPageState extends State<TableDataPage> {
       debugPrint('[TableData] Ctrl+S: dirty=$_dirty, saving=$_saving');
       if (_saving) return true;
       _applyEdits();
+      return true;
+    }
+    // F5 刷新当前表数据(与底部「刷新」按钮同一口径;加载进行中不重复触发)
+    if (event.logicalKey == LogicalKeyboardKey.f5) {
+      if (_loading) return true;
+      _refresh();
       return true;
     }
     // Ctrl+C / Ctrl+V:仅在焦点位于本页且**未进入单元格编辑器**时接管。
@@ -663,12 +676,27 @@ class _TableDataPageState extends State<TableDataPage> {
 
   /// 组装本次页查询的完整 SQL(记录到该 tab 的 SQL 历史)
   String _buildSelectSql(String typeId, {required int limit, required int offset}) {
+    if (kDocumentDbTypes.contains(typeId)) {
+      return _buildFindCall(limit: limit, offset: offset);
+    }
     final where = _whereSql;
     final order = _orderSql;
     return 'SELECT * FROM ${_qualified(typeId, widget.schema, widget.table)}'
         '${where != null ? ' WHERE $where' : ''}'
         '${order != null ? ' ORDER BY $order' : ''}'
         ' LIMIT $limit OFFSET $offset';
+  }
+
+  /// 文档型库没有 SQL,历史里记驱动真正执行的那次集合调用 ——
+  /// 伪造一句 `SELECT ... LIMIT` 等于记下一条在这个连接上跑不出来的语句。
+  /// 过滤条件不出现在这里:驱动对 WHERE 直接拒绝,能跑成功的调用本来就没有过滤。
+  String _buildFindCall({required int limit, required int offset}) {
+    final column = _sortCol == null ? null : _columns?[_sortCol!];
+    final sort = column == null
+        ? ''
+        : '.sort({${jsonEncode(column)}: ${_sortAsc ? 1 : -1}})';
+    return 'db.getCollection(${jsonEncode(widget.table)}).find()$sort'
+        '.skip($offset).limit($limit)';
   }
 
   // ── 加载 / 翻页 ────────────────────────────────────────
@@ -947,8 +975,10 @@ class _TableDataPageState extends State<TableDataPage> {
     if (!mounted) return;
     app.recordSql(
       _tabKey,
-      'SELECT COUNT(*) FROM ${_qualified(conn.typeId, widget.schema, widget.table)}'
-      '${_whereSql != null ? ' WHERE $_whereSql' : ''}',
+      kDocumentDbTypes.contains(conn.typeId)
+          ? 'db.getCollection(${jsonEncode(widget.table)}).count()'
+          : 'SELECT COUNT(*) FROM ${_qualified(conn.typeId, widget.schema, widget.table)}'
+              '${_whereSql != null ? ' WHERE $_whereSql' : ''}',
     );
     setState(() => _totalRows = total);
     final lastPage = total <= 0 ? 0 : (total / _pageSize).ceil() - 1;
@@ -985,8 +1015,19 @@ class _TableDataPageState extends State<TableDataPage> {
 
   // ── 本地行操作 ──────────────────────────────────────────
 
+  /// 只读连接的写操作拦口:状态栏说明原因并返回 true(调用方直接 return)。
+  /// 放在各个入口而不是只放工具栏,是因为键盘 Delete / Ctrl+V / 单元格右键
+  /// 都能绕过按钮的 disabled 状态。
+  bool _rejectIfReadOnly() {
+    if (!_readOnly) return false;
+    // 要 setState:[_setStatus] 只写字段,不重建就没人渲染这条提示
+    setState(() => _setStatus(context.l10n.gridReadOnlyBrowse, error: true));
+    return true;
+  }
+
   /// 添加:当前页末尾追加一条空记录并选中
   void _addRow() {
+    if (_rejectIfReadOnly()) return;
     final pageData = _pageData;
     final columns = _columns;
     if (pageData == null || columns == null) return;
@@ -1043,6 +1084,7 @@ class _TableDataPageState extends State<TableDataPage> {
 
   /// 删除指定行(右键菜单 / 工具栏 / Del 键共用);先弹确认对话框
   Future<void> _deleteRowAt(int row) async {
+    if (_rejectIfReadOnly()) return;
     final pageData = _pageData;
     if (pageData == null || row >= pageData.rows.length) return;
     final l = context.l10n;
@@ -1078,6 +1120,7 @@ class _TableDataPageState extends State<TableDataPage> {
   /// 原始行(≥0)登记到 [_deletedOriginals] 走 DELETE 分支,
   /// 本地新增行(<0)直接丢弃即可
   Future<void> _deleteRows(List<int> rowsAsc) async {
+    if (_rejectIfReadOnly()) return;
     final pageData = _pageData;
     if (pageData == null || rowsAsc.isEmpty) return;
     final valid = rowsAsc
@@ -1125,6 +1168,7 @@ class _TableDataPageState extends State<TableDataPage> {
   /// 按住 Ctrl / Shift 的点击只改选区,不起编辑器 —— 否则抬起补发的这一下
   /// 会把刚加选 / 连选出来的多格重新收成单格
   void _startEdit(int row, int col) {
+    if (_rejectIfReadOnly()) return;
     final kb = HardwareKeyboard.instance;
     if (kb.isControlPressed || kb.isShiftPressed) return;
     final pageData = _pageData;
@@ -1180,6 +1224,7 @@ class _TableDataPageState extends State<TableDataPage> {
   /// 确认修改:组装 DELETE / UPDATE / INSERT SQL 并执行,写回数据库。
   /// 遍历所有访问过的页(当前页 + 缓存页)对比原始行,保证翻页后的修改不遗漏
   Future<void> _applyEdits() async {
+    if (_rejectIfReadOnly()) return;
     final pageData = _pageData;
     final columns = _columns;
     final hasChanges = _dirty;
@@ -1484,8 +1529,8 @@ class _TableDataPageState extends State<TableDataPage> {
       _draftSource != _appliedSource ||
       _whereTextController.text != _appliedWhereText;
 
-  /// 通知「未应用的更改」提示区刷新(输入框 onChanged 调用,
-  /// 只重建那一点 UI,不动数据网格)
+  /// 通知「条件已编辑」区刷新(输入框 onChanged 调用:含「应用」按钮的可用态
+  /// 与灰字提示,见 `_applyRow`),只重建那一点 UI,不动数据网格
   void _touchDraft() => _draftRevision.value++;
 
   /// 用已应用状态重建草稿与值控制器(换表 / 应用 / 清除后调用)
@@ -2235,33 +2280,41 @@ class _TableDataPageState extends State<TableDataPage> {
   }
 
   /// 底部动作行:主按钮 + 有未应用改动时的灰字(设计图的「已编辑准则」)
+  ///
+  /// 按钮必须一起挂在 `_draftRevision` 里:纯键入(值输入框、WHERE 文本)只发
+  /// `_touchDraft()` 不 setState,按钮落在 builder 外就拿到旧的 `onPressed`,
+  /// 表现为「改了条件但应用键还是灰的」。
   Widget _applyRow(AppPalette t) {
     final l = context.l10n;
-    return Row(
-      children: [
-        Button(
-          text: l.gridApplyFilterSort,
-          variant: ButtonVariant.primary,
-          // 草稿与已应用一致时无需重查数据
-          onPressed: _draftDirty ? _applyDraft : null,
-        ),
-        const SizedBox(width: 10),
-        ValueListenableBuilder<int>(
-          valueListenable: _draftRevision,
-          builder: (context, _, __) => _draftDirty
-              ? Text(
-                  l.gridCriterionEdited,
-                  style: TextStyle(
-                    fontSize: 12,
-                    decoration: TextDecoration.none,
-                    fontWeight: FontWeight.w400,
-                    color: t.mutedForeground,
-                    fontFamilyFallback: chineseFontFamilyFallback,
-                  ),
-                )
-              : const SizedBox.shrink(),
-        ),
-      ],
+    return ValueListenableBuilder<int>(
+      valueListenable: _draftRevision,
+      builder: (context, _, __) {
+        // 草稿与已应用一致时无需重查数据
+        final dirty = _draftDirty;
+        return Row(
+          children: [
+            Button(
+              text: l.gridApplyFilterSort,
+              variant: ButtonVariant.primary,
+              onPressed: dirty ? _applyDraft : null,
+            ),
+            const SizedBox(width: 10),
+            if (dirty)
+              Text(
+                l.gridCriterionEdited,
+                style: TextStyle(
+                  fontSize: 12,
+                  decoration: TextDecoration.none,
+                  fontWeight: FontWeight.w400,
+                  color: t.mutedForeground,
+                  fontFamilyFallback: chineseFontFamilyFallback,
+                ),
+              )
+            else
+              const SizedBox.shrink(),
+          ],
+        );
+      },
     );
   }
 
@@ -2736,6 +2789,13 @@ class _TableDataPageState extends State<TableDataPage> {
             onPressed: _copySelectedCells),
         const MenuSeparator(),
       ],
+      // 单格复制:右键落点现在必定是当前格(组件层已把选中跟到右键),
+      // 不用先把鼠标移去左键点一下才知道操作目标
+      if (!inRegion)
+        MenuItem(
+            text: l.gridCellCopyOne,
+            shortcut: 'Ctrl+C',
+            onPressed: () => _copyText(cell)),
       MenuItem(
           text: l.cellMenuSetBlank, onPressed: () => _setCell(row, col, '')),
       MenuItem(
@@ -2882,6 +2942,7 @@ class _TableDataPageState extends State<TableDataPage> {
 
   /// 修改单元格值(本地副本,标记待确认)
   void _setCell(int row, int col, String value) {
+    if (_rejectIfReadOnly()) return;
     final pageData = _pageData;
     if (pageData == null ||
         row >= pageData.rows.length ||
@@ -2999,6 +3060,7 @@ class _TableDataPageState extends State<TableDataPage> {
   /// 把给定单元格一律置为 NULL(本地副本,仍需「确认修改」落库)。
   /// 整批一次 setState:全选时区域可达数千格,逐格 `_setCell` 会刷爆重建
   void _clearCellsToNull(Set<(int, int)> cells) {
+    if (_rejectIfReadOnly()) return;
     final pageData = _pageData;
     if (pageData == null || cells.isEmpty) return;
     final l = context.l10n;
@@ -3023,6 +3085,7 @@ class _TableDataPageState extends State<TableDataPage> {
   /// 依**可见列顺序**填入新行末尾(隐藏列留空),整批走 INSERT 分支。
   /// 单元格数超过可见列数则截断,不足则右侧补空。
   Future<void> _pasteRowsFromClipboard() async {
+    if (_rejectIfReadOnly()) return;
     final pageData = _pageData;
     final columns = _columns;
     if (pageData == null || columns == null) return;
@@ -3293,25 +3356,25 @@ class _TableDataPageState extends State<TableDataPage> {
         ToolStripButton(
           icon: Icons.add,
           tooltip: l.gridAddRecord,
-          enabled: ready,
+          enabled: ready && !_readOnly,
           onPressed: _addRow,
         ),
         ToolStripButton(
           icon: Icons.remove,
           tooltip: l.gridDeleteSelectedRecords,
-          enabled: ready && _selected != null,
+          enabled: ready && !_readOnly && _selected != null,
           onPressed: _deleteRow,
         ),
         ToolStripButton(
           icon: _saving ? Icons.hourglass_empty : Icons.check,
           tooltip: _saving ? l.gridSaving : l.btnCommitChanges,
-          enabled: ready && _dirty && !_saving,
+          enabled: ready && !_readOnly && _dirty && !_saving,
           onPressed: _saving ? null : _applyEdits,
         ),
         ToolStripButton(
           icon: Icons.close,
           tooltip: l.gridRevertChanges,
-          enabled: ready && _dirty,
+          enabled: ready && !_readOnly && _dirty,
           onPressed: _discardEdits,
         ),
         const ToolStripSeparator(),

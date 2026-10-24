@@ -14,13 +14,15 @@ import 'package:provider/provider.dart';
 
 import 'mcp_fakes.dart';
 
-/// 表数据页的单元格多选 / 框选 / 全选(宿主侧)。
+/// 表数据页的单元格多选 / 框选 / 全选 + 右键目标 + F5 / 应用筛选(宿主侧)。
 ///
-/// 组件层的矩形算法、滚动偏移、单击 vs 拖拽由 base-ui 的
-/// `data_grid_region_select_test.dart` 覆盖;这里只验宿主独有的事:
+/// 组件层的矩形算法、滚动偏移、单击 vs 拖拽、右键落点的选中同步由 base-ui 的
+/// `data_grid_region_select_test.dart` 与 `data_grid_context_select_test.dart`
+/// 覆盖;这里只验宿主独有的事:
 /// 选中集合按**数据列**存(隐藏列后不漂移)、Ctrl+A 覆盖本页全部可见格、
 /// 区域复制的 Tab / 换行格式、Del 整批置 NULL 且状态栏按覆盖行数报数、
-/// 右键菜单在编辑态让位给单元格编辑器的文本菜单。
+/// 右键菜单在编辑态让位给单元格编辑器的文本菜单、菜单文案随落点单格 / 整批切换、
+/// F5 走一次取数、只键入 WHERE 文本也能让「应用」按钮立刻可点。
 ///
 /// 驱动走 `test/mcp_fakes.dart` 的 FakeDriver:只给一页固定数据,
 /// 不校验服务端 SQL(那是驱动层用例的事)。
@@ -117,6 +119,39 @@ Set<(int, int)>? _selectedGridCells(WidgetTester tester) =>
 
 DataGridView _grid(WidgetTester tester) =>
     tester.widget<DataGridView>(find.byType(DataGridView));
+
+/// 「应用筛选 & 排序」主按钮:禁用态就是 `onPressed == null`
+final _applyButtonFinder =
+    find.ancestor(of: find.text('应用筛选 & 排序'), matching: find.byType(Button));
+
+Button _applyButton(WidgetTester tester) =>
+    tester.widget<Button>(_applyButtonFinder);
+
+/// 只用来数取数次数的假驱动(F5 刷新的回归目标)
+class _CountingDriver extends FakeDriver {
+  _CountingDriver(super.label);
+
+  int previewCount = 0;
+
+  @override
+  Future<TablePreview> previewTable(
+    String database,
+    String table, {
+    int limit = 100,
+    int offset = 0,
+    String? schema,
+    String? where,
+    String? orderBy,
+  }) {
+    previewCount++;
+    return super.previewTable(database, table,
+        limit: limit,
+        offset: offset,
+        schema: schema,
+        where: where,
+        orderBy: orderBy);
+  }
+}
 
 /// 最近一次 `Clipboard.setData` 写入的文本
 String? _clipText;
@@ -313,6 +348,87 @@ void main() {
 
       await rightClick(tester, 'r1-c1');
       expect(find.text('设置为空白字符串'), findsOneWidget);
+    });
+
+    testWidgets('右键落在单格上:菜单给「复制单元格」,复制的就是那一格',
+        (tester) async {
+      _watchClipboard(tester);
+      await _pumpPage(tester, _driver([_row(0), _row(1)]));
+
+      await rightClick(tester, 'r1-c1');
+      expect(find.text('复制单元格'), findsOneWidget);
+
+      await tester.tap(find.text('复制单元格'));
+      await _settle(tester);
+      expect(_clipText, 'r1-c1');
+    });
+
+    testWidgets('右键落在区域外:目标收缩为该格,菜单文案跟着变单数',
+        (tester) async {
+      await _pumpPage(tester, _driver([_row(0), _row(1)]));
+
+      await _boxSelect(tester, 'r0-c0', 'r1-c1');
+      expect(_selectedGridCells(tester), isNotNull);
+
+      await rightClick(tester, 'r0-c3');
+
+      expect(_selectedGridCells(tester), {(0, 3)});
+      expect(find.text('复制单元格'), findsOneWidget);
+      expect(find.text('复制 4 个单元格'), findsNothing);
+    });
+
+    testWidgets('右键落在选区内:整批保留,不给单格项', (tester) async {
+      await _pumpPage(tester, _driver([_row(0), _row(1)]));
+
+      await _boxSelect(tester, 'r0-c0', 'r1-c1');
+      await rightClick(tester, 'r0-c0');
+
+      expect(_selectedGridCells(tester), {(0, 0), (0, 1), (1, 0), (1, 1)},
+          reason: '区域内右键不该把框选拆成单格');
+      expect(find.text('复制 4 个单元格'), findsOneWidget);
+      expect(find.text('复制单元格'), findsNothing);
+    });
+  });
+
+  group('F5 刷新 与「应用筛选」按钮', () {
+    testWidgets('F5 重新取当前页数据(有未保存修改时先确认,这里没有)', (tester) async {
+      final driver = _CountingDriver('c')
+        ..preview = TablePreview(
+          columns: _columns,
+          rows: [_row(0), _row(1)],
+          limit: 100,
+        );
+      await _pumpPage(tester, driver);
+      final before = driver.previewCount;
+
+      await tester.sendKeyEvent(LogicalKeyboardKey.f5);
+      await _settle(tester);
+
+      expect(driver.previewCount, greaterThan(before),
+          reason: 'F5 应走一次取数');
+      expect(find.text('设置为空白字符串'), findsNothing,
+          reason: '刷新不该带出任何弹窗 / 菜单');
+    });
+
+    testWidgets('只键入 WHERE 文本也要让「应用筛选 & 排序」立刻可点', (tester) async {
+      await _pumpPage(tester, _driver([_row(0), _row(1)]));
+
+      await tester.tap(find.text('筛选 & 排序'));
+      await _settle(tester);
+      // 切到「文本」模式并先应用掉:此后草稿 == 已应用,按钮必须是灰的
+      await tester.tap(find.text('文本').last);
+      await _settle(tester);
+      await tester.tap(_applyButtonFinder);
+      await _settle(tester);
+      expect(_applyButton(tester).onPressed, isNull,
+          reason: '草稿与已应用一致时不该可点');
+
+      // 这一步只有草稿信号、没有整页 setState —— 旧版按钮没挂信号,一直是灰的
+      await tester.enterText(find.byType(Textarea).last, 'id > 1');
+      await _settle(tester);
+
+      expect(_applyButton(tester).onPressed, isNotNull,
+          reason: '改了条件就必须让用户看得见能应用');
     });
   });
 }
