@@ -16,6 +16,7 @@ import '../widgets/view_tabs.dart';
 import '../widgets/table_data_page.dart';
 import '../widgets/query_page.dart';
 import '../widgets/command_line_page.dart';
+import '../widgets/kv_browser_page.dart';
 import '../widgets/table_designer_page.dart';
 import '../widgets/routine_design_page.dart';
 import '../widgets/user_design_page.dart';
@@ -168,6 +169,16 @@ class _MainPageState extends State<MainPage> {
                                   return CommandLinePage(
                                     connection: tab.connection!,
                                     database: tab.database!,
+                                  );
+                                if (tab.type == TabType.kvKeys)
+                                  return KvBrowserPage(
+                                    // key 用标签身份:db0 与 db15 两个标签同为
+                                    // KvBrowserPage,不给 key 会复用同一个 State,
+                                    // 切过去仍显示上一个库的键列表
+                                    key: ValueKey(tab.key),
+                                    connection: tab.connection!,
+                                    namespaceId: tab.database!,
+                                    namespaceLabel: tab.title,
                                   );
                                 if (tab.type == TabType.createTable)
                                   return TableDesignerPage(

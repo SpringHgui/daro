@@ -59,6 +59,13 @@ class DatabaseInfo extends StatelessWidget {
               break;
             case NodeKind.connGroup:
               return _ConnGroupInfoView(group: node.name);
+            case NodeKind.kvNamespace:
+              return _KvNamespaceInfoView(
+                app: app,
+                namespace: node.name,
+                connection: node.connection,
+                namespaceId: node.database,
+              );
           }
         }
         // 未选中节点:跟随对象页上下文展示库信息
@@ -1375,8 +1382,62 @@ class _ConnGroupInfoView extends StatelessWidget {
   }
 }
 
-// ───────────────────────────────────────────────────────────── 公共小件
+/// 缓存型引擎(Redis 等)的命名空间详情。
+///
+/// 只有「哪个库 + 多少键」两件事:SQL 侧的库详情(字符集 / 排序规则 / 所有者)
+/// 对 Redis 没有对应概念,走那条路只会得到一次被驱动拒掉的目录查询。
+/// 键数取自驱动的 INFO keyspace / DBSIZE,取不到显示占位符而不猜值。
+class _KvNamespaceInfoView extends StatelessWidget {
+  const _KvNamespaceInfoView({
+    required this.app,
+    required this.namespace,
+    this.connection,
+    this.namespaceId,
+  });
 
+  final AppState app;
+  final String namespace;
+  final String? connection;
+
+  /// 命名空间 id(Redis 的库号),装在 [SelectedNode.database] 槽位里带过来
+  final String? namespaceId;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Tokens.of(context);
+    final l = context.l10n;
+    final conn = DatabaseInfo._find(app, connection);
+    final ns = conn == null || namespaceId == null
+        ? null
+        : app.kvManager.namespacesOf(conn.name).namespace(namespaceId!);
+
+    return Container(
+      color: t.background,
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          UiIcon(kDatabaseIcon, size: 46),
+          const SizedBox(height: 8),
+          Text(
+            namespace,
+            style: TextStyle(
+                fontSize: 20, fontWeight: FontWeight.w600, color: t.foreground),
+          ),
+          const SizedBox(height: 4),
+          Text(l.infoSectionKvNamespace,
+              style: TextStyle(fontSize: 12, color: t.mutedForeground)),
+          const SizedBox(height: 18),
+          _field(t, l.fieldConnection, conn?.name),
+          if (conn != null) _field(t, l.fieldType, _typeName(conn.typeId)),
+          _field(t, l.fieldKeyCount, ns?.keyCount?.toString()),
+        ],
+      ),
+    );
+  }
+}
+
+// ───────────────────────────────────────────────────────────── 公共小件
 /// 按类型 id 查显示名(取 label 首行)
 String _typeName(String typeId) {
   for (final type in kAllDbTypes) {

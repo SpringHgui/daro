@@ -20,6 +20,11 @@ dependencies:
   flutter_svg: ^2.0.10
   mysql_client: ^0.0.27
   postgres: ^3.5.12
+  # 可行性验证(只读):MongoDB 驱动,详见 mongo_probe 试验
+  mongo_dart: ^0.10.10
+  # 缓存 / KV 引擎驱动(Redis)。锁死小版本:驱动的字节解析口径按 4.1.0 实测
+  # (RedisParserBulkBinary / RedisBulk 的语义变了就要重跑 .redis_probe 探针)
+  redis: 4.1.0
   dart_odbc: ^6.2.1
   sqlite3: ^2.7.6
   path_provider: ^2.1.6

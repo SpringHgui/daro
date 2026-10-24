@@ -5,7 +5,6 @@ import 'package:flutter/services.dart';
 import '../data/connection_defaults.dart';
 import '../data/db_data.dart';
 import '../data/db_types.dart';
-import '../data/drivers/db_driver.dart';
 import '../theme/app_theme.dart';
 
 /// 分组下拉里代表「不属于任何分组」的哨兵值(不是合法分组名)
@@ -440,7 +439,7 @@ class _ConnectionFormPageState extends State<ConnectionFormPage> {
                 group: _group,
                 isLive: true,
               );
-              if (!hasDriver(info)) {
+              if (!hasAnyDriver(info)) {
                 _setStatus('${_shortLabel} 驱动尚未实现,连接后无法加载元数据');
                 return;
               }

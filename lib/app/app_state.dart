@@ -23,10 +23,20 @@ import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
 import 'cli_console.dart';
 import 'connection_manager.dart';
+import 'kv_manager.dart';
 import 'mcp_service.dart';
 
 /// 中部视图标签的类型:对象浏览页 / 表数据页 / 查询编辑页 / 表设计器 / 命令列界面
-enum TabType { object, table, query, design, createTable, commandLine }
+/// / 键值浏览页(缓存型引擎的一个命名空间,如 Redis 的 db0)
+enum TabType {
+  object,
+  table,
+  query,
+  design,
+  createTable,
+  commandLine,
+  kvKeys
+}
 
 /// 中部对象页当前浏览的对象分类(对应连接树的分组节点)
 enum ObjectCategory { table, view, materializedView, function, procedure, user, query, backup }
@@ -172,6 +182,11 @@ enum NodeKind {
   schema,
   tableGroup,
   table,
+
+  /// 缓存型引擎的命名空间(Redis 的 db0..db15)。
+  /// 与 [database] 分开列:详情面板拿 [SelectedNode.database] 那套去查
+  /// 字符集 / 排序规则,对 Redis 只会得到一次必然失败的目录查询。
+  kvNamespace,
 }
 
 /// 表数据页的分页 / 记录位置状态,供状态栏显示
@@ -272,6 +287,10 @@ class AppState extends ChangeNotifier {
 
   /// 真实连接管理:驱动连接池 + 树元数据懒加载状态
   final ConnectionManager connectionManager = ConnectionManager();
+
+  /// 缓存 / 键值型连接(Redis 等)的管理:与 [connectionManager] 并列的另一套
+  /// 驱动字典。判据是 kKvStoreTypes,两侧互斥(见 kv_driver.dart)
+  final KvConnectionManager kvManager = KvConnectionManager();
 
   /// 连接配置持久化存储(应用支持目录 connections.json)
   final ConnectionStore _store = ConnectionStore();
@@ -523,6 +542,7 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     _persist();
     await connectionManager.disconnect(conn.name);
+    await kvManager.disconnect(conn.name);
     if (objectConnection == conn.name) {
       objectConnection = null;
       objectDatabase = null;
@@ -553,6 +573,7 @@ class AppState extends ChangeNotifier {
     if (updated.name != oldConn.name) {
       _migrateTabsConnection(oldConn.name, updated.name);
       await connectionManager.disconnect(oldConn.name);
+      await kvManager.disconnect(oldConn.name);
     }
     return updated;
   }
@@ -1052,6 +1073,22 @@ class AppState extends ChangeNotifier {
   bool get ctrlPressed => HardwareKeyboard.instance.isControlPressed;
 
   bool get shiftPressed => HardwareKeyboard.instance.isShiftPressed;
+
+  /// 双击 KV 连接的命名空间:打开该库的键浏览页,每个「连接 + 库」一个标签。
+  /// [OpenTab.database] 槽位承载命名空间 id(Redis 的库号 '0'..'15'),
+  /// 标题用引擎给的显示名(db0)—— 键浏览页没有「同名对象跨库共存」的问题,
+  /// 但标签身份仍要含库号,否则两个连接的同名 db0 会撞成同一个 key。
+  void openKvKeys({
+    required String connection,
+    required String namespaceId,
+    required String namespaceLabel,
+  }) {
+    final tab = OpenTab(
+        TabType.kvKeys, namespaceLabel, null, connection, namespaceId);
+    if (!tabs.any((t) => t.key == tab.key)) tabs.add(tab);
+    activeTab = tab.key;
+    notifyListeners();
+  }
 
   OpenTab? get activeTabModel {
     for (final tab in tabs) {

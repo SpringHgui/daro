@@ -11,9 +11,11 @@ import 'package:provider/provider.dart';
 import 'package:base_ui_flutter/base_ui_flutter.dart';
 import '../app/app_state.dart';
 import '../app/connection_manager.dart';
+import '../app/kv_manager.dart';
 import '../data/db_data.dart';
 import '../data/db_types.dart';
 import '../data/drivers/db_driver.dart';
+import '../data/drivers/kv_driver.dart';
 import '../data/table_design.dart';
 import '../data/user_sql.dart';
 import '../pages/connection_dialog_page.dart';
@@ -104,6 +106,9 @@ class _DatabaseTreeState extends State<DatabaseTree> {
 
   /// 订阅 ConnectionManager:真实连接的库/表列表加载完成后重建树
   ConnectionManager? _listenedManager;
+
+  /// 订阅 KvConnectionManager:缓存型连接(Redis 等)的命名空间加载完成后重建树
+  KvConnectionManager? _listenedKvManager;
 
   /// 订阅 AppState:Ribbon 按钮点击后展开祖先并选中分组节点
   AppState? _listenedApp;
@@ -334,6 +339,11 @@ class _DatabaseTreeState extends State<DatabaseTree> {
       _listenedManager = manager;
       manager.addListener(_onManagerChanged);
     }
+    if (_listenedKvManager != app.kvManager) {
+      _listenedKvManager?.removeListener(_onManagerChanged);
+      _listenedKvManager = app.kvManager;
+      app.kvManager.addListener(_onManagerChanged);
+    }
     if (_listenedApp != app) {
       _listenedApp?.treeNavigate.removeListener(_onTreeNavigate);
       _listenedApp?.connectionAdded.removeListener(_onConnectionAdded);
@@ -376,7 +386,7 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     // 连接节点可能需要补录密码(弹窗可被取消):「展开 + 标记已打开 + 记日志 +
     // 拉库列表」整体延后到密码确认之后(见 [_lazyExpandConnection])。否则弹窗
     // 一取消,节点就停在展开态且状态仍是 idle,树上留下永久「加载中...」。
-    if (kind == NodeKind.connection && hasDriver(conn)) {
+    if (kind == NodeKind.connection && hasAnyDriver(conn)) {
       _lazyExpandConnection(app, conn);
       return;
     }
@@ -406,6 +416,9 @@ class _DatabaseTreeState extends State<DatabaseTree> {
       case NodeKind.tableGroup:
       case NodeKind.table:
       case NodeKind.connGroup:
+      // 命名空间是叶子:键不进树(Redis 单库几千个键,塞进树等于把
+      // 浏览页的活搬到侧栏),键列表在点开该节点时的键浏览标签里
+      case NodeKind.kvNamespace:
         // 分组 / 叶子不可展开(分组对象行随父级展开始终可见),仅保留 case 满足穷尽
         break;
     }
@@ -559,8 +572,8 @@ class _DatabaseTreeState extends State<DatabaseTree> {
           schema: detail.schema,
         );
       }
-      if (_expanded.contains(updated.name) && hasDriver(updated)) {
-        app.connectionManager.expandConnection(updated);
+      if (_expanded.contains(updated.name) && hasAnyDriver(updated)) {
+        expandKvOrSql(app, updated);
       }
       // 连接改名守卫:旧名若已被 MCP 授权,自动迁移策略与池驱动实例
       try {
@@ -791,6 +804,7 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     }
     app.logTreeAction(context.l10n.closedConnection(conn.name));
     await app.connectionManager.disconnect(conn.name);
+    await app.kvManager.disconnect(conn.name);
   }
 
   /// 「新建数据库」:弹出名称输入对话框,成功后库列表已刷新(树无需额外动作)
@@ -1491,6 +1505,16 @@ class _DatabaseTreeState extends State<DatabaseTree> {
         conn.copyWith(password: result.password);
   }
 
+  /// 展开 / 刷新连接时按驱动链分流。SQL 与 KV 各持一套管理器与状态字典,
+  /// 判据是 [isKvStoreConnection](两侧类型集合互斥,见 kv_driver.dart)。
+  static void expandKvOrSql(AppState app, ConnectionInfo conn) {
+    if (isKvStoreConnection(conn)) {
+      app.kvManager.expandConnection(conn);
+    } else {
+      app.connectionManager.expandConnection(conn);
+    }
+  }
+
   /// 展开连接节点:类型需要密码且未保存时先弹窗补录,确认后再展开节点并
   /// 懒加载库列表。用户取消密码输入(或环境已卸载)时整次展开作废——不展开、
   /// 不标记已打开、不记日志,转圈指示器也随之撤下。
@@ -1511,7 +1535,7 @@ class _DatabaseTreeState extends State<DatabaseTree> {
       _opened.add(conn.name);
     });
     app.logTreeAction(context.l10n.openedConnection(conn.name));
-    app.connectionManager.expandConnection(target);
+    expandKvOrSql(app, target);
   }
 
   /// 「打开连接」:真实连接服务器并获取数据库信息(非仅展开树)。
@@ -1520,7 +1544,7 @@ class _DatabaseTreeState extends State<DatabaseTree> {
   Future<void> _openConnectionNode(AppState app, ConnectionInfo conn) async {
     _selectNode(conn.name);
     final l = context.l10n;
-    if (!hasDriver(conn)) {
+    if (!hasAnyDriver(conn)) {
       _expandNode(conn.name);
       MessageBox.show(
         context,
@@ -1542,8 +1566,9 @@ class _DatabaseTreeState extends State<DatabaseTree> {
       return;
     }
     _expandNode(conn.name);
-    final (ok, message) =
-        await app.connectionManager.forceExpandConnection(target);
+    final (ok, message) = isKvStoreConnection(target)
+        ? await app.kvManager.forceExpandConnection(target)
+        : await app.connectionManager.forceExpandConnection(target);
     _clearOpening(conn.name);
     if (!mounted) return;
     if (ok) {
@@ -1591,8 +1616,8 @@ class _DatabaseTreeState extends State<DatabaseTree> {
         );
       }
     }
-    if (_expanded.contains(updated.name) && hasDriver(updated)) {
-      app.connectionManager.expandConnection(updated);
+    if (_expanded.contains(updated.name) && hasAnyDriver(updated)) {
+      expandKvOrSql(app, updated);
     }
   }
 
@@ -1638,6 +1663,7 @@ class _DatabaseTreeState extends State<DatabaseTree> {
   @override
   void dispose() {
     _listenedManager?.removeListener(_onManagerChanged);
+    _listenedKvManager?.removeListener(_onManagerChanged);
     _listenedApp?.treeNavigate.removeListener(_onTreeNavigate);
     _listenedApp?.connectionAdded.removeListener(_onConnectionAdded);
     for (final timer in _minSpinnerTimers.values) {
@@ -1977,7 +2003,10 @@ class _DatabaseTreeState extends State<DatabaseTree> {
   }) {
     final c = AppColors.of(context);
     final manager = app.connectionManager;
-    final supported = hasDriver(conn);
+    final supported = hasAnyDriver(conn);
+    // 缓存型引擎(Redis 等)走 KvConnectionManager 那条独立驱动链;
+    // 两侧类型集合互斥,所以这是一个二选一的开关而不是叠加状态
+    final isKv = isKvStoreConnection(conn);
     final rows = <Widget>[];
 
     // 查找连接类型对应的品牌图标定义
@@ -1987,7 +2016,9 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     }
 
     // 连接图标:品牌图标 + 右下角状态点;离线时品牌色去饱和
-    final connected = manager.isConnected(conn.name);
+    final connected = isKv
+        ? app.kvManager.isConnected(conn.name)
+        : manager.isConnected(conn.name);
     final connLeading = dbType == null
         ? null
         : DbTypeIcon(type: dbType, size: _treeIconSize, connected: connected);
@@ -1995,7 +2026,10 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     // 或已触发打开动作但还在等密码补录(见 [_pendingOpening])。
     // 行首品牌图标整体换成转圈指示器。不看展开态——收起也照常反映进度
     final connLoading = supported &&
-        (manager.databaseStateOf(conn.name).status == LoadStatus.loading ||
+        ((isKv
+                ? app.kvManager.namespacesOf(conn.name).status
+                : manager.databaseStateOf(conn.name).status) ==
+            LoadStatus.loading ||
             _pendingOpening.contains(conn.name));
 
     // 连接节点:展开时触发连接 + 拉取库列表
@@ -2017,8 +2051,7 @@ class _DatabaseTreeState extends State<DatabaseTree> {
         // 箭头 / 灰色态跟随真实连接状态:查询页等外部入口打开连接后
         // (驱动已建立,isConnected=true)即使本树未展开过也显示展开箭头;
         // 与右键菜单「已连接=显示关闭连接」的判定口径保持一致
-        opened:
-            _opened.contains(conn.name) || manager.isConnected(conn.name),
+        opened: _opened.contains(conn.name) || connected,
         onToggle: () => _toggleNode(
           app: app,
           conn: conn,
@@ -2069,6 +2102,13 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     if (!supported) {
       rows.add(_hintNode(
           context, depth: base + 1, text: context.l10n.driverNotImplemented));
+      return rows;
+    }
+
+    // 缓存型引擎(Redis 等):连接下直接挂命名空间,没有「库 → 模式 → 对象
+    // 分组」那三层关系型结构,键本身也不进树(见 _kvNamespaceRows)
+    if (isKv) {
+      rows.addAll(_kvNamespaceRows(context, app, conn, base + 1));
       return rows;
     }
 
@@ -2215,6 +2255,76 @@ class _DatabaseTreeState extends State<DatabaseTree> {
         // 无模式层:分组直挂库节点下(原布局)
         rows.addAll(_groupRows(context, app, conn, database, null, dbKey, base + 2));
       }
+    }
+    return rows;
+  }
+
+  /// KV 连接的子级:命名空间节点(Redis 的 db0..db15)。
+  ///
+  /// 节点是**叶子** —— 键不进树:单库几千上万个键,而 SCAN 是游标式的,
+  /// 树要「展开时才知有没有子级」就得替浏览页把整轮扫描跑完。键列表与值
+  /// 网格都在双击节点后打开的键浏览标签里(那里才有过滤、分页与续扫)。
+  /// 行尾的计数是驱动从 DBSIZE / INFO keyspace 一次拿到的现成值,
+  /// 取不到就不显示 —— 不为了凑一个数字去扫键空间。
+  List<Widget> _kvNamespaceRows(
+    BuildContext context,
+    AppState app,
+    ConnectionInfo conn,
+    int depth,
+  ) {
+    final kv = app.kvManager;
+    final state = kv.namespacesOf(conn.name);
+    final rows = <Widget>[];
+    switch (state.status) {
+      case LoadStatus.idle:
+      case LoadStatus.loading:
+        // 加载中不挂提示行:进度由连接行的行首图标转圈表达(见 _node 的 loading)
+        return rows;
+      case LoadStatus.error:
+        rows.add(_hintNode(
+          context,
+          depth: depth,
+          text: context.l10n.loadFailedDetail('${state.error}'),
+          isAction: true,
+          onTap: () => kv.retryExpandConnection(conn),
+        ));
+        return rows;
+      case LoadStatus.loaded:
+        break;
+    }
+    final c = AppColors.of(context);
+    for (final ns in state.namespaces) {
+      final key = '${conn.name}|${ns.id}';
+      rows.add(
+        ValueListenableBuilder<String?>(
+          valueListenable: _selectedNode,
+          builder: (context, sel, _) => _node(
+            context,
+            key: key,
+            depth: depth,
+            text: ns.keyCount == null ? ns.label : '${ns.label} · ${ns.keyCount}',
+            icon: Icons.storage,
+            color: c.iconSuccess,
+            noArrow: true,
+            selected: sel == key,
+            kind: NodeKind.kvNamespace,
+            onDoubleTapActivate: () => app.openKvKeys(
+              connection: conn.name,
+              namespaceId: ns.id,
+              namespaceLabel: ns.label,
+            ),
+            onSelect: () {
+              _selectNode(key);
+              app.detailSelection.value = SelectedNode(
+                NodeKind.kvNamespace,
+                ns.label,
+                connection: conn.name,
+                database: ns.id,
+              );
+            },
+          ),
+        ),
+      );
     }
     return rows;
   }
@@ -2644,15 +2754,15 @@ class _DatabaseTreeState extends State<DatabaseTree> {
             id: e.id,
             label: e.label,
             leading: Opacity(
-              opacity: kSupportedDriverTypes.contains(e.id) ? 1.0 : 0.35,
+              opacity: isEngineTypeSupported(e.id) ? 1.0 : 0.35,
               child: DbTypeIcon(type: e, size: 16),
             ),
             selected: selectedDbTypes.contains(e.id),
-            onToggle: kSupportedDriverTypes.contains(e.id)
+            onToggle: isEngineTypeSupported(e.id)
                 ? () => app.toggleDbTypeFilter(e.id)
                 : null,
           ),
-          supported: kSupportedDriverTypes.contains(e.id),
+          supported: isEngineTypeSupported(e.id),
         ),
     ];
 
@@ -2805,6 +2915,10 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     required NodeKind kind,
     bool expanded = false,
     VoidCallback? onToggle,
+    // 叶子节点的「双击进入」动作(如 KV 命名空间 → 打开键浏览页)。
+    // 传了它,行体双击就取代「切换子树」—— 叶子没有子树可切,
+    // 但仍要能双击进入(noArrow 只关掉箭头热区,不该连进入一起没了)
+    VoidCallback? onDoubleTapActivate,
     // 无展开功能的节点(分组):隐藏箭头(保留箭头宽占位对齐文本)、双击无动作
     bool noArrow = false,
     // 节点是否已被打开过:未打开的节点隐藏箭头并以灰色显示,
@@ -2865,12 +2979,16 @@ class _DatabaseTreeState extends State<DatabaseTree> {
             opened &&
             dx >= arrowLeft &&
             dx < arrowLeft + 20;
-        // 行体双击整行 = 切换子树(与箭头同一逻辑),手动判定不拖累单击
-        final bodyDouble = onToggle != null &&
-            !noArrow &&
-            key == _lastTapKey &&
-            now - _lastTapMs <= _doubleTapWindowMs;
-        if (inArrow || bodyDouble) onToggle();
+        // 行体双击整行:叶子节点(传了 [onDoubleTapActivate])进入该对象,
+        // 其余走「切换子树」(与箭头同一逻辑),手动判定不拖累单击
+        final bodyDouble = key == _lastTapKey &&
+            now - _lastTapMs <= _doubleTapWindowMs &&
+            (onDoubleTapActivate != null || (onToggle != null && !noArrow));
+        if (bodyDouble && onDoubleTapActivate != null) {
+          onDoubleTapActivate();
+        } else if (inArrow || bodyDouble) {
+          onToggle?.call();
+        }
         _lastTapKey = key;
         _lastTapMs = now;
       },

@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
+import 'db_data.dart';
+import 'drivers/db_driver.dart';
+import 'drivers/kv_driver.dart';
+
 /// 连接类型条目:用于"选择一个连接类型"对话框里的每一个图标卡片。
 ///
 /// [label] 支持两行(如"阿里云 云数据库\nRDS MySQL 版"),渲染时按 \n 自动分行。
@@ -23,6 +27,9 @@ class DbType {
 // ────────────────────────────────────────────────────────────
 
 /// 全部数据库类型(已实现的在前,未实现的在后)
+///
+/// 「已实现」的口径是 [isEngineTypeSupported]:SQL 侧的 kSupportedDriverTypes
+/// ∪ KV 侧的 kKvStoreTypes。只有驱动能连、树里能展开的才算。
 const List<DbType> kAllDbTypes = [
   // ── 已实现 ──
   DbType(id: 'mysql', label: 'MySQL'),
@@ -31,12 +38,27 @@ const List<DbType> kAllDbTypes = [
   DbType(id: 'sqlite', label: 'SQLite'),
   DbType(id: 'access', label: 'Access'),
   DbType(id: 'mariadb', label: 'MariaDB'),
-  // ── 未实现 ──
-  DbType(id: 'oracle', label: 'Oracle'),
   DbType(id: 'mongodb', label: 'MongoDB'),
   DbType(id: 'redis', label: 'Redis'),
+  // ── 未实现 ──
+  DbType(id: 'oracle', label: 'Oracle'),
   DbType(id: 'snowflake', label: 'Snowflake'),
 ];
+
+/// 该引擎类型在界面上是否可用(「新建连接」卡片、类型筛选、导入勾选的统一判据)。
+///
+/// 两条驱动链互不包含(SQL 的 kSupportedDriverTypes 与 KV 的 kKvStoreTypes),
+/// 但**对用户是同一个问题**:这个类型能不能连。所以这里取并集,而不是让每个
+/// 门控点各自 ∪ 一次(漏一处就是「驱动已就绪但界面点不动」)。
+/// 拿到类型可用 ≠ 拿到驱动实例:实例仍要按 [hasDriver] / [isKvStoreConnection]
+/// 分流到 createDriver 或 createKvDriver。
+bool isEngineTypeSupported(String typeId) =>
+    kSupportedDriverTypes.contains(typeId) || kKvStoreTypes.contains(typeId);
+
+/// 该连接是否有可用驱动(SQL / 文档型 / 缓存型任一)。
+/// 树与详情页用它决定「能不能展开、要不要报「暂不支持」」
+bool hasAnyDriver(ConnectionInfo conn) =>
+    hasDriver(conn) || isKvStoreConnection(conn);
 
 /// 连接状态点配色:在线绿 / 离线灰,与图标几何无关,主题下均可辨
 const Color kConnOnline = Color(0xff22b573);

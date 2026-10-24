@@ -77,10 +77,14 @@ class ViewTabs extends StatelessWidget {
               // 命令列界面 → 自绘终端图(它不是对象分类,不走 ObjectCategoryIcon)
               icon: tab.type == TabType.commandLine
                   ? const UiIcon(kConsoleIcon, size: 16)
-                  : ObjectCategoryIcon(
-                      category: _tabCategory(tab),
-                      size: 16,
-                    ),
+                  : tab.type == TabType.kvKeys
+                      // 键浏览标签绑的是缓存命名空间(Redis 的 db0..),
+                      // 与 SQL 对象分类无关,取库图标
+                      ? const UiIcon(kDatabaseIcon, size: 16)
+                      : ObjectCategoryIcon(
+                          category: _tabCategory(tab),
+                          size: 16,
+                        ),
               onClose: () => context.read<AppState>().closeTab(tab.key),
               contextMenuItems: _tabMenuItems(context, tab.key),
             ),
@@ -112,6 +116,11 @@ class ViewTabs extends StatelessWidget {
     final l = context.l10n;
     if (tab.type == TabType.commandLine) {
       return '${tab.connection} - ${l.tabCommandLine}';
+    }
+    // 键浏览标签:database 槽位装的是命名空间 id(Redis 的库号),
+    // 标题已经是 db0 这样的显示名,不能再拼一遍「@ 0」
+    if (tab.type == TabType.kvKeys) {
+      return '${tab.title}（${tab.connection}）- ${l.kvTabCategory}';
     }
     final name = splitTabTitle(tab.title).name;
     final db = tab.database ?? '';

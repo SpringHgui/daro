@@ -4,7 +4,7 @@ import 'package:provider/provider.dart';
 import '../app/app_state.dart';
 import '../data/db_data.dart';
 import '../data/db_types.dart';
-import '../data/drivers/db_driver.dart';
+import '../data/drivers/kv_driver.dart';
 import '../theme/app_theme.dart';
 import '../widgets/connection_group_prompt.dart';
 import '../widgets/connection_form_page.dart';
@@ -100,7 +100,7 @@ class _ConnectionWizardState extends State<ConnectionWizard> {
   void _onNext() {
     final id = _selectedId;
     if (id == null) return;
-    if (!kSupportedDriverTypes.contains(id)) return;
+    if (!isEngineTypeSupported(id)) return;
     final type = _findType(id);
     if (type == null) return;
     setState(() => _selectedType = type);
@@ -108,7 +108,7 @@ class _ConnectionWizardState extends State<ConnectionWizard> {
 
   /// 双击类型卡片:直接选中并进入 form 步,跳过「下一步」。
   void _onDoubleSelect(DbType type) {
-    if (!kSupportedDriverTypes.contains(type.id)) return;
+    if (!isEngineTypeSupported(type.id)) return;
     setState(() {
       _selectedId = type.id;
       _selectedType = type;
@@ -241,7 +241,7 @@ class _ConnectionWizardState extends State<ConnectionWizard> {
           Button(
             text: '下一步',
             onPressed: _selectedId != null &&
-                    kSupportedDriverTypes.contains(_selectedId)
+                    isEngineTypeSupported(_selectedId!)
                 ? _onNext
                 : null,
           ),
@@ -270,7 +270,12 @@ class ConnectionDialogPage extends StatelessWidget {
       onClose: () => Navigator.of(context).pop(),
       child: ConnectionWizard(
         initial: initial,
-        onTestConnection: app.connectionManager.testConnection,
+        // 缓存 / KV 引擎(redis 等)走另一条驱动链,SQL 侧的 testConnection 不认它;
+        // 这里按类型 id 分流 —— 测试用的 ConnectionInfo 没有 isLive,
+        // 不能用 isKvStoreConnection 判
+        onTestConnection: (conn) => kKvStoreTypes.contains(conn.typeId)
+            ? app.kvManager.testConnection(conn)
+            : app.connectionManager.testConnection(conn),
         onResult: (result) => Navigator.of(context).pop(result),
         // 分组候选与「新建分组」由宿主(唯一知道 AppState 的一层)提供
         groupOptions: app.groupNames,
@@ -350,7 +355,7 @@ class _TypeGrid extends StatelessWidget {
             SelectableCard(
               width: 120,
               selected: type.id == selectedId,
-              disabled: !kSupportedDriverTypes.contains(type.id),
+              disabled: !isEngineTypeSupported(type.id),
               disabledLabel: '未实现',
               selectedColor: t.accent,
               borderRadius: BorderRadius.circular(14),
@@ -386,15 +391,15 @@ class _TypeGrid extends StatelessWidget {
             height: 36,
             selected: type.id == selectedId,
             selectedColor: t.accent.withValues(alpha: 0.15),
-            enabled: kSupportedDriverTypes.contains(type.id),
+            enabled: isEngineTypeSupported(type.id),
             onSelect: () => onSelect(type),
             onDoubleTap: () => onDoubleSelect(type),
             leading: Opacity(
-              opacity: kSupportedDriverTypes.contains(type.id) ? 1.0 : 0.35,
+              opacity: isEngineTypeSupported(type.id) ? 1.0 : 0.35,
               child: DbTypeIcon(type: type, size: 24),
             ),
             title: type.label.replaceAll('\n', ' '),
-            trailing: kSupportedDriverTypes.contains(type.id)
+            trailing: isEngineTypeSupported(type.id)
                 ? (type.id == selectedId
                     ? Icon(Icons.check, color: t.accent, size: 18)
                     : null)

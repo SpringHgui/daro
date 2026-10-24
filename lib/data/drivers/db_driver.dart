@@ -4,6 +4,7 @@ import '../user_sql.dart';
 import 'access_driver.dart';
 import 'mariadb_driver.dart';
 import 'mysql_driver.dart';
+import 'mongo_driver.dart';
 import 'pgsql_driver.dart';
 import 'sqlite_driver.dart';
 import 'sqlserver_driver.dart';
@@ -594,7 +595,14 @@ abstract class DatabaseDriver {
 }
 
 /// 当前已实现驱动的数据库类型 id(见 db_types.dart)
-const kSupportedDriverTypes = {'mysql', 'mariadb', 'postgresql', 'sqlite', 'sqlserver', 'access'};
+const kSupportedDriverTypes = {'mysql', 'mariadb', 'postgresql', 'sqlite', 'sqlserver', 'access', 'mongodb'};
+
+/// 文档型(非 SQL)引擎:没有表/列的声明式结构,也没有 SQL 查询控制台。
+///
+/// 与 [kSupportedDriverTypes] 分开列,是因为「有驱动」不等于「能跑 SQL」——
+/// MongoDB 的只读驱动已可用,但查询页的输入语义是 SQL,直接放它进去会得到
+/// 一个必然报错的编辑器(驱动侧 executeQuery 已明确拒绝,见 mongo_driver.dart)。
+const kDocumentDbTypes = {'mongodb'};
 
 /// 打开前需要密码的连接类型(「是否需要密码」判断的唯一入口)。
 /// 文件型 SQLite / Access 无密码概念;SQL Server 的 Windows 身份验证
@@ -602,6 +610,8 @@ const kSupportedDriverTypes = {'mysql', 'mariadb', 'postgresql', 'sqlite', 'sqls
 bool connectionNeedsPassword(ConnectionInfo conn) => switch (conn.typeId) {
       'mysql' || 'mariadb' || 'postgresql' => true,
       'sqlserver' => conn.authMethod != 'windows',
+      // MongoDB 可整体无认证起跑(常见于本地/容器);填了账号才需要密码
+      'mongodb' => conn.username.isNotEmpty,
       _ => false,
     };
 
@@ -693,7 +703,9 @@ const kSequenceTypes = {
 /// 'user' / 'query' / 'backup'。
 /// 用于 Ribbon 按钮与树分组节点的动态显隐,避免 db_driver 反向依赖 app_state。
 bool isCategorySupportedForType(String typeId, String categoryName) => switch (categoryName) {
-  'table' || 'view' || 'query' => true,
+  'table' || 'view' => true,
+  // SQL 控制台:文档型引擎没有 SQL,不出这个分组(见 kDocumentDbTypes)
+  'query' => !kDocumentDbTypes.contains(typeId),
   'materializedView' => kMaterializedViewTypes.contains(typeId),
   'function' => kFunctionTypes.contains(typeId),
   'procedure' => kProcedureTypes.contains(typeId),
@@ -702,6 +714,11 @@ bool isCategorySupportedForType(String typeId, String categoryName) => switch (c
 };
 
 /// 判断连接是否可由真实驱动驱动(未实现驱动的类型在树里提示不支持)
+///
+/// 只覆盖 SQL / 文档型这条链。缓存型(Redis 等)走另一套抽象 KvStoreDriver
+/// (见 kv_driver.dart),**不要**把它的 id 加进 kSupportedDriverTypes:
+/// 那等于让树、SQL 补全、schema_sync、MCP 池都拿 createDriver 去要么 null
+/// 要么当 SQL 引擎用。KV 连接的可用性判据是 isKvStoreConnection。
 bool hasDriver(ConnectionInfo conn) =>
     conn.isLive && kSupportedDriverTypes.contains(conn.typeId);
 
@@ -720,6 +737,8 @@ DatabaseDriver? createDriver(ConnectionInfo conn) {
       return SqlServerDriver(conn);
     case 'access':
       return AccessDriver(conn);
+    case 'mongodb':
+      return MongoDriver(conn);
     default:
       return null;
   }
