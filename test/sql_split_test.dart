@@ -189,6 +189,62 @@ void main() {
       );
     });
   });
+
+  group('sqlStatementAt', () {
+    test('空 / 纯空白脚本返回 null', () {
+      expect(sqlStatementAt('', 0), isNull);
+      expect(sqlStatementAt('   \n\t', 4), isNull);
+    });
+
+    test('单条语句:光标在任意位置都命中它', () {
+      const sql = 'SELECT 1';
+      expect(sqlStatementAt(sql, 0), 'SELECT 1');
+      expect(sqlStatementAt(sql, 4), 'SELECT 1');
+      expect(sqlStatementAt(sql, sql.length), 'SELECT 1');
+    });
+
+    test('多条语句按光标所在的那条返回', () {
+      const sql = 'SELECT 1; SELECT 2';
+      final second = sql.indexOf('SELECT 2');
+      expect(sqlStatementAt(sql, 3), 'SELECT 1');
+      expect(sqlStatementAt(sql, 8), 'SELECT 1'); // 结束符位置仍归前一条
+      expect(sqlStatementAt(sql, 9), 'SELECT 2'); // 两条之间的空白归后一条
+      expect(sqlStatementAt(sql, second + 4), 'SELECT 2');
+    });
+
+    test('光标越过末尾仍返回最后一条', () {
+      const sql = 'SELECT 1;\nSELECT 2;\n';
+      expect(sqlStatementAt(sql, sql.length + 5), 'SELECT 2');
+    });
+
+    test('归属与 splitSqlStatements 的分组逐条一致(注释跟着下一条)', () {
+      const sql = "SELECT 'a;b' FROM t; -- x;y\nSELECT 2";
+      expect(
+        sqlStatementAt(sql, sql.indexOf("'a;b'") + 4),
+        "SELECT 'a;b' FROM t",
+      );
+      // 行注释与其后的语句之间没有分号,切分器把它们算同一条
+      expect(
+        sqlStatementAt(sql, sql.indexOf('-- x;y') + 3),
+        '-- x;y\nSELECT 2',
+      );
+      expect(sqlStatementAt(sql, sql.indexOf('SELECT 2')), '-- x;y\nSELECT 2');
+    });
+
+    test('美元引号函数体内的光标命中整条 CREATE FUNCTION', () {
+      const sql = 'CREATE FUNCTION f() RETURNS int AS \$\$\n'
+          'BEGIN\n'
+          '  RETURN 1;\n'
+          'END\n'
+          '\$\$ LANGUAGE plpgsql;\n'
+          'SELECT f();';
+      expect(
+        sqlStatementAt(sql, sql.indexOf('RETURN 1')),
+        contains('RETURN 1;'),
+      );
+      expect(sqlStatementAt(sql, sql.indexOf('SELECT f()')), 'SELECT f()');
+    });
+  });
 }
 
 /// 按固定块长 [size] 把 [script] 喂给切分器,汇总所有产出的语句

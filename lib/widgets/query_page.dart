@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:base_ui_flutter/base_ui_flutter.dart';
+import 'package:flutter/gestures.dart' show PointerDownEvent, kSecondaryMouseButton;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -14,6 +15,7 @@ import '../data/drivers/db_driver.dart';
 import '../data/result_grid_layout.dart';
 import '../data/sql_completions.dart';
 import '../data/sql_split.dart';
+import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
 import 'result_export_dialog.dart';
 
@@ -107,6 +109,8 @@ class QueryPage extends StatefulWidget {
 class _QueryPageState extends State<QueryPage> {
   final CodeLineEditingController _controller =
       CodeLineEditingController.fromText('');
+  /// 运行快捷键挂在**这个节点自身**上(initState 里绑定),不是祖先 Focus:
+  /// 祖先层收不到 Ctrl+Enter(中间的补全层把 Enter 消费了)。
   final FocusNode _focusNode = FocusNode();
 
   /// SQL 补全构建器(schema 感知,跟随运行上下文刷新数据源)
@@ -182,6 +186,7 @@ class _QueryPageState extends State<QueryPage> {
     _connection = widget.connection;
     _database = widget.database;
     _schema = widget.schema;
+    _focusNode.onKeyEvent = _onEditorKey;
     _controller.text = context.read<AppState>().queryTextFor(_tabKey);
     _controller.addListener(_onEditorChanged);
     // 补全构建器读取整篇 SQL:解析 `FROM ... AS 别名`(别名可能在其他行)
@@ -375,6 +380,31 @@ class _QueryPageState extends State<QueryPage> {
   /// 运行:对运行上下文的连接执行 SQL(选中文本优先),结果写入结果面板
   Future<void> _onRun() => _runSql(_effectiveSql);
 
+  /// 快捷键 / 右键「运行当前语句」的目标:有选区用选区,否则用光标所在的
+  /// 那条语句(多语句脚本里不想手选也能只跑一句),定位不到再退回全文。
+  /// 单语句脚本下结果与 [_effectiveSql] 完全一致。
+  String get _runTargetAtCaret {
+    final selected = _selectedSql;
+    if (selected != null) return selected;
+    final text = _controller.text;
+    return sqlStatementAt(text, _caretOffset) ?? text.trim();
+  }
+
+  /// 光标处的扁平字符偏移。编辑器禁用了折叠(`NonCodeChunkAnalyzer`),
+  /// 所以 `selection.extentIndex` 与 `text` 按 `\n` 切出的行一一对应。
+  int get _caretOffset {
+    final selection = _controller.selection;
+    final lines = _controller.text.split('\n');
+    var offset = 0;
+    for (var i = 0; i < selection.extentIndex; i++) {
+      offset += lines[i].length + 1;
+    }
+    return offset + selection.extentOffset;
+  }
+
+  /// 运行光标处(或选区)的语句:F5 / F9 / Ctrl+Enter 共用
+  Future<void> _runAtCaret() => _runSql(_runTargetAtCaret);
+
   /// 解释:按连接类型拼 EXPLAIN 语句执行,展示执行计划
   Future<void> _onExplain() async {
     final sql = _effectiveSql;
@@ -555,7 +585,16 @@ class _QueryPageState extends State<QueryPage> {
         children: [
           _toolbar(t),
           _connectionBar(t),
-          Expanded(child: _editor(t)),
+          Expanded(
+            // 编辑区右键菜单挂在这一层:Listener 不消费事件,按下右键即弹、
+            // 零延迟。运行快捷键不在这里,见 [_onEditorKey] —— 祖先层收不到
+            // Ctrl+Enter。
+            child: Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerDown: _onEditorPointerDown,
+              child: _editor(t),
+            ),
+          ),
           if (panelVisible) ...[
             // 顶边分隔条:上下拖动改变结果面板高度(编辑区随之伸缩)。
             // 与表数据页底部单元格编辑器同一套 Splitter 口径:不画自己的
@@ -1009,6 +1048,86 @@ class _QueryPageState extends State<QueryPage> {
         ),
       ),
     );
+  }
+
+  /// 编辑区运行键:F5 / F9 / Ctrl+Enter 都跑 `_runAtCaret()`(有选区跑选区,
+  /// 否则跑光标所在语句)。F5 与 F9 同给是照顾 SSMS 与浏览器两种肌肉记忆;
+  /// 本页 F5 = 运行,表数据页 F5 = 刷新,两页焦点域互斥不冲突。
+  ///
+  /// 为什么挂在编辑器的 FocusNode 自身而不是祖先 Focus:实测祖先收不到
+  /// Ctrl+Enter —— re_editor 把 Enter(含 Ctrl+Enter)映射成换行,中间的补全
+  /// 层先把它消费掉了;挂在节点上时本页是按键链的第一站。其余键一律 ignored
+  /// 交回编辑器,复制 / 粘贴 / 撤销都不受影响。
+  KeyEventResult _onEditorKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    final ctrlEnter = key == LogicalKeyboardKey.enter &&
+        HardwareKeyboard.instance.isControlPressed;
+    if (!ctrlEnter &&
+        key != LogicalKeyboardKey.f5 &&
+        key != LogicalKeyboardKey.f9) {
+      return KeyEventResult.ignored;
+    }
+    // 运行中不重入(与工具栏按钮的 enabled: !_running 同一口径)
+    if (!_running) _runAtCaret();
+    return KeyEventResult.handled;
+  }
+
+  /// 编辑区按下右键:弹运行 / 剪贴板菜单(编辑态下的文本菜单归编辑器自己,
+  /// 这里不与它叠层)
+  void _onEditorPointerDown(PointerDownEvent event) {
+    if (event.buttons != kSecondaryMouseButton) return;
+    _onEditorContext(event.position);
+  }
+
+  void _onEditorContext(Offset position) {
+    final l = context.l10n;
+    final hasSelection = _selectedSql != null;
+    final all = _controller.text.trim();
+    showContextMenu(
+      context,
+      position: position,
+      items: [
+        MenuItem(
+            text: l.sqlRunAtCursor,
+            shortcut: 'F5',
+            enabled: !_running,
+            onPressed: _runAtCaret),
+        MenuItem(
+            text: l.sqlRunSelected,
+            enabled: !_running && hasSelection,
+            onPressed: () => _runSql(_selectedSql!)),
+        MenuItem(
+            text: l.sqlRunAll,
+            enabled: !_running,
+            onPressed: () => _runSql(all)),
+        const MenuSeparator(),
+        MenuItem(
+            text: l.sqlMenuCopy,
+            shortcut: 'Ctrl+C',
+            enabled: hasSelection,
+            onPressed: () => Clipboard.setData(
+                ClipboardData(text: _controller.selectedText))),
+        MenuItem(
+            text: l.sqlMenuPaste,
+            shortcut: 'Ctrl+V',
+            onPressed: _pasteIntoEditor),
+        MenuItem(
+            text: l.sqlMenuSelectAll,
+            shortcut: 'Ctrl+A',
+            onPressed: _controller.selectAll),
+      ],
+    );
+  }
+
+  /// 粘贴到编辑器:替换当前选区(无选区则在光标处插入),粘贴后把焦点还给
+  /// 编辑器,免得接着打字要再点一下
+  Future<void> _pasteIntoEditor() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text;
+    if (text == null || text.isEmpty || !mounted) return;
+    _controller.replaceSelection(text);
+    _focusNode.requestFocus();
   }
 
   // SQL 编辑区:re_editor 自绘编辑器(语法高亮 + 行号 + schema 感知补全)

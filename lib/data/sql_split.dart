@@ -89,6 +89,30 @@ List<String> splitSqlStatements(String script) {
   return [...statements, ...splitter.finish()];
 }
 
+/// 找出 [script] 中**包含 [offset]** 的那条语句(词法口径与
+/// [splitSqlStatements] 完全一致),供「运行光标所在语句」使用。
+///
+/// 不改动状态机就能拿到区间:切分器只把原串的连续片段写进缓冲
+/// (`DELIMITER` / `GO` 指令行整行吞掉、不并入语句),再 `trim` 掉首尾空白,
+/// 所以每条语句都是 [script] 的一段**逐字子串**,且按出现先后排列 ——
+/// 顺着 `indexOf` 游标就能还原出偏移。
+///
+/// 光标落在两条语句之间(紧跟结束符或其后的空白)时归给**后一条**;
+/// 落在最后一条语句之后仍返回最后一条。空 / 纯空白脚本返回 null ——
+/// 注意孤立注释按 [splitSqlStatements] 的口径本身就是一条语句。
+String? sqlStatementAt(String script, int offset) {
+  final statements = splitSqlStatements(script);
+  if (statements.isEmpty) return null;
+  var cursor = 0;
+  for (final statement in statements) {
+    final start = script.indexOf(statement, cursor);
+    if (start < 0) break; // 理论上到不了(见上文逐字子串不变量)
+    if (start + statement.length >= offset) return statement;
+    cursor = start + statement.length;
+  }
+  return statements.last;
+}
+
 /// 增量 SQL 语句切分器:见文件头注释。
 ///
 /// [feed] 接受任意切块(不要求按行、不要求边界对齐),返回**本次新完成**
