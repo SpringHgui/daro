@@ -9,6 +9,7 @@ import '../data/user_sql.dart';
 import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
 import 'routine_design_page.dart' show sqlDarkTheme, sqlLightTheme;
+import 'sql_find_bar.dart';
 
 /// 用户 / 角色(User & Role)设计页。
 ///
@@ -87,6 +88,9 @@ class _UserDesignPageState extends State<UserDesignPage> {
   /// SQL 预览的只读 controller(文本在 build 中同步)
   final CodeLineEditingController _previewCtrl =
       CodeLineEditingController.fromText('');
+  // 预览编辑器的查找控制器：绑定 _previewCtrl，须随本页 dispose
+  late final CodeFindController _findController =
+      CodeFindController(_previewCtrl);
 
   /// didChangeDependencies 中缓存的 AppState(dispose 时安全引用)
   AppState? _appState;
@@ -167,6 +171,8 @@ class _UserDesignPageState extends State<UserDesignPage> {
     ]) {
       c.dispose();
     }
+    // findController 监听预览编辑器,必须先于它销毁
+    _findController.dispose();
     _previewCtrl.dispose();
     super.dispose();
   }
@@ -1027,6 +1033,10 @@ class _UserDesignPageState extends State<UserDesignPage> {
     return CodeEditor(
       controller: _previewCtrl,
       readOnly: true,
+      findController: _findController,
+      findBuilder: (context, controller, readOnly) =>
+          SqlFindBar(controller: controller, readOnly: readOnly),
+      shortcutsActivatorsBuilder: const SqlFindShortcuts(),
       wordWrap: true,
       chunkAnalyzer: const NonCodeChunkAnalyzer(),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),

@@ -104,6 +104,10 @@ class _DatabaseTreeState extends State<DatabaseTree> {
 
   final _searchController = TextEditingController();
 
+  /// 底部搜索框的焦点节点:Ctrl+F 把光标送进来、Esc 再交还给树,
+  /// [_onPanelKey] 也用它判断「焦点此刻是否就在搜索框里」。
+  final FocusNode _searchFocus = FocusNode();
+
   /// 订阅 ConnectionManager:真实连接的库/表列表加载完成后重建树
   ConnectionManager? _listenedManager;
 
@@ -455,6 +459,44 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     return KeyEventResult.handled;
   }
 
+  /// 区域级快捷键:Ctrl+F 把光标送进底部搜索框,Esc 再退出回到树。
+  ///
+  /// 挂在 [build] 返回的最外层 Focus 上而不是 [_treeFocus] 上:`_treeFocus` 只包住
+  /// ListView,底部搜索栏与它是**兄弟节点**——光标一旦进了搜索框,树这条分支再也
+  /// 收不到任何按键(按 Esc 退出时正是如此);祖先 Focus 则会收到后代冒泡上来的事件。
+  /// `canRequestFocus = false` 让这层只做转发,不参与焦点竞争、也不吞掉 Tab 键。
+  KeyEventResult _onPanelKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    // 内联改名编辑器持有焦点时不抢键(与 [_onTreeKey] 同一口径)
+    if (_editingKey != null) return KeyEventResult.ignored;
+
+    if (event.logicalKey == LogicalKeyboardKey.keyF &&
+        HardwareKeyboard.instance.isControlPressed) {
+      _searchFocus.requestFocus();
+      // 整段选中:再按一次 Ctrl+F 是直接改写现有过滤词,而不是把光标挪到末尾
+      final text = _searchController.text;
+      _searchController.selection =
+          TextSelection(baseOffset: 0, extentOffset: text.length);
+      return KeyEventResult.handled;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.escape && _searchFocus.hasFocus) {
+      final app = context.read<AppState>();
+      if (_searchController.text.isNotEmpty) {
+        // 与搜索框内 × 按钮同一动作(SearchInput._clear 会补发一次空串):
+        // controller.clear() 不走 onChanged,所以落盘与滚回选中连接都得手动补
+        _searchController.clear();
+        app.setTreeSearchText('');
+        _revealSelectedConnection(app);
+      }
+      // 交还焦点:Esc 之后方向键 / F2 仍然作用在树里选中的节点上
+      _treeFocus.requestFocus();
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
+  }
+
   /// key 是否可就地改名:分组(存在)/ 连接(存在)/ 表(节点可见且已连接)。
   bool _canRenameKey(String key, AppState app) {
     if (key.startsWith('g:')) {
@@ -631,11 +673,18 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     ConnectionInfo conn,
     Offset position,
   ) {
-    final connected = app.connectionManager.isConnected(conn.name);
+    // 状态一律按驱动链分流取(与连接行的图标 / 转圈判定同口径):
+    // Redis 等缓存型引擎的驱动与库列表在 KvConnectionManager 里,
+    // 只读 SQL 侧会让它恒判为「未连接」——菜单永远只显示「打开连接」,关不掉。
+    final isKv = isKvStoreConnection(conn);
+    final connected = isKv
+        ? app.kvManager.isConnected(conn.name)
+        : app.connectionManager.isConnected(conn.name);
     final l = context.l10n;
-    // 刷新仅对已加载出子节点(库列表)的连接可用
-    final hasDbChildren =
-        app.connectionManager.databaseStateOf(conn.name).databases.isNotEmpty;
+    // 刷新仅对已加载出子节点(库 / 命名空间列表)的连接可用
+    final hasDbChildren = isKv
+        ? app.kvManager.namespacesOf(conn.name).namespaces.isNotEmpty
+        : app.connectionManager.databaseStateOf(conn.name).databases.isNotEmpty;
     showContextMenu(
       context,
       position: position,
@@ -658,8 +707,9 @@ class _DatabaseTreeState extends State<DatabaseTree> {
         MenuItem(
           text: l.ctxNewDatabase,
           // 需连接处于打开状态(驱动已建立)才可建库;
-          // 文件型数据库(SQLite / Access)无独立库概念,不支持建库
-          enabled: connected && !_isFileBasedType(conn),
+          // 文件型数据库(SQLite / Access)无独立库概念,不支持建库;
+          // 缓存型引擎的库数由服务端配置决定(databases),客户端建不出新库
+          enabled: connected && !isKv && !_isFileBasedType(conn),
           onPressed: () => _createDatabaseNode(app, conn),
         ),
         MenuSeparator(),
@@ -1674,6 +1724,7 @@ class _DatabaseTreeState extends State<DatabaseTree> {
     _treeFocus.dispose();
     _treeScroll.dispose();
     _searchController.dispose();
+    _searchFocus.dispose();
     super.dispose();
   }
 
@@ -1764,7 +1815,7 @@ class _DatabaseTreeState extends State<DatabaseTree> {
       );
     }
 
-    return Container(
+    final panel = Container(
       color: t.background,
       child: Column(
         children: [
@@ -1782,6 +1833,14 @@ class _DatabaseTreeState extends State<DatabaseTree> {
           _buildBottomBar(context, t, hasFilter),
         ],
       ),
+    );
+
+    // Ctrl+F / Esc 走这层(见 [_onPanelKey]):它是树与底部搜索栏的共同祖先,
+    // 焦点落在哪一侧都能收到冒泡上来的按键
+    return Focus(
+      canRequestFocus: false,
+      onKeyEvent: _onPanelKey,
+      child: panel,
     );
   }
 
@@ -2778,6 +2837,8 @@ class _DatabaseTreeState extends State<DatabaseTree> {
               padding: const EdgeInsets.only(left: 6, top: 3, bottom: 3),
               child: SearchInput(
                 controller: _searchController,
+                // 焦点节点交给 State:Ctrl+F 进来、Esc 出去都由 [_onPanelKey] 调度
+                focusNode: _searchFocus,
                 hintText: l.searchConnectionsHint,
                 // 清空搜索(× 内部会补发一次 onChanged('') / 退格删空)视作
                 // 「关闭筛选」:滚回当前操作的连接位置

@@ -7,6 +7,7 @@ import '../data/db_data.dart';
 import '../data/db_metadata.dart';
 import '../data/db_types.dart';
 import '../data/drivers/db_driver.dart';
+import '../data/drivers/kv_driver.dart';
 import '../data/table_design.dart';
 import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
@@ -1293,38 +1294,48 @@ class _ConnectionInfoView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = Tokens.of(context);
-    final conn = DatabaseInfo._find(context.read<AppState>(), connection);
-    // 与连接树同源:品牌图标 + 右下角状态点,离线时品牌色去饱和
+    final app = context.read<AppState>();
+    final conn = DatabaseInfo._find(app, connection);
+    // 与连接树同源:品牌图标 + 右下角状态点,离线时品牌色去饱和。
+    // 状态必须按驱动链分流取(Redis 等缓存型引擎的驱动在 kvManager 里),
+    // 只读 SQL 侧会让它恒判「未连接」—— 开着库也显示成灰底 + 灰点。
     final dbType = DatabaseInfo._dbTypeOf(conn?.typeId);
     final connected = conn != null &&
-        context.read<AppState>().connectionManager.isConnected(conn.name);
+        (isKvStoreConnection(conn)
+            ? app.kvManager.isConnected(conn.name)
+            : app.connectionManager.isConnected(conn.name));
 
-    return Container(
-      color: t.background,
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (dbType != null)
-            DbTypeIcon(type: dbType, size: 46, connected: connected)
-          else
-            Icon(Icons.dns, size: 46, color: t.mutedForeground),
-          const SizedBox(height: 8),
-          Text(
-            connection,
-            style: TextStyle(
-                fontSize: 20, fontWeight: FontWeight.w600, color: t.foreground),
-          ),
-          const SizedBox(height: 4),
-          Text(context.l10n.infoSectionConnection,
-              style: TextStyle(fontSize: 12, color: t.mutedForeground)),
-          const SizedBox(height: 18),
-          if (conn != null) ...[
-            _field(t, context.l10n.fieldType, _typeName(conn.typeId)),
-            _field(t, context.l10n.fieldHost, '${conn.host}:${conn.port}'),
-            _field(t, context.l10n.fieldUser, conn.username),
+    return AnimatedBuilder(
+      // 打开 / 关闭连接都不改选中项,面板本身不会重建;不挂这两条驱动链的
+      // 通知,状态点就会停在旧状态(连接树是 watch 的,两边会显示成两种事实)
+      animation: Listenable.merge([app.connectionManager, app.kvManager]),
+      builder: (context, _) => Container(
+        color: t.background,
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (dbType != null)
+              DbTypeIcon(type: dbType, size: 46, connected: connected)
+            else
+              Icon(Icons.dns, size: 46, color: t.mutedForeground),
+            const SizedBox(height: 8),
+            Text(
+              connection,
+              style: TextStyle(
+                  fontSize: 20, fontWeight: FontWeight.w600, color: t.foreground),
+            ),
+            const SizedBox(height: 4),
+            Text(context.l10n.infoSectionConnection,
+                style: TextStyle(fontSize: 12, color: t.mutedForeground)),
+            const SizedBox(height: 18),
+            if (conn != null) ...[
+              _field(t, context.l10n.fieldType, _typeName(conn.typeId)),
+              _field(t, context.l10n.fieldHost, '${conn.host}:${conn.port}'),
+              _field(t, context.l10n.fieldUser, conn.username),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }

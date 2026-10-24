@@ -11,6 +11,7 @@ import '../data/routine_sql.dart';
 import '../theme/app_theme.dart';
 import 'query_page.dart' show formatSql;
 import 'routine_design_page.dart' show sqlLightTheme, sqlDarkTheme;
+import 'sql_find_bar.dart';
 import 'view_rule_dialog.dart';
 
 /// 工具栏度量:与「设计表」同一档 —— 纯图标点击块 25 宽(14 图标 + 5.5 × 2)、
@@ -108,9 +109,15 @@ class _ViewState {
 class _ViewDesignPageState extends State<ViewDesignPage> {
   final CodeLineEditingController _controller =
       CodeLineEditingController.fromText('');
+  final FocusNode _focusNode = FocusNode();
+  late final CodeFindController _findController =
+      CodeFindController(_controller);
   final TextEditingController _commentController = TextEditingController();
   final CodeLineEditingController _changeController =
       CodeLineEditingController.fromText('');
+  /// 「更改」预览区的查找控制器:每个编辑区要各配一个(见 `_sqlEditor`)
+  late final CodeFindController _changeFindController =
+      CodeFindController(_changeController);
 
   /// 主页签下标(0 定义 / 1 规则 / 2 高级 / 3 注释 / 4 SQL 预览;
   /// 非 PG 没有规则页,下标整体前移一位)
@@ -227,8 +234,12 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     _commentController.removeListener(_onCommentChanged);
     _appState?.updateRoutineText(_tabKey, _controller.text);
     _appState?.updateRoutineComment(_tabKey, _commentController.text);
+    // findController 监听编辑控制器,必须先于它销毁
+    _findController.dispose();
     _controller.dispose();
+    _focusNode.dispose();
     _commentController.dispose();
+    _changeFindController.dispose();
     _changeController.dispose();
     _ruleLocation.dispose();
     _ruleDefinition.dispose();
@@ -885,6 +896,7 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
             controller: _controller,
             readOnly: false,
             hint: null,
+            findController: _findController,
           ),
         ),
         if (_panelVisible) _bottomPanel(t),
@@ -1169,6 +1181,7 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
                                   readOnly: true,
                                   showLineNumbers: false,
                                   hint: null,
+                                  findController: _changeFindController,
                                 ),
                               ),
                               Positioned(
@@ -1230,13 +1243,21 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     required bool readOnly,
     String? hint,
     bool showLineNumbers = true,
+    CodeFindController? findController,
   }) {
     final isDark = t.background.computeLuminance() < 0.5;
     return CodeEditor(
       controller: controller,
+      focusNode: readOnly ? null : _focusNode,
       readOnly: readOnly,
       hint: hint,
       chunkAnalyzer: const NonCodeChunkAnalyzer(),
+      // 两者要成对:只给 findController 时 Ctrl+F 的默认动作没有落点(不渲染栏),
+      // 只给 findBuilder 时栏会去用编辑器自建的控制器 —— 所以控制器由调用方按
+      // 编辑区各传一个,别在这里共用。
+      findBuilder: findController == null ? null : _buildFind,
+      findController: findController,
+      shortcutsActivatorsBuilder: const SqlFindShortcuts(),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
       style: CodeEditorStyle(
         fontFamily: 'monospace',
@@ -1272,6 +1293,17 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
             minNumberCount: 2,
           )
           : null,
+    );
+  }
+
+  /// 查找栏(CodeEditor.findBuilder):未进入查找模式时零高度
+  PreferredSizeWidget _buildFind(
+      BuildContext context, CodeFindController controller, bool readOnly) {
+    return SqlFindBar(
+      controller: controller,
+      readOnly: readOnly,
+      // 只读区没把 `_focusNode` 交给编辑器(它不接焦点),关闭时无处可还
+      onClosed: readOnly ? null : () => _focusNode.requestFocus(),
     );
   }
 }

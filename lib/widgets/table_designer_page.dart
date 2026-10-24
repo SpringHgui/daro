@@ -13,6 +13,7 @@ import '../data/drivers/db_driver.dart';
 import '../data/table_design.dart';
 import '../theme/app_theme.dart';
 import 'index_column_picker_dialog.dart';
+import 'sql_find_bar.dart';
 
 // ── 度量:全部取自参考工具(Navicat 表设计器)截图的设备像素实测 ÷ 200% 缩放 ──
 //
@@ -129,6 +130,10 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
 
   /// SQL 预览控制器(只读,每次重建时同步 DDL 文本)
   final CodeLineEditingController _sqlCtrl = CodeLineEditingController.fromText('');
+
+  // 预览编辑器的查找控制器:绑定 _sqlCtrl,须随本页 dispose
+  late final CodeFindController _sqlFindController =
+      CodeFindController(_sqlCtrl);
 
   /// 表注释输入控制器(注释标签页)
   final TextEditingController _commentCtrl = TextEditingController();
@@ -536,6 +541,8 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   void dispose() {
     _nameCtrl.dispose();
     _commentCtrl.dispose();
+    // findController 监听 SQL 编辑器,必须先于它销毁
+    _sqlFindController.dispose();
     _sqlCtrl.dispose();
     _gridFocus.dispose();
     _chromeRev.dispose();
@@ -2486,6 +2493,10 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
           child: CodeEditor(
             controller: _sqlCtrl,
             readOnly: true,
+            findController: _sqlFindController,
+            findBuilder: (context, controller, readOnly) =>
+                SqlFindBar(controller: controller, readOnly: readOnly),
+            shortcutsActivatorsBuilder: const SqlFindShortcuts(),
             wordWrap: false,
             chunkAnalyzer: const NonCodeChunkAnalyzer(),
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),

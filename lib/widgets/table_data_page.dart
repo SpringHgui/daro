@@ -430,6 +430,11 @@ class _TableDataPageState extends State<TableDataPage> {
   /// 供 Del 键判断焦点是否在表数据页内(避免在左侧搜索框按 Del 误删)
   final FocusNode _pageFocusNode = FocusNode();
 
+  /// 列面板底部搜索框的焦点与文本:Ctrl+F 要把焦点送进这个框、Esc 要清空它,
+  /// 而 Input 不传 controller 时自建的控制器宿主拿不到,只能由页面持有
+  final FocusNode _columnSearchFocus = FocusNode();
+  final TextEditingController _columnSearchController = TextEditingController();
+
   /// 数据网格双向滚动控制器:横向供外层 SingleChildScrollView 浏览宽表,
   /// 纵向供 DataGridView 内部 ListView 浏览多行;二者各挂一条可见 ScrollBar
   final ScrollController _hScrollController = ScrollController();
@@ -451,6 +456,8 @@ class _TableDataPageState extends State<TableDataPage> {
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_onKey);
     _pageFocusNode.dispose();
+    _columnSearchFocus.dispose();
+    _columnSearchController.dispose();
     _hScrollController.dispose();
     _vScrollController.dispose();
     for (final controller in _valueControllers.values) {
@@ -479,6 +486,24 @@ class _TableDataPageState extends State<TableDataPage> {
     if (event.logicalKey == LogicalKeyboardKey.f5) {
       if (_loading) return true;
       _refresh();
+      return true;
+    }
+    // Ctrl+F:聚焦列面板底部的搜索框(面板未开时先开面板)。
+    // 与 Del / Ctrl+C 同一门槛:焦点必须在本页内,否则会把左侧连接树
+    // 搜索框里的 Ctrl+F 抢走(那由页面自己处理)。单元格编辑态同理不抢。
+    if (ctrl && event.logicalKey == LogicalKeyboardKey.keyF) {
+      if (_editing != null || !_focusInPage) return false;
+      _focusColumnSearch();
+      return true;
+    }
+    // Esc 落在搜索框里:有词先清空,再把焦点还给页面(方向键 / Del 继续可用)
+    if (event.logicalKey == LogicalKeyboardKey.escape &&
+        _columnSearchFocus.hasFocus) {
+      if (_columnSearch.isNotEmpty) {
+        _columnSearchController.clear();
+        setState(() => _columnSearch = '');
+      }
+      _pageFocusNode.requestFocus();
       return true;
     }
     // Ctrl+C / Ctrl+V:仅在焦点位于本页且**未进入单元格编辑器**时接管。
@@ -520,6 +545,23 @@ class _TableDataPageState extends State<TableDataPage> {
       node = node.parent;
     }
     return false;
+  }
+
+  /// 把焦点送到列面板底部的搜索框。
+  ///
+  /// 该面板是本页状态开关控制的**停靠面板**(与右键菜单「列面板」同一开口),
+  /// 不是弹窗,所以可以直接开;但面板里的 Input 要到下一帧才挂上焦点树,
+  /// 同步 requestFocus 会打在一个尚未 attach 的节点上,故放到 post-frame。
+  void _focusColumnSearch() {
+    if (_openPanels.contains(_ToolPanel.columns)) {
+      _columnSearchFocus.requestFocus();
+      return;
+    }
+    setState(() => _openPanels.add(_ToolPanel.columns));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_openPanels.contains(_ToolPanel.columns)) return;
+      _columnSearchFocus.requestFocus();
+    });
   }
 
   /// Del 键:多选单元格区域 → 区域内每格置 NULL;多行选中 → 一次确认整批删除;
@@ -580,6 +622,7 @@ class _TableDataPageState extends State<TableDataPage> {
         _columnVisible = null;
         _columnVisibleNotifier.value = null;
         _columnSearch = '';
+        _columnSearchController.clear();
         _cellEditorCell = null;
         _cellController.clear();
         _resetSelection();
@@ -2494,6 +2537,8 @@ class _TableDataPageState extends State<TableDataPage> {
             ),
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
             child: Input(
+              controller: _columnSearchController,
+              focusNode: _columnSearchFocus,
               hint: l.gridSearch,
               showBorder: false,
               onChanged: (value) => setState(() => _columnSearch = value),

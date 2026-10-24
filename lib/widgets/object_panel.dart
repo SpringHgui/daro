@@ -51,6 +51,14 @@ class _ObjectPanelState extends State<ObjectPanel> {
   /// 对象列表的键盘焦点(F2 改名 / Ctrl+C 复制 / Ctrl+V 粘贴)
   final FocusNode _listFocus = FocusNode();
 
+  /// Ctrl+F 用的搜索框展开句柄。工具栏有两份(选中库的正常态 / 未选库的禁用态),
+  /// 各挂各的:两者挂在不同父节点下(ValueListenableBuilder 与 ToolStrip),切换浏览
+  /// 上下文时整棵工具栏子树会重挂载,旧实例的 dispose 会把**共享**句柄的登记置空
+  /// (且晚于新实例的 initState),共用一个就等于切一次上下文快捷键哑一次。
+  final ExpandableSearchController _toolbarSearch = ExpandableSearchController();
+  final ExpandableSearchController _disabledToolbarSearch =
+      ExpandableSearchController();
+
   /// 列表模式纵向滚动控制器:框选要把选框矩形按当前滚动偏移换算成内容坐标
   final ScrollController _itemsScroll = ScrollController();
 
@@ -94,6 +102,18 @@ class _ObjectPanelState extends State<ObjectPanel> {
 
   @override
   Widget build(BuildContext context) {
+    // Ctrl+F 的门控挂在这层(见 [_onPanelKey]):工具栏里的搜索框与内容区里的
+    // _listFocus 是兄弟节点,光标进了搜索框后 _listFocus 收不到按键,只有共同
+    // 祖先能收到冒泡上来的事件。canRequestFocus = false:本层只做转发,
+    // 不参与焦点竞争。四个分支(正常 / 三种禁用态)都在它下面,故一处生效。
+    return Focus(
+      canRequestFocus: false,
+      onKeyEvent: _onPanelKey,
+      child: _buildBody(context),
+    );
+  }
+
+  Widget _buildBody(BuildContext context) {
     final t = Tokens.of(context);
     // 布局模式(网格/列表)变化时才重建
     final grid = context.select<AppState, bool>((a) => a.objectGridLayout);
@@ -240,12 +260,20 @@ class _ObjectPanelState extends State<ObjectPanel> {
 
     return ToolStrip(
       tokens: stripTokens,
-      trailing: ExpandableSearch(
-        // 无 Key:过滤词是全局状态,切连接 / 库 / 分类都沿用同一份,
-        // 不能因为上下文变化就把它重建回收起态
-        controller: app.objectSearchController,
-        tokens: searchTokens,
-        onChanged: (v) => setState(() => app.objectSearchText = v.toLowerCase()),
+      trailing: Focus(
+        canRequestFocus: false,
+        // Esc 退出搜索框挂在这层:焦点真的落在搜索框内时它才收得到按键
+        onKeyEvent: (node, event) => _onSearchKey(node, event, _toolbarSearch),
+        child: ExpandableSearch(
+          // 无 Key:过滤词是全局状态,切连接 / 库 / 分类都沿用同一份,
+          // 不能因为上下文变化就把它重建回收起态
+          controller: app.objectSearchController,
+          // 收起态只剩一个放大镜按钮,输入框不在焦点树上,Ctrl+F 只能靠它展开
+          expandController: _toolbarSearch,
+          tokens: searchTokens,
+          onChanged: (v) =>
+              setState(() => app.objectSearchText = v.toLowerCase()),
+        ),
       ),
       items: [
         // 打开:表 / 视图 / 实体化视图打开数据页;函数 / 过程打开设计页;
@@ -557,11 +585,18 @@ class _ObjectPanelState extends State<ObjectPanel> {
       tokens: stripTokens,
       // 「禁用操作栏」禁的是对当前对象动手的按钮,搜索框照常可编辑:
       // 换连接时只要没打开库就藏起搜索框,全局过滤词会看着像被清空了
-      trailing: ExpandableSearch(
-        controller: app.objectSearchController,
-        tokens: stripTokens.copyWith(surfaceColor: t.secondary),
-        onChanged: (v) =>
-            setState(() => app.objectSearchText = v.toLowerCase()),
+      trailing: Focus(
+        canRequestFocus: false,
+        // 与正常工具栏同一套快捷键出口,只是各挂各的展开句柄(见字段注释)
+        onKeyEvent: (node, event) =>
+            _onSearchKey(node, event, _disabledToolbarSearch),
+        child: ExpandableSearch(
+          controller: app.objectSearchController,
+          expandController: _disabledToolbarSearch,
+          tokens: stripTokens.copyWith(surfaceColor: t.secondary),
+          onChanged: (v) =>
+              setState(() => app.objectSearchText = v.toLowerCase()),
+        ),
       ),
       items: [
         ToolStripButton(
@@ -1216,6 +1251,51 @@ class _ObjectPanelState extends State<ObjectPanel> {
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
+  }
+
+  /// 面板级快捷键:Ctrl+F 把光标送进工具栏搜索框。
+  ///
+  /// 挂在包裹面板根的 Focus 上而不是 [_itemSurface] 里的 [_listFocus] 上:工具栏
+  /// (搜索框所在)与内容区是**兄弟节点**,光标进了搜索框之后 `_listFocus` 收不到
+  /// 任何按键;祖先 Focus 才会收到后代冒泡上来的事件,所以焦点在列表里还是在搜索框里
+  /// 都能按 Ctrl+F。Esc 不在这里处理(见 [_onSearchKey]),那一层才知道焦点确实在搜索框内。
+  KeyEventResult _onPanelKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    // 内联改名编辑器持有焦点时不抢键(与 [_onListKey] 同一口径)
+    if (_renaming != null) return KeyEventResult.ignored;
+
+    if (event.logicalKey == LogicalKeyboardKey.keyF &&
+        HardwareKeyboard.instance.isControlPressed) {
+      // 两份工具栏同时只有一份在树上;未挂载的那个句柄调用无副作用
+      _toolbarSearch.expandAndFocus();
+      _disabledToolbarSearch.expandAndFocus();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  /// 搜索框持有焦点时按 Esc:清空并收起为放大镜,焦点交还给列表。
+  ///
+  /// [controller] 是这一处 ExpandableSearch 自己的展开句柄(工具栏有两份)。
+  /// `collapse()` 内部会补发一次 `onChanged('')`(clear 不走 onChanged),所以全局
+  /// 过滤词随之一并清空,与点输入框旁的关闭按钮同一动作。
+  KeyEventResult _onSearchKey(
+    FocusNode node,
+    KeyEvent event,
+    ExpandableSearchController controller,
+  ) {
+    if (event is! KeyDownEvent ||
+        event.logicalKey != LogicalKeyboardKey.escape) {
+      return KeyEventResult.ignored;
+    }
+    controller.collapse();
+    // 焦点交还给列表。禁用工具栏那一支的内容区是空白、_listFocus 没挂在树上,
+    // 此时不能 requestFocus:未挂载的节点会把请求攒下来,等下次挂载才生效,
+    // 表现为「过了一会儿焦点自己跳进列表里」
+    if (_itemsScroll.hasClients || _gridScrollX.hasClients) {
+      _listFocus.requestFocus();
+    }
+    return KeyEventResult.handled;
   }
 
   /// 指针是否落在正在改名的那一格(视口坐标)。列表模式整行通栏,只比纵向;

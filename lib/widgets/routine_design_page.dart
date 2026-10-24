@@ -6,6 +6,7 @@ import 'package:re_highlight/languages/sql.dart';
 import '../app/app_state.dart';
 import '../data/routine_sql.dart';
 import '../theme/app_theme.dart';
+import 'sql_find_bar.dart';
 
 /// 例程设计页:展示并编辑过程 / 函数 / 视图的 CREATE 定义。
 /// - 编辑模式(打开 / 设计):加载现有定义,保存时 DROP + CREATE 重写;
@@ -807,6 +808,8 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
       chunkAnalyzer: const NonCodeChunkAnalyzer(),
       findBuilder: findBuilder,
       findController: findBuilder != null ? _findController : null,
+      // findController 单独给不够:Ctrl+F 的默认动作要有 findBuilder 才落地
+      shortcutsActivatorsBuilder: const SqlFindShortcuts(),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
       style: CodeEditorStyle(
         fontFamily: 'monospace',
@@ -842,10 +845,14 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
     );
   }
 
-  /// 查找面板(CodeEditor.findBuilder):未进入查找模式时零高度
+  /// 查找栏(CodeEditor.findBuilder):未进入查找模式时零高度
   PreferredSizeWidget _buildFind(
       BuildContext context, CodeFindController controller, bool readOnly) {
-    return _RoutineFindPanel(controller: controller);
+    return SqlFindBar(
+      controller: controller,
+      readOnly: readOnly,
+      onClosed: () => _focusNode.requestFocus(),
+    );
   }
 
   /// 状态栏:保存 / 执行状态、结果、错误
@@ -898,92 +905,6 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
           ),
         ),
       );
-}
-
-/// 查找栏:Input + 上一个 / 下一个 / 关闭。
-/// 未进入查找模式(controller.value == null)时 preferredSize 为 0,
-/// CodeEditor 自动不预留空间、不渲染内容。
-class _RoutineFindPanel extends StatefulWidget implements PreferredSizeWidget {
-  const _RoutineFindPanel({required this.controller});
-
-  final CodeFindController controller;
-
-  @override
-  Size get preferredSize =>
-      controller.value == null ? Size.zero : const Size(420, 30);
-
-  @override
-  State<_RoutineFindPanel> createState() => _RoutineFindPanelState();
-}
-
-class _RoutineFindPanelState extends State<_RoutineFindPanel> {
-  @override
-  void initState() {
-    super.initState();
-    widget.controller.addListener(_onChanged);
-  }
-
-  @override
-  void didUpdateWidget(_RoutineFindPanel oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.controller != widget.controller) {
-      oldWidget.controller.removeListener(_onChanged);
-      widget.controller.addListener(_onChanged);
-    }
-  }
-
-  @override
-  void dispose() {
-    widget.controller.removeListener(_onChanged);
-    super.dispose();
-  }
-
-  void _onChanged() {
-    if (mounted) setState(() {});
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final t = Tokens.of(context);
-    if (widget.controller.value == null) return const SizedBox.shrink();
-    return Container(
-      height: 30,
-      color: t.secondary,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      child: Row(
-        children: [
-          Icon(Icons.search, size: 14, color: t.mutedForeground),
-          const SizedBox(width: 6),
-          SizedBox(
-            width: 220,
-            child: Input(
-              controller: widget.controller.findInputController,
-              focusNode: widget.controller.findInputFocusNode,
-              hint: '查找',
-              textInputAction: TextInputAction.search,
-            ),
-          ),
-          const SizedBox(width: 4),
-          ToolbarButton(
-            icon: Icons.arrow_upward,
-            tooltip: '上一个',
-            onTap: widget.controller.previousMatch,
-          ),
-          ToolbarButton(
-            icon: Icons.arrow_downward,
-            tooltip: '下一个',
-            onTap: widget.controller.nextMatch,
-          ),
-          const Spacer(),
-          ToolbarButton(
-            icon: Icons.close,
-            tooltip: '关闭',
-            onTap: widget.controller.close,
-          ),
-        ],
-      ),
-    );
-  }
 }
 
 /// SQL 语法高亮配色(与查询页一致:明亮近似 SSMS / VS Code Light+,

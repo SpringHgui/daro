@@ -11,6 +11,7 @@ import '../data/db_edit_options.dart';
 import '../data/db_export.dart';
 import '../data/db_import.dart';
 import '../data/drivers/db_driver.dart';
+import '../data/drivers/kv_driver.dart';
 import '../data/locale_store.dart';
 import '../data/matview_sql.dart';
 import '../data/routine_sql.dart';
@@ -751,6 +752,17 @@ class AppState extends ChangeNotifier {
   /// 对象面板布局:true = 多列网格(详细布局), false = 单列列表
   bool objectGridLayout = true;
 
+  /// Redis 值面板的显示格式(文本 / JSON / 十六进制)。
+  /// 与 [objectSearchController] 同一口径放在这里:键浏览页会随标签切换销毁重建,
+  /// 「我这轮就是要按 JSON 看」是会话级意图,不该在回到标签时又变回文本。
+  KvValueFormat kvValueFormat = KvValueFormat.text;
+
+  void setKvValueFormat(KvValueFormat format) {
+    if (kvValueFormat == format) return;
+    kvValueFormat = format;
+    notifyListeners();
+  }
+
   /// 对象面板工具栏搜索框的输入控制器。状态放在 AppState 而不是面板里:
   /// 打开一张表会让面板整棵子树销毁,回到「对象」标签时是全新实例;
   /// 且搜索是全局口径——换连接 / 库 / 分类都沿用同一份过滤词。
@@ -1452,6 +1464,19 @@ class AppState extends ChangeNotifier {
 
   void activateTab(String key) {
     activeTab = key;
+    notifyListeners();
+  }
+
+  /// Ctrl+Tab / Ctrl+Shift+Tab:在标签条上前后循环切换。
+  /// 标签条顺序 = 固定的「对象」首页在前,其余按 [tabs] 追加顺序,
+  /// 故循环序列也要含 [objectsTabKey],否则每次都会跳过首页。
+  void activateAdjacentTab({required bool backward}) {
+    if (tabs.isEmpty) return;
+    final keys = [objectsTabKey, for (final tab in tabs) tab.key];
+    final current = keys.indexOf(activeTab);
+    final step = backward ? keys.length - 1 : 1;
+    // Dart 的 % 对正除数恒返回非负余数,-1(活动标签已不在表里)由此落回首页
+    activeTab = keys[(current + step) % keys.length];
     notifyListeners();
   }
 

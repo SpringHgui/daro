@@ -213,4 +213,29 @@ void main() {
     expect(app.objectSearchText, isEmpty);
     expect(find.text('tc_area'), findsOneWidget);
   });
+
+  testWidgets('Ctrl+F 就地展开搜索框并聚焦,Esc 收起', (tester) async {
+    final app = await _makeApp();
+    await _pumpPanel(tester, app);
+
+    // 焦点先落到列表里(点一个表项,与平时操作面板的入口一致)
+    await tester.tap(find.text('tc_area'));
+    await _settle(tester);
+    expect(find.byType(SearchInput), findsNothing, reason: '收起态没有输入框');
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await _settle(tester);
+
+    expect(find.byType(SearchInput), findsOneWidget,
+        reason: 'Ctrl+F 应展开搜索框');
+    final field = tester.widget<TextField>(
+        find.descendant(of: find.byType(SearchInput), matching: find.byType(TextField)));
+    expect(field.focusNode!.hasFocus, isTrue, reason: '展开后光标直接落进框里');
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await _settle(tester);
+    expect(find.byType(SearchInput), findsNothing, reason: 'Esc 收回到放大镜');
+  });
 }

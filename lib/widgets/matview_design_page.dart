@@ -12,6 +12,7 @@ import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
 import 'query_page.dart' show formatSql;
 import 'routine_design_page.dart' show sqlLightTheme, sqlDarkTheme;
+import 'sql_find_bar.dart';
 
 /// 实体化视图设计器(按 Navicat 的实体化视图编辑器还原)。
 ///
@@ -55,6 +56,13 @@ class _MatViewDesignPageState extends State<MatViewDesignPage> {
       CodeLineEditingController.fromText('');
   final CodeLineEditingController _ddlController =
       CodeLineEditingController.fromText('');
+  // 每个编辑器一个查找控制器：CodeFindController 绑定其编辑控制器，须随本页 dispose
+  late final CodeFindController _findController =
+      CodeFindController(_controller);
+  late final CodeFindController _changeFindController =
+      CodeFindController(_changeController);
+  late final CodeFindController _ddlFindController =
+      CodeFindController(_ddlController);
   final TextEditingController _indexName = TextEditingController();
   final TextEditingController _indexColumns = TextEditingController();
   final TextEditingController _storageOptions = TextEditingController();
@@ -137,9 +145,13 @@ class _MatViewDesignPageState extends State<MatViewDesignPage> {
     _commentController.removeListener(_onCommentChanged);
     _appState?.updateRoutineText(_tabKey, _controller.text);
     _appState?.updateRoutineComment(_tabKey, _commentController.text);
+    // findController 监听编辑控制器,必须先于它销毁
+    _findController.dispose();
     _controller.dispose();
     _commentController.dispose();
+    _changeFindController.dispose();
     _changeController.dispose();
+    _ddlFindController.dispose();
     _ddlController.dispose();
     _indexName.dispose();
     _indexColumns.dispose();
@@ -791,7 +803,12 @@ class _MatViewDesignPageState extends State<MatViewDesignPage> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Expanded(
-          child: _sqlEditor(t, controller: _controller, readOnly: false),
+          child: _sqlEditor(
+            t,
+            controller: _controller,
+            readOnly: false,
+            findController: _findController,
+          ),
         ),
         if (_panelVisible) _bottomPanel(t),
       ],
@@ -1081,6 +1098,9 @@ class _MatViewDesignPageState extends State<MatViewDesignPage> {
                           ? _changeController
                           : _ddlController,
                       readOnly: true,
+                      findController: _previewSub == 0
+                          ? _changeFindController
+                          : _ddlFindController,
                       showLineNumbers: false,
                     ),
                   ),
@@ -1110,12 +1130,17 @@ class _MatViewDesignPageState extends State<MatViewDesignPage> {
     AppPalette t, {
     required CodeLineEditingController controller,
     required bool readOnly,
+    required CodeFindController findController,
     bool showLineNumbers = true,
   }) {
     final isDark = t.background.computeLuminance() < 0.5;
     return CodeEditor(
       controller: controller,
       readOnly: readOnly,
+      findController: findController,
+      findBuilder: (context, controller, readOnly) =>
+          SqlFindBar(controller: controller, readOnly: readOnly),
+      shortcutsActivatorsBuilder: const SqlFindShortcuts(),
       chunkAnalyzer: const NonCodeChunkAnalyzer(),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
       style: CodeEditorStyle(

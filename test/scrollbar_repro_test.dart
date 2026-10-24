@@ -72,7 +72,7 @@ void main() {
         ..something((method, args) {
           if (method != #drawRect) return false;
           final r = args.first as Rect;
-          // Windows 主题下轨道 = thickness(5) + 两侧 crossAxisMargin(2),
+          // Windows 主题下轨道 = 静止 thickness + 两侧 crossAxisMargin(2),
           // 轨道右缘 600、滑块右缘 598,均落在视口右缘窄带内
           return r.right >= 597.0 && r.width <= 12.0;
         }),

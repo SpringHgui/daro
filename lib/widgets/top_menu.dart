@@ -273,7 +273,10 @@ class _TopMenuState extends State<TopMenu> with WindowListener {
         MenuItem(
             text: l.menuNewConnection,
             onPressed: () => _openConnectionWindow(context)),
-        MenuItem(text: l.menuNewQuery, onPressed: app.newQuery),
+        MenuItem(
+            text: l.menuNewQuery,
+            shortcut: 'Ctrl+N',
+            onPressed: app.newQuery),
         const MenuSeparator(),
         MenuItem(
             text: l.menuImportConnections,
