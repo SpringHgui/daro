@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:daro/data/navicat_import.dart';
@@ -32,9 +33,81 @@ const _ncxFixture = '''
 </Connections>
 ''';
 
+/// Navicat 在 Redis 模型下导出的 `.ano`:整份文件是 base64 的 JSON 数组。
+///
+/// 结构照本机真实导出文件(`host / port / auth / username / name / separator /
+/// cluster / connectionReadOnly / key / order / connectionName`)复刻,
+/// 主机与口令**全是假值**,不含任何真实实例凭据。
+/// 注意 `port` 在真实文件里数字与字符串混写,这里两种都留一条。
+final String _anoFixture = base64Encode(utf8.encode(jsonEncode([
+  {
+    'host': 'r-fake-instance.redis.rds.example.com',
+    'port': 6379,
+    'auth': 'Test@1234',
+    'username': '',
+    'name': '一部',
+    'separator': ':',
+    'cluster': false,
+    'connectionReadOnly': false,
+    'key': '1680846449382_3kp4n',
+    'order': 0,
+    'connectionName': '一部',
+  },
+  {
+    'host': 'hex.redis.example.com',
+    'port': 6379,
+    'auth': 'abcdef1234567890',
+    'username': '',
+    'name': 'hex_like_auth',
+    'separator': ':',
+    'cluster': false,
+    'connectionReadOnly': false,
+    'key': '1680846449382_aaaa1',
+    'order': 1,
+    'connectionName': 'hex_like_auth',
+  },
+  {
+    'host': 'open.redis.example.com',
+    'port': 6379,
+    'auth': '',
+    'username': '',
+    'name': 'no_auth',
+    'separator': ':',
+    'cluster': false,
+    'connectionReadOnly': false,
+    'key': '1680846449382_bbbb2',
+    'order': 2,
+    'connectionName': 'no_auth',
+  },
+  {
+    'host': 'named.redis.example.com',
+    'port': '6380',
+    'auth': 'Test@1234',
+    'username': '',
+    'name': 'only_name',
+    'separator': ':',
+    'cluster': false,
+    'connectionReadOnly': false,
+    'key': '1680846449382_cccc3',
+    'order': 3,
+  },
+  {
+    'host': 'cluster.redis.example.com',
+    'port': '9099',
+    'auth': 'Test@1234',
+    'username': '',
+    'name': '集群从节点',
+    'separator': ':',
+    'cluster': true,
+    'connectionReadOnly': true,
+    'key': '1680846449382_dddd4',
+    'order': 4,
+    'connectionName': 'cluster_node',
+  },
+])));
+
 void main() {
-  group('AES-128-CBC 原语', () {
-    test('与 FIPS-197 官方向量一致(零 IV 单块即 ECB 解密)', () {
+  group('AES-128-CBC 原语', () {    test('与 FIPS-197 官方向量一致(零 IV 单块即 ECB 解密)', () {
       final key = Uint8List(16);
       final iv = Uint8List(16);
       final ct = _hex('66e94bd4ef8a2c3b884cfa59ca342b2e');
@@ -180,7 +253,120 @@ void main() {
           throwsA(isA<FormatException>()));
     });
   });
+
+  group('.ano(Redis)解析与映射', () {
+    final ano = NavicatNcx.parse(_anoFixture);
+    NavicatConnection entry(String name) =>
+        ano.connections.firstWhere((e) => e.name == name);
+
+    test('读出全部连接,类型归一到 redis 且可导入', () {
+      expect(ano.connections.length, 5);
+      expect(ano.formatVersion, '', reason: '.ano 不声明导出格式版本');
+      for (final e in ano.connections.take(4)) {
+        expect(e.typeId, 'redis');
+        // 集群版那条单独挡,见下
+        expect(e.isSupported, isTrue, reason: e.name);
+      }
+    });
+
+    test('auth 按明文直取:十六进制形状的口令也不会被当成 Navicat 密文', () {
+      // 'abcdef1234567890' 是偶数长度纯 hex —— 若误走 AES 分支就会变成
+      // undecryptable 或一串乱码,这里是回归守护
+      final e = entry('hex_like_auth');
+      expect(e.passwordState, NavicatPasswordState.decrypted);
+      expect(e.password, 'abcdef1234567890');
+      expect(e.toConnection().password, 'abcdef1234567890');
+    });
+
+    test('空 auth = 这个实例本就没设 requirepass,不报「需手填密码」', () {
+      final e = entry('no_auth');
+      expect(e.passwordState, NavicatPasswordState.noPassword);
+      expect(e.needsManualPassword, isFalse);
+      expect(e.toConnection().password, '');
+    });
+
+    test('port 数字与字符串两种写法都收成字符串', () {
+      expect(entry('一部').port, '6379');
+      expect(entry('cluster_node').port, '9099');
+    });
+
+    test('名称优先 connectionName,缺失时退回 name', () {
+      expect(entry('一部').attr('ConnectionName'), '一部');
+      expect(entry('only_name').name, 'only_name');
+    });
+
+    test('集群版标记挡下:给出原因、不可勾选,而不是导一条点开就报错的连接', () {
+      final e = entry('cluster_node');
+      expect(e.cluster, isTrue);
+      expect(e.isSupported, isFalse);
+      expect(e.unsupportedReason, contains('集群'));
+      // 未实现的引擎同样走这条出口(旧 UI 文案是「不支持 MYSQL」那种)
+      expect(entry('一部').unsupportedReason, isNull);
+    });
+
+    test('映射出的连接:无分组、无默认库、真实连接', () {
+      final e = entry('一部');
+      final conn = e.toConnection();
+      expect(conn.typeId, 'redis');
+      expect(conn.host, 'r-fake-instance.redis.rds.example.com');
+      expect(conn.username, '');
+      expect(conn.database, '', reason: 'Redis 的库号在连接树里选,不落默认库');
+      expect(conn.group, '');
+      expect(conn.isLive, isTrue);
+      expect(e.targetLabel, 'r-fake-instance.redis.rds.example.com:6379');
+    });
+
+    test('base64 折行(带换行)也能解', () {
+      final folded = _fold(_anoFixture);
+      expect(NavicatNcx.parse(folded).connections.length, 5);
+    });
+
+    test('.ano 里塞进非数组内容时给中文原因,不静默产出空列表', () {
+      expect(
+        () => NavicatNcx.parse(base64Encode(utf8.encode('{"host":"x"}'))),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => NavicatNcx.parse(base64Encode(utf8.encode('[]'))),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('XML 与 .ano 由同一入口按内容识别,后缀不参与判断', () {
+      // 把 XML 文件改名成 .ano 也照样按 XML 解
+      expect(NavicatNcx.parse(_ncxFixture).connections.length, 8);
+    });
+  });
+
+  // 真实导出文件的抽样回归:开关口径与实连数据库测试一致 —— 只有显式给出路径
+  // 才跑(默认跳过,不依赖任何人的个人目录)。
+  // 断言只看条数 / 类型 / 端口 / 密码「可得性」这些形状,**不打印也不比对口令值**。
+  group('真实 Navicat .ano 抽样(按需)', () {
+    final path = Platform.environment['DARO_NAVICAT_ANO'] ?? '';
+    final skip = path.isEmpty ? '未给出导出文件路径(DARO_NAVICAT_ANO)' : null;
+
+    test('解析真实 Redis 导出:条数、类型、寻址与口令状态', () {
+      final parsed = NavicatNcx.readFileSync(path);
+      expect(parsed.connections, isNotEmpty);
+      for (final e in parsed.connections) {
+        expect(e.typeId, 'redis', reason: e.name);
+        expect(e.isSupported, isTrue, reason: '${e.name}:${e.unsupportedReason}');
+        expect(e.host, isNotEmpty, reason: e.name);
+        expect(int.tryParse(e.port), greaterThan(0), reason: e.name);
+        // 该文件是勾选「导出密码」导出的:每条都该带明文 auth
+        expect(e.passwordState, NavicatPasswordState.decrypted, reason: e.name);
+        expect(e.password, isNotEmpty, reason: e.name);
+        expect(e.toConnection().isLive, isTrue);
+      }
+    }, skip: skip);
+  });
 }
 
 Uint8List _hex(String s) => Uint8List.fromList(
     List<int>.generate(s.length ~/ 2, (i) => int.parse(s.substring(i * 2, i * 2 + 2), radix: 16)));
+
+/// 按 76 列折行(Navicat 写出 base64 时的排版),用来验证解码前剔空白。
+String _fold(String s) => [
+      for (var i = 0; i < s.length; i += 76)
+        i + 76 < s.length ? s.substring(i, i + 76) : s.substring(i)
+    ].join('\r\n');

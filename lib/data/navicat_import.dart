@@ -6,14 +6,27 @@ import 'package:pointycastle/export.dart';
 import 'package:xml/xml.dart';
 
 import 'db_data.dart';
-import 'drivers/db_driver.dart';
+import 'db_types.dart';
 
-/// Navicat 导出的连接配置(`.ncx`)导入:XML 解析 + 保存的密码解密 + 映射为
-/// daro 的 [ConnectionInfo]。
+/// Navicat 导出的连接配置导入:格式识别 + 密码还原 + 映射为 daro 的
+/// [ConnectionInfo]。
 ///
-/// ── 密码加密方式(实测本机 Navicat Premium 16/17 导出文件所得) ──
-/// `<Connection>` 的 `Password` 属性是**大写十六进制**密文,算法为
-/// AES-128-CBC + PKCS#7,密钥与 IV 是 Navicat 内置固定常量(libcc 公共库,
+/// ── 两种导出格式(实测本机 Navicat Premium 16/17) ──
+/// * **`.ncx` = XML**。关系型与文件型连接走这条,`<Connection>` 属性平铺,
+///   `Password` 是**大写十六进制**密文(见下)。
+/// * **`.ano` = base64 的 JSON 数组**。Redis 这类非关系型连接用它导出,字段是
+///   `host / port / auth / username / name / connectionName / separator /
+///   cluster / connectionReadOnly / key / order`。
+///   这里 `auth` 是**明文口令**,不存在解密环节 —— 所以它绝不进
+///   [decryptNavicatPassword] 那条 AES 分支(十六进制形状的口令会解出垃圾)。
+///   `separator`(键名前缀分层符)与 `connectionReadOnly` 在 daro 的
+///   [ConnectionInfo] 里没有对应字段:前者是 Navicat 的树形显示糖,后者当前
+///   恒等于驱动口径(Redis 首版只读),导入时丢弃。`cluster=true` 会被挡掉。
+///
+/// 格式靠内容识别,不看后缀:根元素是 `<` 走 XML,否则按 base64 JSON 试。
+///
+/// ── `.ncx` 的密码加密方式 ──
+/// 算法为 AES-128-CBC + PKCS#7,密钥与 IV 是 Navicat 内置固定常量(libcc 公共库,
 /// 与其源文件名同名):
 ///
 /// * key = `libcckeylibcckey` (16 字节 ASCII)
@@ -43,7 +56,7 @@ final Uint8List _libccIvBytes = Uint8List.fromList(utf8.encode(kNavicatLibccIv))
 
 /// Navicat 连接类型 → daro `DbType.id`。
 ///
-/// 值域与 [kSupportedDriverTypes] 对齐:不在此表内的 ConnType 原样小写返回,
+/// 值域与 [isEngineTypeSupported] 对齐:不在此表内的 ConnType 原样小写返回,
 /// 由 [NavicatConnection.isSupported] 判定是否可导入。
 const Map<String, String> kNavicatConnTypes = {
   'MYSQL': 'mysql',
@@ -73,15 +86,18 @@ enum NavicatPasswordState {
   undecryptable,
 }
 
-/// 解析自 `.ncx` 的一条连接。
+/// 解析自 Navicat 导出文件的一条连接。
 class NavicatConnection {
   const NavicatConnection({
     required this.attributes,
     required this.passwordState,
     this.password = '',
+    this.cluster = false,
   });
 
-  /// `<Connection>` 元素上的全部属性(Navicat 把配置平铺在属性里,无子节点)
+  /// `<Connection>` 元素上的全部属性(Navicat 把配置平铺在属性里,无子节点)。
+  /// `.ano` 的 JSON 条目也归一化到这张表,键名与 `.ncx` 属性同名(见
+  /// [NavicatConnection.fromAnoEntry]),下游取值口径因此不必分叉。
   final Map<String, String> attributes;
 
   /// 密码解密结果状态
@@ -90,7 +106,38 @@ class NavicatConnection {
   /// 明文密码,仅当 [passwordState] == [NavicatPasswordState.decrypted] 时有意义
   final String password;
 
+  /// Redis 集群版标记(`.ano` 的 `cluster`)。
+  ///
+  /// 只有 Redis 的导出文件带这个字段,其余类型恒为 false。
+  final bool cluster;
+
   String attr(String key) => attributes[key] ?? '';
+
+  /// 从 `.ano`(base64 JSON 数组)的一个条目建出连接。
+  ///
+  /// Navicat 的 Redis 导出把配置平铺成 JSON 键,这里映射到与 `.ncx` 同名的属性
+  /// 键上;`port` 在真实文件里数字与字符串都出现过(实测 6379 与 "9099" 同存),
+  /// 一律按字符串收下。
+  ///
+  /// `auth` 是**明文**,直接进 [NavicatPasswordState.decrypted],不试 AES;
+  /// 空 `auth` 记 [NavicatPasswordState.noPassword](Redis 未设 requirepass)。
+  factory NavicatConnection.fromAnoEntry(Map<String, Object?> json) {
+    final auth = '${json['auth'] ?? ''}';
+    return NavicatConnection(
+      attributes: {
+        // 这份文件没有类型字段:它是 Navicat 在 Redis 模型下「导出连接」的产物
+        'ConnType': 'REDIS',
+        'ConnectionName': '${json['connectionName'] ?? json['name'] ?? ''}',
+        'Host': '${json['host'] ?? ''}',
+        'Port': '${json['port'] ?? ''}',
+        'UserName': '${json['username'] ?? ''}',
+      },
+      passwordState:
+          auth.isEmpty ? NavicatPasswordState.noPassword : NavicatPasswordState.decrypted,
+      password: auth,
+      cluster: json['cluster'] == true,
+    );
+  }
 
   /// 连接显示名
   String get name => attr('ConnectionName');
@@ -108,7 +155,20 @@ class NavicatConnection {
       kNavicatConnTypes[connType.toUpperCase()] ?? connType.toLowerCase();
 
   /// daro 是否已实现该引擎的驱动(未实现的导入进来也是死条目,故不放开勾选)
-  bool get isSupported => kSupportedDriverTypes.contains(typeId);
+  bool get isSupported => unsupportedReason == null;
+
+  /// 不可导入的具体原因;null = 可导入。
+  ///
+  /// Redis 集群版单独挡一条:集群要处理 `MOVED`/`ASK` 重定向并按槽建连,
+  /// 现有 Redis 驱动是单节点 RESP,导进来只会连不上——
+  /// 与其给一条「回显成功、点开就报错」的连接,不如在导入列表里就说明白。
+  String? get unsupportedReason {
+    if (!isEngineTypeSupported(typeId)) {
+      return connType.isEmpty ? '引擎未实现($typeId)' : '引擎未实现($connType)';
+    }
+    if (cluster) return 'Redis 集群版暂不支持';
+    return null;
+  }
 
   /// SQLite / Access:寻址方式是文件路径而非 host:port
   bool get isFileBased => typeId == 'sqlite' || typeId == 'access';
@@ -166,17 +226,17 @@ class NavicatConnection {
   }
 }
 
-/// 一个 `.ncx` 文件的解析结果。
+/// 一个 Navicat 导出文件的解析结果(`.ncx` 与 `.ano` 共用)。
 class NavicatNcx {
   NavicatNcx({required this.connections, this.formatVersion = ''});
 
   /// 全部连接(保持文件中的原始顺序)
   final List<NavicatConnection> connections;
 
-  /// `<Connections Ver="1.5">` 里的导出格式版本,仅用于界面提示
+  /// `<Connections Ver="1.5">` 里的导出格式版本,仅用于界面提示;`.ano` 没有这个声明
   final String formatVersion;
 
-  /// 读取并解析磁盘上的 `.ncx`。
+  /// 读取并解析磁盘上的导出文件。
   ///
   /// Navicat 在中文 Windows 上偶尔按本地代码页(GBK)写出、却仍声明 UTF-8,
   /// 因此 UTF-8 解码失败时回退 [systemEncoding],避免整文件不可用。
@@ -191,8 +251,33 @@ class NavicatNcx {
     return NavicatNcx.parse(text);
   }
 
-  /// 解析 NCX 文本。格式不符时抛 [FormatException](带中文原因,供 UI 直接展示)。
+  /// 解析导出文件文本,按**内容**认格式(后缀不可信,用户常手改扩展名)。
+  ///
+  /// 格式不符时抛 [FormatException](带中文原因,供 UI 直接展示)。
   static NavicatNcx parse(String text) {
+    final trimmed = text.trimLeft();
+    if (trimmed.startsWith('<')) return _parseNcx(text);
+    // 不是 XML 就按 `.ano` 试:base64 → UTF-8 → JSON 数组
+    List<Object?> list;
+    try {
+      final raw = utf8.decode(base64Decode(_stripWhitespace(text)));
+      list = jsonDecode(raw) as List<Object?>;
+    } catch (_) {
+      throw FormatException(
+          '无法识别的文件格式:既不是 XML 导出(.ncx),也不是 base64 JSON 导出(.ano)');
+    }
+    final connections = <NavicatConnection>[
+      for (final item in list)
+        if (item is Map<String, Object?>) NavicatConnection.fromAnoEntry(item),
+    ];
+    if (connections.isEmpty) {
+      throw FormatException('文件里没有任何连接条目');
+    }
+    return NavicatNcx(connections: connections);
+  }
+
+  /// 解析 NCX(XML)文本。格式不符时抛 [FormatException]。
+  static NavicatNcx _parseNcx(String text) {
     XmlDocument doc;
     try {
       doc = XmlDocument.parse(text);
@@ -330,6 +415,9 @@ String? _decodePrintable(Uint8List bytes) {
     return null;
   }
 }
+
+/// base64 串里可能夹换行/空白(Navicat 折行写出时),解码前先剔掉。
+String _stripWhitespace(String text) => text.replaceAll(RegExp(r'\s'), '');
 
 /// 严格十六进制解析:奇数长度、非 0-9a-fA-F 字符一律返回 null。
 Uint8List? _tryParseHex(String text) {

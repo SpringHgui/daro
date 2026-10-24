@@ -29,6 +29,9 @@ import 'navicat_import.dart';
 /// 不可导出的 daro 连接类型 → 原因(Navicat 侧没有对应 ConnType)
 const Map<String, String> kNavicatExportBlockers = {
   'access': 'Navicat 没有 Access 连接类型',
+  // 实测:Navicat 导出 Redis 连接给的是 base64 JSON 的 .ano,不是 .ncx。
+  // 没有真实 .ncx Redis 样本可对照属性表,就不凭猜模板写出去。
+  'redis': 'Redis 在 Navicat 侧按 .ano 导出,.ncx 里没有它的属性模板',
 };
 
 /// 一次导出的结果。

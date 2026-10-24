@@ -60,7 +60,9 @@ void main() {
     await tester.tap(find.text('导入连接'));
     await tester.pumpAndSettle();
     expect(find.byType(NavicatImportDialog), findsOneWidget);
-    expect(find.text('请先选择 Navicat 导出的 .ncx 文件。'), findsOneWidget);
+    // 只认「请先选择 Navicat 导出的连接文件」这句前缀:引导文案里的后缀列表
+    // (.ncx / .ano)会随支持的格式变,不该牵动这条冒烟线
+    expect(find.textContaining('请先选择 Navicat 导出的连接文件'), findsOneWidget);
   });
 
   testWidgets('工具菜单里的「选项…」打开选项对话框', (tester) async {

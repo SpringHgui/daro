@@ -123,7 +123,9 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
   Future<void> _pickFile() async {
     final file = await openFile(
       acceptedTypeGroups: const [
-        XTypeGroup(label: 'Navicat 连接文件', extensions: ['ncx', 'xml']),
+        // .ncx = XML 导出;.ano = Navicat 在 Redis 等模型下导出的 base64 JSON。
+        // 解析按内容认格式,后缀只影响这里能不能选中文件。
+        XTypeGroup(label: 'Navicat 连接文件', extensions: ['ncx', 'ano', 'xml']),
         XTypeGroup(label: '所有文件'),
       ],
       confirmButtonText: '打开',
@@ -260,7 +262,8 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
                     child: Input(
                       controller: _pathController,
                       focusNode: _pathFocus,
-                      hint: r'选择 Navicat 导出的 .ncx(路径也可直接粘贴),如 C:\Users\你\Desktop\connections.ncx',
+                      hint: r'选择 Navicat 导出的连接文件(路径也可直接粘贴),'
+                          r'如 C:\Users\你\Desktop\connections.ncx 或 Redis 的 connections.ano',
                       onChanged: (v) => setState(() => _filePath = v),
                       onSubmitted: (_) => _parse(),
                     ),
@@ -310,7 +313,7 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
     }
     if (!_parsedOk) {
       return Text(
-        _hasPath ? '路径已填:按回车或点到别处即读取该文件。' : '请先选择 Navicat 导出的 .ncx 文件。',
+        _hasPath ? '路径已填:按回车或点到别处即读取该文件。' : '请先选择 Navicat 导出的连接文件(.ncx / .ano)。',
         style: _style(t, color: t.mutedForeground),
       );
     }
@@ -330,12 +333,12 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
     // 文件里出现的分组去重计数(未分组不计),与「是否已存在」无关,纯说清量级
     final groups = {for (final e in _entries) e.group}..remove('');
     final parts = <String>[
-      if (unsupported > 0) '引擎不支持 $unsupported',
+      if (unsupported > 0) '不可导入 $unsupported',
       if (_duplicates.isNotEmpty) '重名 ${_duplicates.length}',
       if (manual > 0) '需手填密码 $manual',
       if (groups.isNotEmpty) '分组 ${groups.length}',
     ];
-    return parts.isEmpty ? '全部可导入,密码均已解密' : parts.join(' · ');
+    return parts.isEmpty ? '全部可导入,密码均已带过来' : parts.join(' · ');
   }
 
   Widget _listHeader(AppPalette t) {
@@ -448,22 +451,23 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
     );
   }
 
-  /// 行尾标记:未实现引擎 / 已存在同名 / 密码要手填 / 密码已解密,各自说清原因
+  /// 行尾标记:不可导入的原因 / 已存在同名 / 密码要手填 / 密码已带过来,各自说清
   Widget _tags(AppPalette t, int index) {
     final e = _entries[index];
     final (String, Color) tag;
-    if (!e.isSupported) {
-      tag = ('不支持 ${e.connType}', t.disabledForeground);
+    final blocked = e.unsupportedReason;
+    if (blocked != null) {
+      tag = (blocked, t.disabledForeground);
     } else if (_duplicates.contains(index)) {
       tag = ('已存在同名', t.mutedForeground);
     } else {
       tag = switch (e.passwordState) {
         NavicatPasswordState.notSaved => ('未保存密码', _warn),
         NavicatPasswordState.undecryptable => ('密码未能解密', _warn),
-        // 解出空串等同「这个连接本来不用密码」(如 SQL Server Windows 验证)
+        // .ncx 的口令是解密得来,.ano 的 auth 本就是明文,标签只说「带过来了」
         NavicatPasswordState.decrypted => e.password.isEmpty
             ? ('无需密码', t.mutedForeground)
-            : ('密码已解密', _ok),
+            : ('口令已带过来', _ok),
         NavicatPasswordState.noPassword => ('无需密码', t.mutedForeground),
       };
     }
@@ -494,9 +498,11 @@ class _NavicatImportDialogState extends State<NavicatImportDialog> {
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 480),
         child: Text(
-          '在 Navicat 里用「文件 → 导出连接设置…」并勾选「导出密码」导出 .ncx,'
+          '在 Navicat 里用「文件 → 导出连接设置…」并勾选「导出密码」导出,'
           '然后在这里选择该文件。\n'
-          '文件里保存的密码会按 Navicat 内置算法解密后一并带过来。\n'
+          '关系型连接导成 .ncx;Redis 这类连接导成 .ano(内容是 base64 的 JSON),'
+          '两种都支持,后缀不必手工对齐。\n'
+          '.ncx 里保存的密码按 Navicat 内置算法解密后带过来,.ano 里的 auth 本就是明文。\n'
           'daro 导出的文件带 Group 属性,导入时本地没有的分组会自动新建;'
           'Navicat 自身导出的文件没有分组信息,连接会落在「未分组」。',
           textAlign: TextAlign.center,
