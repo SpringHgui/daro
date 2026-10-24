@@ -10,11 +10,25 @@
     "trademark_owner": "Microsoft Corporation",
     "viewBox": "0 0 165.36159 156.44981"
   },
+  "another-redis-desktop-manager": {
+    "bytes": 108520,
+    "candidates": [
+      "https://raw.githubusercontent.com/qishibo/AnotherRedisDesktopManager/master/pack/electron/icons/icon.png"
+    ],
+    "kind": "tool",
+    "mark": "红色圆角瓦片 + 白色五角星轮廓与圆点(应用图标)",
+    "note": "「从 Navicat 导入连接」向导的来源工具标识。原件即方形瓦片且四角透明,整幅取用,等比缩到 128px 后内嵌进 assets/icons/tools/another-redis-desktop-manager.svg。",
+    "pixels": "512x512",
+    "source_url": "https://raw.githubusercontent.com/qishibo/AnotherRedisDesktopManager/master/pack/electron/icons/icon.png",
+    "trademark_owner": "qishibo / Another Redis Desktop Manager(仓库以 MIT 授权,含该图标)",
+    "viewBox": "n/a (PNG)"
+  },
   "gitee": {
     "bytes": 606,
     "candidates": [
       "https://cdn.simpleicons.org/gitee"
     ],
+    "kind": "site",
     "mark": "红色圆弧 G 字标",
     "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@13/icons/gitee.svg",
     "trademark_owner": "深圳奥思网络科技有限公司 (OSChina)",
@@ -25,6 +39,7 @@
     "candidates": [
       "https://cdn.simpleicons.org/github"
     ],
+    "kind": "site",
     "mark": "Invertocat 猫头",
     "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@13/icons/github.svg",
     "trademark_owner": "GitHub, Inc. (Microsoft Corporation)",
@@ -62,6 +77,19 @@
     "source_url": "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/mysql/mysql-original.svg",
     "trademark_owner": "Oracle America, Inc.",
     "viewBox": "0 0 128 128"
+  },
+  "navicat": {
+    "bytes": 21947,
+    "candidates": [
+      "https://upload.wikimedia.org/wikipedia/commons/d/dc/Navicat_logo.png"
+    ],
+    "kind": "tool",
+    "mark": "金色三瓣图形 + Navicat 字标(横版 lockup)",
+    "note": "「从 Navicat 导入连接」向导的来源工具标识。原件由厂商自己的 Commons 账号(Mktgnavicat)以 CC0 发布;字标在 44px 以下不可辨,故只裁图形区 x=21..160 y=19..155 等比缩到 128px 内嵌进 assets/icons/tools/navicat.svg,软件名由界面文字承担。",
+    "pixels": "553x175",
+    "source_url": "https://upload.wikimedia.org/wikipedia/commons/d/dc/Navicat_logo.png?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=original",
+    "trademark_owner": "PremiumSoft CyberTech Limited(Navicat)",
+    "viewBox": "n/a (PNG)"
   },
   "oracle": {
     "bytes": 1244,
