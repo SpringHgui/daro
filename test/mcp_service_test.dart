@@ -165,12 +165,18 @@ void main() {
 
   group('启动与对账', () {
     test('没有策略文件 = 默认关闭,不绑任何端口', () async {
+      // 先记下默认端口的**初始**归属:本机若正跑着一个开了 MCP 的 daro 实例
+      // (开发者一边跑应用一边测是常态),端口本来就被那个进程占着,
+      // 事后「仍不可绑」说明不了这个服务干了什么。只有开局是空的才判得准。
+      final freeBefore = await portBindable(5225);
       final service = newService();
       await service.bootstrap();
       expect(service.policyStatus, McpPolicyLoadStatus.missing);
       expect(service.policy.enabled, isFalse);
       expect(service.isRunning, isFalse);
-      expect(await portBindable(5225), isTrue, reason: '默认端口不该被占');
+      if (freeBefore) {
+        expect(await portBindable(5225), isTrue, reason: '默认端口不该被占');
+      }
     });
 
     test('启用后端口在监听,关闭后端口释放', () async {
