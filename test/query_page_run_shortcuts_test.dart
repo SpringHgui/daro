@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:base_ui_flutter/base_ui_flutter.dart';
 import 'package:daro/app/app_state.dart';
 import 'package:daro/data/db_data.dart';
 import 'package:daro/data/drivers/db_driver.dart';
@@ -147,8 +148,16 @@ Future<_Ctx> _openPage(
 /// 三条各占一行的脚本:点第 N 行 = 光标在第 N 条语句里
 const String _script = 'SELECT 1;\nSELECT 2;\nSELECT 3;';
 
+/// 工具栏按钮(按控件类型限定,别和同名的菜单项混在一起)
+Finder _toolButton(String label) => find.descendant(
+      of: find.byType(ToolbarButton),
+      matching: find.text(label),
+    );
+
 Finder _menuItem(String label) => find.descendant(
-      of: find.byType(Overlay),
+      // 限定在浮层面板里:工具栏主按钮在有选区时与「运行已选择的」同字,
+      // 按文本全页找会歧义(点下去就是点工具栏了)
+      of: find.byType(ContextMenuPanel),
       matching: find.text(label),
     );
 
@@ -215,6 +224,37 @@ void main() {
       await _settle(tester);
 
       expect(ctx.driver.sqls, ['SELECT 1', 'SELECT 2', 'SELECT 3']);
+    });
+
+    testWidgets('有选区时主按钮自己写成「运行已选择的」,取消选区后变回「运行」',
+        (tester) async {
+      final ctx = await _openPage(tester, sql: _script);
+
+      // 无选区:按钮就是「运行」(点它跑光标所在语句)
+      expect(_toolButton('运行'), findsOneWidget);
+      expect(_toolButton('运行已选择的'), findsNothing);
+
+      // 走菜单「全选」造选区(不碰 Ctrl+A,那条在裸编辑器探针里不触发)
+      await ctx.tapLine(tester, 1);
+      await ctx.rightClickEditor(tester);
+      await tester.tap(_menuItem('全选'));
+      await _settle(tester);
+
+      expect(_toolButton('运行已选择的'), findsOneWidget,
+          reason: '选中一段后,主按钮必须自己说清这一下跑的是选区');
+      expect(_toolButton('运行'), findsNothing);
+
+      // 直接点主按钮(不开下拉):跑的是选区内容
+      await tester.tap(
+          _toolButton('运行已选择的'), kind: PointerDeviceKind.mouse);
+      await _settle(tester);
+      expect(ctx.driver.sqls, ['SELECT 1', 'SELECT 2', 'SELECT 3']);
+
+      // 点一下编辑区把选区收掉 → 文案得跟着回去,否则按钮从此在说谎
+      await ctx.tapLine(tester, 0);
+      await _settle(tester);
+      expect(_toolButton('运行'), findsOneWidget);
+      expect(_toolButton('运行已选择的'), findsNothing);
     });
 
     testWidgets('回车仍然换行(接管 Intent 不能把换行一起吞了)', (tester) async {

@@ -223,7 +223,7 @@ class _QueryPageState extends State<QueryPage> {
     if (mounted) setState(() {});
   }
 
-  /// 输入即持久化;选区出现/消失时重建(「运行已选择的」菜单项可用性跟随)
+  /// 输入即持久化;选区出现/消失时重建(主按钮文案与「运行已选择的」菜单项都跟着走)
   void _onEditorChanged() {
     _appState?.updateQueryText(_tabKey, _controller.text);
     final hasSelection = _selectedSql != null;
@@ -750,8 +750,9 @@ class _QueryPageState extends State<QueryPage> {
             ),
           ],
           const SizedBox(width: 10),
-          // 运行拆分按钮:主体按下即运行(选中文本优先),尾部 ▾ 开菜单
-          // (同 Navicat「运行 ▾」:菜单含「运行 / 运行已选择的」)
+          // 运行拆分按钮:主体按下即运行(选中文本优先),尾部 ▾ 开菜单。
+          // 主按钮文案跟着选区走(同 Navicat):选中一段 SQL 时它就写着
+          // 「运行已选择的」,否则用户无从知道这一下点下去跑的是选中的还是整篇。
           Popover(
             controller: _runMenu,
             toggleOnTap: false,
@@ -764,7 +765,7 @@ class _QueryPageState extends State<QueryPage> {
                 ToolbarButton(
                   backgroundColor: t.secondary,
                   iconWidget: const _RunTriangleIcon(),
-                  text: '运行',
+                  text: _hasSelection ? context.l10n.sqlRunSelected : '运行',
                   enabled: !_running,
                   onTap: _onRun,
                 ),
