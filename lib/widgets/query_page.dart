@@ -1300,7 +1300,7 @@ class _QueryPageState extends State<QueryPage> {
     if (message != null) {
       return Padding(
         padding: const EdgeInsets.all(12),
-        child: Text(
+        child: SelectableText(
           message,
           style: TextStyle(fontSize: 12.5, color: t.mutedForeground),
         ),
@@ -1310,28 +1310,60 @@ class _QueryPageState extends State<QueryPage> {
   }
 
   /// 消息 tab:各语句执行结果汇总日志(语句回显 + 结果 / 错误 + 耗时)
+  ///
+  /// 整份日志是**一个** SelectableText.rich,而不是每条一个 Text:排查报错时要
+  /// 拖选出「前几条成功、第几条挂在哪句上」这种上下文,拆开各选各的就得复制 N 遍。
   Widget _messagesTab(AppPalette t) {
-    return ListView(
+    return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
-      children: [
-        for (var i = 0; i < _outcomes.length; i++)
-          _messageEntry(t, i + 1, _outcomes[i]),
-        if (_running)
-          Row(
-            children: [
-              const Spinner(size: 13),
-              const SizedBox(width: 6),
-              Text(
-                '正在执行第 ${_outcomes.length + 1}/$_totalStatements 条语句 ...',
-                style: TextStyle(fontSize: 12.5, color: t.mutedForeground),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_outcomes.isNotEmpty)
+            SelectableText.rich(TextSpan(
+              style: TextStyle(
+                fontSize: 12.5,
+                height: 1.45,
+                color: t.foreground,
               ),
-            ],
-          ),
-      ],
+              children: [
+                for (var i = 0; i < _outcomes.length; i++) ...[
+                  TextSpan(
+                    text: '${_oneLine(_outcomes[i].sql)}\n',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontFamily: 'monospace',
+                      color: t.mutedForeground,
+                    ),
+                  ),
+                  TextSpan(
+                    text: '${_messageSummary(i + 1, _outcomes[i])}\n',
+                    style: TextStyle(
+                      color: _outcomes[i].isError ? _errorColor : t.foreground,
+                    ),
+                  ),
+                  const TextSpan(text: '\n'),
+                ],
+              ],
+            )),
+          if (_running)
+            Row(
+              children: [
+                const Spinner(size: 13),
+                const SizedBox(width: 6),
+                Text(
+                  '正在执行第 ${_outcomes.length + 1}/$_totalStatements 条语句 ...',
+                  style: TextStyle(fontSize: 12.5, color: t.mutedForeground),
+                ),
+              ],
+            ),
+        ],
+      ),
     );
   }
 
-  Widget _messageEntry(AppPalette t, int index, _StatementOutcome o) {
+  /// 单条语句在消息 tab 里的那一行结论
+  String _messageSummary(int index, _StatementOutcome o) {
     final isError = o.isError;
     final r = o.result;
     String summary;
@@ -1346,35 +1378,9 @@ class _QueryPageState extends State<QueryPage> {
     } else {
       summary = '执行成功';
     }
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // 语句回显(折叠为单行)
-          Text(
-            _oneLine(o.sql),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 12,
-              fontFamily: 'monospace',
-              color: t.mutedForeground,
-            ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            isError
-                ? '语句 $index 出错:$summary · ${o.elapsedMs} ms'
-                : '语句 $index:$summary · ${o.elapsedMs} ms',
-            style: TextStyle(
-              fontSize: 12.5,
-              color: isError ? _errorColor : t.foreground,
-            ),
-          ),
-        ],
-      ),
-    );
+    return isError
+        ? '语句 $index 出错:$summary · ${o.elapsedMs} ms'
+        : '语句 $index:$summary · ${o.elapsedMs} ms';
   }
 
   /// 语句文本折叠为单行(消息 tab 回显用)
@@ -1387,7 +1393,8 @@ class _QueryPageState extends State<QueryPage> {
       return Padding(
         padding: const EdgeInsets.all(12),
         child: SingleChildScrollView(
-          child: Text(
+          // 报错原文要能整段拖选复制(贴给同事 / 搜错误码),不只是看见
+          child: SelectableText(
             error,
             style: const TextStyle(
               fontSize: 12.5,
