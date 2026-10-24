@@ -507,6 +507,9 @@ class AppLocalizationsJa extends AppLocalizations {
   String get infoSectionConnGroup => '接続グループ';
 
   @override
+  String get infoSectionKvNamespace => 'キャッシュ名前空間';
+
+  @override
   String get infoSectionTable => 'テーブル';
 
   @override
@@ -514,6 +517,9 @@ class AppLocalizationsJa extends AppLocalizations {
 
   @override
   String get fieldType => 'タイプ';
+
+  @override
+  String get fieldKeyCount => 'キー数';
 
   @override
   String get fieldHost => 'ホスト';
@@ -1611,6 +1617,9 @@ class AppLocalizationsJa extends AppLocalizations {
   String get gridStop => '停止';
 
   @override
+  String get gridReadOnlyBrowse => 'この接続は読み取り専用です。グリッド内での編集や保存はできません。';
+
+  @override
   String gridPagerRange(String from, String to, String total) {
     return '$from-$to / 全 $total 件';
   }
@@ -1755,6 +1764,9 @@ class AppLocalizationsJa extends AppLocalizations {
 
   @override
   String get gridCellEditorPanelTitle => 'セルエディター';
+
+  @override
+  String get gridCellCopyOne => 'セルをコピー';
 
   @override
   String get gridCellCopyAs => '形式を指定してコピー';
@@ -2058,4 +2070,165 @@ class AppLocalizationsJa extends AppLocalizations {
   String matvIndexDropConfirm(String name) {
     return 'インデックス「$name」を削除しますか?\nDROP INDEX を実行し、元に戻せません。';
   }
+
+  @override
+  String get sqlRunAtCursor => '現在の文を実行';
+
+  @override
+  String get sqlRunSelected => '選択部分を実行';
+
+  @override
+  String get sqlRunAll => 'すべて実行';
+
+  @override
+  String get sqlMenuCopy => 'コピー';
+
+  @override
+  String get sqlMenuPaste => '貼り付け';
+
+  @override
+  String get sqlMenuSelectAll => 'すべて選択';
+
+  @override
+  String get kvTabCategory => 'キー参照';
+
+  @override
+  String get kvPatternHint => 'キー名のパターンで絞り込み(glob、例 scan:*)';
+
+  @override
+  String get kvTypeAll => 'すべての型';
+
+  @override
+  String get kvActionRefresh => '更新';
+
+  @override
+  String get kvActionLoadMore => 'さらに読み込む';
+
+  @override
+  String get kvActionReadMore => '続きを読む';
+
+  @override
+  String get kvColKeyName => 'キー名';
+
+  @override
+  String get kvColType => '型';
+
+  @override
+  String get kvColTtl => 'TTL';
+
+  @override
+  String get kvColEncoding => 'エンコーディング';
+
+  @override
+  String get kvColBytes => 'バイト';
+
+  @override
+  String get kvColField => 'フィールド';
+
+  @override
+  String get kvColIndex => '番号';
+
+  @override
+  String get kvColEntryId => 'エントリ ID';
+
+  @override
+  String get kvColScore => 'スコア';
+
+  @override
+  String get kvColMember => 'メンバー';
+
+  @override
+  String get kvColValue => '値';
+
+  @override
+  String get kvTypeString => '文字列';
+
+  @override
+  String get kvTypeList => 'リスト';
+
+  @override
+  String get kvTypeSet => 'セット';
+
+  @override
+  String get kvTypeZset => 'ソート済みセット';
+
+  @override
+  String get kvTypeHash => 'ハッシュ';
+
+  @override
+  String get kvTypeStream => 'ストリーム';
+
+  @override
+  String get kvTypeNone => '存在せず';
+
+  @override
+  String get kvTypeUnknown => '不明';
+
+  @override
+  String get kvTtlNone => '期限なし';
+
+  @override
+  String get kvTtlDay => '日';
+
+  @override
+  String get kvScanning => 'スキャン中…';
+
+  @override
+  String get kvScanComplete => '走査完了';
+
+  @override
+  String get kvRoundCapHint => '今回のラウンドで該当なし、続けて読み込めます';
+
+  @override
+  String kvLoadedCount(String loaded) {
+    return '$loaded 件のキーを読み込み済み';
+  }
+
+  @override
+  String kvLoadedOfTotal(String loaded, String total) {
+    return '$loaded 件のキーを読み込み済み / 約 $total';
+  }
+
+  @override
+  String get kvNoMatch => '条件に一致するキーはありません';
+
+  @override
+  String get kvNoMatchYet => 'まだ一致するキーは見つかっていません。「さらに読み込む」で続行できます';
+
+  @override
+  String kvLoadFailed(String error) {
+    return 'キー一覧の読み込みに失敗:$error';
+  }
+
+  @override
+  String kvValueFailed(String error) {
+    return '値の読み込みに失敗:$error';
+  }
+
+  @override
+  String get kvPickKey => '左のキーを選ぶと値を表示します';
+
+  @override
+  String get kvKeyGone => 'このキーは存在しません(期限切れまたは削除)';
+
+  @override
+  String kvValueBytes(String total) {
+    return '全 $total バイト';
+  }
+
+  @override
+  String kvValueCount(String total) {
+    return '全 $total 件';
+  }
+
+  @override
+  String kvValueTruncated(String shown, String total) {
+    return '値が大きいため先頭 $shown / $total バイトを表示中';
+  }
+
+  @override
+  String get kvConnectionGone => 'この接続は存在しないためキーを読めません';
+
+  @override
+  String get kvScanUnsupported => 'このエンジンキー列挙には対応していません';
 }

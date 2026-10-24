@@ -515,6 +515,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get infoSectionConnGroup => 'Connection group';
 
   @override
+  String get infoSectionKvNamespace => 'Cache namespace';
+
+  @override
   String get infoSectionTable => 'Table';
 
   @override
@@ -522,6 +525,9 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get fieldType => 'Type';
+
+  @override
+  String get fieldKeyCount => 'Key count';
 
   @override
   String get fieldHost => 'Host';
@@ -1625,6 +1631,10 @@ class AppLocalizationsEn extends AppLocalizations {
   String get gridStop => 'Stop';
 
   @override
+  String get gridReadOnlyBrowse =>
+      'This connection is read-only; data cannot be edited or saved in the grid.';
+
+  @override
   String gridPagerRange(String from, String to, String total) {
     return '$from-$to of $total';
   }
@@ -1769,6 +1779,9 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get gridCellEditorPanelTitle => 'Cell Editor';
+
+  @override
+  String get gridCellCopyOne => 'Copy Cell';
 
   @override
   String get gridCellCopyAs => 'Copy As';
@@ -2078,4 +2091,166 @@ class AppLocalizationsEn extends AppLocalizations {
   String matvIndexDropConfirm(String name) {
     return 'Drop index \"$name\"?\nThis runs DROP INDEX and cannot be undone.';
   }
+
+  @override
+  String get sqlRunAtCursor => 'Run Current Statement';
+
+  @override
+  String get sqlRunSelected => 'Run Selected';
+
+  @override
+  String get sqlRunAll => 'Run All';
+
+  @override
+  String get sqlMenuCopy => 'Copy';
+
+  @override
+  String get sqlMenuPaste => 'Paste';
+
+  @override
+  String get sqlMenuSelectAll => 'Select All';
+
+  @override
+  String get kvTabCategory => 'Key browser';
+
+  @override
+  String get kvPatternHint => 'Filter by key name pattern (glob, e.g. scan:*)';
+
+  @override
+  String get kvTypeAll => 'All types';
+
+  @override
+  String get kvActionRefresh => 'Refresh';
+
+  @override
+  String get kvActionLoadMore => 'Load More';
+
+  @override
+  String get kvActionReadMore => 'Read rest';
+
+  @override
+  String get kvColKeyName => 'Key';
+
+  @override
+  String get kvColType => 'Type';
+
+  @override
+  String get kvColTtl => 'TTL';
+
+  @override
+  String get kvColEncoding => 'Encoding';
+
+  @override
+  String get kvColBytes => 'Bytes';
+
+  @override
+  String get kvColField => 'Field';
+
+  @override
+  String get kvColIndex => 'Index';
+
+  @override
+  String get kvColEntryId => 'Entry ID';
+
+  @override
+  String get kvColScore => 'Score';
+
+  @override
+  String get kvColMember => 'Member';
+
+  @override
+  String get kvColValue => 'Value';
+
+  @override
+  String get kvTypeString => 'String';
+
+  @override
+  String get kvTypeList => 'List';
+
+  @override
+  String get kvTypeSet => 'Set';
+
+  @override
+  String get kvTypeZset => 'Sorted set';
+
+  @override
+  String get kvTypeHash => 'Hash';
+
+  @override
+  String get kvTypeStream => 'Stream';
+
+  @override
+  String get kvTypeNone => 'Missing';
+
+  @override
+  String get kvTypeUnknown => 'Unknown';
+
+  @override
+  String get kvTtlNone => 'No expiry';
+
+  @override
+  String get kvTtlDay => 'd';
+
+  @override
+  String get kvScanning => 'Scanning…';
+
+  @override
+  String get kvScanComplete => 'Fully scanned';
+
+  @override
+  String get kvRoundCapHint => 'No hit in this round, keep loading';
+
+  @override
+  String kvLoadedCount(String loaded) {
+    return '$loaded keys loaded';
+  }
+
+  @override
+  String kvLoadedOfTotal(String loaded, String total) {
+    return '$loaded keys loaded / about $total';
+  }
+
+  @override
+  String get kvNoMatch => 'No keys match the filter';
+
+  @override
+  String get kvNoMatchYet =>
+      'No matching key found yet — use Load More to keep scanning';
+
+  @override
+  String kvLoadFailed(String error) {
+    return 'Failed to load keys: $error';
+  }
+
+  @override
+  String kvValueFailed(String error) {
+    return 'Failed to read value: $error';
+  }
+
+  @override
+  String get kvPickKey => 'Select a key on the left to view its value';
+
+  @override
+  String get kvKeyGone => 'This key no longer exists (expired or deleted)';
+
+  @override
+  String kvValueBytes(String total) {
+    return '$total bytes';
+  }
+
+  @override
+  String kvValueCount(String total) {
+    return '$total items';
+  }
+
+  @override
+  String kvValueTruncated(String shown, String total) {
+    return 'Large value — first $shown of $total bytes shown';
+  }
+
+  @override
+  String get kvConnectionGone => 'This connection no longer exists';
+
+  @override
+  String get kvScanUnsupported => 'This engine cannot enumerate keys';
 }

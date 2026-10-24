@@ -1018,6 +1018,12 @@ abstract class AppLocalizations {
   /// **'连接分组'**
   String get infoSectionConnGroup;
 
+  /// No description provided for @infoSectionKvNamespace.
+  ///
+  /// In zh, this message translates to:
+  /// **'缓存命名空间'**
+  String get infoSectionKvNamespace;
+
   /// No description provided for @infoSectionTable.
   ///
   /// In zh, this message translates to:
@@ -1035,6 +1041,12 @@ abstract class AppLocalizations {
   /// In zh, this message translates to:
   /// **'类型'**
   String get fieldType;
+
+  /// No description provided for @fieldKeyCount.
+  ///
+  /// In zh, this message translates to:
+  /// **'键数量'**
+  String get fieldKeyCount;
 
   /// No description provided for @fieldHost.
   ///
@@ -2890,6 +2902,12 @@ abstract class AppLocalizations {
   /// **'停止'**
   String get gridStop;
 
+  /// No description provided for @gridReadOnlyBrowse.
+  ///
+  /// In zh, this message translates to:
+  /// **'该连接为只读浏览,数据不可在网格中编辑或保存。'**
+  String get gridReadOnlyBrowse;
+
   /// No description provided for @gridPagerRange.
   ///
   /// In zh, this message translates to:
@@ -3135,6 +3153,12 @@ abstract class AppLocalizations {
   /// In zh, this message translates to:
   /// **'单元格编辑器'**
   String get gridCellEditorPanelTitle;
+
+  /// No description provided for @gridCellCopyOne.
+  ///
+  /// In zh, this message translates to:
+  /// **'复制单元格'**
+  String get gridCellCopyOne;
 
   /// No description provided for @gridCellCopyAs.
   ///
@@ -3657,6 +3681,300 @@ abstract class AppLocalizations {
   /// In zh, this message translates to:
   /// **'确定删除索引「{name}」吗?\n将执行 DROP INDEX,不可恢复。'**
   String matvIndexDropConfirm(String name);
+
+  /// No description provided for @sqlRunAtCursor.
+  ///
+  /// In zh, this message translates to:
+  /// **'运行当前语句'**
+  String get sqlRunAtCursor;
+
+  /// No description provided for @sqlRunSelected.
+  ///
+  /// In zh, this message translates to:
+  /// **'运行已选择的'**
+  String get sqlRunSelected;
+
+  /// No description provided for @sqlRunAll.
+  ///
+  /// In zh, this message translates to:
+  /// **'运行全部'**
+  String get sqlRunAll;
+
+  /// No description provided for @sqlMenuCopy.
+  ///
+  /// In zh, this message translates to:
+  /// **'复制'**
+  String get sqlMenuCopy;
+
+  /// No description provided for @sqlMenuPaste.
+  ///
+  /// In zh, this message translates to:
+  /// **'粘贴'**
+  String get sqlMenuPaste;
+
+  /// No description provided for @sqlMenuSelectAll.
+  ///
+  /// In zh, this message translates to:
+  /// **'全选'**
+  String get sqlMenuSelectAll;
+
+  /// No description provided for @kvTabCategory.
+  ///
+  /// In zh, this message translates to:
+  /// **'键浏览'**
+  String get kvTabCategory;
+
+  /// No description provided for @kvPatternHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'按键名模式过滤(glob,如 scan:*)'**
+  String get kvPatternHint;
+
+  /// No description provided for @kvTypeAll.
+  ///
+  /// In zh, this message translates to:
+  /// **'全部类型'**
+  String get kvTypeAll;
+
+  /// No description provided for @kvActionRefresh.
+  ///
+  /// In zh, this message translates to:
+  /// **'刷新'**
+  String get kvActionRefresh;
+
+  /// No description provided for @kvActionLoadMore.
+  ///
+  /// In zh, this message translates to:
+  /// **'加载更多'**
+  String get kvActionLoadMore;
+
+  /// No description provided for @kvActionReadMore.
+  ///
+  /// In zh, this message translates to:
+  /// **'读取后续内容'**
+  String get kvActionReadMore;
+
+  /// No description provided for @kvColKeyName.
+  ///
+  /// In zh, this message translates to:
+  /// **'键名'**
+  String get kvColKeyName;
+
+  /// No description provided for @kvColType.
+  ///
+  /// In zh, this message translates to:
+  /// **'类型'**
+  String get kvColType;
+
+  /// No description provided for @kvColTtl.
+  ///
+  /// In zh, this message translates to:
+  /// **'TTL'**
+  String get kvColTtl;
+
+  /// No description provided for @kvColEncoding.
+  ///
+  /// In zh, this message translates to:
+  /// **'编码'**
+  String get kvColEncoding;
+
+  /// No description provided for @kvColBytes.
+  ///
+  /// In zh, this message translates to:
+  /// **'字节'**
+  String get kvColBytes;
+
+  /// No description provided for @kvColField.
+  ///
+  /// In zh, this message translates to:
+  /// **'字段'**
+  String get kvColField;
+
+  /// No description provided for @kvColIndex.
+  ///
+  /// In zh, this message translates to:
+  /// **'下标'**
+  String get kvColIndex;
+
+  /// No description provided for @kvColEntryId.
+  ///
+  /// In zh, this message translates to:
+  /// **'条目 ID'**
+  String get kvColEntryId;
+
+  /// No description provided for @kvColScore.
+  ///
+  /// In zh, this message translates to:
+  /// **'分数'**
+  String get kvColScore;
+
+  /// No description provided for @kvColMember.
+  ///
+  /// In zh, this message translates to:
+  /// **'成员'**
+  String get kvColMember;
+
+  /// No description provided for @kvColValue.
+  ///
+  /// In zh, this message translates to:
+  /// **'值'**
+  String get kvColValue;
+
+  /// No description provided for @kvTypeString.
+  ///
+  /// In zh, this message translates to:
+  /// **'字符串'**
+  String get kvTypeString;
+
+  /// No description provided for @kvTypeList.
+  ///
+  /// In zh, this message translates to:
+  /// **'列表'**
+  String get kvTypeList;
+
+  /// No description provided for @kvTypeSet.
+  ///
+  /// In zh, this message translates to:
+  /// **'集合'**
+  String get kvTypeSet;
+
+  /// No description provided for @kvTypeZset.
+  ///
+  /// In zh, this message translates to:
+  /// **'有序集合'**
+  String get kvTypeZset;
+
+  /// No description provided for @kvTypeHash.
+  ///
+  /// In zh, this message translates to:
+  /// **'哈希'**
+  String get kvTypeHash;
+
+  /// No description provided for @kvTypeStream.
+  ///
+  /// In zh, this message translates to:
+  /// **'流'**
+  String get kvTypeStream;
+
+  /// No description provided for @kvTypeNone.
+  ///
+  /// In zh, this message translates to:
+  /// **'不存在'**
+  String get kvTypeNone;
+
+  /// No description provided for @kvTypeUnknown.
+  ///
+  /// In zh, this message translates to:
+  /// **'未知'**
+  String get kvTypeUnknown;
+
+  /// No description provided for @kvTtlNone.
+  ///
+  /// In zh, this message translates to:
+  /// **'不过期'**
+  String get kvTtlNone;
+
+  /// No description provided for @kvTtlDay.
+  ///
+  /// In zh, this message translates to:
+  /// **'天'**
+  String get kvTtlDay;
+
+  /// No description provided for @kvScanning.
+  ///
+  /// In zh, this message translates to:
+  /// **'扫描中…'**
+  String get kvScanning;
+
+  /// No description provided for @kvScanComplete.
+  ///
+  /// In zh, this message translates to:
+  /// **'已遍历完'**
+  String get kvScanComplete;
+
+  /// No description provided for @kvRoundCapHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'本轮未命中,可继续加载'**
+  String get kvRoundCapHint;
+
+  /// No description provided for @kvLoadedCount.
+  ///
+  /// In zh, this message translates to:
+  /// **'已加载 {loaded} 个键'**
+  String kvLoadedCount(String loaded);
+
+  /// No description provided for @kvLoadedOfTotal.
+  ///
+  /// In zh, this message translates to:
+  /// **'已加载 {loaded} 个键 / 约 {total}'**
+  String kvLoadedOfTotal(String loaded, String total);
+
+  /// No description provided for @kvNoMatch.
+  ///
+  /// In zh, this message translates to:
+  /// **'没有符合条件的键'**
+  String get kvNoMatch;
+
+  /// No description provided for @kvNoMatchYet.
+  ///
+  /// In zh, this message translates to:
+  /// **'尚未扫到符合条件的键,可点「加载更多」继续'**
+  String get kvNoMatchYet;
+
+  /// No description provided for @kvLoadFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'键列表读取失败:{error}'**
+  String kvLoadFailed(String error);
+
+  /// No description provided for @kvValueFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'值读取失败:{error}'**
+  String kvValueFailed(String error);
+
+  /// No description provided for @kvPickKey.
+  ///
+  /// In zh, this message translates to:
+  /// **'选择左侧的键查看值'**
+  String get kvPickKey;
+
+  /// No description provided for @kvKeyGone.
+  ///
+  /// In zh, this message translates to:
+  /// **'该键已不存在(可能刚过期或被删除)'**
+  String get kvKeyGone;
+
+  /// No description provided for @kvValueBytes.
+  ///
+  /// In zh, this message translates to:
+  /// **'共 {total} 字节'**
+  String kvValueBytes(String total);
+
+  /// No description provided for @kvValueCount.
+  ///
+  /// In zh, this message translates to:
+  /// **'共 {total} 项'**
+  String kvValueCount(String total);
+
+  /// No description provided for @kvValueTruncated.
+  ///
+  /// In zh, this message translates to:
+  /// **'值较大,已显示前 {shown} / {total} 字节'**
+  String kvValueTruncated(String shown, String total);
+
+  /// No description provided for @kvConnectionGone.
+  ///
+  /// In zh, this message translates to:
+  /// **'该连接已不存在,无法读取键'**
+  String get kvConnectionGone;
+
+  /// No description provided for @kvScanUnsupported.
+  ///
+  /// In zh, this message translates to:
+  /// **'该引擎不支持枚举键'**
+  String get kvScanUnsupported;
 }
 
 class _AppLocalizationsDelegate

@@ -72,3 +72,7 @@ pubspec.lock
 /pr6.diff
 /pr6-comment.md
 /package-lock.json
+
+# 探针脚手架:内含本地测试实例的口令(requirepass / SCRAM 账号),绝不入库
+.redis_probe/
+.mongo_probe/

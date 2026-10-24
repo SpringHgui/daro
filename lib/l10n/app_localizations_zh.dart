@@ -504,6 +504,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get infoSectionConnGroup => '连接分组';
 
   @override
+  String get infoSectionKvNamespace => '缓存命名空间';
+
+  @override
   String get infoSectionTable => '表';
 
   @override
@@ -511,6 +514,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get fieldType => '类型';
+
+  @override
+  String get fieldKeyCount => '键数量';
 
   @override
   String get fieldHost => '主机';
@@ -1604,6 +1610,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get gridStop => '停止';
 
   @override
+  String get gridReadOnlyBrowse => '该连接为只读浏览,数据不可在网格中编辑或保存。';
+
+  @override
   String gridPagerRange(String from, String to, String total) {
     return '第 $from-$to 条 / 共 $total 条';
   }
@@ -1748,6 +1757,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get gridCellEditorPanelTitle => '单元格编辑器';
+
+  @override
+  String get gridCellCopyOne => '复制单元格';
 
   @override
   String get gridCellCopyAs => '复制为';
@@ -2049,4 +2061,165 @@ class AppLocalizationsZh extends AppLocalizations {
   String matvIndexDropConfirm(String name) {
     return '确定删除索引「$name」吗?\n将执行 DROP INDEX,不可恢复。';
   }
+
+  @override
+  String get sqlRunAtCursor => '运行当前语句';
+
+  @override
+  String get sqlRunSelected => '运行已选择的';
+
+  @override
+  String get sqlRunAll => '运行全部';
+
+  @override
+  String get sqlMenuCopy => '复制';
+
+  @override
+  String get sqlMenuPaste => '粘贴';
+
+  @override
+  String get sqlMenuSelectAll => '全选';
+
+  @override
+  String get kvTabCategory => '键浏览';
+
+  @override
+  String get kvPatternHint => '按键名模式过滤(glob,如 scan:*)';
+
+  @override
+  String get kvTypeAll => '全部类型';
+
+  @override
+  String get kvActionRefresh => '刷新';
+
+  @override
+  String get kvActionLoadMore => '加载更多';
+
+  @override
+  String get kvActionReadMore => '读取后续内容';
+
+  @override
+  String get kvColKeyName => '键名';
+
+  @override
+  String get kvColType => '类型';
+
+  @override
+  String get kvColTtl => 'TTL';
+
+  @override
+  String get kvColEncoding => '编码';
+
+  @override
+  String get kvColBytes => '字节';
+
+  @override
+  String get kvColField => '字段';
+
+  @override
+  String get kvColIndex => '下标';
+
+  @override
+  String get kvColEntryId => '条目 ID';
+
+  @override
+  String get kvColScore => '分数';
+
+  @override
+  String get kvColMember => '成员';
+
+  @override
+  String get kvColValue => '值';
+
+  @override
+  String get kvTypeString => '字符串';
+
+  @override
+  String get kvTypeList => '列表';
+
+  @override
+  String get kvTypeSet => '集合';
+
+  @override
+  String get kvTypeZset => '有序集合';
+
+  @override
+  String get kvTypeHash => '哈希';
+
+  @override
+  String get kvTypeStream => '流';
+
+  @override
+  String get kvTypeNone => '不存在';
+
+  @override
+  String get kvTypeUnknown => '未知';
+
+  @override
+  String get kvTtlNone => '不过期';
+
+  @override
+  String get kvTtlDay => '天';
+
+  @override
+  String get kvScanning => '扫描中…';
+
+  @override
+  String get kvScanComplete => '已遍历完';
+
+  @override
+  String get kvRoundCapHint => '本轮未命中,可继续加载';
+
+  @override
+  String kvLoadedCount(String loaded) {
+    return '已加载 $loaded 个键';
+  }
+
+  @override
+  String kvLoadedOfTotal(String loaded, String total) {
+    return '已加载 $loaded 个键 / 约 $total';
+  }
+
+  @override
+  String get kvNoMatch => '没有符合条件的键';
+
+  @override
+  String get kvNoMatchYet => '尚未扫到符合条件的键,可点「加载更多」继续';
+
+  @override
+  String kvLoadFailed(String error) {
+    return '键列表读取失败:$error';
+  }
+
+  @override
+  String kvValueFailed(String error) {
+    return '值读取失败:$error';
+  }
+
+  @override
+  String get kvPickKey => '选择左侧的键查看值';
+
+  @override
+  String get kvKeyGone => '该键已不存在(可能刚过期或被删除)';
+
+  @override
+  String kvValueBytes(String total) {
+    return '共 $total 字节';
+  }
+
+  @override
+  String kvValueCount(String total) {
+    return '共 $total 项';
+  }
+
+  @override
+  String kvValueTruncated(String shown, String total) {
+    return '值较大,已显示前 $shown / $total 字节';
+  }
+
+  @override
+  String get kvConnectionGone => '该连接已不存在,无法读取键';
+
+  @override
+  String get kvScanUnsupported => '该引擎不支持枚举键';
 }
