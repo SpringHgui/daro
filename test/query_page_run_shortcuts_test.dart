@@ -15,7 +15,8 @@ import 'package:provider/provider.dart';
 import 'package:re_editor/re_editor.dart';
 
 // 查询编辑页的运行入口:F5 / F9 / Ctrl+Enter 跑「光标所在语句」,
-// 右键菜单给运行当前 / 运行已选择的 / 运行全部 + 剪贴板四项。
+// 右键菜单只给一个运行项 —— 落点在选区内就是「运行已选择的」,否则是
+// 「运行当前语句」;整篇执行归工具栏 ▾ 的「运行全部」。
 //
 // 这里守的是两件看不见的事:
 // 1. 快捷键只能作用在查询页(焦点域是编辑区的祖先 Focus,不吞 Ctrl+C/V/A
@@ -90,17 +91,21 @@ class _Ctx {
     await tester.pump();
   }
 
-  /// 在编辑区按下右键(按下即弹,不等抬起 —— 与网格同一口径)
-  Future<void> rightClickEditor(WidgetTester tester) async {
+  /// 在编辑区 [line] 行(0 起)按下右键(按下即弹,不等抬起 —— 与网格同一口径)
+  Future<void> rightClickLine(WidgetTester tester, int line) async {
     final top = tester.getTopLeft(editor);
     final gesture = await tester.startGesture(
-      Offset(top.dx + 90, top.dy + 28),
+      Offset(top.dx + 90, top.dy + 8 + line * 20 + 10),
       kind: PointerDeviceKind.mouse,
       buttons: kSecondaryButton,
     );
     await gesture.up();
     await _settle(tester);
   }
+
+  /// 在编辑区按下右键(按下即弹,不等抬起 —— 与网格同一口径)
+  Future<void> rightClickEditor(WidgetTester tester) =>
+      rightClickLine(tester, 1);
 }
 
 Future<void> _settle(WidgetTester tester) async {
@@ -294,37 +299,62 @@ void main() {
   });
 
   group('编辑区右键菜单', () {
-    testWidgets('四项运行 + 剪贴板齐全,运行项带 F5 提示', (tester) async {
+    testWidgets('无选区:运行项只有「运行当前语句」,带 F5 提示', (tester) async {
       final ctx = await _openPage(tester, sql: _script);
 
       await ctx.rightClickEditor(tester);
 
       expect(_menuItem('运行当前语句'), findsOneWidget);
-      expect(_menuItem('运行已选择的'), findsOneWidget);
-      expect(_menuItem('运行全部'), findsOneWidget);
+      expect(_menuItem('运行已选择的'), findsNothing,
+          reason: '运行项只给一个,落点不在选区内就不该出现「已选择的」');
+      expect(_menuItem('运行全部'), findsNothing,
+          reason: '整篇执行归工具栏 ▾,右键菜单不再并列三项');
       expect(_menuItem('复制'), findsOneWidget);
       expect(_menuItem('粘贴'), findsOneWidget);
       expect(_menuItem('全选'), findsOneWidget);
     });
 
-    testWidgets('「运行全部」逐条发送三条语句', (tester) async {
+    testWidgets('右键落在选区内:运行项换成「运行已选择的」', (tester) async {
       final ctx = await _openPage(tester, sql: _script);
 
+      await ctx.tapLine(tester, 1);
       await ctx.rightClickEditor(tester);
-      await tester.tap(_menuItem('运行全部'));
+      await tester.tap(_menuItem('全选'));
+      await _settle(tester);
+      // 右键点(第 1 行)仍在全选范围内 → 选区保留,文案跟着换
+      await ctx.rightClickLine(tester, 1);
+
+      expect(_menuItem('运行已选择的'), findsOneWidget);
+      expect(_menuItem('运行当前语句'), findsNothing);
+    });
+
+    testWidgets('右键落在选区外:选区收掉,只跑落点那条', (tester) async {
+      final ctx = await _openPage(tester, sql: _script);
+
+      // 直接给控制器造「前两行」的选区:拖选在 widget 测试里被滚动手势抢走、
+      // Shift+方向键走 IME 通道也造不出,而本页要守的是右键落点与选区的关系
+      tester.widget<CodeEditor>(ctx.editor).controller!.selection =
+          const CodeLineSelection(
+              baseIndex: 0, baseOffset: 0, extentIndex: 1, extentOffset: 8);
+      await _settle(tester);
+      await ctx.rightClickLine(tester, 2);
+      await tester.tap(_menuItem('运行当前语句'));
+      await _settle(tester);
+
+      expect(ctx.driver.sqls, ['SELECT 3'],
+          reason: '右键点在选区外,光标已移过去,跑的不是刚才那段选区');
+    });
+
+    testWidgets('工具栏 ▾ 的「运行全部」逐条发送三条语句', (tester) async {
+      final ctx = await _openPage(tester, sql: _script);
+
+      await tester.tap(find.byIcon(Icons.arrow_drop_down),
+          kind: PointerDeviceKind.mouse);
+      await _settle(tester);
+      await tester.tap(find.text('运行全部'), kind: PointerDeviceKind.mouse);
       await _settle(tester);
 
       expect(ctx.driver.sqls, ['SELECT 1', 'SELECT 2', 'SELECT 3']);
-    });
-
-    testWidgets('无选区时「运行已选择的」点不动(不静默跑整篇)', (tester) async {
-      final ctx = await _openPage(tester, sql: _script);
-
-      await ctx.rightClickEditor(tester);
-      await tester.tap(_menuItem('运行已选择的'));
-      await _settle(tester);
-
-      expect(ctx.driver.sqls, isEmpty);
     });
 
     testWidgets('「运行当前语句」与 F5 同口径:只跑光标那条', (tester) async {

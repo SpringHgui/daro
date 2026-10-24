@@ -10,7 +10,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
-import 'package:re_editor/re_editor.dart';
 
 // 查询页输出区的「可选、可复制」:
 // 1. 消息 tab 的整份日志是**一个**选择区(不是每条一个 Text),否则排查报错时
@@ -103,20 +102,12 @@ Future<void> _runTo(WidgetTester tester, String tabLabel) async {
     ),
   );
   await _settle(tester);
-  // 让两条语句都跑:右键编辑区 →「运行全部」
+  // 让两条语句都跑:工具栏 ▾ →「运行全部」
   // (F5 只跑光标所在那条,拿不到「一条成功 + 一条出错」的日志)
-  final editorTop = tester.getTopLeft(find.byType(CodeEditor));
-  final rightClick = await tester.startGesture(
-    Offset(editorTop.dx + 90, editorTop.dy + 28),
-    kind: PointerDeviceKind.mouse,
-    buttons: kSecondaryButton,
-  );
-  await rightClick.up();
+  await tester.tap(find.byIcon(Icons.arrow_drop_down),
+      kind: PointerDeviceKind.mouse);
   await _settle(tester);
-  await tester.tap(find.descendant(
-    of: find.byType(Overlay),
-    matching: find.text('运行全部'),
-  ), kind: PointerDeviceKind.mouse);
+  await tester.tap(find.text('运行全部'), kind: PointerDeviceKind.mouse);
   await _settle(tester);
   await tester.tap(find.text(tabLabel).first, kind: PointerDeviceKind.mouse);
   await _settle(tester);

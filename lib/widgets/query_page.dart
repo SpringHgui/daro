@@ -18,6 +18,7 @@ import '../data/sql_split.dart';
 import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
 import 'result_export_dialog.dart';
+import 'sql_find_bar.dart';
 
 /// 结果网格行高(与表数据页一致)
 const double _rowHeight = 22.0;
@@ -52,6 +53,12 @@ const Color _errorColor = Color(0xffd93025);
 const Color _runBlue = Color(0xff0092ff);
 const Color _stopIdleRed = Color(0xfff79e95);
 const Color _explainBlue = Color(0xff50a0f0);
+
+/// SQL 编辑区排版常量:右键落点 → 文档位置的换算要用同一套数值
+/// (见 [_QueryPageState._documentPositionAt]),改样式必须连那边一起改
+const double _kSqlFontSize = 13.5;
+const double _kSqlLineHeight = 20.0;
+const double _kSqlEditorPadding = 8.0;
 
 /// 单条语句的执行结果(结果面板每条语句一个 tab,同 pgAdmin)。
 /// [result] 与 [error] 互斥:成功取结果(写操作结果无列),失败取错误文本
@@ -109,6 +116,10 @@ class QueryPage extends StatefulWidget {
 class _QueryPageState extends State<QueryPage> {
   final CodeLineEditingController _controller =
       CodeLineEditingController.fromText('');
+  /// 查找 / 替换状态(Ctrl+F / Ctrl+H 唤起顶部 SqlFindBar);模式与命中结果都归它,
+  /// 本 State 只负责把它交给 CodeEditor。
+  late final CodeFindController _findController =
+      CodeFindController(_controller);
   /// 运行快捷键挂在**这个节点自身**上(initState 里绑定),不是祖先 Focus:
   /// 祖先层收不到 Ctrl+Enter(中间的补全层把 Enter 消费了)。
   final FocusNode _focusNode = FocusNode();
@@ -167,6 +178,13 @@ class _QueryPageState extends State<QueryPage> {
 
   /// 「运行 ▾」拆分按钮的下拉菜单控制器
   final OverlayController _runMenu = OverlayController();
+
+  /// 编辑区 / 行号槽的 key:右键落点换算要量编辑区原点与行号槽宽
+  final GlobalKey _editorKey = GlobalKey();
+  final GlobalKey _lineNumberKey = GlobalKey();
+
+  /// 编辑区滚动控制器:右键落点换算要扣掉滚动偏移(自建才能读 offset)
+  final CodeScrollController _editorScroll = CodeScrollController();
 
   /// ConnectionManager 监听:库列表加载状态变化时刷新数据库下拉弹层
   ConnectionManager? _listenedManager;
@@ -272,6 +290,8 @@ class _QueryPageState extends State<QueryPage> {
     _runMenu.dispose();
     // controller 销毁前再持久化一次当前文本(用 didChangeDependencies 缓存的引用,不可走 context.read)
     _appState?.updateQueryText(_tabKey, _controller.text);
+    _findController.dispose();
+    _editorScroll.dispose();
     _controller.dispose();
     _focusNode.dispose();
     super.dispose();
@@ -578,37 +598,44 @@ class _QueryPageState extends State<QueryPage> {
   Widget build(BuildContext context) {
     final t = Tokens.of(context);
     final panelVisible = _running || _outcomes.isNotEmpty || _message != null;
-    return Container(
-      color: t.background,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _toolbar(t),
-          _connectionBar(t),
-          Expanded(
-            // 编辑区右键菜单挂在这一层:Listener 不消费事件,按下右键即弹、
-            // 零延迟。运行快捷键不在这里,见 [_onEditorKey] —— 祖先层收不到
-            // Ctrl+Enter。
-            child: Listener(
-              behavior: HitTestBehavior.translucent,
-              onPointerDown: _onEditorPointerDown,
-              child: _editor(t),
+    return Focus(
+      // 兜底接查找 / 替换:编辑器有焦点时这两个键由 re_editor 自己的 Shortcuts
+      // 派发(见 `_editor`),焦点落在结果网格、上下文栏等别处时才轮到这一层。
+      // canRequestFocus: false —— 本节点只是按键链上的一站,不参与 Tab 巡回。
+      canRequestFocus: false,
+      onKeyEvent: _onPageFindKey,
+      child: Container(
+        color: t.background,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _toolbar(t),
+            _connectionBar(t),
+            Expanded(
+              // 编辑区右键菜单挂在这一层:Listener 不消费事件,按下右键即弹、
+              // 零延迟。运行快捷键不在这里,见 [_onEditorKey] —— 祖先层收不到
+              // Ctrl+Enter。
+              child: Listener(
+                behavior: HitTestBehavior.translucent,
+                onPointerDown: _onEditorPointerDown,
+                child: _editor(t),
+              ),
             ),
-          ),
-          if (panelVisible) ...[
-            // 顶边分隔条:上下拖动改变结果面板高度(编辑区随之伸缩)。
-            // 与表数据页底部单元格编辑器同一套 Splitter 口径:不画自己的
-            // 发丝线 / 不做 hover 高亮,分割线由面板自身的顶边框承担,
-            // 拖动反馈靠 resizeUpDown 光标(Splitter 内部已设)。
-            Splitter(
-              orientation: Axis.vertical,
-              showHairline: false,
-              showHoverHighlight: false,
-              onDrag: _resizeResultPanel,
-            ),
-            _resultPanel(t),
+            if (panelVisible) ...[
+              // 顶边分隔条:上下拖动改变结果面板高度(编辑区随之伸缩)。
+              // 与表数据页底部单元格编辑器同一套 Splitter 口径:不画自己的
+              // 发丝线 / 不做 hover 高亮,分割线由面板自身的顶边框承担,
+              // 拖动反馈靠 resizeUpDown 光标(Splitter 内部已设)。
+              Splitter(
+                orientation: Axis.vertical,
+                showHairline: false,
+                showHoverHighlight: false,
+                onDrag: _resizeResultPanel,
+              ),
+              _resultPanel(t),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }
@@ -816,8 +843,9 @@ class _QueryPageState extends State<QueryPage> {
     );
   }
 
-  /// 运行下拉菜单:「运行」始终执行全部文本;「运行已选择的」仅在有选区时可用
+  /// 运行下拉菜单:「运行全部」始终执行整篇文本;「运行已选择的」仅在有选区时可用
   Widget _runMenuList(AppPalette t) {
+    final l = context.l10n;
     final hasSelection = _selectedSql != null;
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -826,7 +854,7 @@ class _QueryPageState extends State<QueryPage> {
         ListItem(
           height: 24,
           leading: const SizedBox(width: 16),
-          title: '运行',
+          title: l.sqlRunAll,
           hoverBase: t.popover,
           onSelect: () {
             _runMenu.close();
@@ -836,7 +864,7 @@ class _QueryPageState extends State<QueryPage> {
         ListItem(
           height: 24,
           leading: const SizedBox(width: 16),
-          title: '运行已选择的',
+          title: l.sqlRunSelected,
           enabled: hasSelection,
           hoverBase: t.popover,
           onSelect: () {
@@ -1051,9 +1079,35 @@ class _QueryPageState extends State<QueryPage> {
     );
   }
 
-  /// 编辑区运行键:F5 / F9 / Ctrl+Enter 都跑 `_runAtCaret()`(有选区跑选区,
-  /// 否则跑光标所在语句)。F5 与 F9 同给是照顾 SSMS 与浏览器两种肌肉记忆;
-  /// 本页 F5 = 运行,表数据页 F5 = 刷新,两页焦点域互斥不冲突。
+  /// 焦点落在编辑器之外(结果网格 / 上下文栏 / 工具栏)时的 Ctrl+F 与 Ctrl+H。
+  /// 编辑器自己有内建 Shortcuts 处理这两个键,轮不到这一层 —— 顺序是
+  /// 焦点节点的 onKeyEvent → 由近及远的祖先,`_editor` 的 Shortcuts 更近。
+  KeyEventResult _onPageFindKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent ||
+        !HardwareKeyboard.instance.isControlPressed) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyF) {
+      _findController.findMode();
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyH) {
+      _findController.replaceMode();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  /// 编辑区快捷键:Ctrl+Enter / F5 / F9 都跑 `_runAtCaret()`(有选区跑选区,
+  /// 否则跑光标所在语句),Ctrl+S 保存查询。F5 与 F9 同给是照顾 SSMS 与浏览器
+  /// 两种肌肉记忆;本页 F5 = 运行,表数据页 F5 = 刷新,两页焦点域互斥不冲突。
+  ///
+  /// Ctrl+S 必须在这里拦:re_editor 把 Ctrl+S 映射到自己的 save intent,
+  /// 却没有任何处理分支,而兜底 Action 照样吞键 —— 于是按下 Ctrl+S 毫无反应,
+  /// 请求也传不上来(此前「保存」只有工具栏入口)。
+  ///
+  /// 查找 / 替换(Ctrl+F / Ctrl+H)不在这里处理:编辑器内建 Shortcuts 会把它们
+  /// 派发给 SqlFindBar,只要 CodeEditor 收到 findController + findBuilder 就生效。
   ///
   /// 为什么挂在编辑器的 FocusNode 自身而不是祖先 Focus:实测祖先收不到
   /// Ctrl+Enter —— re_editor 把 Enter(含 Ctrl+Enter)映射成换行,中间的补全
@@ -1062,8 +1116,12 @@ class _QueryPageState extends State<QueryPage> {
   KeyEventResult _onEditorKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
     final key = event.logicalKey;
-    final ctrlEnter = key == LogicalKeyboardKey.enter &&
-        HardwareKeyboard.instance.isControlPressed;
+    final ctrl = HardwareKeyboard.instance.isControlPressed;
+    if (key == LogicalKeyboardKey.keyS && ctrl) {
+      _onSave();
+      return KeyEventResult.handled;
+    }
+    final ctrlEnter = key == LogicalKeyboardKey.enter && ctrl;
     if (!ctrlEnter &&
         key != LogicalKeyboardKey.f5 &&
         key != LogicalKeyboardKey.f9) {
@@ -1078,30 +1136,117 @@ class _QueryPageState extends State<QueryPage> {
   /// 这里不与它叠层)
   void _onEditorPointerDown(PointerDownEvent event) {
     if (event.buttons != kSecondaryMouseButton) return;
+    _moveCaretToRightClick(event.position);
     _onEditorContext(event.position);
+  }
+
+  /// 右键与左键同一口径:落点在选区外就把选区收掉、光标移到落点,否则菜单
+  /// 会顶着「运行已选择的」去跑一段用户没在指的选区。re_editor 自己右键
+  /// 不动光标(左键才动),所以这里按落点自己收。
+  void _moveCaretToRightClick(Offset global) {
+    final at = _documentPositionAt(global);
+    if (at == null) return;
+    final sel = _controller.selection;
+    if (!sel.isCollapsed && _selectionContains(sel, at)) return;
+    if (sel == at) return;
+    _controller.selection = at;
+  }
+
+  /// [p] 是否落在 [sel] 的起止之间(含端点)
+  static bool _selectionContains(CodeLineSelection sel, CodeLineSelection p) {
+    final s = sel.start;
+    final e = sel.end;
+    final beforeStart =
+        p.baseIndex < s.index || (p.baseIndex == s.index && p.baseOffset < s.offset);
+    final afterEnd =
+        p.baseIndex > e.index || (p.baseIndex == e.index && p.baseOffset > e.offset);
+    return !beforeStart && !afterEnd;
+  }
+
+  /// 右键落点 → 文档位置。re_editor 没公开命中测试 API(命中函数在私有
+  /// RenderObject 上),这里用本页自己掌握的量换算:编辑区原点与行号槽宽
+  /// 运行时量,行高 / 留白取自己下发的样式,滚动偏移读自建控制器,列用该行
+  /// 文本的 TextPainter 精确定位(不依赖等宽假设)。点在文本区外返回 null。
+  CodeLineSelection? _documentPositionAt(Offset global) {
+    final editorBox =
+        _editorKey.currentContext?.findRenderObject() as RenderBox?;
+    if (editorBox == null || !editorBox.attached) return null;
+    final numberBox =
+        _lineNumberKey.currentContext?.findRenderObject() as RenderBox?;
+    final local = editorBox.globalToLocal(global);
+    final gutter =
+        numberBox != null && numberBox.attached ? numberBox.size.width : 0.0;
+    final metricPainter = TextPainter(
+      text: TextSpan(
+        text: ' ',
+        style: TextStyle(
+          fontFamily: 'monospace',
+          fontSize: _kSqlFontSize,
+          height: _kSqlLineHeight / _kSqlFontSize,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final lineHeight = metricPainter.preferredLineHeight;
+    final scrollY = _editorScroll.verticalScroller.hasClients
+        ? _editorScroll.verticalScroller.offset
+        : 0.0;
+    final scrollX = _editorScroll.horizontalScroller.hasClients
+        ? _editorScroll.horizontalScroller.offset
+        : 0.0;
+    final lines = _controller.text.split('\n');
+    final line =
+        ((local.dy - _kSqlEditorPadding + scrollY) / lineHeight).floor();
+    if (line < 0 || line >= lines.length) return null;
+    final lineText = lines[line];
+    final x = local.dx - gutter - _kSqlEditorPadding + scrollX;
+    final int col;
+    if (x <= 0) {
+      col = 0;
+    } else {
+      final linePainter = TextPainter(
+        text: TextSpan(
+          text: lineText,
+          style: const TextStyle(
+              fontFamily: 'monospace', fontSize: _kSqlFontSize),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      col = linePainter
+          .getPositionForOffset(Offset(x, lineHeight / 2))
+          .offset
+          .clamp(0, lineText.length);
+    }
+    return CodeLineSelection(
+        baseIndex: line, baseOffset: col, extentIndex: line, extentOffset: col);
   }
 
   void _onEditorContext(Offset position) {
     final l = context.l10n;
-    final hasSelection = _selectedSql != null;
-    final all = _controller.text.trim();
+    // 运行项只给一个,文案由右键落点决定:re_editor 在右键按下时已按落点处理过
+    // 选区 —— 落在选区内保留选区,落在选区外则把光标移过去并收掉选区,所以此刻
+    // 有选区就等于「右键点在选中文字上」(re_editor _selectPosition 的 tapDown
+    // 包含判定)。并列「当前 / 已选择 / 全部」三项会让人猜这一下到底跑哪段。
+    final selected = _selectedSql;
+    final hasSelection = selected != null;
     showContextMenu(
       context,
       position: position,
       items: [
         MenuItem(
-            text: l.sqlRunAtCursor,
+            text: hasSelection ? l.sqlRunSelected : l.sqlRunAtCursor,
             shortcut: 'F5',
             enabled: !_running,
-            onPressed: _runAtCaret),
+            onPressed: hasSelection ? () => _runSql(selected) : _runAtCaret),
+        const MenuSeparator(),
         MenuItem(
-            text: l.sqlRunSelected,
-            enabled: !_running && hasSelection,
-            onPressed: () => _runSql(_selectedSql!)),
+            text: l.findHint,
+            shortcut: 'Ctrl+F',
+            onPressed: _findController.findMode),
         MenuItem(
-            text: l.sqlRunAll,
-            enabled: !_running,
-            onPressed: () => _runSql(all)),
+            text: l.findReplaceHint,
+            shortcut: 'Ctrl+H',
+            onPressed: _findController.replaceMode),
         const MenuSeparator(),
         MenuItem(
             text: l.sqlMenuCopy,
@@ -1141,17 +1286,27 @@ class _QueryPageState extends State<QueryPage> {
       ),
       promptsBuilder: _promptsBuilder,
       child: CodeEditor(
+        key: _editorKey,
         controller: _controller,
         focusNode: _focusNode,
+        scrollController: _editorScroll,
+        // 查找 / 替换:两者都要给 —— 只给 findController 时 Ctrl+F 无人接线
+        findController: _findController,
+        findBuilder: (context, controller, readOnly) => SqlFindBar(
+          controller: controller,
+          onClosed: () => _focusNode.requestFocus(),
+        ),
+        shortcutsActivatorsBuilder: const SqlFindShortcuts(),
         hint: '-- 在此输入 SQL 语句',
         wordWrap: false,
         // SQL 无 {} 折叠语义,禁用折叠分析
         chunkAnalyzer: const NonCodeChunkAnalyzer(),
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        padding: const EdgeInsets.symmetric(
+            horizontal: _kSqlEditorPadding, vertical: _kSqlEditorPadding),
         style: CodeEditorStyle(
           fontFamily: 'monospace',
-          fontSize: 13.5,
-          fontHeight: 20 / 13.5,
+          fontSize: _kSqlFontSize,
+          fontHeight: _kSqlLineHeight / _kSqlFontSize,
           textColor: t.foreground,
           backgroundColor: t.background,
           hintTextColor: t.disabledForeground,
@@ -1172,12 +1327,15 @@ class _QueryPageState extends State<QueryPage> {
         ),
         indicatorBuilder:
             (context, editingController, chunkController, notifier) =>
-                DefaultCodeLineNumber(
-          controller: editingController,
-          notifier: notifier,
-          textStyle: TextStyle(fontSize: 12.5, color: t.disabledForeground),
-          focusedTextStyle: TextStyle(fontSize: 12.5, color: t.mutedForeground),
-          minNumberCount: 4,
+                KeyedSubtree(
+          key: _lineNumberKey,
+          child: DefaultCodeLineNumber(
+            controller: editingController,
+            notifier: notifier,
+            textStyle: TextStyle(fontSize: 12.5, color: t.disabledForeground),
+            focusedTextStyle: TextStyle(fontSize: 12.5, color: t.mutedForeground),
+            minNumberCount: 4,
+          ),
         ),
       ),
     );
