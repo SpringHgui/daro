@@ -27,8 +27,8 @@ Flutter 构建的轻量级桌面数据库管理工具
 | SQLite | ✅ 已支持 | `sqlite3`（FFI，文件型） |
 | Access | ✅ 已支持 | `dart_odbc`（ODBC，文件型） |
 | Oracle | ⏳ 规划中 | — |
-| MongoDB | ⏳ 规划中 | — |
-| Redis | ⏳ 规划中 | — |
+| MongoDB | ✅ 规划中 | — |
+| Redis | ✅ 规划中 | — |
 | Snowflake | ⏳ 规划中 | — |
 
 > 各引擎能力（是否支持模式层、函数 / 过程、角色管理、实体化视图等）由
