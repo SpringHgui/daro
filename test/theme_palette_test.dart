@@ -159,4 +159,35 @@ void main() {
       expect(AppPalette.fromJson(AppTheme.dark.toJson()), AppTheme.dark);
     });
   });
+
+  group('明 / 暗判定(AppPalette.isDark)', () {
+    test('内置两套色板各归一边', () {
+      expect(AppTheme.light.isDark, isFalse);
+      expect(AppTheme.dark.isDark, isTrue);
+    });
+
+    test('判据跟底色走,不跟 ThemeMode 走', () {
+      // 主题定制允许把「明亮」调成深底(反之亦然)。派生色、品牌图标提亮档、
+      // SQL 高亮配色都得跟着实际看到的那块底色走 —— 走 Theme.of(brightness)
+      // 的实现会在这一条上红。
+      final deep =
+          AppTheme.light.copyWith(background: const Color(0xFF1E1E1E));
+      expect(deep.isDark, isTrue);
+      final pale =
+          AppTheme.dark.copyWith(background: const Color(0xFFFAFAFA));
+      expect(pale.isDark, isFalse);
+    });
+
+    test('toDesktopTokens 的按钮面色与 isDark 同向', () {
+      // 桥接里那句 light = !isDark 必须与判定同源:分两处算,就会出现
+      // 「色板判成暗、按钮却按亮底配面色」的错位。
+      expect(AppTheme.light.toDesktopTokens().buttonFaceColor,
+          AppTheme.light.background);
+      expect(AppTheme.dark.toDesktopTokens().buttonFaceColor,
+          isNot(AppTheme.dark.background));
+      final deep =
+          AppTheme.light.copyWith(background: const Color(0xFF1E1E1E));
+      expect(deep.toDesktopTokens().buttonFaceColor, isNot(deep.background));
+    });
+  });
 }

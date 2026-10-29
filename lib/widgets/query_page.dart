@@ -1279,7 +1279,7 @@ class _QueryPageState extends State<QueryPage> {
 
   // SQL 编辑区:re_editor 自绘编辑器(语法高亮 + 行号 + schema 感知补全)
   Widget _editor(AppPalette t) {
-    final isDark = t.background.computeLuminance() < 0.5;
+    final isDark = t.isDark;
     return CodeAutocomplete(
       viewBuilder: (context, notifier, onSelected) => _SqlPromptPanel(
         notifier: notifier,

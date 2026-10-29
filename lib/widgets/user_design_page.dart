@@ -1029,7 +1029,7 @@ class _UserDesignPageState extends State<UserDesignPage> {
     _pullFromControllers();
     final text = UserSql.buildScriptText(_typeId, _spec);
     if (_previewCtrl.text != text) _previewCtrl.text = text;
-    final isDark = t.background.computeLuminance() < 0.5;
+    final isDark = t.isDark;
     return CodeEditor(
       controller: _previewCtrl,
       readOnly: true,

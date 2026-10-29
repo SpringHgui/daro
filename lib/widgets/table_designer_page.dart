@@ -2474,7 +2474,7 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
   Widget _sqlTab(AppPalette t) {
     final sql = _previewSql();
     if (_sqlCtrl.text != sql) _sqlCtrl.text = sql;
-    final isDark = t.background.computeLuminance() < 0.5;
+    final isDark = t.isDark;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [

@@ -99,6 +99,16 @@ class AppPalette {
   Color get accentSoftBg =>
       Color.alphaBlend(accent.withValues(alpha: 0.20), background);
 
+  /// 明 / 暗判定:按**窗口底色**的亮度切,阈值 0.5。
+  ///
+  /// 刻意不走 `Theme.of(context).brightness` —— 主题定制色板下两者会不一致
+  /// (用户能把「明亮」调成深底),而派生色、品牌图标提亮档、SQL 高亮配色
+  /// 都必须跟着实际看到的那块底色走。
+  ///
+  /// 这条判据原先散在 9 处(`toDesktopTokens` 里一份取反、`about_dialog`
+  /// 一份、查询页 / 对象面板 / 六个设计器各一份),改阈值要满仓找。
+  bool get isDark => background.computeLuminance() < 0.5;
+
   /// 拷贝并覆盖指定字段,用于主题定制时逐项修改。
   AppPalette copyWith({
     Color? background,
@@ -273,7 +283,7 @@ class AppPalette {
   ///
   /// 只做颜色映射,**不含显示缩放** —— 渲染组件请用 [desktopTokensFor]。
   DesktopTokens toDesktopTokens() {
-    final light = background.computeLuminance() > 0.5;
+    final light = !isDark;
 
     // ── 按钮(对齐 Windows 桌面按钮)────────────────────────────────────
     // 尺寸(24 高 / 最小 73 宽)由 base-ui 的 winForm 预设给(VCL/WinForms

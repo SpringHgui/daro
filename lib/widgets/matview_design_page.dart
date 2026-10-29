@@ -1133,7 +1133,7 @@ class _MatViewDesignPageState extends State<MatViewDesignPage> {
     required CodeFindController findController,
     bool showLineNumbers = true,
   }) {
-    final isDark = t.background.computeLuminance() < 0.5;
+    final isDark = t.isDark;
     return CodeEditor(
       controller: controller,
       readOnly: readOnly,
