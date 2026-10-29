@@ -106,17 +106,19 @@ void main() {
   });
 
   group('字号与字体由根 span 兜底', () {
-    test('根 span 带统一字体,子 span 不各自塞字号', () {
+    test('根 span 带统一字体,命中的子 span 不各自塞字号', () {
       final span = highlightedSqlSpan(ddl, palette: AppTheme.light);
       expect(span.style?.fontFamily, 'Consolas');
       expect(span.style?.fontSize, 12);
       expect(span.style?.height, 1.45);
       expect(span.style?.decoration, TextDecoration.none);
-      // 根 span 自己就是兜底字体,排除它、只看命中的子 span。
-      final colored = flatten(span)
-          .where((s) => !identical(s, span) && s.style?.color != null);
-      expect(colored, isNotEmpty);
-      expect(colored.any((s) => s.style?.fontSize != null), isFalse,
+      // 没命中任何 scope 的文本直接拿兜底样式(它本来就带字号),要看的是命中的那些。
+      final base = sqlCodeStyle(color: AppTheme.light.foreground);
+      final themed = flatten(span)
+          .where((s) => !identical(s, span) && s.style != base)
+          .toList();
+      expect(themed, isNotEmpty);
+      expect(themed.any((s) => s.style?.fontSize != null), isFalse,
           reason: '子 span 自带字号会盖掉调用方的字号参数');
     });
 
