@@ -238,6 +238,14 @@ void main() {
       expect(find.textContaining('CREATE TABLE `bx11_yz_payorder`',
               findRichText: true),
           findsOneWidget);
+      // 正文可划选(局部复制),按内容定位以免被面板上其它可选文本干扰。
+      final ddlTexts = tester
+          .widgetList<SelectableText>(find.byType(SelectableText))
+          .where((w) => (w.textSpan?.toPlainText() ?? w.data ?? '')
+              .contains('CREATE TABLE'))
+          .toList();
+      expect(ddlTexts, hasLength(1));
+      expect(ddlTexts.single.selectionEnabled, isTrue);
       // 信息页正文此时被 DDL 页替换
       expect(find.text('引擎'), findsNothing);
     });

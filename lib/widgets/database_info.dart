@@ -999,8 +999,8 @@ class _DdlText extends StatelessWidget {
                 _panePadding, 14, _panePadding, _panePadding),
             // 与表设计器「SQL 预览」同款高亮:同步解析出帧,首帧就是彩色,
             // 不会有「先裸文本、等 isolate 回帧再上色」的慢半拍。
-            // 保持 Text.rich 而非 SelectableText —— 这块的复制走右上角按钮。
-            child: Text.rich(highlightedSqlSpan(sql, palette: t)),
+            // 可划选(局部复制),右上角的整段复制按钮照旧保留。
+            child: SelectableText.rich(highlightedSqlSpan(sql, palette: t)),
           ),
         ),
         Positioned(
