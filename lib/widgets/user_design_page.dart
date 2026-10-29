@@ -8,7 +8,7 @@ import '../app/app_state.dart';
 import '../data/user_sql.dart';
 import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
-import 'routine_design_page.dart' show sqlDarkTheme, sqlLightTheme;
+import '../theme/sql_highlight.dart';
 import 'sql_find_bar.dart';
 
 /// 用户 / 角色(User & Role)设计页。
@@ -1050,10 +1050,7 @@ class _UserDesignPageState extends State<UserDesignPage> {
           languages: {
             'sql': CodeHighlightThemeMode(mode: langSql),
           },
-          theme: {
-            ...(isDark ? sqlDarkTheme : sqlLightTheme),
-            'root': TextStyle(color: t.foreground),
-          },
+          theme: sqlEditorTheme(isDark: isDark, foreground: t.foreground),
         ),
       ),
       indicatorBuilder:

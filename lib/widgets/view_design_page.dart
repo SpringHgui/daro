@@ -9,8 +9,8 @@ import '../app/app_state.dart';
 import '../data/db_data.dart';
 import '../data/routine_sql.dart';
 import '../theme/app_theme.dart';
+import '../theme/sql_highlight.dart';
 import 'query_page.dart' show formatSql;
-import 'routine_design_page.dart' show sqlLightTheme, sqlDarkTheme;
 import 'sql_find_bar.dart';
 import 'view_rule_dialog.dart';
 
@@ -1275,10 +1275,7 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
           languages: {
             'sql': CodeHighlightThemeMode(mode: langSql),
           },
-          theme: {
-            ...(isDark ? sqlDarkTheme : sqlLightTheme),
-            'root': TextStyle(color: t.foreground),
-          },
+          theme: sqlEditorTheme(isDark: isDark, foreground: t.foreground),
         ),
       ),
       indicatorBuilder: showLineNumbers

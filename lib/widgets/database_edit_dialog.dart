@@ -8,6 +8,7 @@ import '../data/database_edit_catalog.dart';
 import '../data/db_data.dart';
 import '../data/db_edit_options.dart';
 import '../theme/app_theme.dart';
+import '../theme/sql_highlight.dart';
 
 /// 校验失败提示的红:与「新建数据库」同一中调色,主题无关(色板里没有语义错误色)。
 const Color _kErrorColor = Color(0xffd93025);
@@ -635,15 +636,9 @@ class _DatabaseEditDialogState extends State<DatabaseEditDialog> {
               ),
               child: SingleChildScrollView(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                child: SelectableText(
-                  script,
-                  style: TextStyle(
-                    fontFamily: 'Consolas',
-                    fontFamilyFallback: const ['monospace'],
-                    fontSize: 12,
-                    color: t.foreground,
-                    decoration: TextDecoration.none,
-                  ),
+                child: SelectableText.rich(
+                  // 与详情面板 DDL 页同款高亮;行距沿用这里原本的默认值,不顺手改排版。
+                  highlightedSqlSpan(script, palette: t, height: null),
                 ),
               ),
             ),

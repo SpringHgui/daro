@@ -108,7 +108,9 @@ void main() {
 
     await tester.tap(find.text('SQL 预览'));
     await tester.pumpAndSettle();
-    expect(find.textContaining('CREATE DATABASE "demo"'), findsOneWidget);
+    // 预览区现在是带语法高亮的富文本,finder 必须开 findRichText 才看得见。
+    expect(find.textContaining('CREATE DATABASE "demo"', findRichText: true),
+        findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

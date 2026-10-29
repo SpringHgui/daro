@@ -12,6 +12,7 @@ import '../data/db_metadata.dart';
 import '../data/drivers/db_driver.dart';
 import '../data/table_design.dart';
 import '../theme/app_theme.dart';
+import '../theme/sql_highlight.dart';
 import 'index_column_picker_dialog.dart';
 import 'sql_find_bar.dart';
 
@@ -2513,10 +2514,7 @@ class _TableDesignerPageState extends State<TableDesignerPage> {
               cursorColor: t.foreground,
               codeTheme: CodeHighlightTheme(
                 languages: {'sql': CodeHighlightThemeMode(mode: langSql)},
-                theme: {
-                  ...(isDark ? _sqlDarkTheme : _sqlLightTheme),
-                  'root': TextStyle(color: t.foreground),
-                },
+                theme: sqlEditorTheme(isDark: isDark, foreground: t.foreground),
               ),
             ),
             indicatorBuilder:
@@ -3575,46 +3573,3 @@ class _ModelTextareaState extends State<_ModelTextarea> {
     );
   }
 }
-
-// SQL 语法高亮配色(与查询页同款,中调色主题无关)
-const Map<String, TextStyle> _sqlLightTheme = {
-  'keyword': TextStyle(color: Color(0xff0000ff)),
-  'literal': TextStyle(color: Color(0xff001080)),
-  'name': TextStyle(color: Color(0xff001080)),
-  'attr': TextStyle(color: Color(0xff001080)),
-  'variable': TextStyle(color: Color(0xff001080)),
-  'meta': TextStyle(color: Color(0xff001080)),
-  'string': TextStyle(color: Color(0xffa31515)),
-  'quote': TextStyle(color: Color(0xffa31515)),
-  'regexp': TextStyle(color: Color(0xffa31515)),
-  'comment': TextStyle(color: Color(0xff008000), fontStyle: FontStyle.italic),
-  'doctag': TextStyle(color: Color(0xff800000)),
-  'section': TextStyle(color: Color(0xff800000)),
-  'number': TextStyle(color: Color(0xff098658)),
-  'symbol': TextStyle(color: Color(0xff098658)),
-  'type': TextStyle(color: Color(0xff267f99)),
-  'class-title': TextStyle(color: Color(0xff267f99)),
-  'built_in': TextStyle(color: Color(0xff795e26)),
-  'title': TextStyle(color: Color(0xff795e26)),
-};
-
-const Map<String, TextStyle> _sqlDarkTheme = {
-  'keyword': TextStyle(color: Color(0xff569cd6)),
-  'literal': TextStyle(color: Color(0xff569cd6)),
-  'name': TextStyle(color: Color(0xff9cdcfe)),
-  'attr': TextStyle(color: Color(0xff9cdcfe)),
-  'variable': TextStyle(color: Color(0xff9cdcfe)),
-  'meta': TextStyle(color: Color(0xff9cdcfe)),
-  'string': TextStyle(color: Color(0xffce9178)),
-  'quote': TextStyle(color: Color(0xffce9178)),
-  'regexp': TextStyle(color: Color(0xffd16969)),
-  'comment': TextStyle(color: Color(0xff6a9955), fontStyle: FontStyle.italic),
-  'doctag': TextStyle(color: Color(0xff6a9955)),
-  'section': TextStyle(color: Color(0xff6a9955)),
-  'number': TextStyle(color: Color(0xffb5cea8)),
-  'symbol': TextStyle(color: Color(0xffb5cea8)),
-  'type': TextStyle(color: Color(0xff4ec9b0)),
-  'class-title': TextStyle(color: Color(0xff4ec9b0)),
-  'built_in': TextStyle(color: Color(0xffdcdcaa)),
-  'title': TextStyle(color: Color(0xffdcdcaa)),
-};

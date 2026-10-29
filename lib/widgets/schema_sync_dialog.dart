@@ -13,6 +13,7 @@ import '../data/db_types.dart';
 import '../data/drivers/db_driver.dart';
 import '../data/schema_sync.dart';
 import '../theme/app_theme.dart';
+import '../theme/sql_highlight.dart';
 import 'object_category_icon.dart';
 
 /// 打开「工具 → 结构同步」弹窗。
@@ -1436,18 +1437,20 @@ class _SchemaSyncDialogState extends State<SchemaSyncDialog> {
           Expanded(
             child: SingleChildScrollView(
               padding: const EdgeInsets.all(8),
-              // DDL 和脚本一样要能划选复制。
-              child: SelectableText(
-                showEmpty ? emptyHint : body,
-                style: TextStyle(
-                  fontFamily: 'Consolas',
-                  fontFamilyFallback: const ['monospace'],
-                  fontSize: 12,
-                  height: 1.4,
-                  color: showEmpty ? t.mutedForeground : t.foreground,
-                  decoration: TextDecoration.none,
-                ),
-              ),
+              // DDL 和脚本一样要能划选复制。空提示是文案不是 SQL,
+              // 走高亮解析只会把「（源不存在该对象）」染成怪色,故分支渲染。
+              child: showEmpty
+                  ? SelectableText(
+                      // showEmpty 的定义里已含 emptyHint != null,这里不用再判空。
+                      emptyHint,
+                      style: sqlCodeStyle(
+                        color: t.mutedForeground,
+                        fontSize: 12,
+                        height: 1.4,
+                      ),
+                    )
+                  : SelectableText.rich(
+                      highlightedSqlSpan(body, palette: t, height: 1.4)),
             ),
           ),
         ],
@@ -1523,17 +1526,18 @@ class _SchemaSyncDialogState extends State<SchemaSyncDialog> {
               padding: const EdgeInsets.all(10),
               // 只读但要能划选复制 → SelectableText(不用 Input/Textarea,那会带上
               // 编辑框的面与边框,和这里的「纯文本区」观感不符)。
-              child: SelectableText(
-                script.isEmpty ? '（未勾选任何可部署对象）' : script,
-                style: TextStyle(
-                  fontFamily: 'Consolas',
-                  fontFamilyFallback: const ['monospace'],
-                  fontSize: 12,
-                  height: 1.4,
-                  color: script.isEmpty ? t.mutedForeground : t.foreground,
-                  decoration: TextDecoration.none,
-                ),
-              ),
+              // 空态那行是提示文案,不参与高亮(理由同 _monoCard)。
+              child: script.isEmpty
+                  ? SelectableText(
+                      '（未勾选任何可部署对象）',
+                      style: sqlCodeStyle(
+                        color: t.mutedForeground,
+                        fontSize: 12,
+                        height: 1.4,
+                      ),
+                    )
+                  : SelectableText.rich(
+                      highlightedSqlSpan(script, palette: t, height: 1.4)),
             ),
           ),
         ),
@@ -1771,17 +1775,17 @@ class _DeployPreview extends StatelessWidget {
           ),
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(8),
-            child: Text(
-              script.isEmpty ? '（无）' : script,
-              style: TextStyle(
-                fontFamily: 'Consolas',
-                fontFamilyFallback: const ['monospace'],
-                fontSize: 12,
-                height: 1.4,
-                color: t.foreground,
-                decoration: TextDecoration.none,
-              ),
-            ),
+            child: script.isEmpty
+                ? Text(
+                    '（无）',
+                    style: sqlCodeStyle(
+                      color: t.foreground,
+                      fontSize: 12,
+                      height: 1.4,
+                    ),
+                  )
+                : Text.rich(
+                    highlightedSqlSpan(script, palette: t, height: 1.4)),
           ),
         ),
       ],
