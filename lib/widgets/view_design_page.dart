@@ -1245,7 +1245,7 @@ class _ViewDesignPageState extends State<ViewDesignPage> {
     bool showLineNumbers = true,
     CodeFindController? findController,
   }) {
-    final isDark = t.background.computeLuminance() < 0.5;
+    final isDark = t.isDark;
     return CodeEditor(
       controller: controller,
       focusNode: readOnly ? null : _focusNode,

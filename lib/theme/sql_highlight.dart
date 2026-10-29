@@ -114,9 +114,8 @@ TextSpan? _lastSpan;
 /// 把一段 SQL / DDL 解析成带高亮的 [TextSpan],供 `Text.rich` /
 /// `SelectableText.rich` 直接渲染。
 ///
-/// 字体与明暗都从 [palette] 推导:明暗口径沿用全应用既有的「按 background 亮度」
-/// 判法,不走 `Theme.of` —— 定制色板下两者可能不一致。字号 / 行高各展示位不同,
-/// 故仍留参数。
+/// 字体与明暗都从 [palette] 推导:明暗取 [AppPalette.isDark],不走 `Theme.of`
+/// —— 定制色板下两者可能不一致。字号 / 行高各展示位不同,故仍留参数。
 ///
 /// 返回的是**根 span**,兜底字体([sqlCodeStyle])挂在它身上,命中的 scope 子 span
 /// 只带自己的颜色与斜体、字号与字体沿用它——所以调用方直接 `Text.rich(span)` 即可,
@@ -128,7 +127,7 @@ TextSpan highlightedSqlSpan(
   double fontSize = 12,
   double? height = 1.45,
 }) {
-  final isDark = palette.background.computeLuminance() < 0.5;
+  final isDark = palette.isDark;
   final base = sqlCodeStyle(
     color: palette.foreground,
     fontSize: fontSize,

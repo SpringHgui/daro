@@ -799,7 +799,7 @@ class _RoutineDesignPageState extends State<RoutineDesignPage> {
     CodeFindBuilder? findBuilder,
     bool readOnly = false,
   }) {
-    final isDark = t.background.computeLuminance() < 0.5;
+    final isDark = t.isDark;
     return CodeEditor(
       controller: controller,
       focusNode: readOnly ? null : _focusNode,

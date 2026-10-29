@@ -124,7 +124,7 @@ class DaroAboutDialog extends StatelessWidget {
   Widget _buildLinks(BuildContext context, DesktopTokens dt, AppPalette t) {
     // 品牌原色是按亮底挑的,暗色主题下对比度不够(GitHub 的黑几乎看不见),
     // 取每个平台备好的提亮档 —— 判据跟查询页 / 对象面板一致,跟主题色板走。
-    final dark = t.background.computeLuminance() < 0.5;
+    final dark = t.isDark;
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [

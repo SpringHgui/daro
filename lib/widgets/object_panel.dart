@@ -651,7 +651,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
   /// 工具条走灰(见 [_buildToolbar] 里的 searchTokens),边框线仍把输入框勾勒
   /// 出来。hover / pressed 在该灰底上派生(暗色提亮、亮色加深),交互反馈不变。
   DesktopTokens _toolbarTokens(AppPalette t) {
-    final isDark = t.background.computeLuminance() < 0.5;
+    final isDark = t.isDark;
     final hoverBlend =
         isDark ? Colors.white.withValues(alpha: 0.08) : Colors.black.withValues(alpha: 0.08);
     final pressedBlend =
