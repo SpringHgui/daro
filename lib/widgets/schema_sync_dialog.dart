@@ -1441,7 +1441,8 @@ class _SchemaSyncDialogState extends State<SchemaSyncDialog> {
               // 走高亮解析只会把「（源不存在该对象）」染成怪色,故分支渲染。
               child: showEmpty
                   ? SelectableText(
-                      emptyHint!,
+                      // showEmpty 的定义里已含 emptyHint != null,这里不用再判空。
+                      emptyHint,
                       style: sqlCodeStyle(
                         color: t.mutedForeground,
                         fontSize: 12,
