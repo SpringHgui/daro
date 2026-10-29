@@ -217,7 +217,10 @@ void main() {
     expect(find.text('hstore'), findsOneWidget);
 
     await _showTab(tester, 'SQL 预览');
-    expect(find.textContaining('CREATE EXTENSION IF NOT EXISTS "pg_trgm"'),
+    // SQL 预览区现在是带语法高亮的富文本,finder 必须开 findRichText 才看得见。
+    expect(
+        find.textContaining('CREATE EXTENSION IF NOT EXISTS "pg_trgm"',
+            findRichText: true),
         findsOneWidget);
     expect(tester.takeException(), isNull);
   });
@@ -233,7 +236,8 @@ void main() {
     expect(find.text('hstore'), findsOneWidget);
 
     await _showTab(tester, 'SQL 预览');
-    expect(find.textContaining('DROP EXTENSION IF EXISTS "hstore"'),
+    expect(find.textContaining('DROP EXTENSION IF EXISTS "hstore"',
+            findRichText: true),
         findsOneWidget);
     expect(tester.takeException(), isNull);
   });
@@ -250,7 +254,9 @@ void main() {
     await tester.pumpAndSettle();
 
     await _showTab(tester, 'SQL 预览');
-    expect(find.textContaining('CREATE EXTENSION IF NOT EXISTS "btree_gin"'),
+    expect(
+        find.textContaining('CREATE EXTENSION IF NOT EXISTS "btree_gin"',
+            findRichText: true),
         findsOneWidget);
     expect(tester.takeException(), isNull);
   });
@@ -309,7 +315,8 @@ void main() {
   testWidgets('SQL 预览无改动时显示说明而非空框', (tester) async {
     await _open(tester);
     await _showTab(tester, 'SQL 预览');
-    expect(find.textContaining('没有需要执行的改动'), findsOneWidget);
+    expect(find.textContaining('没有需要执行的改动', findRichText: true),
+        findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 }

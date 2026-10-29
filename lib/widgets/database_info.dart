@@ -11,6 +11,7 @@ import '../data/drivers/kv_driver.dart';
 import '../data/table_design.dart';
 import '../l10n/locale_config.dart';
 import '../theme/app_theme.dart';
+import '../theme/sql_highlight.dart';
 import 'object_category_icon.dart';
 
 // 右侧对象详情面板:根据当前选中节点展示不同信息。
@@ -996,15 +997,10 @@ class _DdlText extends StatelessWidget {
           child: SingleChildScrollView(
             padding: const EdgeInsets.fromLTRB(
                 _panePadding, 14, _panePadding, _panePadding),
-            child: Text(
-              sql,
-              style: TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 12,
-                height: 1.45,
-                color: t.foreground,
-              ),
-            ),
+            // 与表设计器「SQL 预览」同款高亮:同步解析出帧,首帧就是彩色,
+            // 不会有「先裸文本、等 isolate 回帧再上色」的慢半拍。
+            // 保持 Text.rich 而非 SelectableText —— 这块的复制走右上角按钮。
+            child: Text.rich(highlightedSqlSpan(sql, palette: t)),
           ),
         ),
         Positioned(

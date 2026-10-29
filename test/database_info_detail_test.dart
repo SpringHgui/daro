@@ -234,7 +234,9 @@ void main() {
       await tester.pump();
 
       expect(driver.lastDefinitionKind, 'table');
-      expect(find.textContaining('CREATE TABLE `bx11_yz_payorder`'),
+      // DDL 页现在是带语法高亮的富文本,finder 必须开 findRichText 才看得见。
+      expect(find.textContaining('CREATE TABLE `bx11_yz_payorder`',
+              findRichText: true),
           findsOneWidget);
       // 信息页正文此时被 DDL 页替换
       expect(find.text('引擎'), findsNothing);

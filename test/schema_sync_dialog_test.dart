@@ -379,13 +379,17 @@ void main() {
     await tester.tap(find.text('v_only_src'));
     await tester.pumpAndSettle();
     expect(find.textContaining('源 · v_only_src'), findsOneWidget);
-    expect(find.textContaining('CREATE VIEW v_only_src'), findsWidgets);
+    // DDL / 脚本区现在是带高亮的富文本,finder 必须开 findRichText 才看得见。
+    expect(find.textContaining('CREATE VIEW v_only_src', findRichText: true),
+        findsWidgets);
 
     // 切到底部「部署脚本」页:拼接勾选对象的语句(删除未勾,不在脚本里)
     await tester.tap(find.text('部署脚本'));
     await tester.pumpAndSettle();
-    expect(find.textContaining('CREATE VIEW v_only_src'), findsWidgets);
-    expect(find.textContaining('DROP VIEW v_only_tgt'), findsNothing);
+    expect(find.textContaining('CREATE VIEW v_only_src', findRichText: true),
+        findsWidgets);
+    expect(find.textContaining('DROP VIEW v_only_tgt', findRichText: true),
+        findsNothing);
 
     // 下一步 → 部署页:目标服务器说明 + 复制脚本 + 部署选项,「开始」可用
     await tester.tap(find.text('下一步'));
@@ -405,7 +409,7 @@ void main() {
     // 执行过程落在消息日志里(部署开始会自动切到这个标签页)
     final logText = tester
         .widgetList<SelectableText>(find.byType(SelectableText))
-        .map((w) => w.data ?? '')
+        .map(_selectablePlainText)
         .join('\n');
     expect(logText, contains('--End--'));
     expect(logText, contains('Result: OK'));
@@ -510,7 +514,7 @@ void main() {
     // 勾了「在消息日志中包含部署查询」→ 日志展开 SQL,成功与失败各记一条
     final logText = tester
         .widgetList<SelectableText>(find.byType(SelectableText))
-        .map((w) => w.data ?? '')
+        .map(_selectablePlainText)
         .join('\n');
     expect(logText, contains('Query:'));
     expect(logText, contains('Result: OK'));
@@ -584,7 +588,7 @@ void main() {
         .textEditingValue
         .selection;
     expect(sel.isCollapsed, isFalse, reason: '脚本应能划出选区');
-    expect(sel.textInside(script.data!), isNotEmpty);
+    expect(sel.textInside(_selectablePlainText(script)), isNotEmpty);
 
     // 消息日志页同样是可划选文本(空态占位亦为 SelectableText)。
     await tester.tap(find.text('消息日志'));
@@ -594,6 +598,11 @@ void main() {
     expect(log.data, '（尚未执行部署）');
   });
 }
+
+/// 取只读文本区的内容:裸文本走 `data`,带语法高亮的是 `textSpan`
+/// (见 lib/theme/sql_highlight.dart),两者都当成纯字符串看。
+String _selectablePlainText(SelectableText w) =>
+    w.data ?? w.textSpan?.toPlainText() ?? '';
 
 /// 放大测试视口,避免 1040×700 大弹窗被默认 800×600 压扁 / 命中重叠。
 void _bigSurface(WidgetTester tester) {
