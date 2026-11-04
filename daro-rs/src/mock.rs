@@ -8,6 +8,7 @@ pub enum DbKind {
     MySql,
     PostgreSql,
     SqlServer,
+    SQLite,
     MongoDb,
     Redis,
 }
@@ -18,6 +19,7 @@ impl DbKind {
             DbKind::MySql => "MySQL",
             DbKind::PostgreSql => "PostgreSQL",
             DbKind::SqlServer => "SQL Server",
+            DbKind::SQLite => "SQLite",
             DbKind::MongoDb => "MongoDB",
             DbKind::Redis => "Redis",
         }
@@ -28,6 +30,7 @@ impl DbKind {
             DbKind::MySql => 3306,
             DbKind::PostgreSql => 5432,
             DbKind::SqlServer => 1433,
+            DbKind::SQLite => 0,
             DbKind::MongoDb => 27017,
             DbKind::Redis => 6379,
         }
@@ -38,7 +41,7 @@ impl DbKind {
             DbKind::MySql => "root",
             DbKind::PostgreSql => "postgres",
             DbKind::SqlServer => "sa",
-            DbKind::MongoDb | DbKind::Redis => "",
+            DbKind::SQLite | DbKind::MongoDb | DbKind::Redis => "",
         }
     }
 }
@@ -86,14 +89,15 @@ impl Connection {
     }
 }
 
+/// 首次启动（还没有存盘）的演示连接树。只列还没有真驱动的引擎：
+/// SQLite / PostgreSQL 已经连真库，演示用的假主机点上去只会报错，
+/// 不如让用户自己建。
 pub fn connections() -> Vec<Connection> {
     vec![
         Connection::new("本地 MySQL", DbKind::MySql, "127.0.0.1", 3306, "bx11", "root", "", "开发环境", true),
-        Connection::new("本地 PostgreSQL", DbKind::PostgreSql, "127.0.0.1", 5432, "postgres", "postgres", "", "开发环境", true),
         Connection::new("测试 SQL Server", DbKind::SqlServer, "192.168.10.21", 1433, "master", "sa", "", "测试环境", false),
         Connection::new("测试 MongoDB", DbKind::MongoDb, "192.168.10.22", 27017, "admin", "", "", "测试环境", false),
         Connection::new("缓存 Redis", DbKind::Redis, "127.0.0.1", 6379, "db0", "", "", "测试环境", true),
-        Connection::new("报表只读库", DbKind::PostgreSql, "10.0.3.8", 5432, "dw", "reader", "", "", false),
     ]
 }
 
@@ -121,6 +125,8 @@ pub fn databases(kind: DbKind) -> &'static [&'static str] {
         DbKind::SqlServer => &["daro", "master", "model", "msdb", "tempdb"],
         DbKind::MongoDb => &["admin", "config", "daro", "local"],
         DbKind::Redis => &["db0", "db1", "db2", "db3"],
+        // SQLite 档的库清单走 catalog（按连接的库文件出），mock 档给空
+        DbKind::SQLite => &[],
     }
 }
 
@@ -433,6 +439,7 @@ pub fn mock_cell(table: &str, row: usize, col: usize) -> String {
 /// mock 档这三类引擎共用同一套取数文案）。
 pub fn mock_select_sql(
     kind: DbKind,
+    cols: &[crate::db_types::ColMeta],
     db: &str,
     schema: &str,
     table: &str,
@@ -446,13 +453,13 @@ pub fn mock_select_sql(
             let cols: Vec<String> = keys
                 .iter()
                 .filter_map(|(c, asc)| {
-                    MOCK_COLUMNS.get(*c).map(|m| {
+                    cols.get(*c).map(|m| {
                         let dir = if *asc { "ASC" } else { "DESC" };
                         match kind {
                             DbKind::MySql | DbKind::MongoDb | DbKind::Redis => {
                                 format!("`{}` {dir}", m.name)
                             }
-                            DbKind::PostgreSql | DbKind::SqlServer => {
+                            DbKind::PostgreSql | DbKind::SqlServer | DbKind::SQLite => {
                                 format!("\"{}\" {dir}", m.name)
                             }
                         }
@@ -465,6 +472,10 @@ pub fn mock_select_sql(
     match kind {
         DbKind::MySql | DbKind::MongoDb | DbKind::Redis => {
             format!("SELECT * FROM `{db}`.`{table}`{where_part}{order} LIMIT 0, 1000")
+        }
+        // SQLite 是单文件库：没有库名前缀，直接表名
+        DbKind::SQLite => {
+            format!("SELECT * FROM \"{table}\"{where_part}{order} LIMIT 1000 OFFSET 0")
         }
         DbKind::PostgreSql | DbKind::SqlServer => {
             format!("SELECT * FROM \"{schema}\".\"{table}\"{where_part}{order} LIMIT 1000 OFFSET 0")

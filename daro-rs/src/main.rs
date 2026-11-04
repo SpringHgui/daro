@@ -2,7 +2,10 @@
 #![recursion_limit = "512"]
 
 mod art;
+mod backend;
+mod catalog;
 mod conn_dialog;
+mod db_types;
 mod dock;
 mod export_format;
 mod table_export;
@@ -11,8 +14,12 @@ mod export_result_dialog;
 mod filter;
 mod filter_value_dialog;
 mod mock;
+mod move_paint_skip;
 mod navicat_export_dialog;
+mod sqlite_driver;
+mod pg_driver;
 mod sql_completion;
+mod sql_format;
 mod sql_highlight;
 mod sql_preview;
 mod ui;
@@ -24,6 +31,7 @@ mod prompt_dialog;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +87,12 @@ const T_BAR_H: f32 = 27.;
 /// 永远只有一页、分页钮永远灰着，mock 档先取 10 让分页交互真实可走；
 /// 真数据接入后改回 1000（或做成可配，Navicat 齿轮里就有页大小）。
 const PAGE_SIZE: usize = 10;
+
+/// 真库表页每页行数（Navicat 默认 1000）；mock 档仍按 PAGE_SIZE 全量内存分页。
+const REMOTE_PAGE_SIZE: usize = 1000;
+
+/// 自适应列宽采样行数：一页 1000 行全量量宽会把每帧渲染变成 O(行×列)。
+const T_COL_W_SCAN: usize = 120;
 
 // ── 设计器密度档 ──────────────────────────────────────────
 // 照 Flutter 版 table_designer_page.dart 的实测常量整批搬来，每个值都有
@@ -658,6 +672,10 @@ fn ui_main() {
 
         let (win, root) =
             gpui_kit::open_window(options, cx, |window, cx| {
+                // 拖动标题栏移动窗口时，gpui 的移动循环每 10ms 同步重绘整帧；
+                // 本应用单帧元素数极大，模态循环被堵住 → 拖动跳格。纯移动期间
+                // 画面不变，交给 DWM 平移表面，吞掉这些重绘。
+                move_paint_skip::install(window);
                 cx.new(|cx| DaroApp::new(window, cx))
             })
             .expect("failed to open window");
@@ -897,11 +915,42 @@ struct OpenTab {
     data: Vec<Vec<String>>,
     /// 上次「应用」✓ 时的快照；「撤销」× / 刷新把 data 退回这里。
     baseline: Vec<Vec<String>>,
+    /// 当前列形：数据页来自真库（SQLite）或 MOCK_COLUMNS；查询 / 设计页恒空。
+    cols: Vec<db_types::ColMeta>,
+    /// data 每行的身份，写回时原样送回驱动：SQLite 是单元素 rowid，
+    /// mock / 无 rowid 表为空向量。
+    row_keys: Vec<db_types::RowKey>,
+    /// 基线时点的行身份；「应用」时与 row_keys 比对得出删除行。
+    baseline_row_keys: Vec<db_types::RowKey>,
     /// 新增、尚未「应用」的行：显示时永远排在排序结果之后（Navicat 同款——
     /// 新行贴在网格尾部、行头带 *，「应用」后才并进 data 参与排序）。
     inserted: Vec<Vec<String>>,
     /// 数据页签的筛选 / 排序面板（Navicat 网格工具条漏斗）；设计 / 查询页签不用。
     filter: filter::FilterState,
+    /// SQLite 表页的远程分页状态：Some 时 data 只装当前页，筛选 / 排序 /
+    /// COUNT 全部下推到驱动；mock 档 None（整表物化在内存里翻页）。
+    page: Option<RemotePage>,
+    /// 正在后台取的目标页号：Some 时网格仍显示上一页、状态栏标「载入中」，
+    /// 回执落地才把 page.page_no 切过去（先切页号再取数会让「应用」写错行）。
+    loading_page: Option<usize>,
+}
+
+/// 远程分页游标：页号 + 页大小 + 当前筛选条件下的总行数。
+#[derive(Clone, Debug, PartialEq)]
+struct RemotePage {
+    page_no: usize,
+    page_size: usize,
+    total: usize,
+}
+
+/// 后台取数回执的认领键：页签下标会随关页漂移，只能按身份回查。
+#[derive(Clone)]
+struct PageIdent {
+    conn: String,
+    db: &'static str,
+    schema: usize,
+    cat: usize,
+    obj: usize,
 }
 
 impl OpenTab {
@@ -2814,6 +2863,8 @@ fn design_type_candidates(kind: mock::DbKind) -> &'static [&'static str] {
         ],
         mock::DbKind::MongoDb => &["string", "int", "long", "double", "decimal", "bool", "date", "object", "array", "binary", "objectId"],
         mock::DbKind::Redis => &["string", "list", "set", "zset", "hash", "stream"],
+        // SQLite 只有 5 个存储类（类型名随意写，亲和规则决定实际存储）
+        mock::DbKind::SQLite => &["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"],
     }
 }
 
@@ -2831,6 +2882,13 @@ fn split_sql_statements(script: &str) -> Vec<String> {
     let mut quote_close: Option<char> = None;
     // 美元引号未闭合时的完整定界符（含首尾 $）
     let mut dollar_tag: Option<String> = None;
+    // `CREATE TRIGGER … BEGIN … END`：触发器体里的分号不拆语句。
+    // `saw_trigger` 在本条语句出现过 TRIGGER 关键字后置位，遇到 BEGIN
+    // 进入体；体内 CASE … END 与 BEGIN 都要配平 END，免得 CASE 的 END
+    // 提前把体收掉。
+    let mut saw_trigger = false;
+    let mut trigger_depth = 0usize;
+    let mut case_depth = 0usize;
     let mut i = 0usize;
     while i < script.len() {
         if block_depth > 0 {
@@ -2876,11 +2934,18 @@ fn split_sql_statements(script: &str) -> Vec<String> {
             continue;
         }
         if script[i..].starts_with(';') {
+            if trigger_depth > 0 {
+                buf.push(';');
+                i += 1;
+                continue;
+            }
             let s = buf.trim();
             if !s.is_empty() {
                 out.push(s.to_string());
             }
             buf.clear();
+            saw_trigger = false;
+            case_depth = 0;
             i += 1;
             continue;
         }
@@ -2907,6 +2972,41 @@ fn split_sql_statements(script: &str) -> Vec<String> {
             continue;
         }
         let ch = script[i..].chars().next().unwrap();
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let start = i;
+            while i < script.len() {
+                let c = script[i..].chars().next().unwrap();
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    i += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let word = &script[start..i];
+            buf.push_str(word);
+            if trigger_depth == 0 {
+                if saw_trigger && word.eq_ignore_ascii_case("begin") {
+                    trigger_depth = 1;
+                    case_depth = 0;
+                } else if word.eq_ignore_ascii_case("trigger") {
+                    saw_trigger = true;
+                }
+            } else if word.eq_ignore_ascii_case("case") {
+                case_depth += 1;
+            } else if word.eq_ignore_ascii_case("end") {
+                if case_depth > 0 {
+                    case_depth -= 1;
+                } else {
+                    trigger_depth -= 1;
+                    if trigger_depth == 0 {
+                        saw_trigger = false;
+                    }
+                }
+            } else if word.eq_ignore_ascii_case("begin") {
+                trigger_depth += 1;
+            }
+            continue;
+        }
         if matches!(ch, '\'' | '"' | '`' | '[') {
             quote_close = Some(if ch == '[' { ']' } else { ch });
         }
@@ -2918,6 +3018,21 @@ fn split_sql_statements(script: &str) -> Vec<String> {
         out.push(s.to_string());
     }
     out
+}
+
+/// 语句是否可能改动库结构。只有这类语句执行成功后才需要失效目录
+/// 缓存；普通 SELECT / INSERT / UPDATE / DELETE 不动清单。
+fn stmt_may_change_schema(stmt: &str) -> bool {
+    let head: String = stmt
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    matches!(
+        head.as_str(),
+        "CREATE" | "DROP" | "ALTER" | "ATTACH" | "DETACH" | "VACUUM" | "REINDEX"
+    )
 }
 
 /// `$$` / `$tag$` 的定界符（标签为标识符、不能数字开头，`$1` 占位符不误判）。
@@ -2991,13 +3106,207 @@ fn materialize_rows(obj: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// 页签的下推条件：筛选面板应用过的 WHERE（真库才用得上）。
+fn tab_where(t: &OpenTab) -> Option<String> {
+    t.filter.applied.as_ref().and_then(|a| a.where_sql.clone())
+}
+
+/// 页签的排序：应用面板多键优先，否则表头单键；换成列名给驱动拼 SQL。
+fn tab_orders(t: &OpenTab) -> Vec<(String, bool)> {
+    let picks: Vec<(usize, bool)> = match t.filter.applied.as_ref() {
+        Some(a) if !a.sorts.is_empty() => a.sorts.clone(),
+        _ => t.sort.into_iter().collect(),
+    };
+    picks
+        .iter()
+        .filter_map(|(c, asc)| t.cols.get(*c).map(|m| (m.name.clone(), *asc)))
+        .collect()
+}
+
+/// 页签当前模式名。没有模式层的引擎（SQLite / mock）返回空串，分发层兜底。
+fn tab_schema(conn: &mock::Connection, t: &OpenTab) -> &'static str {
+    catalog::schemas(conn, t.db)
+        .get(t.schema)
+        .copied()
+        .unwrap_or("")
+}
+
+/// 查询上下文的默认落点 (库下标, 模式下标)：库取连接配置里那一个（Navicat
+/// 新建查询就落在配置的库上），模式优先 public（PG 的清单按字母序，public
+/// 排在 information_schema 之后）。
+fn default_query_context(conn: &mock::Connection) -> (usize, usize) {
+    let dbs = catalog::databases(conn);
+    let db = dbs
+        .iter()
+        .position(|d| *d == conn.database.trim())
+        .unwrap_or(0);
+    let schema = catalog::schemas(conn, dbs.get(db).copied().unwrap_or(""))
+        .iter()
+        .position(|s| *s == "public")
+        .unwrap_or(0);
+    (db, schema)
+}
+
+/// 打开表的取数：真库（SQLite / PG）走服务端分页（WHERE / ORDER BY /
+/// LIMIT / OFFSET 全部下推，另取 COUNT 供页码）；mock 保持整表物化。
+/// 返回 (当前页, 总行数)。
+#[allow(clippy::too_many_arguments)]
+fn load_table_page(
+    conn: &mock::Connection,
+    db: &str,
+    schema: &str,
+    table: &str,
+    where_sql: Option<&str>,
+    orders: &[(String, bool)],
+    offset: usize,
+    limit: usize,
+) -> Result<(db_types::SelectPage, usize), String> {
+    if let Some(t) = backend::Target::of(conn, db, schema) {
+        let page = t.select_table(table, where_sql, orders, offset, limit)?;
+        let total = t
+            .count_table(table, where_sql)
+            .unwrap_or(offset + page.rows.len());
+        return Ok((page, total));
+    }
+    let rows = materialize_rows(table);
+    let total = rows.len();
+    Ok((
+        db_types::SelectPage {
+            columns: mock::MOCK_COLUMNS
+                .iter()
+                .map(|m| db_types::ColMeta::new(m.name, m.ty, m.numeric))
+                .collect(),
+            keys: vec![Vec::new(); rows.len()],
+            rows,
+            truncated: false,
+        },
+        total,
+    ))
+}
+
+/// 重新从目录取数并替换页签工作集（真库查服务端，mock 取回物化数据）。
+/// 筛选 / 排序面板状态保留：刷新后条件仍生效；真库按当前页号重取。
+fn reload_table_page(conn: &mock::Connection, t: &mut OpenTab) -> Result<(), String> {
+    let schema = tab_schema(conn, t);
+    let name = catalog::objects(conn, t.db, schema, t.cat)
+        .get(t.obj)
+        .copied()
+        .unwrap_or_default();
+    let size = t.page.as_ref().map(|p| p.page_size).unwrap_or(PAGE_SIZE);
+    let page_no = t.page.as_ref().map(|p| p.page_no).unwrap_or(0);
+    let where_sql = tab_where(t);
+    let orders = tab_orders(t);
+    let (page, total) = load_table_page(
+        conn,
+        t.db,
+        schema,
+        name,
+        where_sql.as_deref(),
+        &orders,
+        page_no * size,
+        size,
+    )?;
+    t.cols = page.columns;
+    t.data = page.rows.clone();
+    t.baseline = page.rows;
+    t.row_keys = page.keys.clone();
+    t.baseline_row_keys = page.keys;
+    t.inserted.clear();
+    if let Some(p) = t.page.as_mut() {
+        // 删除 / 筛选后总页数可能变少：页号夹回末页，避免停在一片空白
+        let pages = total.div_ceil(p.page_size).max(1);
+        p.page_no = p.page_no.min(pages - 1);
+        p.total = total;
+        if p.page_no != page_no {
+            return reload_table_page(conn, t);
+        }
+    }
+    Ok(())
+}
+
+/// 后台线程取一页 + 总数（分页 / 排序 / 筛选全下推到驱动）。
+fn load_page_blocking(
+    target: &backend::Target,
+    table: &str,
+    where_sql: Option<&str>,
+    orders: &[(String, bool)],
+    page_no: usize,
+    size: usize,
+) -> Result<(db_types::SelectPage, usize), String> {
+    let page = target.select_table(table, where_sql, orders, page_no * size, size)?;
+    let total = target
+        .count_table(table, where_sql)
+        .unwrap_or(page_no * size + page.rows.len());
+    Ok((page, total))
+}
+
+/// 整表取数的终止原因：用户取消和真出错要分开报（取消不是失败）。
+pub(crate) enum FetchAbort {
+    Cancelled,
+    Failed(String),
+}
+
+/// 分块取回整表（导出 / 复制用）：按 REMOTE_PAGE_SIZE 翻完，避免一次性
+/// 把百万行压进内存的同时也避免只导出当前页。
+/// **只允许在后台线程调用**：网络取数可能跑几十秒，放界面上就是把窗口冻住。
+pub(crate) fn load_all_table_rows(
+    conn: &mock::Connection,
+    db: &str,
+    schema: &str,
+    table: &str,
+    where_sql: Option<&str>,
+    orders: &[(String, bool)],
+    progress: &mut dyn FnMut(usize, usize),
+    cancel: &AtomicBool,
+) -> Result<db_types::SelectPage, FetchAbort> {
+    let mut out = db_types::SelectPage {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        keys: Vec::new(),
+        truncated: false,
+    };
+    let mut offset = 0usize;
+    loop {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err(FetchAbort::Cancelled);
+        }
+        let (page, total) = load_table_page(
+            conn,
+            db,
+            schema,
+            table,
+            where_sql,
+            orders,
+            offset,
+            REMOTE_PAGE_SIZE,
+        )
+        .map_err(FetchAbort::Failed)?;
+        if out.columns.is_empty() {
+            out.columns = page.columns;
+        }
+        let got = page.rows.len();
+        out.rows.extend(page.rows);
+        out.keys.extend(page.keys);
+        offset += got;
+        progress(offset, total);
+        if got == 0 || offset >= total {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// 排序后的显示序位 → 原行下标映射；无排序即恒等。稳定排序：同值行保持
 /// 原相对次序（Rust sort_by 稳定）。列下标越界（防御）也按恒等处理。
-fn sorted_row_order(data: &[Vec<String>], sort: Option<(usize, bool)>) -> Vec<usize> {
+fn sorted_row_order(
+    data: &[Vec<String>],
+    cols: &[db_types::ColMeta],
+    sort: Option<(usize, bool)>,
+) -> Vec<usize> {
     let Some((col, asc)) = sort else {
         return (0..data.len()).collect();
     };
-    let numeric = mock::MOCK_COLUMNS.get(col).is_some_and(|c| c.numeric);
+    let numeric = cols.get(col).is_some_and(|c| c.numeric);
     let cell = |r: usize| {
         data.get(r)
             .and_then(|row| row.get(col))
@@ -3016,19 +3325,24 @@ fn sorted_row_order(data: &[Vec<String>], sort: Option<(usize, bool)>) -> Vec<us
 /// （多键），否则回退表头单键排序；应用过的 WHERE 把不过滤条件的行剔除。
 /// 新增行不参与（调用方恒把它们排在显示序之后）。
 fn visible_data_order(t: &OpenTab) -> Vec<usize> {
+    // 远程分页：WHERE / ORDER BY 已在服务端生效，当前页顺序即显示序，
+    // 不能再按筛选模型二次剔除（自定义 SQL 条件在本地无从判定）。
+    if t.page.is_some() {
+        return (0..t.data.len()).collect();
+    }
     let applied = t.filter.applied.as_ref();
     let mut base = match applied {
         Some(a) if !a.sorts.is_empty() => {
             let picks: Vec<usize> = (0..t.data.len()).collect();
-            filter::multi_sort_order(&t.data, &picks, &a.sorts)
+            filter::multi_sort_order(&t.data, &picks, &a.sorts, &t.cols)
         }
-        _ => sorted_row_order(&t.data, t.sort),
+        _ => sorted_row_order(&t.data, &t.cols, t.sort),
     };
     if let Some(a) = applied {
         base.retain(|&r| {
             t.data
                 .get(r)
-                .is_some_and(|row| filter::row_matches(row, &a.model))
+                .is_some_and(|row| filter::row_matches(row, &t.cols, &a.model))
         });
     }
     base
@@ -3066,8 +3380,12 @@ fn filter_node_at_mut<'a>(
 struct QueryOutcome {
     /// 语句原文（消息页回显用）
     sql: String,
-    /// SELECT 的假结果行；None = 写操作（mock 不执行）
+    /// SELECT 的结果行；None = 写操作 / 出错
     result: Option<Vec<Vec<String>>>,
+    /// 结果列形（真实执行来自驱动；mock 用 MOCK_COLUMNS）
+    columns: Vec<db_types::ColMeta>,
+    /// 非 SELECT 的一句话结果（影响行数 / 错误）；mock 写操作为 None
+    message: Option<String>,
     elapsed_ms: u128,
     /// 网格里当前格（行 × 列）
     cell: (usize, usize),
@@ -3095,6 +3413,8 @@ struct QueryState {
     last_ms: u128,
     /// 运行前的提示（如「请输入 SQL 语句」），出结果后撤
     prompt: Option<&'static str>,
+    /// 正在后台跑的脚本任务（Some = 运行中，「停止」可用）
+    job: Option<backend::Job>,
     /// 结果面板高度（可拖动调整，默认 Q_PANEL_H）
     panel_h: f32,
 }
@@ -3111,6 +3431,10 @@ struct CellEdit {
 
 struct DaroApp {
     dark: bool,
+    /// 主窗口句柄：Render 时记下。后台回执要靠它落地，不能只认
+    /// `App::active_window()`——测试环境或失焦时它可能为空，回执丢了
+    /// 页签会永远停在「载入中」。
+    win: Option<AnyWindowHandle>,
     /// 树上当前选中的节点。对象面板、右侧信息卡、状态栏都由它推导。
     sel: Act,
     /// 分组是运行时可增的，所以按名字记折叠态（索引会随新建组漂移）
@@ -3125,6 +3449,13 @@ struct DaroApp {
     expanded: HashSet<String>,
     /// 打开过的库：Navicat 用绿色圆柱标出，没打开过的是灰色
     visited_dbs: HashSet<String>,
+    /// 正在后台载入的目录节点（键 = `catalog::Pending::key`）。渲染只读缓存，
+    /// 未命中的项进队列，由 [DaroApp::pump_catalog] 投后台跑，这里记着给对应
+    /// 行画「载入中」。
+    loading: HashSet<String>,
+    /// 一轮后台载入里攒下的目录错误；等所有在飞任务都回来才合并成一个弹窗，
+    /// 否则展开 10 个库失败就是 10 个对话框。
+    catalog_errors: Vec<String>,
     /// 上一次点中的行与时刻，用来自己判双击（见 DOUBLE_CLICK_INTERVAL）
     last_click: Option<(Act, Instant)>,
     conn_colors: HashMap<String, u8>,
@@ -3218,14 +3549,17 @@ impl DaroApp {
                     let mut visited_dbs = HashSet::new();
                     if let Some(conn) = conns.first() {
                         expanded.insert(conn.name.clone());
-                        let db = mock::databases(conn.kind)[0];
-                        let db_key = node_key(&conn.name, db);
-                        expanded.insert(db_key.clone());
-                        visited_dbs.insert(db_key.clone());
-                        if mock::has_schemas(conn.kind) {
-                            expanded.insert(node_key(&db_key, mock::schemas(conn.kind)[0]));
+                        if let Some(&db) = catalog::databases(conn).first() {
+                            let db_key = node_key(&conn.name, db);
+                            expanded.insert(db_key.clone());
+                            visited_dbs.insert(db_key.clone());
+                            if catalog::has_schemas(conn.kind)
+                                && let Some(&s) = catalog::schemas(conn, db).first()
+                            {
+                                expanded.insert(node_key(&db_key, s));
+                            }
+                            expanded.insert(node_key(&db_key, CATEGORIES[0].0));
                         }
-                        expanded.insert(node_key(&db_key, CATEGORIES[0].0));
                     }
                     (
                         GROUPS.iter().map(|g| g.to_string()).collect(),
@@ -3260,6 +3594,7 @@ impl DaroApp {
         .detach();
         Self {
             dark,
+            win: Some(window.window_handle()),
             sel: Act::Obj(0, 0, NO_SCHEMA, 0, 0),
             groups,
             collapsed_groups,
@@ -3267,6 +3602,8 @@ impl DaroApp {
             starred,
             expanded,
             visited_dbs,
+            loading: HashSet::new(),
+            catalog_errors: Vec::new(),
             last_click: None,
             conn_colors,
             ctx: None,
@@ -3391,12 +3728,13 @@ impl DaroApp {
     /// 选中节点的库名。没选中库层以下时返回 None（Navicat 此时对象区是空的）。
     fn sel_db_name(&self) -> Option<&'static str> {
         let (c, d) = (self.sel_conn_ix()?, self.sel.db()?);
-        mock::databases(self.conns[c].kind).get(d).copied()
+        catalog::databases(&self.conns[c]).get(d).copied()
     }
 
     fn sel_schema_name(&self) -> Option<&'static str> {
         let (c, s) = (self.sel_conn_ix()?, self.sel.schema()?);
-        mock::schemas(self.conns[c].kind).get(s).copied()
+        let db = self.sel.db().and_then(|d| catalog::databases(&self.conns[c]).get(d).copied())?;
+        catalog::schemas(&self.conns[c], db).get(s).copied()
     }
 
     /// 对象面板该显示哪一分类；只有选中库（默认表分类）、分类或对象时才有内容。
@@ -3420,7 +3758,7 @@ impl DaroApp {
             return (0, 0, NO_SCHEMA, 0);
         };
         let (_, d) = self.anchor_db().unwrap_or((c, 0));
-        let has_schema = mock::has_schemas(self.conns[c].kind);
+        let has_schema = catalog::has_schemas(self.conns[c].kind);
         let s = match self.sel.schema() {
             Some(s) => s,
             None if has_schema => 0,
@@ -3438,7 +3776,12 @@ impl DaroApp {
         ) else {
             return &[];
         };
-        mock::objects(conn, db, cat)
+        let schema = self
+            .sel
+            .schema()
+            .and_then(|s| catalog::schemas(conn, db).get(s).copied())
+            .unwrap_or("");
+        catalog::objects(conn, db, schema, cat)
     }
 
     pub(crate) fn push_connection(&mut self, conn: mock::Connection) {
@@ -3463,6 +3806,7 @@ impl DaroApp {
         let Some(conn) = self.conns.get_mut(ix) else {
             return;
         };
+        let old_kind = conn.kind;
         let old_name = std::mem::replace(&mut conn.name, name);
         let old_db = std::mem::replace(&mut conn.database, database);
         conn.kind = kind;
@@ -3471,6 +3815,11 @@ impl DaroApp {
         conn.user = user;
         conn.password = password;
         conn.connected = false;
+        // 旧真库句柄、目录缓存都按旧参数建，编辑后一律作废，重连再开
+        if backend::is_real(old_kind) {
+            backend::close_named(&old_name, old_kind);
+            catalog::invalidate();
+        }
         // 编辑完连接是断开的，旧展开态直接丢掉，重连时按 Navicat 重新展开
         self.expanded.remove(&old_name);
         self.expanded.remove(&node_key(&old_name, &old_db));
@@ -3576,7 +3925,15 @@ impl DaroApp {
         if new.is_empty() || new == old || self.conns.iter().any(|c| c.name == new) {
             return;
         }
+        let kind = conn.kind;
+        let path = catalog::sqlite_path(conn);
         self.conns[ix].name = new.clone();
+        // 连接注册表按名字记键：SQLite 的活句柄跟着改名迁移；PG 每个库一条连接，
+        // 旧的关掉，重连时按新名字重建
+        if backend::is_real(kind) {
+            backend::rename_connection(&old, &new, kind, &path);
+            catalog::invalidate();
+        }
         let remap = |set: &mut HashSet<String>| {
             let prefix = format!("{old}\u{1}");
             *set = set
@@ -3648,30 +4005,148 @@ impl DaroApp {
         if let Some(conn) = self.conns.get_mut(ix) {
             conn.connected = false;
             let name = conn.name.clone();
+            if backend::is_real(conn.kind) {
+                backend::close_connection(conn);
+                catalog::invalidate();
+            }
             // Navicat 断开时子树整棵收掉，重连后要重新展开
             self.drop_tree_state(&name);
             self.save();
         }
     }
 
-    fn open_connection(&mut self, ix: usize) {
-        if let Some(conn) = self.conns.get_mut(ix) {
-            conn.connected = true;
-            let name = conn.name.clone();
-            // 实测 Navicat：连接成功后只展开到数据库那一层，库不跟着展开
-            self.expanded.insert(name);
-            self.save();
+    /// 把 catalog 排队的目录加载投到后台线程。渲染只读缓存，未命中的项就是
+    /// 从这里出去的：本帧先给对应行画「载入中」，跑完由 [Self::catalog_loaded]
+    /// 填回缓存并重绘——建连和查询都不再占用这条线程，界面不会冻。
+    fn pump_catalog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let jobs = catalog::take_pending();
+        if jobs.is_empty() {
+            return;
         }
+        let win = window.window_handle();
+        let entity = cx.entity().downgrade();
+        for job in jobs {
+            for k in job.marks() {
+                self.loading.insert(k);
+            }
+            let bg = job.clone();
+            let ent = entity.clone();
+            cx.spawn(async move |_, cx| {
+                let err = cx
+                    .background_executor()
+                    .spawn(async move { bg.run() })
+                    .await;
+                // 无论界面还在不在，都要放开在飞标记，否则这个键永远不再重试
+                catalog::finish(&job);
+                let _ = win.update(cx, |_, _, app| {
+                    let Some(ent) = ent.upgrade() else { return };
+                    ent.update(app, |a, cx| a.catalog_loaded(&job, err, cx));
+                });
+            })
+            .detach();
+        }
+        // 让下一帧把「载入中」画出来；后台回来时 catalog_loaded 再画一次
+        cx.notify();
+    }
+
+    /// 后台目录加载回到界面线程：摘掉标记、汇总错误、重绘。
+    /// 错误等所有在飞任务都回来才合并成一个弹窗——展开 10 个库全失败，
+    /// 不该拍 10 个对话框。
+    fn catalog_loaded(
+        &mut self,
+        job: &catalog::Pending,
+        err: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        for k in job.marks() {
+            self.loading.remove(&k);
+        }
+        // 建连的回执不只是「载入完了」：成了才把连接标成已连接并展开，
+        // 失败是另一件事，弹窗口径要和旧版一致
+        if let catalog::Pending::Connect(conn) = job {
+            let name = conn.name.clone();
+            match err {
+                None => self.apply_connected(&name, cx),
+                Some(e) => {
+                    let dark = self.dark;
+                    open_confirm(
+                        cx.entity(),
+                        dark,
+                        "连接失败",
+                        format!("打开「{name}」失败：{e}"),
+                        |_| {},
+                        cx,
+                    );
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        if let Some(e) = err.filter(|e| !self.catalog_errors.contains(e)) {
+            self.catalog_errors.push(e);
+        }
+        if self.loading.is_empty() && !self.catalog_errors.is_empty() {
+            let msgs = std::mem::take(&mut self.catalog_errors);
+            let dark = self.dark;
+            open_confirm(
+                cx.entity(),
+                dark,
+                "目录读取失败",
+                msgs.join("\n"),
+                |_| {},
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// 树右键 / F5「刷新」：清掉目录缓存，已打开的连接重新排队加载。
+    /// 失败不静默吞掉——后台任务回来后弹窗说明，树上的空文件夹和
+    /// 「读不到」长得一模一样，不区分就是骗人。
+    fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        catalog::invalidate();
+        for conn in self.conns.iter() {
+            if conn.connected && backend::is_real(conn.kind) {
+                let _ = catalog::databases(conn);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 打开连接：建连（TCP 握手 / 开库文件）连同库清单一起进 catalog 队列，
+    /// 由 pump_catalog 投到后台线程；期间连接行标「连接中」，界面不冻。
+    fn open_connection(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(conn) = self.conns.get(ix).cloned() else {
+            return;
+        };
+        if !backend::is_real(conn.kind) {
+            self.apply_connected(&conn.name, cx);
+            return;
+        }
+        catalog::request_open(&conn);
+        cx.notify();
+    }
+
+    /// 建连回执落回界面：按名字定位（中途删掉这条连接时不能把回执落到别人身上），
+    /// 标记已连接并展开到库那一层（实测 Navicat：库不跟着展开）。
+    fn apply_connected(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(ix) = self.conns.iter().position(|c| c.name == name) else {
+            return;
+        };
+        self.conns[ix].connected = true;
+        self.expanded.insert(name.to_string());
+        self.save();
+        cx.notify();
     }
 
     /// 三角与双击都走这里：未连接时先连接（连接即展开），已连接时折叠/展开。
     /// 实测：折叠不会断开连接，「会话」计数与状态栏的连接指示都还在。
-    fn toggle_connection(&mut self, ix: usize) {
+    fn toggle_connection(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(conn) = self.conns.get(ix) else {
             return;
         };
         if !conn.connected {
-            self.open_connection(ix);
+            self.open_connection(ix, cx);
             return;
         }
         let name = conn.name.clone();
@@ -3679,15 +4154,15 @@ impl DaroApp {
     }
 
     /// 库节点：展开即「打开」这个库（Navicat 里图标会从灰转绿并一直保持）
-    fn toggle_db(&mut self, c: usize, d: usize) {
+    fn toggle_db(&mut self, c: usize, d: usize, cx: &mut Context<Self>) {
         let Some(conn) = self.conns.get(c) else {
             return;
         };
         if !conn.connected {
-            self.open_connection(c);
+            self.open_connection(c, cx);
             return;
         }
-        let Some(db) = mock::databases(conn.kind).get(d) else {
+        let Some(db) = catalog::databases(conn).get(d) else {
             return;
         };
         let key = node_key(&conn.name, db);
@@ -3699,15 +4174,15 @@ impl DaroApp {
     }
 
     /// 右键「打开数据库」：只展开并把库标记为已打开（Navicat 里图标转绿）
-    fn open_db(&mut self, c: usize, d: usize) {
+    fn open_db(&mut self, c: usize, d: usize, cx: &mut Context<Self>) {
         let Some(conn) = self.conns.get(c) else {
             return;
         };
         if !conn.connected {
-            self.open_connection(c);
+            self.open_connection(c, cx);
         }
         let conn = &self.conns[c];
-        let Some(db) = mock::databases(conn.kind).get(d).copied() else {
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
             return;
         };
         let key = node_key(&conn.name, db);
@@ -3720,7 +4195,7 @@ impl DaroApp {
         let Some(conn) = self.conns.get(c) else {
             return;
         };
-        let Some(db) = mock::databases(conn.kind).get(d).copied() else {
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
             return;
         };
         let key = node_key(&conn.name, db);
@@ -3730,18 +4205,18 @@ impl DaroApp {
     }
 
     /// 右键「打开模式」：展开模式节点，顺带把所属库标成已打开
-    fn open_schema(&mut self, c: usize, d: usize, s: usize) {
+    fn open_schema(&mut self, c: usize, d: usize, s: usize, cx: &mut Context<Self>) {
         let Some(conn) = self.conns.get(c) else {
             return;
         };
         if !conn.connected {
-            self.open_connection(c);
+            self.open_connection(c, cx);
         }
         let conn = &self.conns[c];
-        let (Some(db), Some(schema)) = (
-            mock::databases(conn.kind).get(d).copied(),
-            mock::schemas(conn.kind).get(s).copied(),
-        ) else {
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
+            return;
+        };
+        let Some(schema) = catalog::schemas(conn, db).get(s).copied() else {
             return;
         };
         let db_key = node_key(&conn.name, db);
@@ -3754,10 +4229,10 @@ impl DaroApp {
         let Some(conn) = self.conns.get(c) else {
             return;
         };
-        let (Some(db), Some(schema)) = (
-            mock::databases(conn.kind).get(d).copied(),
-            mock::schemas(conn.kind).get(s).copied(),
-        ) else {
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
+            return;
+        };
+        let Some(schema) = catalog::schemas(conn, db).get(s).copied() else {
             return;
         };
         self.toggle_key(node_key(&node_key(&conn.name, db), schema));
@@ -3781,10 +4256,11 @@ impl DaroApp {
         let Some(key) = self.cat_key_of(conn, d, s, cat) else {
             return;
         };
-        let Some(db) = mock::databases(conn.kind).get(d).copied() else {
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
             return;
         };
-        let Some(obj_name) = mock::objects(conn, db, cat).get(obj).copied() else {
+        let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
+        let Some(obj_name) = catalog::objects(conn, db, schema, cat).get(obj).copied() else {
             return;
         };
         self.toggle_key(node_key(&key, obj_name));
@@ -3798,10 +4274,10 @@ impl DaroApp {
         s: usize,
         cat: usize,
     ) -> Option<String> {
-        let db = mock::databases(conn.kind).get(d).copied()?;
+        let db = catalog::databases(conn).get(d).copied()?;
         let base = node_key(&conn.name, db);
-        let scoped = if mock::has_schemas(conn.kind) {
-            node_key(&base, mock::schemas(conn.kind).get(s).copied()?)
+        let scoped = if catalog::has_schemas(conn.kind) {
+            node_key(&base, catalog::schemas(conn, db).get(s).copied()?)
         } else {
             base
         };
@@ -3820,36 +4296,63 @@ impl DaroApp {
         let double = self
             .last_click
             .is_some_and(|(prev, at)| prev == act && now.duration_since(at) < DOUBLE_CLICK_INTERVAL);
-        eprintln!("[dbg] is_double_click: act={:?}, double={}, last_click={:?}", act, double, self.last_click.map(|(_, at)| now.duration_since(at)));
         self.last_click = if double { None } else { Some((act, now)) };
         double
     }
 
     /// 双击树节点 = Navicat 的「打开表」：表 / 视图开数据网格页签，
     /// 已打开过的直接切过去（不重复开）。
-    fn open_object(&mut self, act: Act) {
-        eprintln!("[dbg] open_object called: act={:?}", act);
-        let Act::Obj(c, d, s, k, o) = act else { 
-            eprintln!("[dbg] open_object: not an Obj action");
-            return; 
+    fn open_object(&mut self, act: Act, cx: &mut Context<Self>) {
+        let Act::Obj(c, d, s, k, o) = act else { return };
+        let Some(conn) = self.conns.get(c) else { return };
+        let Some(db) = catalog::databases(conn).get(d).copied() else { return };
+        let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
+        let obj_name = catalog::objects(conn, db, schema, k).get(o).copied().unwrap_or_default();
+        let remote = backend::is_real(conn.kind);
+        let size = if remote { REMOTE_PAGE_SIZE } else { PAGE_SIZE };
+        let dark = self.dark;
+        let mut open_error = None;
+        // 真库先拿缓存列占位开页签，取数交给后台（前台取数 = 双击表后整个窗口卡住）
+        let (page, total) = if remote {
+            (
+                db_types::SelectPage {
+                    columns: catalog::table_columns(conn, db, schema, obj_name),
+                    rows: Vec::new(),
+                    keys: Vec::new(),
+                    truncated: false,
+                },
+                0,
+            )
+        } else {
+            match load_table_page(conn, db, schema, obj_name, None, &[], 0, size) {
+                Ok(v) => v,
+                Err(e) => {
+                    open_error = Some(e);
+                    (
+                        db_types::SelectPage {
+                            columns: catalog::table_columns(conn, db, schema, obj_name),
+                            rows: Vec::new(),
+                            keys: Vec::new(),
+                            truncated: false,
+                        },
+                        0,
+                    )
+                }
+            }
         };
-        let Some(conn) = self.conns.get(c) else { 
-            eprintln!("[dbg] open_object: connection {} not found", c);
-            return; 
-        };
-        let Some(db) = mock::databases(conn.kind).get(d).copied() else { 
-            eprintln!("[dbg] open_object: database {} not found", d);
-            return; 
-        };
-        let obj_name = mock::objects(conn, db, k).get(o).copied().unwrap_or_default();
-        eprintln!("[dbg] open_object: opening table '{}' in conn '{}' db '{}'", obj_name, conn.name, db);
-        if !self.opened.iter().any(|t| {
+        let page_state = remote.then(|| RemotePage {
+            page_no: 0,
+            page_size: size,
+            total,
+        });
+        let existing = self.opened.iter().position(|t| {
             t.conn_name == conn.name
                 && t.db == db
                 && t.schema == s
                 && t.cat == k
                 && t.obj == o
-        }) {
+        });
+        if existing.is_none() {
             self.opened.push(OpenTab {
                 conn_name: conn.name.clone(),
                 db,
@@ -3864,25 +4367,19 @@ impl DaroApp {
                 qid: 0,
                 qstate: None,
                 sort: None,
-                data: materialize_rows(obj_name),
-                baseline: materialize_rows(obj_name),
+                data: page.rows.clone(),
+                baseline: page.rows,
+                cols: page.columns,
+                row_keys: page.keys.clone(),
+                baseline_row_keys: page.keys,
                 inserted: Vec::new(),
-            filter: filter::FilterState::default(),
+                filter: filter::FilterState::default(),
+                page: page_state,
+                loading_page: None,
             });
         }
         // 已开过的页签直接切过去；新页签落在当前聚焦窗格
-        let ix = self
-            .opened
-            .iter()
-            .position(|t| {
-                t.conn_name == conn.name
-                    && t.db == db
-                    && t.schema == s
-                    && t.cat == k
-                    && t.obj == o
-            })
-            .map(|p| p + 1)
-            .unwrap_or(self.opened.len());
+        let ix = existing.map(|p| p + 1).unwrap_or(self.opened.len());
         if self.dock.pane_of(ix).is_some() {
             self.dock.focus_tab(ix);
         } else {
@@ -3890,6 +4387,12 @@ impl DaroApp {
         }
         self.active_tab = ix;
         self.sel = act;
+        if let Some(e) = open_error {
+            open_confirm(cx.entity(), dark, "打开表失败", e, |_| {}, cx);
+        }
+        if remote && existing.is_none() {
+            self.request_table_page(ix - 1, 0, true, cx);
+        }
     }
 
     /// 打开「设计表」页签（动作条铅笔 / 对象右键菜单共用入口）。
@@ -3897,7 +4400,7 @@ impl DaroApp {
     fn open_designer(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
         let Act::Obj(c, d, s, k, o) = act else { return };
         let Some(conn) = self.conns.get(c) else { return };
-        let Some(db) = mock::databases(conn.kind).get(d).copied() else { return };
+        let Some(db) = catalog::databases(conn).get(d).copied() else { return };
         let conn_name = conn.name.clone();
         if let Some(ix) = self.opened.iter().position(|t| {
             t.design
@@ -3912,7 +4415,8 @@ impl DaroApp {
             cx.notify();
             return;
         }
-        let obj = mock::objects(conn, db, k).get(o).copied().unwrap_or_default();
+        let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
+        let obj = catalog::objects(conn, db, schema, k).get(o).copied().unwrap_or_default();
         let did = self.next_did;
         self.next_did += 1;
         self.opened.push(OpenTab {
@@ -3998,8 +4502,13 @@ impl DaroApp {
             sort: None,
             data: Vec::new(),
             baseline: Vec::new(),
+            cols: Vec::new(),
+            row_keys: Vec::new(),
+            baseline_row_keys: Vec::new(),
             inserted: Vec::new(),
             filter: filter::FilterState::default(),
+            page: None,
+            loading_page: None,
         });
         // 已开过的页签直接切过去；新页签落在当前聚焦窗格
         let ix = self
@@ -4046,7 +4555,7 @@ impl DaroApp {
     fn open_new_designer(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
         let Act::Obj(c, d, s, 0, _) = act else { return };
         let Some(conn) = self.conns.get(c) else { return };
-        let Some(db) = mock::databases(conn.kind).get(d).copied() else { return };
+        let Some(db) = catalog::databases(conn).get(d).copied() else { return };
         let did = self.next_did;
         self.next_did += 1;
         let empty = vec![DesignCol::default()];
@@ -4133,8 +4642,13 @@ impl DaroApp {
             sort: None,
             data: Vec::new(),
             baseline: Vec::new(),
+            cols: Vec::new(),
+            row_keys: Vec::new(),
+            baseline_row_keys: Vec::new(),
             inserted: Vec::new(),
             filter: filter::FilterState::default(),
+            page: None,
+            loading_page: None,
         });
         let ix = self.opened.len();
         self.dock.add_tab(ix);
@@ -4180,15 +4694,23 @@ impl DaroApp {
         let seq = self.next_qseq;
         self.next_qid += 1;
         self.next_qseq += 1;
-        let db0 = mock::databases(conn.kind)[0];
-        let comp_tables: Vec<String> = mock::objects(conn, db0, 0)
+        // 运行上下文默认落在连接配置的那个库（Navicat 口径）；模式默认 public
+        let (db0_ix, schema0_ix) = default_query_context(conn);
+        let db0 = catalog::databases(conn).get(db0_ix).copied().unwrap_or("");
+        let schema0 = catalog::schemas(conn, db0).get(schema0_ix).copied().unwrap_or("");
+        let comp_tables: Vec<String> = catalog::objects(conn, db0, schema0, 0)
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let comp_columns: Vec<String> = mock::MOCK_COLUMNS
-            .iter()
-            .map(|c| c.name.to_string())
-            .collect();
+        // 真库列名要查库：先只装表名，列名后台补进补全器——开页签不该等一次扫描
+        let tg = backend::Target::of(conn, db0, schema0);
+        let comp_columns: Vec<String> = match &tg {
+            Some(_) => Vec::new(),
+            None => mock::MOCK_COLUMNS
+                .iter()
+                .map(|c| c.name.to_string())
+                .collect(),
+        };
         let editor = cx.new(|cx| {
             let mut state = EditorState::new(window, cx).placeholder("-- 在此输入 SQL 语句");
             // SQL 语法高亮（迁移自 Flutter sql_highlight.dart）。
@@ -4218,11 +4740,13 @@ impl DaroApp {
             }
         })
         .detach();
+        // 列名回填要跨线程，先留一个句柄（editor 会被挪进页签状态）
+        let completion_editor = editor.clone();
         let log = cx.new(|cx| TextareaState::new(window, cx));
         self.opened.push(OpenTab {
             conn_name,
-            db: mock::databases(self.conns[ix].kind)[0],
-            schema: 0,
+            db: db0,
+            schema: schema0_ix,
             cat: 4,
             obj: 0,
             cell: (0, 0),
@@ -4234,20 +4758,26 @@ impl DaroApp {
             sort: None,
             data: Vec::new(),
             baseline: Vec::new(),
+            cols: Vec::new(),
+            row_keys: Vec::new(),
+            baseline_row_keys: Vec::new(),
             inserted: Vec::new(),
             filter: filter::FilterState::default(),
+            page: None,
+            loading_page: None,
             qstate: Some(QueryState {
                 editor,
                 log,
                 conn: self.conns[ix].name.clone(),
-                db: 0,
-                schema: 0,
+                db: db0_ix,
+                schema: schema0_ix,
                 seq,
                 dirty: false,
                 outcomes: Vec::new(),
                 pane: 0,
                 last_ms: 0,
                 prompt: None,
+                job: None,
                 panel_h: Q_PANEL_H,
             }),
         });
@@ -4255,12 +4785,56 @@ impl DaroApp {
         self.dock.add_tab(ix);
         self.active_tab = ix;
         cx.notify();
+        // 真库列名在后台扫完再换一份补全器：开页签不跟着卡一次全库扫描
+        if let Some(tg) = tg {
+            cx.spawn(async move |_, cx| {
+                let cols = cx
+                    .background_executor()
+                    .spawn(async move { tg.column_names() })
+                    .await;
+                let _ = cx.update(|app| {
+                    completion_editor.update(app, |state, cx| {
+                        state.lsp_mut().completion_provider =
+                            Some(sql_completion::provider_for(&comp_tables, &cols));
+                        cx.notify();
+                    });
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// 「美化 SQL」：整篇重排（顶层子句换行、关键字大写、触发器体缩进）。
+    /// 只动空白与关键字大小写，语句语义与原文一致。
+    fn query_prettify(&mut self, qid: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.opened.iter_mut().find(|t| t.qid == qid) else {
+            return;
+        };
+        let Some(q) = t.qstate.as_mut() else { return };
+        // 后台脚本还在跑正文：改正文会让回执与原句对不上
+        if q.job.is_some() {
+            return;
+        }
+        let src = q.editor.read(cx).value().to_string();
+        let out = sql_format::pretty(&src);
+        if out != src {
+            q.editor.update(cx, |s, cx| s.set_value(out, window, cx));
+            q.dirty = true;
+        }
+        cx.notify();
     }
 
     /// 运行（查询页签）：优先选中文本（selected_only 时强制选中），无选中跑整篇。
-    /// 按顶层分号逐条「执行」：SELECT 出 mock 结果网格，写操作不出网格；
-    /// 全程同步瞬时完成，「停止」因此在 mock 档恒灰。
+    /// 按顶层分号逐条执行：SQLite 库文件在后台线程另开一条连接跑（界面不
+    /// 冻结，「停止」能掐断正在跑的语句），内存库与演示连接沿用同步路径。
     fn query_run(&mut self, qid: u64, selected_only: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(t) = self.opened.iter().find(|t| t.qid == qid)
+            && let Some(q) = t.qstate.as_ref()
+            && q.job.is_some()
+        {
+            // 上一轮还在跑：重复点击直接忽略（工具条的运行钮此时也是灰的）
+            return;
+        }
         let Some(t) = self.opened.iter_mut().find(|t| t.qid == qid) else {
             return;
         };
@@ -4279,19 +4853,203 @@ impl DaroApp {
             return;
         }
         q.prompt = None;
+        let target = self
+            .conns
+            .iter()
+            .find(|c| c.name == q.conn)
+            .and_then(|c| {
+                let db = catalog::databases(c).get(q.db).copied().unwrap_or("");
+                let schema = catalog::schemas(c, db).get(q.schema).copied().unwrap_or("");
+                backend::Target::of(c, db, schema)
+            });
+        if let Some(t) = target.as_ref().filter(|t| t.background_ok()) {
+            let t = t.clone();
+            self.query_run_background(qid, split_sql_statements(&trimmed), t, window, cx);
+            return;
+        }
         let started = Instant::now();
         let mut outcomes: Vec<QueryOutcome> = Vec::new();
+        let mut had_error = false;
+        let mut schema_changed = false;
         for stmt in split_sql_statements(&trimmed) {
             let sw = Instant::now();
-            let result = query_is_select(&stmt).then(|| mock_query_rows(&stmt));
+            if stmt_may_change_schema(&stmt) {
+                schema_changed = true;
+            }
+            let (result, columns, message) = match &target {
+                Some(t) => match t.execute(&stmt, t.row_limit()) {
+                    Ok(out) => {
+                        let msg = (!out.message.is_empty()).then_some(out.message);
+                        match out.select {
+                            Some(page) => (Some(page.rows), page.columns, msg),
+                            None => (None, Vec::new(), msg),
+                        }
+                    }
+                    Err(e) => {
+                        had_error = true;
+                        (None, Vec::new(), Some(format!("错误：{e}")))
+                    }
+                },
+                None => {
+                    let is_select = query_is_select(&stmt);
+                    let columns = mock::MOCK_COLUMNS
+                        .iter()
+                        .map(|m| db_types::ColMeta::new(m.name, m.ty, m.numeric))
+                        .collect();
+                    (is_select.then(|| mock_query_rows(&stmt)), columns, None)
+                }
+            };
             outcomes.push(QueryOutcome {
                 elapsed_ms: sw.elapsed().as_millis(),
                 sql: stmt,
                 result,
+                columns,
+                message,
                 cell: (0, 0),
             });
         }
-        q.last_ms = started.elapsed().as_millis();
+        let mut notes = String::new();
+        if let Some(t) = &target {
+            // 脚本在事务中途失败会把连接挂在 BEGIN 里，后续取数 / 写回全遭殃
+            if had_error && t.rollback_open_tx() {
+                notes.push_str("检测到未提交事务（脚本中途失败），已自动回滚。\n\n");
+            }
+            // 只有 DDL / ATTACH 会改目录，普通 DML 不再清缓存
+            if schema_changed {
+                catalog::invalidate();
+            }
+        }
+        let total_ms = started.elapsed().as_millis();
+        self.query_finish(qid, outcomes, notes, total_ms, window, cx);
+    }
+
+    /// 后台执行：工作线程自己开一条连接逐条跑，回来只上屏。
+    /// 期间「运行」禁用、「停止」可用；页签中途被关掉，回执找不到页签就丢弃。
+    fn query_run_background(
+        &mut self,
+        qid: u64,
+        stmts: Vec<String>,
+        target: backend::Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let job = target.create_job();
+        let Some(q) = Self::query_state_mut(&mut self.opened, qid) else {
+            return;
+        };
+        q.job = Some(job.clone());
+        q.outcomes.clear();
+        q.pane = 0;
+        q.prompt = Some("执行中…");
+        let hint = format!("执行中…（{} 条语句）\n", stmts.len());
+        q.log.update(cx, |s, cx| s.set_value(hint, window, cx));
+        cx.notify();
+
+        let win = window.window_handle();
+        let entity = cx.entity().downgrade();
+        let worker_stmts = stmts.clone();
+        cx.spawn(async move |_, cx| {
+            let worker_job = job;
+            let run = cx
+                .background_executor()
+                .spawn(async move { target.run_script(&worker_job, &worker_stmts) })
+                .await;
+            let _ = win.update(cx, |_, window, app| {
+                let Some(entity) = entity.upgrade() else { return };
+                entity.update(app, |a, cx| {
+                    a.query_apply_script(qid, &stmts, run, window, cx)
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 后台脚本的回执上屏：逐条转成结果页签，再补「已停止 / 已回滚」的说明。
+    fn query_apply_script(
+        &mut self,
+        qid: u64,
+        stmts: &[String],
+        run: db_types::ScriptRun,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dark = self.dark;
+        let Some(q) = Self::query_state_mut(&mut self.opened, qid) else {
+            return;
+        };
+        // 任务结束（或被停止）：先摘牌子，运行钮立刻恢复
+        q.job = None;
+        if stmts.iter().any(|s| stmt_may_change_schema(s)) {
+            catalog::invalidate();
+        }
+        if let Some(e) = run.open_error {
+            q.prompt = Some("执行失败");
+            open_confirm(cx.entity(), dark, "执行失败", e, |_| {}, cx);
+            cx.notify();
+            return;
+        }
+        let mut outcomes: Vec<QueryOutcome> = Vec::with_capacity(run.runs.len());
+        for (stmt, r) in stmts.iter().zip(run.runs) {
+            let (result, columns, message) = match r.result {
+                Ok(out) => {
+                    let msg = (!out.message.is_empty()).then_some(out.message);
+                    match out.select {
+                        Some(page) => (Some(page.rows), page.columns, msg),
+                        None => (None, Vec::new(), msg),
+                    }
+                }
+                Err(e) => (None, Vec::new(), Some(format!("错误：{e}"))),
+            };
+            outcomes.push(QueryOutcome {
+                elapsed_ms: r.elapsed_ms,
+                sql: stmt.clone(),
+                result,
+                columns,
+                message,
+                cell: (0, 0),
+            });
+        }
+        let mut notes = String::new();
+        if run.cancelled {
+            let left = stmts.len() - outcomes.len();
+            notes.push_str(&format!("已停止：剩余 {left} 条语句未执行。\n\n"));
+            if outcomes.is_empty() {
+                q.prompt = Some("已停止");
+            }
+        }
+        if run.rolled_back {
+            notes.push_str("检测到未提交事务（脚本中途失败），已自动回滚。\n\n");
+        }
+        let total_ms = run.total_ms;
+        self.query_finish(qid, outcomes, notes, total_ms, window, cx);
+    }
+
+    /// 「停止」：置取消标志并掐断正在跑的那条语句；回执回来再收尾上屏。
+    fn query_cancel(&mut self, qid: u64, cx: &mut Context<Self>) {
+        if let Some(q) = Self::query_state_mut(&mut self.opened, qid)
+            && let Some(job) = &q.job
+        {
+            job.cancel();
+            cx.notify();
+        }
+    }
+
+    /// 一轮执行的回执上屏：结果页签、消息日志、状态耗时。同步路径与后台
+    /// 回执都收敛到这里，两条路不会各写一份口径。
+    fn query_finish(
+        &mut self,
+        qid: u64,
+        outcomes: Vec<QueryOutcome>,
+        notes: String,
+        total_ms: u128,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(q) = Self::query_state_mut(&mut self.opened, qid) else {
+            return;
+        };
+        q.job = None;
+        q.last_ms = total_ms;
         // 执行完自动切到最新的「有网格」结果页签；全是写操作就停在消息页
         q.pane = match outcomes.iter().rposition(|o| o.result.is_some()) {
             Some(i) => i + 1,
@@ -4302,16 +5060,26 @@ impl DaroApp {
         for (i, o) in outcomes.iter().enumerate() {
             log.push_str(&format!("{}\n", o.sql.replace(['\n', '\r'], " ")));
             let summary = match &o.result {
-                Some(rows) => format!("{} 行", rows.len()),
-                None => "演示数据：写操作未执行".to_string(),
+                Some(rows) => match &o.message {
+                    Some(m) => format!("{} 行 · {m}", rows.len()),
+                    None => format!("{} 行", rows.len()),
+                },
+                None => o
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "演示数据：写操作未执行".to_string()),
             };
             log.push_str(&format!("语句 {}: {} · {} ms\n\n", i + 1, summary, o.elapsed_ms));
         }
-        q.log.update(cx, |s, cx| {
-            s.set_value(log, window, cx);
-        });
+        log.push_str(&notes);
+        q.log.update(cx, |s, cx| s.set_value(log, window, cx));
         q.outcomes = outcomes;
         cx.notify();
+    }
+
+    /// 按页签号取查询状态（qid 全局递增，下标会随开关页漂移）。
+    fn query_state_mut(opened: &mut [OpenTab], qid: u64) -> Option<&mut QueryState> {
+        opened.iter_mut().find(|t| t.qid == qid)?.qstate.as_mut()
     }
 
     /// 结果面板头的状态文案（同 Flutter 版口径：结果 + 耗时）。
@@ -4322,8 +5090,20 @@ impl DaroApp {
         }
         if n == 1 {
             return match &q.outcomes[0].result {
-                Some(rows) => format!("执行成功 · {} 行 · {} ms", rows.len(), q.last_ms),
-                None => format!("演示数据 · 写操作未执行 · {} ms", q.last_ms),
+                Some(rows) => match &q.outcomes[0].message {
+                    Some(m) => {
+                        format!("执行成功 · {} 行 · {m} · {} ms", rows.len(), q.last_ms)
+                    }
+                    None => format!("执行成功 · {} 行 · {} ms", rows.len(), q.last_ms),
+                },
+                None => format!(
+                    "{} · {} ms",
+                    q.outcomes[0]
+                        .message
+                        .as_deref()
+                        .unwrap_or("演示数据 · 写操作未执行"),
+                    q.last_ms
+                ),
             };
         }
         format!("执行成功 · {n} 条语句 · {} ms", q.last_ms)
@@ -4975,7 +5755,7 @@ impl DaroApp {
         let Some(conn) = self.conns.iter().find(|c| c.name == t.conn_name) else {
             return Vec::new();
         };
-        mock::objects(conn, t.db, 0)
+        catalog::objects(conn, t.db, tab_schema(conn, t), 0)
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -5414,6 +6194,14 @@ impl DaroApp {
             && let Some((sub, col, start_x, start_w)) = d.resize
         {
             let w = (start_w + (x - start_x)).clamp(40., 480.);
+            // 取整后宽度没变就不要 notify：根视图重建会连带重画所有窗格
+            // （数据页一次画整页上千行 × 所有列），逐帧重建就是拖动的卡点。
+            if d.widths
+                .get(&(sub, col))
+                .is_some_and(|old| old.round() == w.round())
+            {
+                return;
+            }
             d.widths.insert((sub, col), w);
             cx.notify();
         }
@@ -9419,7 +10207,7 @@ impl DaroApp {
                 .find(|t| t.did == did)
                 .and_then(|t| {
                     let conn = self.conns.iter().find(|c| c.name == t.conn_name)?;
-                    mock::objects(conn, t.db, t.cat)
+                    catalog::objects(conn, t.db, tab_schema(conn, t), t.cat)
                         .get(t.obj)
                         .copied()
                         .map(|s| s.to_string())
@@ -9624,7 +10412,7 @@ impl DaroApp {
         let Some(conn) = self.conns.iter().find(|c| c.name == t.conn_name) else {
             return Vec::new();
         };
-        mock::objects(conn, t.db, 0)
+        catalog::objects(conn, t.db, tab_schema(conn, t), 0)
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -11902,40 +12690,81 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
 
     /// 打开「导出表数据」对话框（SQL/CSV/JSON… + 分块写盘）。
     /// 数据页签在时用它当前工作集；否则回落到树/对象面板里选中的表。
+    /// 远程表只装了当前页：整表取数交给对话框在后台跑，这里绝不先取一遍——
+    /// 对话框要弹出来之前先把百万行拉回来，就是「点了没反应」的典型。
     fn open_table_export(&mut self, cx: &mut Context<Self>) {
-        let columns: Vec<String> = mock::MOCK_COLUMNS.iter().map(|c| c.name.to_string()).collect();
-        let (table, rows) = if let Some(tab) = self.active_table() {
-            let table = self
-                .conns
-                .iter()
-                .find(|c| c.name == tab.conn_name)
-                .and_then(|c| mock::objects(c, tab.db, tab.cat).get(tab.obj).map(|s| s.to_string()))
+        let mut fetch = None;
+        let (table, columns, rows, is_mysql) = if let Some(tab) = self.active_table() {
+            let conn = self.conns.iter().find(|c| c.name == tab.conn_name);
+            let table = conn
+                .and_then(|c| {
+                    catalog::objects(c, tab.db, tab_schema(c, &tab), tab.cat)
+                        .get(tab.obj)
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_else(|| "export".to_string());
-            (table, tab.data)
-        } else if let Act::Obj(c, d, _s, k, o) = self.sel {
+            let columns = tab.cols.iter().map(|m| m.name.clone()).collect();
+            let rows = match conn.filter(|c| backend::is_real(c.kind)) {
+                Some(c) if tab.page.is_some() => {
+                    fetch = Some(table_export_dialog::ExportFetch {
+                        conn: c.clone(),
+                        db: tab.db.to_string(),
+                        schema: tab_schema(c, &tab).to_string(),
+                        table: table.clone(),
+                        where_sql: tab_where(&tab),
+                        orders: tab_orders(&tab),
+                    });
+                    Vec::new()
+                }
+                _ => tab.data.clone(),
+            };
+            let mysql = conn.map(|c| c.kind == mock::DbKind::MySql).unwrap_or(true);
+            (table, columns, rows, mysql)
+        } else if let Act::Obj(c, d, s, k, o) = self.sel {
             let Some(conn) = self.conns.get(c) else { return };
-            let Some(db) = mock::databases(conn.kind).get(d).copied() else {
+            let Some(db) = catalog::databases(conn).get(d).copied() else {
                 return;
             };
-            let Some(name) = mock::objects(conn, db, k).get(o).copied() else {
+            let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
+            let Some(name) = catalog::objects(conn, db, schema, k).get(o).copied() else {
                 return;
             };
-            let rows = materialize_rows(name);
-            (name.to_string(), rows)
+            let columns = catalog::table_columns(conn, db, schema, name)
+                .iter()
+                .map(|m| m.name.clone())
+                .collect();
+            let rows = if backend::is_real(conn.kind) {
+                fetch = Some(table_export_dialog::ExportFetch {
+                    conn: conn.clone(),
+                    db: db.to_string(),
+                    schema: schema.to_string(),
+                    table: name.to_string(),
+                    where_sql: None,
+                    orders: Vec::new(),
+                });
+                Vec::new()
+            } else {
+                load_table_page(conn, db, schema, name, None, &[], 0, PAGE_SIZE)
+                    .map(|(p, _)| p.rows)
+                    .unwrap_or_default()
+            };
+            (name.to_string(), columns, rows, conn.kind == mock::DbKind::MySql)
         } else {
             return;
         };
         table_export_dialog::open_table_export(
             cx.entity().clone(),
             self.dark,
+            is_mysql,
             table,
             columns,
             rows,
+            fetch,
             cx,
         );
     }
 
-    /// 打开「导出结果」对话框：数据页签的当前工作集 + mock 列名。
+    /// 打开「导出结果」对话框：数据页签的当前工作集 + 页签列名。
     fn open_export_result(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.active_table() else {
             return;
@@ -11945,15 +12774,12 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .iter()
             .find(|c| c.name == tab.conn_name)
             .and_then(|c| {
-                mock::objects(c, tab.db, tab.cat)
+                catalog::objects(c, tab.db, tab_schema(c, &tab), tab.cat)
                     .get(tab.obj)
                     .map(|s| s.to_string())
             })
             .unwrap_or_else(|| "result".to_string());
-        let columns: Vec<String> = mock::MOCK_COLUMNS
-            .iter()
-            .map(|c| c.name.to_string())
-            .collect();
+        let columns: Vec<String> = tab.cols.iter().map(|m| m.name.clone()).collect();
         export_result_dialog::open_export_result(
             cx.entity().clone(),
             self.dark,
@@ -11967,6 +12793,10 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     fn close_tab(&mut self, opened_ix: usize) {
         if opened_ix >= self.opened.len() {
             return;
+        }
+        // 关掉正在跑的查询页签：喊停，回执回来时页签已经没了，自然丢弃
+        if let Some(job) = self.opened[opened_ix].qstate.as_ref().and_then(|q| q.job.as_ref()) {
+            job.cancel();
         }
         self.opened.remove(opened_ix);
         // 窗格侧的页签下标（1 基）整体前移；拖空的非 home 窗格会在这里塌掉
@@ -11987,15 +12817,15 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         };
         let obj: &str = match name {
             Some(n) => n,
-            None => mock::objects(conn, t.db, t.cat)
+            None => catalog::objects(conn, t.db, tab_schema(conn, t), t.cat)
                 .get(t.obj)
                 .copied()
                 .unwrap_or_default(),
         };
-        let schema = if mock::has_schemas(conn.kind) {
+        let schema = if catalog::has_schemas(conn.kind) {
             format!(
                 ".{}",
-                mock::schemas(conn.kind).get(t.schema).copied().unwrap_or("public")
+                catalog::schemas(conn, t.db).get(t.schema).copied().unwrap_or("public")
             )
         } else {
             String::new()
@@ -12012,35 +12842,61 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let Some(conn) = self.conns.iter().find(|c| c.name == t.conn_name) else {
             return (String::new(), String::new());
         };
-        let obj = mock::objects(conn, t.db, t.cat)
+        let obj = catalog::objects(conn, t.db, tab_schema(conn, t), t.cat)
             .get(t.obj)
             .copied()
             .unwrap_or_default();
-        let schema = mock::schemas(conn.kind)
+        let schema = catalog::schemas(conn, t.db)
             .get(t.schema)
             .copied()
             .unwrap_or_default();
-        let orders: Vec<(usize, bool)> = match t.filter.applied.as_ref() {
-            Some(a) if !a.sorts.is_empty() => a.sorts.clone(),
-            _ => t.sort.into_iter().collect(),
+        let where_sql = t
+            .filter
+            .applied
+            .as_ref()
+            .and_then(|a| a.where_sql.as_deref());
+        let sql = match backend::Target::of(conn, t.db, schema) {
+            Some(target) => {
+                let (size, offset) = t
+                    .page
+                    .as_ref()
+                    .map(|p| (p.page_size, p.page_no * p.page_size))
+                    .unwrap_or((PAGE_SIZE, 0));
+                target.page_sql(&t.cols, obj, where_sql, &tab_orders(t), size, offset)
+            }
+            None => {
+                let orders: Vec<(usize, bool)> = match t.filter.applied.as_ref() {
+                    Some(a) if !a.sorts.is_empty() => a.sorts.clone(),
+                    _ => t.sort.into_iter().collect(),
+                };
+                mock::mock_select_sql(conn.kind, &t.cols, t.db, schema, obj, where_sql, &orders)
+            }
         };
-        let sql = mock::mock_select_sql(
-            conn.kind,
-            t.db,
-            schema,
-            obj,
-            t.filter
-                .applied
-                .as_ref()
-                .and_then(|a| a.where_sql.as_deref()),
-            &orders,
-        );
-        let rows = visible_data_order(t).len() + t.inserted.len();
+        let loaded = visible_data_order(t).len() + t.inserted.len();
+        if t.loading_page.is_some() {
+            // 后台取数中：网格还显示上一页内容，状态栏必须说清楚，别让人以为
+            // 这就是新页的数据
+            return (sql, "载入中…".to_string());
+        }
+        if let Some(p) = t.page.as_ref() {
+            let total = p.total + t.inserted.len();
+            if total == 0 {
+                return (sql, "共 0 条记录".to_string());
+            }
+            let rec = (p.page_no * p.page_size + t.cell.0 + 1).min(total);
+            return (
+                sql,
+                format!(
+                    "第 {rec} 条记录（共 {total} 条）于第 {} 页",
+                    p.page_no + 1
+                ),
+            );
+        }
         let page = t.cell.0 / PAGE_SIZE + 1;
-        if rows == 0 {
+        if loaded == 0 {
             return (sql, "共 0 条记录".to_string());
         }
-        let (rec, total) = (t.cell.0.min(rows - 1) + 1, rows);
+        let (rec, total) = (t.cell.0.min(loaded - 1) + 1, loaded);
         (sql, format!("第 {rec} 条记录（共 {total} 条）于第 {page} 页"))
     }
 
@@ -12075,14 +12931,229 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             cx.notify();
             return;
         };
-        if self.active_tab > 0
-            && let Some(tab) = self.opened.get_mut(self.active_tab - 1)
-        {
-            let total = tab.data.len() + tab.inserted.len();
-            let pages = total.div_ceil(PAGE_SIZE).max(1);
-            tab.cell.0 = (n.clamp(1, pages) - 1) * PAGE_SIZE;
+        if self.active_tab > 0 {
+            let ix = self.active_tab - 1;
+            if let Some(tab) = self.opened.get(ix) {
+                if let Some(p) = tab.page.as_ref() {
+                    let pages = p.total.div_ceil(p.page_size).max(1);
+                    let target = n.clamp(1, pages) - 1;
+                    if tab.dirty() {
+                        let dark = self.dark;
+                        prompt_dialog::open_confirm(
+                            cx.entity(),
+                            dark,
+                            "无法翻页",
+                            "当前页有未应用的修改，请先应用或撤销后再翻页".to_string(),
+                            |_| {},
+                            cx,
+                        );
+                        cx.notify();
+                        return;
+                    }
+                    self.request_table_page(ix, target, true, cx);
+                    return;
+                }
+                let total = tab.data.len() + tab.inserted.len();
+                let pages = total.div_ceil(PAGE_SIZE).max(1);
+                let target = (n.clamp(1, pages) - 1) * PAGE_SIZE;
+                if let Some(tab) = self.opened.get_mut(ix) {
+                    tab.cell.0 = target;
+                }
+            }
         }
         cx.notify();
+    }
+
+    /// 远程表页重取当前页（筛选 / 排序 / 应用 / 刷新后调用）。
+    /// reset_row：结果集本身变了（排序 / 筛选）→ 回到首页首行；
+    /// 单纯刷新保持当前位置。
+    fn reload_active_remote(&mut self, reset_row: bool, cx: &mut Context<Self>) {
+        if self.active_tab == 0 {
+            return;
+        }
+        let ix = self.active_tab - 1;
+        let Some(tab) = self.opened.get(ix) else {
+            return;
+        };
+        if tab.page.is_none() {
+            return;
+        }
+        let target = if reset_row {
+            0
+        } else {
+            tab.page.as_ref().map(|p| p.page_no).unwrap_or(0)
+        };
+        self.request_table_page(ix, target, reset_row, cx);
+    }
+
+    /// 表页取数的唯一出口：真库一律后台取（前台取就是「翻页转圈、窗口白屏」），
+    /// mock / 全量页签仍在内存里同步翻。`target` 是目标页号，回执落地才切页号
+    /// ——先切页号再取数会让这期间的「应用」写到错的页上。
+    fn request_table_page(
+        &mut self,
+        ix: usize,
+        target: usize,
+        reset_row: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.opened.get(ix).cloned() else {
+            return;
+        };
+        let Some(conn) = self.conns.iter().find(|c| c.name == tab.conn_name).cloned() else {
+            return;
+        };
+        let remote = tab.page.is_some() && backend::is_real(conn.kind);
+        if !remote {
+            if let Some(t) = self.opened.get_mut(ix) {
+                if let Some(p) = t.page.as_mut() {
+                    p.page_no = target;
+                }
+                if reset_row {
+                    t.cell.0 = 0;
+                }
+                if let Err(e) = reload_table_page(&conn, t) {
+                    let dark = self.dark;
+                    prompt_dialog::open_confirm(cx.entity(), dark, "取数失败", e, |_| {}, cx);
+                }
+                t.cell.0 = t.cell.0.min(t.data.len().saturating_sub(1));
+                t.cell.1 = t.cell.1.min(t.cols.len().saturating_sub(1));
+            }
+            cx.notify();
+            return;
+        }
+        // 已经有一页在路上：再点也不叠加（回执只按一个页号认领）
+        if tab.loading_page.is_some() {
+            return;
+        }
+        let schema = catalog::schemas(&conn, tab.db).get(tab.schema).copied().unwrap_or("");
+        let table = catalog::objects(&conn, tab.db, schema, tab.cat)
+            .get(tab.obj)
+            .copied()
+            .unwrap_or_default()
+            .to_string();
+        let Some(tg) = backend::Target::of(&conn, tab.db, schema) else {
+            return;
+        };
+        let Some(handle) = cx.active_window().or(self.win) else {
+            return;
+        };
+        let size = tab.page.as_ref().map(|p| p.page_size).unwrap_or(PAGE_SIZE);
+        let where_sql = tab_where(&tab);
+        let orders = tab_orders(&tab);
+        let identity = PageIdent {
+            conn: tab.conn_name.clone(),
+            db: tab.db,
+            schema: tab.schema,
+            cat: tab.cat,
+            obj: tab.obj,
+        };
+        // 约定：先把「载入中」推上屏，再去后台占线程
+        if let Some(t) = self.opened.get_mut(ix) {
+            t.loading_page = Some(target);
+            if reset_row {
+                t.cell.0 = 0;
+            }
+        }
+        cx.notify();
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    load_page_blocking(&tg, &table, where_sql.as_deref(), &orders, target, size)
+                })
+                .await;
+            let _ = handle.update(cx, |_, _, app| {
+                let Some(ent) = entity.upgrade() else { return };
+                ent.update(app, |a, cx| {
+                    a.page_loaded(identity, target, reset_row, "取数失败", res, cx)
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 后台取数回执：按身份找页签，把数据换成新页；期间页签已关就丢掉。
+    fn page_loaded(
+        &mut self,
+        id: PageIdent,
+        target: usize,
+        reset_row: bool,
+        err_title: &'static str,
+        res: Result<(db_types::SelectPage, usize), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.opened.iter().position(|t| {
+            t.conn_name == id.conn
+                && t.db == id.db
+                && t.schema == id.schema
+                && t.cat == id.cat
+                && t.obj == id.obj
+        }) else {
+            return;
+        };
+        let Some(t) = self.opened.get_mut(ix) else {
+            return;
+        };
+        t.loading_page = None;
+        match res {
+            Ok((page, total)) => {
+                t.data = page.rows.clone();
+                t.baseline = page.rows;
+                t.cols = page.columns;
+                t.row_keys = page.keys.clone();
+                t.baseline_row_keys = page.keys;
+                // 新增行已经随写回落库，重取的一页就是新基线
+                t.inserted.clear();
+                if let Some(p) = t.page.as_mut() {
+                    p.page_no = target;
+                    p.total = total;
+                }
+                if reset_row {
+                    t.cell.0 = 0;
+                }
+                t.cell.0 = t.cell.0.min(t.data.len().saturating_sub(1));
+                t.cell.1 = t.cell.1.min(t.cols.len().saturating_sub(1));
+            }
+            Err(e) => {
+                let dark = self.dark;
+                prompt_dialog::open_confirm(cx.entity(), dark, err_title, e, |_| {}, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 远程分页翻页：有未应用修改时先拦下，避免丢掉工作集。
+    fn grid_page_to(&mut self, page_no: usize, cx: &mut Context<Self>) {
+        if self.active_tab == 0 {
+            return;
+        }
+        let ix = self.active_tab - 1;
+        let Some(tab) = self.opened.get(ix) else {
+            return;
+        };
+        let Some(page) = tab.page.as_ref() else {
+            return;
+        };
+        let pages = page.total.div_ceil(page.page_size).max(1);
+        let target = page_no.min(pages - 1);
+        if target == page.page_no {
+            return;
+        }
+        if tab.dirty() {
+            let dark = self.dark;
+            prompt_dialog::open_confirm(
+                cx.entity(),
+                dark,
+                "无法翻页",
+                "当前页有未应用的修改，请先应用或撤销后再翻页".to_string(),
+                |_| {},
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        self.request_table_page(ix, target, true, cx);
     }
 
     /// 格子上的双击判定（同 [DaroApp::is_double_click] 的口径，键是格位）。
@@ -12226,7 +13297,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         if let Some(t) = self.opened.get_mut(self.active_tab - 1) {
             // 新行贴在「可见行」之后：筛选态下 = 过滤后的数据行数 + 已有新增
             let vis = visible_data_order(t).len();
-            t.inserted.push(vec![String::new(); mock::MOCK_COLUMNS.len()]);
+            t.inserted.push(vec![String::new(); t.cols.len()]);
             t.cell = (vis + t.inserted.len() - 1, 0);
         }
         cx.notify();
@@ -12243,7 +13314,11 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             let order = visible_data_order(t);
             let disp = t.cell.0;
             if disp < order.len() {
-                t.data.remove(order[disp]);
+                let data_ix = order[disp];
+                t.data.remove(data_ix);
+                if data_ix < t.row_keys.len() {
+                    t.row_keys.remove(data_ix);
+                }
             } else if disp < order.len() + t.inserted.len() {
                 t.inserted.remove(disp - order.len());
             }
@@ -12253,14 +13328,122 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         cx.notify();
     }
 
-    /// 导航条 ✓（应用）：把工作集固定成新基线（mock 档没有真库可写，
-    /// 这一步等于「保存成功」，✓ / × 随即变灰，页签 * 摘掉）。
+    /// 导航条 ✓（应用）：真库页签把工作集差异写回服务端（UPDATE / DELETE /
+    /// INSERT 在一个事务里），成功后重新取数；mock 档没有真库可写，这一步
+    /// 等于「保存成功」，✓ / × 随即变灰，页签 * 摘掉。
     fn grid_apply(&mut self, cx: &mut Context<Self>) {
         if self.active_tab == 0 {
             return;
         }
         self.commit_cell_edit(cx);
-        if let Some(t) = self.opened.get_mut(self.active_tab - 1) {
+        let ix = self.active_tab - 1;
+        let Some(tab) = self.opened.get(ix) else {
+            return;
+        };
+        let Some(conn) = self.conns.iter().find(|c| c.name == tab.conn_name).cloned() else {
+            return;
+        };
+        if let Some(target) = backend::Target::of(&conn, tab.db, tab_schema(&conn, tab)) {
+            let table = catalog::objects(&conn, tab.db, tab_schema(&conn, tab), tab.cat)
+                .get(tab.obj)
+                .copied()
+                .unwrap_or_default()
+                .to_string();
+            // 定位不到行的表（视图 / WITHOUT ROWID / 无主键）：有改 / 删就拒绝，
+            // 纯新增仍可写
+            if tab.data != tab.baseline && tab.row_keys.iter().any(|k| k.is_empty()) {
+                let dark = self.dark;
+                prompt_dialog::open_confirm(
+                    cx.entity(),
+                    dark,
+                    "无法写回",
+                    "该表没有可用的行标识（视图 / 无主键 / 无 rowid），不支持编辑和删除；纯新增仍可保存"
+                        .to_string(),
+                    |_| {},
+                    cx,
+                );
+                cx.notify();
+                return;
+            }
+            let mut updates: Vec<(db_types::RowKey, usize, String)> = Vec::new();
+            for (i, row) in tab.data.iter().enumerate() {
+                let Some(key) = tab.row_keys.get(i) else {
+                    continue;
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                let Some(base_ix) = tab.baseline_row_keys.iter().position(|k| k == key) else {
+                    continue;
+                };
+                let Some(base_row) = tab.baseline.get(base_ix) else {
+                    continue;
+                };
+                if base_row == row {
+                    continue;
+                }
+                for (c, val) in row.iter().enumerate() {
+                    if base_row.get(c) != Some(val) {
+                        updates.push((key.clone(), c, val.clone()));
+                    }
+                }
+            }
+            let deletes: Vec<db_types::RowKey> = tab
+                .baseline_row_keys
+                .iter()
+                .filter(|k| !k.is_empty() && !tab.row_keys.contains(k))
+                .cloned()
+                .collect();
+            let inserts = tab.inserted.clone();
+            let cols = tab.cols.clone();
+            // 写回（一个事务）和重新取数都下放后台：在 UI 线程上跑就是
+            // 「点完 ✓ 窗口不动」。回执按页签身份认领，期间关页也不落到别人身上。
+            let Some(handle) = cx.active_window().or(self.win) else {
+                return;
+            };
+            let page_no = tab.page.as_ref().map(|p| p.page_no).unwrap_or(0);
+            let size = tab.page.as_ref().map(|p| p.page_size).unwrap_or(PAGE_SIZE);
+            let where_sql = tab_where(tab);
+            let orders = tab_orders(tab);
+            let identity = PageIdent {
+                conn: tab.conn_name.clone(),
+                db: tab.db,
+                schema: tab.schema,
+                cat: tab.cat,
+                obj: tab.obj,
+            };
+            if let Some(t) = self.opened.get_mut(ix) {
+                t.cell.0 = 0;
+                t.loading_page = Some(page_no);
+            }
+            cx.notify();
+            let entity = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let ch = db_types::GridChanges {
+                            table: &table,
+                            columns: &cols,
+                            updates: &updates,
+                            deletes: &deletes,
+                            inserts: &inserts,
+                        };
+                        target.apply(&ch)?;
+                        load_page_blocking(&target, &table, where_sql.as_deref(), &orders, page_no, size)
+                    })
+                    .await;
+                let _ = handle.update(cx, |_, _, app| {
+                    let Some(ent) = entity.upgrade() else { return };
+                    ent.update(app, |a, cx| {
+                        a.page_loaded(identity, page_no, true, "写回失败", res, cx)
+                    });
+                });
+            })
+            .detach();
+            return;
+        }
+        if let Some(t) = self.opened.get_mut(ix) {
             if !t.inserted.is_empty() {
                 t.data.extend(t.inserted.drain(..));
             }
@@ -12276,8 +13459,18 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             return;
         }
         self.cancel_cell_edit(cx);
+        // 远程表页：撤销 = 按当前筛选 / 排序重取本页（同时捞到外部改动）
+        let remote = self
+            .active_data_tab()
+            .map(|t| t.page.is_some())
+            .unwrap_or(false);
+        if remote {
+            self.reload_active_remote(false, cx);
+            return;
+        }
         if let Some(t) = self.opened.get_mut(self.active_tab - 1) {
             t.data = t.baseline.clone();
+            t.row_keys = t.baseline_row_keys.clone();
             t.inserted.clear();
             // 筛选面板的应用态刻意保留：Navicat 的「刷新」= 重发带 WHERE 的
             // 取数，面板条件不清
@@ -12287,18 +13480,26 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         cx.notify();
     }
 
-    /// F5 刷新当前视图。数据页签 = 重新取数（mock 档取回基线，走 × 的
-    /// 同一条路径）；树 / 对象面板的目录在 mock 档是静态的、设计 / 查询
-    /// 页签没有「数据」可重取，重渲染即可 = 无操作。
+    /// F5 刷新当前视图。数据页签 = 重新取数；SQLite 直接查真库（带上其它
+    /// 客户端的改动），mock 档取回基线。树 / 对象面板的目录在 mock 档是
+    /// 静态的、设计 / 查询页签没有「数据」可重取，重渲染即可 = 无操作。
     fn refresh_view(&mut self, cx: &mut Context<Self>) {
         if self.active_tab == 0 {
             return;
         }
-        if self
-            .opened
-            .get(self.active_tab - 1)
-            .is_some_and(|t| !t.design && !t.query)
-        {
+        let ix = self.active_tab - 1;
+        let Some(tab) = self.opened.get(ix) else {
+            return;
+        };
+        if tab.design || tab.query {
+            return;
+        }
+        let Some(conn) = self.conns.iter().find(|c| c.name == tab.conn_name).cloned() else {
+            return;
+        };
+        if backend::is_real(conn.kind) {
+            self.reload_active_remote(false, cx);
+        } else {
             self.grid_revert(cx);
         }
     }
@@ -12309,11 +13510,18 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_data_tab_mut() {
             let row = tab.cell.0;
-            if row < tab.data.len() {
-                // 删除选中行：从 data 里移除
-                tab.data.remove(row);
+            let order = visible_data_order(tab);
+            if row < order.len() {
+                // 删除选中行（显示序位换算回原行下标）；SQLite 的 rowid
+                // 并行数组同步移除，应用时才能识别出这条删除
+                let data_ix = order[row];
+                tab.data.remove(data_ix);
+                if data_ix < tab.row_keys.len() {
+                    tab.row_keys.remove(data_ix);
+                }
                 // 调整选中位置
-                tab.cell.0 = row.min(tab.data.len().saturating_sub(1));
+                let total = visible_data_order(tab).len();
+                tab.cell.0 = row.min(total.saturating_sub(1));
                 cx.notify();
             }
         }
@@ -12481,7 +13689,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
 
     fn filter_add_crit(&mut self, cx: &mut Context<Self>) {
         if let Some(t) = self.active_data_tab_mut() {
-            let crit = filter::FCrit::new(0);
+            let crit = filter::FCrit::new(&t.cols, 0);
             if !t.filter.model.items.is_empty() {
                 t.filter.model.conns.push(true);
             }
@@ -12495,7 +13703,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         if let Some(t) = self.active_data_tab_mut() {
             let g = filter::FNode::Group {
                 conns: vec![],
-                children: vec![filter::FNode::Crit(filter::FCrit::new(0))],
+                children: vec![filter::FNode::Crit(filter::FCrit::new(&t.cols, 0))],
             };
             if !t.filter.model.items.is_empty() {
                 t.filter.model.conns.push(true);
@@ -12566,7 +13774,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         if let Some(t) = self.active_data_tab_mut() {
             if let Some(filter::FNode::Crit(c)) = filter_node_at_mut(&mut t.filter.model, path) {
                 c.col = col;
-                c.op = filter::default_op(col);
+                c.op = filter::default_op(&t.cols, col);
                 c.v1.clear();
                 c.v2.clear();
                 t.filter.edited = true;
@@ -12604,9 +13812,10 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             return;
         };
         let col = c.col;
-        let col_name = mock::MOCK_COLUMNS
+        let col_name = t
+            .cols
             .get(col)
-            .map(|m| m.name)
+            .map(|m| m.name.as_str())
             .unwrap_or("?");
         let title: &'static str = Box::leak(format!("输入筛选值 - {col_name}").into_boxed_str());
         let v1 = c.v1.clone();
@@ -12656,7 +13865,26 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .find(|c| c.name == conn_name)
             .map(|c| c.kind)
             .unwrap_or(mock::DbKind::MySql);
+        // 远程分页：筛选会重查整表，工作集里的未应用修改必须先处理
+        let (remote, dirty) = self
+            .active_data_tab()
+            .map(|t| (t.page.is_some(), t.dirty()))
+            .unwrap_or((false, false));
+        if remote && dirty {
+            let dark = self.dark;
+            prompt_dialog::open_confirm(
+                cx.entity(),
+                dark,
+                "无法筛选",
+                "当前页有未应用的修改，请先应用或撤销后再筛选".to_string(),
+                |_| {},
+                cx,
+            );
+            return;
+        }
+        let dark = self.dark;
         let Some(t) = self.active_data_tab_mut() else { return };
+        let mut parsed_ok = true;
         if t.filter.text_mode {
             let text = t
                 .filter
@@ -12664,10 +13892,10 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 .as_ref()
                 .map(|e| e.read(cx).value().to_string())
                 .unwrap_or_default();
-            match filter::parse_where(conn_kind, &text) {
+            match filter::parse_where(conn_kind, &t.cols, &text) {
                 Ok(model) => {
-                    let where_sql = filter::where_sql(conn_kind, &model);
-                    let order_sql = filter::order_by_sql(conn_kind, &t.filter.sorts);
+                    let where_sql = filter::where_sql(conn_kind, &t.cols, &model);
+                    let order_sql = filter::order_by_sql(conn_kind, &t.cols, &t.filter.sorts);
                     t.filter.applied = Some(filter::Applied {
                         model,
                         where_sql,
@@ -12680,10 +13908,11 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                     t.filter.model = t.filter.applied.as_ref().unwrap().model.clone();
                 }
                 Err(e) => {
+                    parsed_ok = false;
                     t.filter.error = Some(e.clone());
                     prompt_dialog::open_confirm(
                         cx.entity(),
-                        self.dark,
+                        dark,
                         "应用筛选",
                         e,
                         |_| {},
@@ -12692,8 +13921,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 }
             }
         } else {
-            let where_sql = filter::where_sql(conn_kind, &t.filter.model);
-            let order_sql = filter::order_by_sql(conn_kind, &t.filter.sorts);
+            let where_sql = filter::where_sql(conn_kind, &t.cols, &t.filter.model);
+            let order_sql = filter::order_by_sql(conn_kind, &t.cols, &t.filter.sorts);
             t.filter.applied = Some(filter::Applied {
                 model: t.filter.model.clone(),
                 where_sql,
@@ -12704,15 +13933,28 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             t.filter.edited = false;
             t.filter.error = None;
         }
+        let reload = parsed_ok && t.page.is_some();
         let _ = window;
-        cx.notify();
+        if reload {
+            self.reload_active_remote(true, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn filter_clear(&mut self, cx: &mut Context<Self>) {
+        let remote = self
+            .active_data_tab()
+            .map(|t| t.page.is_some())
+            .unwrap_or(false);
         if let Some(t) = self.active_data_tab_mut() {
             t.filter.applied = None;
             t.filter.edited = false;
             t.filter.error = None;
+        }
+        if remote {
+            self.reload_active_remote(true, cx);
+        } else {
             cx.notify();
         }
     }
@@ -12770,7 +14012,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             }
             if text_mode {
                 // 切到文本模式：把当前模型序列化成 WHERE 正文
-                t.filter.text_sql = filter::where_sql(conn_kind, &t.filter.model)
+                t.filter.text_sql = filter::where_sql(conn_kind, &t.cols, &t.filter.model)
                     .unwrap_or_default();
             } else {
                 // 切回创建工具：解析文本；失败保留文本模式 + 报错
@@ -12780,7 +14022,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                     .as_ref()
                     .map(|e| e.read(cx).value().to_string())
                     .unwrap_or_else(|| t.filter.text_sql.clone());
-                match filter::parse_where(conn_kind, &text) {
+                match filter::parse_where(conn_kind, &t.cols, &text) {
                     Ok(m) => {
                         t.filter.model = m;
                         t.filter.text_mode = false;
@@ -13162,9 +14404,10 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let me = cx.entity().clone();
         match node {
             filter::FNode::Crit(c) => {
-                let col_name = mock::MOCK_COLUMNS
+                let col_name = t
+                    .cols
                     .get(c.col)
-                    .map(|m| m.name)
+                    .map(|m| m.name.as_str())
                     .unwrap_or("?");
                 let op_label = c.op.label();
                 let value_text = c.value_text(1);
@@ -13181,6 +14424,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 let path_val1 = path.to_vec();
                 let path_val2 = path.to_vec();
                 let path_en = path.to_vec();
+                let col_names: Vec<String> = t.cols.iter().map(|m| m.name.clone()).collect();
                 let me_en = me.clone();
                 let me_col = me.clone();
                 let me_op = me.clone();
@@ -13221,11 +14465,11 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                             .label(col_name)
                             .dropdown_menu(move |menu, _window, _cx| {
                                 let mut m = menu;
-                                for (ix, col) in mock::MOCK_COLUMNS.iter().enumerate() {
+                                for (ix, name) in col_names.iter().enumerate() {
                                     let p = path_col.clone();
                                     let me = me_col.clone();
                                     m = m.item(
-                                        PopupMenuItem::new(col.name)
+                                        PopupMenuItem::new(name.clone())
                                             .on_click(move |_, _, app_cx| {
                                                 me.update(app_cx, |this, cx| {
                                                     this.filter_set_col(&p, ix, cx);
@@ -13439,17 +14683,20 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let me = cx.entity().clone();
+        let col_names: Vec<String> = t.cols.iter().map(|m| m.name.clone()).collect();
         let mut rows: Vec<AnyElement> = Vec::new();
         for (ix, (col, asc)) in t.filter.sorts.iter().enumerate() {
-            let col_name = mock::MOCK_COLUMNS
+            let col_name = t
+                .cols
                 .get(*col)
-                .map(|m| m.name)
+                .map(|m| m.name.as_str())
                 .unwrap_or("?");
             let dir_text = if *asc { "升序" } else { "降序" };
             let ix_del = ix;
             let ix_col = ix;
             let ix_dir = ix;
             let me_sort = me.clone();
+            let col_names = col_names.clone();
             rows.push(
                 h_flex()
                     .h(px(22.))
@@ -13469,11 +14716,11 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                             .label(col_name)
                             .dropdown_menu(move |menu, _window, _cx| {
                                 let mut m = menu;
-                                for (cix, col) in mock::MOCK_COLUMNS.iter().enumerate() {
+                                for (cix, name) in col_names.iter().enumerate() {
                                     let ix = ix_col;
                                     let me = me_sort.clone();
                                     m = m.item(
-                                        PopupMenuItem::new(col.name).on_click(move |_, _, app_cx| {
+                                        PopupMenuItem::new(name.clone()).on_click(move |_, _, app_cx| {
                                             me.update(app_cx, |this, cx| {
                                                 this.filter_set_sort_col(ix, cix, cx);
                                             });
@@ -13585,7 +14832,9 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
 
     /// 取当前数据页签的选中行（支持多选：当前行 + 连续选区）。
     /// mock 档先做单行，真数据接入后扩成 HashSet<usize>。
-    fn selected_data_rows(&self) -> Option<(DbKind, String, String, String, Vec<Vec<String>>)> {
+    fn selected_data_rows(
+        &self,
+    ) -> Option<(DbKind, String, String, String, Vec<String>, Vec<Vec<String>>)> {
         let t = self.active_data_tab()?;
         let conn = self.conns.iter().find(|c| c.name == t.conn_name)?;
         let order = visible_data_order(t);
@@ -13593,35 +14842,41 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let data_row = order.get(row)?;
         let values = t.data.get(*data_row)?.clone();
         let db = t.db.to_string();
-        let schema = mock::schemas(conn.kind).get(t.schema).unwrap_or(&"").to_string();
-        let table = mock::objects(conn, t.db, t.cat).get(t.obj).unwrap_or(&"").to_string();
-        Some((conn.kind, db, schema, table, vec![values]))
+        let schema = catalog::schemas(conn, t.db).get(t.schema).unwrap_or(&"").to_string();
+        let table = catalog::objects(conn, t.db, tab_schema(conn, t), t.cat)
+            .get(t.obj)
+            .unwrap_or(&"")
+            .to_string();
+        let columns = t.cols.iter().map(|m| m.name.clone()).collect();
+        Some((conn.kind, db, schema, table, columns, vec![values]))
     }
 
     fn copy_as_insert(&self, cx: &mut Context<Self>) {
-        let Some((kind, db, schema, table, rows)) = self.selected_data_rows() else { return };
-        let cols: Vec<&str> = mock::MOCK_COLUMNS.iter().map(|c| c.name).collect();
+        let Some((kind, db, schema, table, cols, rows)) = self.selected_data_rows() else { return };
+        let cols: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
         let sql = copy_as_insert(kind, &db, &schema, &table, &cols, &rows);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(sql));
     }
 
     fn copy_as_update(&self, cx: &mut Context<Self>) {
-        let Some((kind, db, schema, table, rows)) = self.selected_data_rows() else { return };
-        let cols: Vec<&str> = mock::MOCK_COLUMNS.iter().map(|c| c.name).collect();
+        let Some((kind, db, schema, table, cols, rows)) = self.selected_data_rows() else { return };
+        let cols: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
         let sql = copy_as_update(kind, &db, &schema, &table, &cols, &rows);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(sql));
     }
 
     fn copy_as_select(&self, cx: &mut Context<Self>) {
-        let Some((kind, db, schema, table, rows)) = self.selected_data_rows() else { return };
-        let cols: Vec<&str> = mock::MOCK_COLUMNS.iter().map(|c| c.name).collect();
+        let Some((kind, db, schema, table, cols, rows)) = self.selected_data_rows() else { return };
+        let cols: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
         let sql = copy_as_select(kind, &db, &schema, &table, &cols, &rows);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(sql));
     }
 
     fn copy_as_html(&self, cx: &mut Context<Self>) {
-        let Some((_kind, _db, _schema, _table, rows)) = self.selected_data_rows() else { return };
-        let cols: Vec<&str> = mock::MOCK_COLUMNS.iter().map(|c| c.name).collect();
+        let Some((_kind, _db, _schema, _table, cols, rows)) = self.selected_data_rows() else {
+            return;
+        };
+        let cols: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
         let html = copy_as_html(&cols, &rows);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(html));
     }
@@ -13654,6 +14909,10 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             return;
         }
         let removed = self.conns.remove(ix);
+        if backend::is_real(removed.kind) {
+            backend::close_connection(&removed);
+            catalog::invalidate();
+        }
         self.starred.remove(&removed.name);
         self.conn_colors.remove(&removed.name);
         // 该连接下的页签一并关掉（从后往前，窗格与页签下标同步前移）
@@ -13873,12 +15132,13 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 ),
                 "连接",
             ),
-            Act::Conn(c) => (Some(mock::databases(self.conns[c].kind).len()), "数据库"),
-            Act::Db(c, _) => {
-                let kind = self.conns[c].kind;
+            Act::Conn(c) => (Some(catalog::databases(&self.conns[c]).len()), "数据库"),
+            Act::Db(c, d) => {
+                let conn = &self.conns[c];
                 // MySQL 系没有模式层，库节点下面直接就是分类
-                if mock::has_schemas(kind) {
-                    (Some(mock::schemas(kind).len()), "模式")
+                if catalog::has_schemas(conn.kind) {
+                    let db = catalog::databases(conn).get(d).copied().unwrap_or("");
+                    (Some(catalog::schemas(conn, db).len()), "模式")
                 } else {
                     (Some(CATEGORIES.len()), "类别")
                 }
@@ -13886,9 +15146,9 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             Act::Schema(_, _, _) => (Some(CATEGORIES.len()), "类别"),
             Act::Cat(c, d, s, k) => {
                 let conn = &self.conns[c];
-                let db = mock::databases(conn.kind)[d];
-                let _ = s;
-                (Some(mock::objects(conn, db, k).len()), CATEGORIES[k].0)
+                let db = catalog::databases(conn).get(d).copied().unwrap_or("");
+                let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
+                (Some(catalog::objects(conn, db, schema, k).len()), CATEGORIES[k].0)
             }
             Act::Obj(..) | Act::Col(..) => (None, ""),
         }
@@ -13922,7 +15182,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let c = self.sel_conn_ix()?;
         let d = match self.sel.db() {
             Some(d) => d,
-            None => mock::databases(self.conns[c].kind)
+            None => catalog::databases(&self.conns[c])
                 .iter()
                 .position(|db| *db == self.conns[c].database)
                 .unwrap_or(0),
@@ -13936,16 +15196,29 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let Some((c, d)) = self.anchor_db() else {
             return;
         };
-        let has_schema = mock::has_schemas(self.conns[c].kind);
+        let has_schema = catalog::has_schemas(self.conns[c].kind);
         let s = self.sel.schema().unwrap_or(0);
         let conn_name = self.conns[c].name.clone();
-        let db_name = mock::databases(self.conns[c].kind)[d];
+        // 清单还没回来时不展开到不存在的节点上（getter 顺带把活儿排进队列，
+        // 用户再点一次就有；这里硬展开会把假名字写进 expanded / visited）
+        let db_name = match catalog::databases(&self.conns[c]).get(d).copied() {
+            Some(v) => v,
+            None => return,
+        };
+        let schema_name = if has_schema {
+            match catalog::schemas(&self.conns[c], db_name).get(s).copied() {
+                Some(v) => Some(v),
+                None => return,
+            }
+        } else {
+            None
+        };
         let db_key = node_key(&conn_name, db_name);
         self.expanded.insert(conn_name);
         self.expanded.insert(db_key.clone());
         self.visited_dbs.insert(db_key.clone());
-        let scoped = if has_schema {
-            let key = node_key(&db_key, mock::schemas(self.conns[c].kind)[s]);
+        let scoped = if let Some(name) = schema_name {
+            let key = node_key(&db_key, name);
             self.expanded.insert(key.clone());
             key
         } else {
@@ -13958,16 +15231,24 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
 
 impl Render for DaroApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t0 = if perf_log() { Some(Instant::now()) } else { None };
+        // 后台回执靠这个句柄落地（测试 / 失焦时 active_window 可能为空）
+        self.win = Some(window.window_handle());
         // 拖拽结束（松开 / Esc 取消）后落点提示要立刻收掉：拖动会话不在时
         // 任何残留的高亮都不该再画。
         if !cx.has_active_drag() && self.drag_hover.take().is_some() {
             // 只清状态，不额外 notify（本帧本来就在重绘）
         }
+        // 树 / 面板这一帧从 catalog 读到的未命中项已经排进队列，帧尾把它们
+        // 投到后台线程（defer_in：渲染中途不起任务，也不占这条线程）。
+        cx.defer_in(window, |this, window, cx| {
+            this.pump_catalog(window, cx)
+        });
         let (bg, fg) = {
             let t = cx.theme();
             (t.background, t.foreground)
         };
-        v_flex()
+        let root = v_flex()
             .size_full()
             .bg(bg)
             .text_color(fg)
@@ -13975,8 +15256,19 @@ impl Render for DaroApp {
             .child(self.menu_bar(cx))
             .child(self.ribbon(cx))
             .child(div().flex_1().min_h_0().child(self.body(cx)))
-            .child(self.status_bar(cx))
+            .child(self.status_bar(cx));
+        if let Some(t0) = t0 {
+            std::hint::black_box(&root);
+            eprintln!("[daro] render {:.1}ms", t0.elapsed().as_secs_f64() * 1000.);
+        }
+        root
     }
+}
+
+/// DARO_PERF 非空时打印每帧根视图重建耗时，用于拖动卡顿取证。
+fn perf_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DARO_PERF").is_ok())
 }
 
 impl DaroApp {
@@ -14586,7 +15878,7 @@ impl DaroApp {
             return Vec::new();
         }
         let mut parts: Vec<Vec<AnyElement>> = Vec::new();
-        for dix in 0..mock::databases(conn.kind).len() {
+        for dix in 0..catalog::databases(conn).len() {
             let sub = self.filtered_db(ix, dix, base + 12.5, q, ink, cx);
             if !sub.is_empty() {
                 parts.push(sub);
@@ -14614,7 +15906,10 @@ impl DaroApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let conn = &self.conns[ix];
-        let db = mock::databases(conn.kind)[dix];
+        // 清单还在后台载入 → 这一行本轮不画（渲染只读缓存，绝不在这儿查库）
+        let Some(db) = catalog::databases(conn).get(dix).copied() else {
+            return Vec::new();
+        };
         let db_key = node_key(&conn.name, db);
         if contains_ci(db, q) {
             let open = self.expanded.contains(&db_key);
@@ -14625,11 +15920,11 @@ impl DaroApp {
             }
             return rows;
         }
-        let has_schema = mock::has_schemas(conn.kind);
+        let has_schema = catalog::has_schemas(conn.kind);
         let mut parts: Vec<Vec<AnyElement>> = Vec::new();
         let mut any = false;
         if has_schema {
-            for six in 0..mock::schemas(conn.kind).len() {
+            for six in 0..catalog::schemas(conn, db).len() {
                 let sub =
                     self.filtered_schema(ix, dix, six, &db_key, db_base + 12.5, q, ink, cx);
                 any |= !sub.is_empty();
@@ -14676,7 +15971,12 @@ impl DaroApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let conn = &self.conns[ix];
-        let schema = mock::schemas(conn.kind)[six];
+        let Some(db) = catalog::databases(conn).get(dix).copied() else {
+            return Vec::new();
+        };
+        let Some(schema) = catalog::schemas(conn, db).get(six).copied() else {
+            return Vec::new();
+        };
         let scoped = node_key(db_key, schema);
         if contains_ci(schema, q) {
             let open = self.expanded.contains(&scoped);
@@ -14749,11 +16049,14 @@ impl DaroApp {
         cx: &mut Context<Self>,
     ) -> (bool, Vec<AnyElement>) {
         let conn = &self.conns[ix];
-        let db = mock::databases(conn.kind)[dix];
+        let Some(db) = catalog::databases(conn).get(dix).copied() else {
+            return (false, Vec::new());
+        };
         let (label, icon) = CATEGORIES[cix];
         let six_val = six.unwrap_or(NO_SCHEMA);
+        let schema = catalog::schemas(conn, db).get(six_val).copied().unwrap_or("");
         let cat_key = node_key(parent_key, label);
-        let objs = mock::objects(conn, db, cix);
+        let objs = catalog::objects(conn, db, schema, cix);
         let indent = cat_base + 12.5;
         // 分类名自己命中：整棵按普通态渲染
         if contains_ci(label, q) {
@@ -14778,9 +16081,10 @@ impl DaroApp {
                         ix, dix, six_val, cix, oix, indent, icon, obj, obj_open, Some(q), ink, cx,
                     ));
                     if obj_open {
-                        for (colix, col) in mock::MOCK_COLUMNS.iter().enumerate() {
+                        for (colix, col) in catalog::table_columns(conn, db, schema, obj).iter().enumerate()
+                        {
                             rows.push(self.col_row_elem(
-                                ix, dix, six_val, cix, oix, colix, indent + 12.5, col.name,
+                                ix, dix, six_val, cix, oix, colix, indent + 12.5, &col.name,
                                 Some(q), ink, cx,
                             ));
                         }
@@ -14799,9 +16103,9 @@ impl DaroApp {
                     ix, dix, six_val, cix, oix, indent, icon, obj, open, Some(q), ink, cx,
                 )];
                 if open {
-                    for (colix, col) in mock::MOCK_COLUMNS.iter().enumerate() {
+                    for (colix, col) in catalog::table_columns(conn, db, schema, obj).iter().enumerate() {
                         r.push(self.col_row_elem(
-                            ix, dix, six_val, cix, oix, colix, indent + 12.5, col.name, Some(q),
+                            ix, dix, six_val, cix, oix, colix, indent + 12.5, &col.name, Some(q),
                             ink, cx,
                         ));
                     }
@@ -14809,10 +16113,11 @@ impl DaroApp {
                 parts.push(r);
                 continue;
             }
-            let hits: Vec<usize> = mock::MOCK_COLUMNS
+            let cols = catalog::table_columns(conn, db, schema, obj);
+            let hits: Vec<usize> = cols
                 .iter()
                 .enumerate()
-                .filter(|(_, col)| contains_ci(col.name, q))
+                .filter(|(_, col)| contains_ci(&col.name, q))
                 .map(|(colix, _)| colix)
                 .collect();
             if !hits.is_empty() {
@@ -14822,7 +16127,7 @@ impl DaroApp {
                 for colix in hits {
                     r.push(self.col_row_elem(
                         ix, dix, six_val, cix, oix, colix, indent + 12.5,
-                        mock::MOCK_COLUMNS[colix].name, Some(q), ink, cx,
+                        cols[colix].name.as_str(), Some(q), ink, cx,
                     ));
                 }
                 parts.push(r);
@@ -14895,6 +16200,10 @@ impl DaroApp {
             .map(|c| to_hsla(CONN_COLORS[*c as usize].1))
             .unwrap_or(if selected { ink.fg } else { ink.muted });
         let starred = self.starred.contains(&name);
+        // 建连任务把「连接」和「库清单」两个键一起标在飞，这里只显示一条：
+        // 连上之前说「连接中」，连上之后（刷新）说「载入中」
+        let connecting = self.loading.contains(&catalog::open_key(&name));
+        let loading_dbs = !connecting && self.loading.contains(&catalog::databases_key(&name));
         tree_row(
             ("conn", ix),
             base,
@@ -14915,6 +16224,8 @@ impl DaroApp {
                     .text_color(to_hsla(0xe8b23f)),
             )
         })
+        .when(connecting, |s| s.child(loading_tag("连接中…", ink)))
+        .when(loading_dbs, |s| s.child(loading_tag("载入中…", ink)))
         .into_any_element()
     }
 
@@ -14930,7 +16241,7 @@ impl DaroApp {
         let conn = &self.conns[ix];
         let name = conn.name.clone();
         let mut rows = Vec::new();
-        for (dix, db) in mock::databases(conn.kind).iter().enumerate() {
+        for (dix, db) in catalog::databases(conn).iter().enumerate() {
             let db_key = node_key(&name, db);
             let db_open = self.expanded.contains(&db_key);
             rows.push(self.db_row_elem(ix, dix, db_base, Some(caret(db_open)), q, ink, cx));
@@ -14956,10 +16267,13 @@ impl DaroApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let conn = &self.conns[ix];
-        let has_schema = mock::has_schemas(conn.kind);
+        let has_schema = catalog::has_schemas(conn.kind);
+        let Some(db) = catalog::databases(conn).get(dix).copied() else {
+            return Vec::new();
+        };
         let mut rows = Vec::new();
         if has_schema {
-            for (six, schema) in mock::schemas(conn.kind).iter().enumerate() {
+            for (six, schema) in catalog::schemas(conn, db).iter().enumerate() {
                 let scoped = node_key(db_key, schema);
                 let schema_open = self.expanded.contains(&scoped);
                 rows.push(self.schema_row_elem(
@@ -15008,13 +16322,16 @@ impl DaroApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let conn = &self.conns[ix];
-        let db = mock::databases(conn.kind)[dix];
+        let Some(db) = catalog::databases(conn).get(dix).copied() else {
+            return Vec::new();
+        };
         let six_val = six.unwrap_or(NO_SCHEMA);
+        let schema = catalog::schemas(conn, db).get(six_val).copied().unwrap_or("");
         let mut rows = Vec::new();
         for (cix, (label, icon)) in CATEGORIES.iter().enumerate() {
             let cat_key = node_key(parent_key, label);
             let cat_open = self.expanded.contains(&cat_key);
-            let objs = mock::objects(conn, db, cix);
+            let objs = catalog::objects(conn, db, schema, cix);
             rows.push(self.cat_row_elem(
                 ix,
                 dix,
@@ -15041,9 +16358,9 @@ impl DaroApp {
                 if !obj_open {
                     continue;
                 }
-                for (colix, col) in mock::MOCK_COLUMNS.iter().enumerate() {
+                for (colix, col) in catalog::table_columns(conn, db, schema, obj).iter().enumerate() {
                     rows.push(self.col_row_elem(
-                        ix, dix, six_val, cix, oix, colix, indent + 12.5, col.name, q, ink, cx,
+                        ix, dix, six_val, cix, oix, colix, indent + 12.5, &col.name, q, ink, cx,
                     ));
                 }
             }
@@ -15063,8 +16380,9 @@ impl DaroApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let conn = &self.conns[ix];
-        let db = mock::databases(conn.kind)[dix];
+        let db = catalog::databases(conn).get(dix).copied().unwrap_or_default();
         let opened = self.visited_dbs.contains(&node_key(&conn.name, db));
+        let busy = self.loading.contains(&catalog::schemas_key(&conn.name, db));
         tree_row(
             rid(&format!("db/{ix}/{dix}")),
             db_base,
@@ -15082,6 +16400,8 @@ impl DaroApp {
             ink,
             cx,
         )
+        .when(busy, |s| s.child(loading_tag("载入中…", ink)))
+        .test_support()
         .into_any_element()
     }
 
@@ -15129,6 +16449,11 @@ impl DaroApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (_, icon) = CATEGORIES[cix];
+        // 分类是固定五个，冷的是它底下的对象清单
+        let conn = &self.conns[ix];
+        let db = catalog::databases(conn).get(dix).copied().unwrap_or_default();
+        let schema = catalog::schemas(conn, db).get(six_val).copied().unwrap_or("");
+        let busy = self.loading.contains(&catalog::objects_key(&conn.name, db, schema, cix));
         tree_row(
             rid(&format!("cat/{ix}/{dix}/{six_val}/{cix}")),
             cat_base,
@@ -15142,6 +16467,7 @@ impl DaroApp {
             ink,
             cx,
         )
+        .when(busy, |s| s.child(loading_tag("载入中…", ink)))
         .into_any_element()
     }
 
@@ -15161,6 +16487,10 @@ impl DaroApp {
         ink: &TreeInk,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let conn = &self.conns[ix];
+        let db = catalog::databases(conn).get(dix).copied().unwrap_or_default();
+        let schema = catalog::schemas(conn, db).get(six_val).copied().unwrap_or("");
+        let busy = obj_open && self.loading.contains(&catalog::columns_key(&conn.name, db, schema, obj));
         tree_row(
             rid(&format!("obj/{ix}/{dix}/{six_val}/{cix}/{oix}")),
             indent,
@@ -15174,6 +16504,7 @@ impl DaroApp {
             ink,
             cx,
         )
+        .when(busy, |s| s.child(loading_tag("载入中…", ink)))
         .into_any_element()
     }
 
@@ -15217,24 +16548,31 @@ impl DaroApp {
             if !conn.connected {
                 continue;
             }
-            for db in mock::databases(conn.kind) {
+            for db in catalog::databases(conn) {
                 if contains_ci(db, q) || CATEGORIES.iter().any(|(label, _)| contains_ci(label, q)) {
                     return true;
                 }
-                for (cix, _) in CATEGORIES.iter().enumerate() {
-                    for obj in mock::objects(conn, db, cix) {
-                        if contains_ci(obj, q)
-                            || mock::MOCK_COLUMNS.iter().any(|col| contains_ci(col.name, q))
-                        {
-                            return true;
+                let scopes: Vec<&str> = if catalog::has_schemas(conn.kind) {
+                    catalog::schemas(conn, db).to_vec()
+                } else {
+                    vec![""]
+                };
+                for schema in scopes {
+                    if contains_ci(schema, q) {
+                        return true;
+                    }
+                    for (cix, _) in CATEGORIES.iter().enumerate() {
+                        for obj in catalog::objects(conn, db, schema, cix) {
+                            if contains_ci(obj, q)
+                                || catalog::table_columns(conn, db, schema, obj)
+                                    .iter()
+                                    .any(|col| contains_ci(&col.name, q))
+                            {
+                                return true;
+                            }
                         }
                     }
                 }
-            }
-            if mock::has_schemas(conn.kind)
-                && mock::schemas(conn.kind).iter().any(|s| contains_ci(s, q))
-            {
-                return true;
             }
         }
         false
@@ -15469,15 +16807,17 @@ impl DaroApp {
         let order = visible_data_order(t);
         let rows = order.len() + t.inserted.len();
         let dirty = t.dirty();
-        let cols = &mock::MOCK_COLUMNS;
-        // 列宽按「表头名 / 类型 / 该列最长的值」自适应，再夹到 [56, 260]：
+        let cols = &t.cols;
+        // 列宽按「表头名 / 类型 / 该列最长的值」自适应，再夹到 [56, 320]：
         // 参考工具里 parent_id 这类列不会被截成 parent…，长 id 也放得下。
+        // 只采样前 T_COL_W_SCAN 行：远程一页 1000 行，逐行量宽每帧都要
+        // 跑满整页；采样后宽度也不随翻页抖动。
         let col_w: Vec<f32> = cols
             .iter()
             .enumerate()
             .map(|(cix, col)| {
-                let mut w: f32 = est_text_w(col.name, 12.).max(est_text_w(col.ty, 10.5) + 12.);
-                for disp in 0..rows {
+                let mut w: f32 = est_text_w(&col.name, 12.).max(est_text_w(&col.ty, 10.5) + 12.);
+                for disp in 0..rows.min(T_COL_W_SCAN) {
                     let v = if disp < order.len() {
                         t.data.get(order[disp]).and_then(|r| r.get(cix))
                     } else {
@@ -15493,10 +16833,26 @@ impl DaroApp {
             })
             .collect();
         let total_w = T_GUTTER_W + col_w.iter().sum::<f32>();
-        let pages = rows.div_ceil(PAGE_SIZE).max(1);
-        let page = t.cell.0 / PAGE_SIZE;
-        let page_start = page * PAGE_SIZE;
-        let page_end = (page_start + PAGE_SIZE).min(rows);
+        // 远程分页：data 就是当前页，页号 / 页数来自服务端 COUNT；
+        // mock：整表在内存里，按 cell.0 切 10 行一页。
+        let (pages, page, page_start, page_end) = match t.page.as_ref() {
+            Some(p) => (
+                p.total.div_ceil(p.page_size).max(1),
+                p.page_no,
+                0,
+                rows,
+            ),
+            None => {
+                let pages = rows.div_ceil(PAGE_SIZE).max(1);
+                let page = t.cell.0 / PAGE_SIZE;
+                (
+                    pages,
+                    page,
+                    page * PAGE_SIZE,
+                    (page * PAGE_SIZE + PAGE_SIZE).min(rows),
+                )
+            }
+        };
 
         // ── 工具条：图标 + 文字（Navicat 数据页；带 Ent 角标的项按用户要求不放）──
         let tbtn = |id: &'static str, glyph: art::Glyph, label: &'static str, enabled: bool| {
@@ -15576,17 +16932,39 @@ impl DaroApp {
                     .border_color(line)
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(tab) =
-                            this.opened.get_mut(this.active_tab.checked_sub(1).unwrap_or(0))
-                        {
-                            tab.sort = Some(match tab.sort {
-                                Some((sc, asc)) if sc == cix => (cix, !asc),
-                                _ => (cix, true),
-                            });
-                            if let Some(a) = tab.filter.applied.as_mut() {
-                                a.sorts.clear();
-                                a.order_sql = None;
+                        let ix = this.active_tab.checked_sub(1);
+                        let Some(ix) = ix else { return };
+                        let mut reload = false;
+                        let mut blocked = false;
+                        if let Some(tab) = this.opened.get_mut(ix) {
+                            if tab.page.is_some() && tab.dirty() {
+                                blocked = true;
+                            } else {
+                                tab.sort = Some(match tab.sort {
+                                    Some((sc, asc)) if sc == cix => (cix, !asc),
+                                    _ => (cix, true),
+                                });
+                                if let Some(a) = tab.filter.applied.as_mut() {
+                                    a.sorts.clear();
+                                    a.order_sql = None;
+                                }
+                                reload = tab.page.is_some();
                             }
+                        }
+                        if blocked {
+                            let dark = this.dark;
+                            prompt_dialog::open_confirm(
+                                cx.entity(),
+                                dark,
+                                "无法排序",
+                                "当前页有未应用的修改，请先应用或撤销后再排序".to_string(),
+                                |_| {},
+                                cx,
+                            );
+                            cx.notify();
+                        } else if reload {
+                            this.reload_active_remote(true, cx);
+                        } else {
                             cx.notify();
                         }
                     }))
@@ -15609,7 +16987,7 @@ impl DaroApp {
                                     .text_size(px(12.))
                                     .font_medium()
                                     .text_color(fg)
-                                    .child(col.name),
+                                    .child(col.name.clone()),
                             )
                             .when(sorted, |s| {
                                 s.child(
@@ -15650,7 +17028,7 @@ impl DaroApp {
                                     .truncate()
                                     .text_size(px(10.5))
                                     .text_color(if cur { fg } else { subtle })
-                                    .child(col.ty),
+                                    .child(col.ty.clone()),
                             ),
                         )
                     })
@@ -15868,11 +17246,13 @@ impl DaroApp {
                     } else {
                         subtle
                     }))
+                    .test_support()
             };
             let nav_btn = |id: &'static str,
                            icon: IconName,
                            enabled: bool,
                            target: usize,
+                           page_target: usize,
                            cx: &mut Context<DaroApp>| {
                 div()
                     .id(rid(&format!("nav/{id}")))
@@ -15885,8 +17265,17 @@ impl DaroApp {
                     .when(enabled, |s| s.cursor_pointer().hover(move |s| s.bg(hover)))
                     .when(enabled, |s| {
                         s.on_click(cx.listener(move |this, _, _, cx| {
-                            if this.active_tab > 0
-                                && let Some(tab) = this.opened.get_mut(this.active_tab - 1)
+                            if this.active_tab == 0 {
+                                return;
+                            }
+                            let remote = this
+                                .opened
+                                .get(this.active_tab - 1)
+                                .is_some_and(|t| t.page.is_some());
+                            if remote {
+                                this.grid_page_to(page_target, cx);
+                            } else if let Some(tab) =
+                                this.opened.get_mut(this.active_tab - 1)
                             {
                                 tab.cell = (target, tab.cell.1);
                                 cx.notify();
@@ -15898,6 +17287,7 @@ impl DaroApp {
                     } else {
                         subtle
                     }))
+                    .test_support()
             };
             h_flex()
                 .h(px(T_BAR_H))
@@ -15925,12 +17315,13 @@ impl DaroApp {
                 )))
                 .child(ghost("stop", IconName::SquareStop))
                 .child(div().flex_1())
-                .child(nav_btn("first", IconName::ChevronFirst, page > 0, 0, cx))
+                .child(nav_btn("first", IconName::ChevronFirst, page > 0, 0, 0, cx))
                 .child(nav_btn(
                     "prev",
                     IconName::ChevronLeft,
                     page > 0,
                     page.saturating_sub(1) * PAGE_SIZE,
+                    page.saturating_sub(1),
                     cx,
                 ))
                 .child(page_box)
@@ -15939,6 +17330,7 @@ impl DaroApp {
                     IconName::ChevronRight,
                     page + 1 < pages,
                     ((page + 1) * PAGE_SIZE).min(rows.saturating_sub(1)),
+                    page + 1,
                     cx,
                 ))
                 .child(nav_btn(
@@ -15946,6 +17338,7 @@ impl DaroApp {
                     IconName::ChevronLast,
                     page + 1 < pages,
                     rows.saturating_sub(1),
+                    pages.saturating_sub(1),
                     cx,
                 ))
                 .child(ghost("opts", IconName::Settings))
@@ -16016,7 +17409,7 @@ impl DaroApp {
             .map(|n| n.as_str())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| {
-                mock::objects(&conn, tab.db, tab.cat)
+                catalog::objects(&conn, tab.db, tab_schema(&conn, tab), tab.cat)
                     .get(tab.obj)
                     .copied()
                     .unwrap_or_default()
@@ -17058,7 +18451,7 @@ impl DaroApp {
         //   末尾固定带触发器 / 规则的生成段，右上角复制按钮；
         // 「DDL」子页 = 「之前：/之后：」并排行号对比，改动行整行铺绿底。
         let dark = self.dark;
-        let schema_name = mock::schemas(conn.kind).get(tab.schema).copied().unwrap_or("");
+        let schema_name = catalog::schemas(&conn, tab.db).get(tab.schema).copied().unwrap_or("");
         let owner = if matches!(conn.kind, mock::DbKind::PostgreSql) {
             conn.user.as_str()
         } else {
@@ -17354,7 +18747,7 @@ impl DaroApp {
             .cloned()
             .unwrap_or_else(|| EMPTY_CONN.clone());
         
-        let obj_name = mock::objects(&conn, tab.db, tab.cat)
+        let obj_name = catalog::objects(&conn, tab.db, tab_schema(&conn, tab), tab.cat)
             .get(tab.obj)
             .copied()
             .unwrap_or_default();
@@ -17555,13 +18948,14 @@ impl DaroApp {
             .find(|c| c.name == q.conn)
             .cloned()
             .unwrap_or_else(|| EMPTY_CONN.clone());
-        let show_schema = mock::has_schemas(conn.kind);
-        let db = mock::databases(conn.kind).get(q.db).copied().unwrap_or("");
-        let schema = mock::schemas(conn.kind)
+        let show_schema = catalog::has_schemas(conn.kind);
+        let db = catalog::databases(&conn).get(q.db).copied().unwrap_or("");
+        let schema = catalog::schemas(&conn, db)
             .get(q.schema)
             .copied()
             .unwrap_or("public");
         let has_selection = !q.editor.read(cx).selected_range().is_empty();
+        let running = q.job.is_some();
         let me = cx.entity();
 
         // ── 运行上下文栏 ─────────────────────────────────────
@@ -17571,6 +18965,7 @@ impl DaroApp {
             DbKind::MySql => 0x1f86c8,
             DbKind::PostgreSql => 0x39709b,
             DbKind::SqlServer => 0xc0392b,
+            DbKind::SQLite => 0x0f80b0,
             DbKind::MongoDb => 0x4db33d,
             DbKind::Redis => 0xd0342c,
         };
@@ -17617,7 +19012,7 @@ impl DaroApp {
                     let app = me.read(cx);
                     let conn = app.conns.iter().find(|c| c.name == app.active_query_conn(qid));
                     let dbs: Vec<&str> = conn
-                        .map(|c| mock::databases(c.kind).to_vec())
+                        .map(|c| catalog::databases(c).to_vec())
                         .unwrap_or_default();
                     let mut m = menu;
                     for d in dbs {
@@ -17637,6 +19032,7 @@ impl DaroApp {
                     .label(if has_selection { "运行已选择的" } else { "运行" })
                     .text_size(px(12.))
                     .h(px(Q_TRIGGER_H))
+                    .disabled(running)
                     .on_click({
                         let me = me.clone();
                         move |_, window, cx| {
@@ -17672,8 +19068,14 @@ impl DaroApp {
             .label("停止")
             .text_size(px(12.))
             .h(px(Q_TRIGGER_H))
-            .disabled(true)
-            .when(true, |b| b.opacity(0.6));
+            .disabled(!running)
+            .when(!running, |b| b.opacity(0.6))
+            .on_click({
+                let me = me.clone();
+                move |_, _, cx| {
+                    me.update(cx, |a, cx| a.query_cancel(qid, cx));
+                }
+            });
         let explain_btn = Button::new("qexplain")
             .icon(Icon::new(IconName::Network).text_color(to_hsla(Q_EXPLAIN_BLUE)))
             .label("解释")
@@ -17697,6 +19099,7 @@ impl DaroApp {
                 .opacity(if enabled { 1. } else { 0.85 })
                 .child(art::icon(glyph, 15., muted))
                 .child(div().text_size(px(12.)).text_color(fg).child(label))
+                .test_support()
         };
         let qsep = || div().w(px(1.)).h(px(15.)).mx(px(6.)).flex_none().bg(border);
         let qbar = h_flex()
@@ -17722,7 +19125,13 @@ impl DaroApp {
                 )),
             )
             .child(qsep())
-            .child(qbtn("pretty", art::Glyph::Beautify, "美化 SQL", false))
+            .child(
+                qbtn("pretty", art::Glyph::Beautify, "美化 SQL", true).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.query_prettify(qid, window, cx);
+                    },
+                )),
+            )
             .child(qbtn("snippet", art::Glyph::Snippet, "代码段", false))
             .child(div().flex_1());
 
@@ -17757,9 +19166,10 @@ impl DaroApp {
                                     .conns
                                     .iter()
                                     .find(|c| c.name == app.active_query_conn(qid));
-                                let schemas: Vec<&str> = conn
-                                    .map(|c| mock::schemas(c.kind).to_vec())
-                                    .unwrap_or_default();
+                                let schemas: Vec<&str> = match (conn, app.active_query_db(qid)) {
+                                    (Some(c), Some(db)) => catalog::schemas(c, db).to_vec(),
+                                    _ => Vec::new(),
+                                };
                                 let mut m = menu;
                                 for sc in schemas {
                                     let me = me.clone();
@@ -17951,11 +19361,11 @@ impl DaroApp {
         let hover = to_hsla(p.hover);
         let selection = to_hsla(p.selection);
         let accent = p.accent;
-        let cols = &mock::MOCK_COLUMNS;
         let oi = q.pane.saturating_sub(1);
         let Some(out) = q.outcomes.get(oi) else {
             return div().into_any_element();
         };
+        let cols = &out.columns;
         let rows = out.result.as_deref().unwrap_or(&[]);
         let cell = out.cell;
         let total_w = Q_ROWNO_W + cols.iter().map(|c| c.width).sum::<f32>();
@@ -17992,7 +19402,7 @@ impl DaroApp {
                             .text_size(px(11.5))
                             .font_medium()
                             .text_color(fg)
-                            .child(col.name),
+                            .child(col.name.clone()),
                     )
             }));
 
@@ -18083,8 +19493,21 @@ impl DaroApp {
             && let Some(q) = t.qstate.as_mut()
         {
             q.conn = name.to_string();
-            q.db = 0;
-            q.schema = 0;
+            // 换连接 = 换整套运行上下文：落到那条连接配置的库（和默认模式）上
+            let (db, schema) = self
+                .conns
+                .iter()
+                .find(|c| c.name == q.conn)
+                .map(default_query_context)
+                .unwrap_or((0, 0));
+            q.db = db;
+            q.schema = schema;
+            t.db = self
+                .conns
+                .iter()
+                .find(|c| c.name == q.conn)
+                .map(|c| catalog::databases(c).get(db).copied().unwrap_or(""))
+                .unwrap_or("");
             cx.notify();
         }
     }
@@ -18093,7 +19516,7 @@ impl DaroApp {
         if let Some(t) = self.opened.iter_mut().find(|t| t.qid == qid)
             && let Some(q) = t.qstate.as_mut()
             && let Some(conn) = self.conns.iter().find(|c| c.name == q.conn)
-            && let Some(i) = mock::databases(conn.kind).iter().position(|d| *d == db)
+            && let Some(i) = catalog::databases(conn).iter().position(|d| *d == db)
         {
             q.db = i;
             cx.notify();
@@ -18104,11 +19527,23 @@ impl DaroApp {
         if let Some(t) = self.opened.iter_mut().find(|t| t.qid == qid)
             && let Some(q) = t.qstate.as_mut()
             && let Some(conn) = self.conns.iter().find(|c| c.name == q.conn)
-            && let Some(i) = mock::schemas(conn.kind).iter().position(|s| *s == schema)
+            && let Some(db) = catalog::databases(conn).get(q.db).copied()
+            && let Some(i) = catalog::schemas(conn, db).iter().position(|s| *s == schema)
         {
             q.schema = i;
             cx.notify();
         }
+    }
+
+    /// 查询页签当前挂的库名（模式清单要按库问，PG 每个库一套模式）。
+    fn active_query_db(&self, qid: u64) -> Option<&'static str> {
+        let q = self
+            .opened
+            .iter()
+            .find(|t| t.qid == qid)
+            .and_then(|t| t.qstate.as_ref())?;
+        let conn = self.conns.iter().find(|c| c.name == q.conn)?;
+        catalog::databases(conn).get(q.db).copied()
     }
 
     /// 查询页签当前的运行上下文连接名（下拉菜单构建期读）。
@@ -18288,7 +19723,7 @@ impl DaroApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 // 对象面板双击 = 打开表
                                 if this.is_double_click(act) {
-                                    this.open_object(act);
+                                    this.open_object(act, cx);
                                 }
                                 this.sel = act;
                                 cx.notify();
@@ -18306,6 +19741,7 @@ impl DaroApp {
                                     .text_color(fg)
                                     .child(*name),
                             )
+                            .test_support()
                     }),
             )
     }
@@ -18344,7 +19780,7 @@ impl DaroApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         // 对象面板双击 = 打开表
                         if this.is_double_click(act) {
-                            this.open_object(act);
+                            this.open_object(act, cx);
                         }
                         this.sel = act;
                         cx.notify();
@@ -18839,6 +20275,17 @@ fn caret(open: bool) -> IconName {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 后台目录加载还没回来时挂在行尾的小标记。空文件夹和「正在读」在树上长得
+/// 一模一样，不标出来就是让用户对着空气猜。
+fn loading_tag(label: &'static str, ink: &TreeInk) -> Div {
+    div()
+        .ml(px(6.))
+        .flex_none()
+        .text_xs()
+        .text_color(ink.muted)
+        .child(label)
+}
+
 fn tree_row(
     id: impl Into<ElementId>,
     indent: f32,
@@ -18895,13 +20342,13 @@ fn tree_row(
                 }
                 Act::Conn(ix) => {
                     if this.is_double_click(action) {
-                        this.toggle_connection(ix);
+                        this.toggle_connection(ix, cx);
                     }
                     this.sel = Act::Conn(ix);
                 }
                 Act::Db(c, d) => {
                     if this.is_double_click(action) {
-                        this.toggle_db(c, d);
+                        this.toggle_db(c, d, cx);
                     }
                     this.sel = Act::Db(c, d);
                 }
@@ -18919,7 +20366,7 @@ fn tree_row(
                 }
                 Act::Obj(..) => {
                     if this.is_double_click(action) {
-                        this.open_object(action);
+                        this.open_object(action, cx);
                     }
                     this.sel = action;
                 }
@@ -18967,8 +20414,8 @@ fn tree_row(
                                 }
                                 this.save();
                             }
-                            Act::Conn(ix) => this.toggle_connection(ix),
-                            Act::Db(c, d) => this.toggle_db(c, d),
+                            Act::Conn(ix) => this.toggle_connection(ix, cx),
+                            Act::Db(c, d) => this.toggle_db(c, d, cx),
                             Act::Schema(c, d, s) => this.toggle_schema(c, d, s),
                             Act::Cat(c, d, s, k) => this.toggle_cat(c, d, s, k),
                             Act::Obj(c, d, s, k, o) => this.toggle_obj(c, d, s, k, o),
@@ -19157,7 +20604,7 @@ fn object_context_menu(
                     window.defer(cx, move |_window, cx| {
                         me.update(cx, |this, cx| {
                             if let Act::Obj(c, d, s, k, o) = act {
-                                this.open_object(Act::Obj(c, d, s, k, o));
+                                this.open_object(Act::Obj(c, d, s, k, o), cx);
                             }
                             cx.notify();
                         });
@@ -19329,6 +20776,15 @@ fn todo_item(label: impl Into<SharedString>, ent: bool) -> PopupMenuItem {
     mi(label, ent).disabled(true)
 }
 
+/// 「刷新」：失效目录缓存并立即重查已打开的连接。真驱动下库内容可能被
+/// 外部改动，树只看缓存，不重查看不见；重查失败要弹窗，否则空树像空库。
+fn refresh_item(me: Entity<DaroApp>) -> PopupMenuItem {
+    PopupMenuItem::new("刷新").on_click(move |_, _, cx| {
+        let target = me.clone();
+        target.update(cx, |app, cx| app.refresh_catalog(cx));
+    })
+}
+
 /// 库节点右键菜单（Navicat Lite 实测，PostgreSQL；关闭态的置灰差异同样实测）。
 fn db_menu(
     me: Entity<DaroApp>,
@@ -19343,7 +20799,7 @@ fn db_menu(
         (
             app.visited_dbs.contains(&node_key(
                 &app.conns[c].name,
-                mock::databases(app.conns[c].kind)[d],
+                catalog::databases(&app.conns[c])[d],
             )),
             matches!(app.conns[c].kind, mock::DbKind::PostgreSql),
         )
@@ -19357,7 +20813,7 @@ fn db_menu(
             if opened {
                 app.close_db(c, d);
             } else {
-                app.open_db(c, d);
+                app.open_db(c, d, cx);
             }
             app.sel = Act::Db(c, d);
             cx.notify();
@@ -19407,7 +20863,7 @@ fn db_menu(
         })
     };
     menu = menu.separator().item(todo_item("共享...", false));
-    menu.separator().item(todo_item("刷新", false))
+    menu.separator().item(refresh_item(me.clone()))
 }
 
 /// 模式节点右键菜单（Navicat Lite 实测，PostgreSQL public）。
@@ -19425,7 +20881,7 @@ fn schema_menu(
     menu = menu.item(
         mi("打开模式", false).on_click(move |_, _, cx| {
             target.update(cx, |app, cx| {
-                app.open_schema(c, d, s);
+                app.open_schema(c, d, s, cx);
                 app.sel = Act::Schema(c, d, s);
                 cx.notify();
             });
@@ -19455,7 +20911,7 @@ fn schema_menu(
         .item(todo_item("数据字典...", true))
         .item(todo_item("逆向模式到模型...", true));
     menu = menu.separator().item(todo_item("共享...", false));
-    menu.separator().item(todo_item("刷新", false))
+    menu.separator().item(refresh_item(me.clone()))
 }
 
 /// 分类节点（表 / 视图 / …）右键菜单，五个分类逐个按 Navicat Lite 实测还原
@@ -19536,7 +20992,7 @@ fn cat_menu(
             .item(todo_item("打开所在的文件夹...", false))
             .item(todo_item("打开外部查询...", false));
     }
-    menu.separator().item(todo_item("刷新", false))
+    menu.separator().item(refresh_item(me.clone()))
 }
 
 /// 对象级「管理组」子菜单：Navicat 是 新建组 / 移动到▸ / 从组中排除（不在组内时灰）。
@@ -19568,7 +21024,7 @@ fn obj_menu(
         let me_open = me.clone();
         menu = menu.item(mi("打开表", false).on_click(move |_, _, cx| {
             me_open.update(cx, |app, cx| {
-                app.open_object(act);
+                app.open_object(act, cx);
                 cx.notify();
             });
         }));
@@ -19631,7 +21087,7 @@ fn obj_menu(
         let open_item = if k == 1 {
             mi("打开视图", false).on_click(move |_, _, cx| {
                 me_open.update(cx, |app, cx| {
-                    app.open_object(act);
+                    app.open_object(act, cx);
                     cx.notify();
                 });
             })
@@ -19676,7 +21132,7 @@ fn obj_menu(
     } else {
         menu = menu.item(todo_item("重命名", false));
     }
-    menu.separator().item(todo_item("刷新", false))
+    menu.separator().item(refresh_item(me.clone()))
 }
 
 /// 连接节点右键菜单，条目与分组顺序照 Navicat Lite 实测结果。
@@ -19732,7 +21188,7 @@ fn conn_menu_body(
                 if connected {
                     app.close_connection(ix);
                 } else {
-                    app.open_connection(ix);
+                    app.open_connection(ix, cx);
                 }
                 cx.notify();
             });
@@ -19906,9 +21362,7 @@ fn conn_menu_body(
 
         menu.item(PopupMenuItem::new("共享...").disabled(true))
             // Navicat 里 共享 与 刷新 之间没有分隔线
-            // 刷新要重查库的目录，驱动层落地前没有可重载的东西；
-            // 给一个点了没反应的enabled项等于骗人，所以先灰掉。
-            .item(PopupMenuItem::new("刷新").disabled(true))
+            .item(refresh_item(me.clone()))
 }
 
 /// 分组节点右键菜单（Navicat Lite 实测：新建连接... / 新建组 / 删除组 / 重命名 / 刷新）。
@@ -19960,8 +21414,8 @@ fn group_menu(
             cx.notify();
         });
     }));
-    // 树是本地即时渲染，没有可重载的东西；先灰掉，不留点了没反应的假入口
-    menu.separator().item(PopupMenuItem::new("刷新").disabled(true))
+    // 组内连接的目录同样要重查（真驱动下库内容可能被外部改）
+    menu.separator().item(refresh_item(me.clone()))
 }
 
 /// 数据页工具条 / 记录导航条的纯图标按钮。`enabled: false` 时是置灰占位
@@ -20509,18 +21963,16 @@ impl Render for FkCommentPopup {
     }
 }
 
+/// 无头 UI 测试的公共装配：隔离数据目录、开窗、推后台任务、失败时补元素快照。
+/// 场景模块只写「点什么 / 断言什么」。
 #[cfg(test)]
-mod designer_tests {
+mod ui_test_support {
     use super::*;
     use gpui_kit::TestAppContext;
     use gpui_kit::test::TestWindowExt;
 
-    // 显式引回标准 test 宏：`use super::*` 会把 gpui 的同名 test 宏带进作用域，
-    // 不然 #[gpui_kit::test] 生成的内部 #[test] 会再次命中 gpui 宏 → 无限递归
-    use core::prelude::v1::test;
-
     /// 每个用例独立数据目录：隔离 connections.json，也隔离用例间状态泄漏。
-    fn isolate_store(tag: &str) {
+    pub(crate) fn isolate_store(tag: &str) {
         let dir =
             std::env::temp_dir().join(format!("daro_rs_test_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -20529,7 +21981,7 @@ mod designer_tests {
         unsafe { std::env::set_var("DARO_DATA_DIR", &dir) };
     }
 
-    fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<DaroApp>) {
+    pub(crate) fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<DaroApp>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             gpui_kit::open_window(
@@ -20546,6 +21998,90 @@ mod designer_tests {
             .expect("open test window")
         })
     }
+
+    /// 目录 / 取数 / 写回都在后台：测试里手动推几轮——渲染把 defer 的 pump
+    /// 展开并补发下一层目录请求，抽干后台执行器落地回执。
+    pub(crate) fn settle(cx: &mut TestAppContext, handle: AnyWindowHandle) {
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    /// 造一个只含测试表的真 SQLite 库，返回连接配置与库路径（收尾记得删）。
+    pub(crate) fn sqlite_fixture(
+        tag: &str,
+        stmts: &[&str],
+    ) -> (mock::Connection, String) {
+        let db = std::env::temp_dir().join(format!("daro_rs_{tag}_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let path = db.to_string_lossy().to_string();
+        crate::sqlite_driver::open(tag, &path).unwrap();
+        for stmt in stmts {
+            crate::sqlite_driver::execute_stmt(tag, stmt, 1).unwrap();
+        }
+        crate::sqlite_driver::close(tag);
+        (
+            mock::Connection::new(
+                "本地 SQLite",
+                DbKind::SQLite,
+                "",
+                0,
+                path.clone(),
+                "",
+                "",
+                "",
+                false,
+            ),
+            path,
+        )
+    }
+
+    /// 场景失败时把最后一帧登记过的元素写进 stderr，定位「哪一步没点到」。
+    /// 断言仍是普通 assert，这里只负责在 panic 前补一屏现场。
+    pub(crate) fn with_failure_dump(
+        cx: &mut TestAppContext,
+        handle: AnyWindowHandle,
+        flow: impl FnOnce(&mut TestAppContext),
+    ) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| flow(cx)));
+        if let Err(err) = result {
+            let dump = cx
+                .update_window(handle, |_, window, _| {
+                    let snaps = gpui_kit::base::test_support::snapshots(window);
+                    let mut lines = Vec::with_capacity(snaps.len());
+                    for snap in snaps {
+                        lines.push(format!(
+                            "  {:?} label={:?} value={:?} visible={} bounds={:?}",
+                            snap.path(),
+                            snap.label(),
+                            snap.value(),
+                            snap.visible(),
+                            snap.bounds()
+                        ));
+                    }
+                    lines.join("\n")
+                })
+                .unwrap_or_else(|_| "<窗口已关闭，无法取快照>".into());
+            eprintln!("\n[ui-flow] 失败时最后一帧的元素：\n{dump}\n");
+            std::panic::resume_unwind(err);
+        }
+    }
+}
+
+#[cfg(test)]
+mod designer_tests {
+    use super::*;
+    use crate::ui_test_support::{isolate_store, open_app, settle};
+    use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt;
+
+    // 显式引回标准 test 宏：`use super::*` 会把 gpui 的同名 test 宏带进作用域，
+    // 不然 #[gpui_kit::test] 生成的内部 #[test] 会再次命中 gpui 宏 → 无限递归
+    use core::prelude::v1::test;
 
     #[test]
     fn design_table_options_and_comment_per_dialect() {
@@ -21501,18 +23037,21 @@ mod designer_tests {
         isolate_store("sqlpv");
         let (handle, app) = open_app(cx);
         cx.update_window(handle, |_, window, cx| {
-            // PostgreSQL 连接（连接 1 / 库 postgres 全量池 / 模式 public）
+            // SQL Server 连接（连接 1 / 库 master 即连接默认库 / 模式 dbo）——
+            // PG 已是真库，方言演示位交给仍为 mock 的引擎
             app.update(cx, |a, cx| {
-                a.open_designer(Act::Obj(1, 3, 0, 0, 0), window, cx)
+                a.open_designer(Act::Obj(1, 1, 0, 0, 0), window, cx)
             });
             window.render_frame(cx);
 
-            // 加一条排除空行（模型直改——排除页的添加入口还在并行重做；
-            // 参考工具口径：新行方法默认 btree，空行也出形状）
+            // 加一个字段（模型直改——排除页的添入口径 PG 专属，这里验证的是
+            // 「更改」脚本与 diff 两栏的通用行为）
             app.update(cx, |a, _| {
                 let ds = a.opened[0].dstate.as_mut().unwrap();
-                ds.excludes.push(DesignExclude::default());
-                assert!(design_dirty(ds), "加排除算已修改");
+                let mut col = DesignCol::default();
+                col.name = "extra_col".into();
+                ds.cols.push(col);
+                assert!(design_dirty(ds), "加字段算已修改");
             });
 
             // SQL 预览页：默认「更改」——增量脚本 + 复制按钮
@@ -21523,26 +23062,17 @@ mod designer_tests {
                 let tab = &a.opened[0];
                 let ds = tab.dstate.as_ref().unwrap();
                 let conn = a.conns.iter().find(|c| c.name == tab.conn_name).unwrap();
-                let schema = mock::schemas(conn.kind)[tab.schema];
-                let table = mock::objects(conn, tab.db, tab.cat)[tab.obj];
+                let schema = catalog::schemas(conn, tab.db)[tab.schema];
+                let table = catalog::objects(conn, tab.db, tab_schema(conn, tab), tab.cat)[tab.obj];
                 let sql = sql_preview::design_change_sql(conn.kind, schema, table, ds);
                 assert!(
-                    sql.contains(&format!("ALTER TABLE \"public\".\"{table}\"\n  ADD EXCLUDE USING btree;")),
+                    sql.contains(&format!("ALTER TABLE \"{schema}\".\"{table}\"\n  ADD COLUMN")),
                     "{sql}"
                 );
-                // 触发器 / 规则段：参考工具即使没有触发器也照出空模板
-                assert!(
-                    sql.contains(&format!(
-                        "CREATE TRIGGER BEFORE ON \"public\".\"{table}\"\nFOR EACH ROW\nEXECUTE PROCEDURE ;"
-                    )),
-                    "{sql}"
-                );
-                assert!(
-                    sql.contains(&format!(
-                        "CREATE RULE  AS ON INSERT TO \"public\".\"{table}\" DO NOTHING;"
-                    )),
-                    "{sql}"
-                );
+                assert!(sql.contains("\"extra_col\""), "{sql}");
+                // 触发器段：参考工具即使一条触发器都没有也照出空模板
+                // （PG 的模板与规则段原文由 sql_preview 的纯函数测试盯住）
+                assert!(sql.contains("CREATE TRIGGER"), "{sql}");
             });
 
             // 切「DDL」子页：之前 / 之后 两栏都渲染
@@ -21605,6 +23135,26 @@ mod designer_tests {
         assert_eq!(dollar_quote_tag("$$"), Some("$$".into()));
         assert_eq!(dollar_quote_tag("$fn$"), Some("$fn$".into()));
         assert_eq!(dollar_quote_tag("$fn"), None);
+
+        // 触发器体：BEGIN … END 之间的分号属于同一条语句
+        let trig = "CREATE TRIGGER t AFTER INSERT ON m BEGIN UPDATE m SET a = 1 WHERE a > 0; END; SELECT 2";
+        let parts = split_sql_statements(trig);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].ends_with("END"), "{:?}", parts[0]);
+        assert_eq!(parts[1], "SELECT 2");
+        // 体内 CASE … END 不提前收体
+        let cases = "CREATE TRIGGER t INSTEAD OF DELETE ON v BEGIN \
+                     UPDATE m SET a = CASE WHEN a IS NULL THEN 0 ELSE a END; END;SELECT 2";
+        let parts = split_sql_statements(cases);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].ends_with("END"), "{:?}", parts[0]);
+
+        // 结构变更判定：只有 DDL / ATTACH 等才需要重查目录
+        assert!(stmt_may_change_schema("create table t (a int)"));
+        assert!(stmt_may_change_schema("  ALTER TABLE t ADD COLUMN b TEXT"));
+        assert!(stmt_may_change_schema("DROP VIEW v"));
+        assert!(!stmt_may_change_schema("INSERT INTO t VALUES (1)"));
+        assert!(!stmt_may_change_schema("SELECT create_fake FROM t"));
 
         assert!(query_is_select("SELECT 1"));
         assert!(query_is_select("  with cte as (select 1) select * from cte"));
@@ -22240,7 +23790,7 @@ mod designer_tests {
                 assert_eq!(a.opened[1].qstate.as_ref().unwrap().seq, 2);
             });
 
-            // 选中连接 1（PostgreSQL）再开：运行上下文跟着选中走，库取第一个
+            // 选中连接 1（SQL Server）再开：运行上下文跟着选中走，库取第一个
             app.update(cx, |a, cx| {
                 a.sel = Act::Conn(1);
                 a.open_query_tab(None, window, cx);
@@ -22248,11 +23798,13 @@ mod designer_tests {
             app.update(cx, |a, _| {
                 assert_eq!(a.opened.len(), 3);
                 let (t, q) = (&a.opened[2], a.opened[2].qstate.as_ref().unwrap());
-                assert_eq!(q.conn, "本地 PostgreSQL");
-                assert_eq!(t.db, mock::databases(DbKind::PostgreSql)[0]);
+                assert_eq!(q.conn, "测试 SQL Server");
+                // 运行上下文落在连接配置的库（master），不是清单第一条
+                assert_eq!(t.db, "master");
+                assert_eq!((q.db, q.schema), (1, 0));
             });
 
-            // 上下文切换：连接变了库 / 模式回 0；库 / 模式按下标落位
+            // 上下文切换：连接变了落到那条连接配置的库；库 / 模式按下标落位
             app.update(cx, |a, cx| {
                 let qid = a.opened[2].qid;
                 a.query_set_conn(qid, "本地 MySQL", cx);
@@ -22261,12 +23813,14 @@ mod designer_tests {
                 assert_eq!((q.db, q.schema), (0, 0));
                 a.query_set_db(qid, "sys", cx);
                 assert_eq!(a.opened[2].qstate.as_ref().unwrap().db, 5);
-                a.query_set_conn(qid, "本地 PostgreSQL", cx);
+                a.query_set_conn(qid, "测试 SQL Server", cx);
                 assert_eq!(
                     a.opened[2].qstate.as_ref().map(|q| (q.db, q.schema)),
-                    Some((0, 0))
+                    Some((1, 0)),
+                    "SQL Server 配置的库是 master（清单第 2 条）"
                 );
-                a.query_set_schema(qid, "public", cx);
+                assert_eq!(a.opened[2].db, "master");
+                a.query_set_schema(qid, "dbo", cx);
                 assert_eq!(a.opened[2].qstate.as_ref().unwrap().schema, 0);
             });
         })
@@ -22431,7 +23985,11 @@ mod designer_tests {
                     .collect()
             })
             .collect();
-        assert_eq!(sorted_row_order(&data, None), vec![0, 1, 2, 3, 4]);
+        let cols: Vec<db_types::ColMeta> = mock::MOCK_COLUMNS
+            .iter()
+            .map(|m| db_types::ColMeta::new(m.name, m.ty, m.numeric))
+            .collect();
+        assert_eq!(sorted_row_order(&data, &cols, None), vec![0, 1, 2, 3, 4]);
 
         // flags 列（值 = 行号 % 3）升序：0/1/2 三组，组内保持原行序（稳定）
         let rows = mock::mock_row_count("orders");
@@ -22443,7 +24001,7 @@ mod designer_tests {
             })
             .collect();
         let flag = |row: &Vec<String>| row[6].parse::<i64>().unwrap();
-        let asc = sorted_row_order(&data, Some((6, true)));
+        let asc = sorted_row_order(&data, &cols, Some((6, true)));
         assert_eq!(asc.len(), rows);
         for w in asc.windows(2) {
             let (a, b) = (flag(&data[w[0]]), flag(&data[w[1]]));
@@ -22453,7 +24011,7 @@ mod designer_tests {
             }
         }
         // 降序：键反序，组内仍按原行序
-        let desc = sorted_row_order(&data, Some((6, false)));
+        let desc = sorted_row_order(&data, &cols, Some((6, false)));
         for w in desc.windows(2) {
             let (a, b) = (flag(&data[w[0]]), flag(&data[w[1]]));
             assert!(a >= b, "降序被破坏: {w:?}");
@@ -22462,9 +24020,9 @@ mod designer_tests {
             }
         }
         // 同一输入恒定
-        assert_eq!(asc, sorted_row_order(&data, Some((6, true))));
+        assert_eq!(asc, sorted_row_order(&data, &cols, Some((6, true))));
         // 列下标越界：防御性恒等
-        assert_eq!(sorted_row_order(&data[..4], Some((99, true))), vec![0, 1, 2, 3]);
+        assert_eq!(sorted_row_order(&data[..4], &cols, Some((99, true))), vec![0, 1, 2, 3]);
     }
 
     #[gpui_kit::test]
@@ -22473,8 +24031,8 @@ mod designer_tests {
         let (handle, app) = open_app(cx);
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            app.update(cx, |a, _| {
-                a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0));
+            app.update(cx, |a, cx| {
+                a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx);
             });
             window.render_frame(cx);
             // 双击 cell/0/1 进就地编辑（测试台的双击 click_count=2；
@@ -22533,8 +24091,8 @@ mod designer_tests {
         let (handle, app) = open_app(cx);
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            app.update(cx, |a, _| {
-                a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0));
+            app.update(cx, |a, cx| {
+                a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx);
             });
             window.render_frame(cx);
         })
@@ -22604,8 +24162,8 @@ mod designer_tests {
         let (handle, app) = open_app(cx);
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            app.update(cx, |a, _| {
-                a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0));
+            app.update(cx, |a, cx| {
+                a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx);
             });
             window.render_frame(cx);
 
@@ -22674,7 +24232,7 @@ mod designer_tests {
         cx.update(|cx| wire_global_keys(app.clone(), handle, cx));
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            app.update(cx, |a, _| a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0)));
+            app.update(cx, |a, cx| a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx));
             window.render_frame(cx);
             app.update(cx, |a, _| {
                 let t = a.opened.first_mut().unwrap();
@@ -22804,6 +24362,675 @@ mod designer_tests {
         })
         .unwrap();
     }
+
+    /// 真 SQLite 驱动的端到端接线：目录 → 打表 → 改 / 删 / 增 → ✓ 写回真库 → 查询页执行。
+    #[gpui_kit::test]
+    fn sqlite_real_table_apply_and_query(cx: &mut TestAppContext) {
+        isolate_store("sqlite-real");
+        let db = std::env::temp_dir().join(format!("daro_rs_sqlite_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let path = db.to_string_lossy().to_string();
+        crate::sqlite_driver::open("sqlite-seed", &path).unwrap();
+        crate::sqlite_driver::execute_stmt(
+            "sqlite-seed",
+            "CREATE TABLE member (id INTEGER PRIMARY KEY, name TEXT, score REAL)",
+            1,
+        )
+        .unwrap();
+        crate::sqlite_driver::execute_stmt(
+            "sqlite-seed",
+            "INSERT INTO member (name, score) VALUES ('阿离', 88.5), ('老张', 60)",
+            1,
+        )
+        .unwrap();
+        crate::sqlite_driver::close("sqlite-seed");
+
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![mock::Connection::new(
+                    "本地 SQLite",
+                    DbKind::SQLite,
+                    "",
+                    0,
+                    path.clone(),
+                    "",
+                    "",
+                    "",
+                    false,
+                )];
+                a.groups.clear();
+                a.sel = Act::Conn(0);
+                a.open_connection(0, cx);
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| assert!(a.conns[0].connected));
+
+        // 目录：单库（main），表清单来自真库（树没展开时自己发一次对象请求）
+        app.update(cx, |a, _| {
+            let conn = &a.conns[0];
+            assert_eq!(catalog::databases(conn).len(), 1);
+            assert!(!catalog::has_schemas(conn.kind));
+            let _ = catalog::objects(conn, "main", "", 0);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            assert_eq!(catalog::objects(&a.conns[0], "main", "", 0), &["member"]);
+        });
+
+        // 打开表：真列 + 真行 + rowid
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx));
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let t = &a.opened[0];
+            assert_eq!(
+                t.cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                ["id", "name", "score"]
+            );
+            assert_eq!(t.data.len(), 2);
+            assert!(t.row_keys.iter().all(|k| !k.is_empty()), "真行带 rowid");
+            assert!(!t.dirty());
+        });
+
+        // 改单元格 → ✓ 写回真库
+        app.update(cx, |a, cx| {
+            a.opened[0].data[0][1] = "阿离改".into();
+            a.grid_apply(cx);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let page =
+                crate::sqlite_driver::select_table("本地 SQLite", "main", "member", None, &[], 0, 10)
+                    .unwrap();
+            assert_eq!(page.rows[0][1], "阿离改");
+            assert!(!a.opened[0].dirty());
+        });
+
+        // 删除第二行 → ✓
+        app.update(cx, |a, cx| {
+            a.opened[0].cell = (1, 0);
+            a.grid_delete_row(cx);
+            a.grid_apply(cx);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let page =
+                crate::sqlite_driver::select_table("本地 SQLite", "main", "member", None, &[], 0, 10)
+                    .unwrap();
+            assert_eq!(page.rows.len(), 1);
+            assert_eq!(a.opened[0].data.len(), 1);
+        });
+
+        // + 新增 → 填值 → ✓
+        app.update(cx, |a, cx| {
+            a.grid_insert_row(cx);
+            a.opened[0].inserted[0] = vec!["3".into(), "新成员".into(), "77".into()];
+            a.grid_apply(cx);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let page =
+                crate::sqlite_driver::select_table("本地 SQLite", "main", "member", None, &[], 0, 10)
+                    .unwrap();
+            assert_eq!(page.rows.len(), 2);
+            assert!(page.rows.iter().any(|r| r[1] == "新成员"));
+            assert!(!a.opened[0].dirty());
+        });
+
+        // 查询页：真执行 SELECT，结果列 / 行来自驱动
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| a.open_query_tab(None, window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let qid = cx
+            .update_window(handle, |_, window, cx| {
+                app.update(cx, |a, cx| {
+                    let editor = a.opened.last().unwrap().qstate.as_ref().unwrap().editor.clone();
+                    editor.update(cx, |s, cx| {
+                        s.set_value("SELECT count(*) AS n FROM member".to_string(), window, cx)
+                    });
+                });
+                let qid = app.update(cx, |a, _| a.opened.last().unwrap().qid);
+                app.update(cx, |a, cx| a.query_run(qid, false, window, cx));
+                app.update(cx, |a, _| {
+                    let q = a.opened.last().unwrap().qstate.as_ref().unwrap();
+                    assert!(q.job.is_some(), "真库脚本转到后台跑，页签先挂上任务");
+                    assert!(q.outcomes.is_empty(), "回执没回来前不留旧结果");
+                });
+                qid
+            })
+            .unwrap();
+        // 回执来自后台执行器：测试里手动抽干（真窗口靠事件循环）
+        cx.run_until_parked();
+        app.update(cx, |a, _| {
+            let q = a.opened.last().unwrap().qstate.as_ref().unwrap();
+            assert!(q.job.is_none(), "回执落地后任务摘除");
+            assert_eq!(q.outcomes.len(), 1);
+            let o = &q.outcomes[0];
+            assert_eq!(o.result.as_deref(), Some(&[vec!["2".to_string()]][..]));
+            assert_eq!(o.columns[0].name, "n");
+            assert!(o.message.is_none());
+        });
+
+        crate::sqlite_driver::close("本地 SQLite");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// PostgreSQL 档全链路（真机：datawalk 开发服务器上的独立测试库
+    /// `daro_pg_test`，每轮先删后建）。UI 与 SQLite 走同一条分发路径，这里验
+    /// 的是换成 PG 之后每一步落点都对：目录 → 打开表 → 分页 / 排序 / 筛选
+    /// 下推 → 改 / 删 / 增写回 → 查询页后台执行。
+    #[gpui_kit::test]
+    #[ignore = "打 datawalk 开发库，需要网络可达"]
+    fn pg_real_catalog_page_apply_and_query(cx: &mut TestAppContext) {
+        use crate::pg_driver::tests::{TEST_DB, reset_test_db};
+        isolate_store("pg-real");
+        let p = reset_test_db().expect("读不到 datawalk 的开发连接串");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![mock::Connection::new(
+                    "真机 PG",
+                    DbKind::PostgreSql,
+                    p.host.clone(),
+                    p.port,
+                    TEST_DB.to_string(),
+                    p.user.clone(),
+                    p.password.clone(),
+                    "",
+                    false,
+                )];
+                a.groups.clear();
+                a.sel = Act::Conn(0);
+                a.open_connection(0, cx);
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+        // 目录一层层来：先把下一层（模式 / 对象 / 列）排上队，再抽干
+        app.update(cx, |a, _| {
+            assert!(a.conns[0].connected, "连接成功");
+            if let Some(e) = catalog::take_error() {
+                panic!("目录读取失败：{e}");
+            }
+            let _ = catalog::schemas(&a.conns[0], TEST_DB);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let conn = &a.conns[0];
+            for cat in 0..5 {
+                let _ = catalog::objects(conn, TEST_DB, "public", cat);
+            }
+            let _ = catalog::table_columns(conn, TEST_DB, "public", "member");
+        });
+        settle(cx, handle);
+
+        // 目录：库 / 模式 / 四类对象 / 列元数据全部来自真库
+        let (db_ix, schema_ix, member_ix) = app.update(cx, |a, _| {
+            let conn = &a.conns[0];
+            let dbs = catalog::databases(conn);
+            let db_ix = dbs.iter().position(|d| *d == TEST_DB).expect("测试库在库清单里");
+            let schemas = catalog::schemas(conn, TEST_DB);
+            let schema_ix = schemas.iter().position(|s| *s == "public").expect("public 在模式清单里");
+            assert!(!schemas.iter().any(|s| s.starts_with("pg_")), "系统模式不列：{schemas:?}");
+
+            let tables = catalog::objects(conn, TEST_DB, "public", 0);
+            for t in ["member", "gen", "nopath", "pair", "wide"] {
+                assert!(tables.contains(&t), "{t} 应在表清单：{tables:?}");
+            }
+            assert!(catalog::objects(conn, TEST_DB, "public", 1).contains(&"v_member"));
+            assert!(catalog::objects(conn, TEST_DB, "public", 2).contains(&"mv_member"));
+            assert!(catalog::objects(conn, TEST_DB, "public", 3).contains(&"add2"));
+            assert!(catalog::objects(conn, TEST_DB, "public", 4).is_empty(), "查询节点不由目录出");
+
+            let cols = catalog::table_columns(conn, TEST_DB, "public", "member");
+            assert_eq!(
+                cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                ["id", "name", "score", "joined", "note"]
+            );
+            assert!(cols[0].pk, "id 是主键");
+            assert!(!cols[0].writable, "标识列不可写");
+            assert!(cols[2].numeric, "numeric 是数值列");
+            let member_ix = tables.iter().position(|t| *t == "member").unwrap();
+            (db_ix, schema_ix, member_ix)
+        });
+
+        // 打开表：真列 + 真行 + 主键当行标识
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| {
+                a.open_object(Act::Obj(0, db_ix, schema_ix, 0, member_ix), cx)
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let t = &a.opened[0];
+            assert_eq!(t.data.len(), 3, "夹具 3 行");
+            assert_eq!(t.page.as_ref().map(|p| (p.page_no, p.total)), Some((0, 3)));
+            assert_eq!(t.row_keys.len(), 3);
+            assert!(
+                t.row_keys.iter().all(|k| k.len() == 1 && !k[0].is_empty()),
+                "行标识 = 单个主键值：{:?}",
+                t.row_keys
+            );
+        });
+
+        // 分页 / 排序 / 筛选都下推到服务端
+        app.update(cx, |a, _| {
+            let c = &a.conns[0];
+            let (desc, total) = load_table_page(
+                c,
+                TEST_DB,
+                "public",
+                "member",
+                None,
+                &[("id".to_string(), false)],
+                0,
+                2,
+            )
+            .unwrap();
+            assert_eq!(
+                desc.rows.iter().map(|r| r[1].clone()).collect::<Vec<_>>(),
+                ["青梧", "北辰"],
+                "ORDER BY id DESC 在服务端做"
+            );
+            assert_eq!((desc.keys[0].as_slice(), total), (&["3".to_string()][..], 3));
+
+            let (hit, hit_total) = load_table_page(
+                c,
+                TEST_DB,
+                "public",
+                "member",
+                Some("score > 80"),
+                &[],
+                0,
+                2,
+            )
+            .unwrap();
+            assert_eq!((hit.rows.len(), hit_total), (1, 1), "WHERE 在服务端做");
+            assert_eq!(hit.rows[0][2], "91.50", "numeric 按服务端文本原样");
+            assert_eq!(hit.rows[0][4], "NULL", "真 NULL 打字面");
+
+            let (tail, tail_total) = load_table_page(
+                c, TEST_DB, "public", "member", None, &[], 2, 2,
+            )
+            .unwrap();
+            assert_eq!((tail.rows.len(), tail_total), (1, 3), "末页只回剩下的行");
+        });
+
+        // 改一行 → ✓：UPDATE 按主键定位，成功后重新取数
+        app.update(cx, |a, cx| {
+            a.opened[0].data[0][1] = "阿离改".into();
+            a.grid_apply(cx);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            assert_eq!(a.opened[0].data[0][1], "阿离改");
+            assert!(!a.opened[0].dirty(), "写回后工作集即基线");
+        });
+
+        // 删一行 → ✓
+        app.update(cx, |a, cx| {
+            a.opened[0].cell = (2, 0);
+            a.grid_delete_row(cx);
+            a.grid_apply(cx);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let p = a.opened[0].page.as_ref().unwrap();
+            assert_eq!((a.opened[0].data.len(), p.total), (2, 2), "删的是真库那一行");
+        });
+
+        // 新增 → ✓：标识列不送，由服务端生成
+        app.update(cx, |a, cx| {
+            a.grid_insert_row(cx);
+            a.opened[0].inserted[0] = vec![
+                "NULL".into(),
+                "新兄弟".into(),
+                "77".into(),
+                "NULL".into(),
+                "NULL".into(),
+            ];
+            a.grid_apply(cx);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let names: Vec<String> = a.opened[0].data.iter().map(|r| r[1].clone()).collect();
+            assert_eq!(names, ["阿离改", "北辰", "新兄弟"], "改 / 删 / 增都落在真库");
+        });
+
+        // 查询页：新建就落在连接配置的库，执行走后台线程
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| a.open_query_tab(None, window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, _| {
+            let q = a.opened.last().unwrap().qstate.as_ref().unwrap();
+            assert_eq!(q.conn, "真机 PG");
+            assert_eq!(catalog::databases(&a.conns[0])[q.db], TEST_DB, "默认库 = 配置的库");
+            assert_eq!(
+                catalog::schemas(&a.conns[0], TEST_DB)[q.schema],
+                "public",
+                "默认模式 = public"
+            );
+        });
+        let qid = cx
+            .update_window(handle, |_, window, cx| {
+                app.update(cx, |a, cx| {
+                    let editor = a.opened.last().unwrap().qstate.as_ref().unwrap().editor.clone();
+                    editor.update(cx, |s, cx| {
+                        s.set_value("SELECT count(*) AS n FROM member".to_string(), window, cx)
+                    });
+                });
+                let qid = app.update(cx, |a, _| a.opened.last().unwrap().qid);
+                app.update(cx, |a, cx| a.query_run(qid, false, window, cx));
+                app.update(cx, |a, _| {
+                    let q = a.opened.last().unwrap().qstate.as_ref().unwrap();
+                    assert!(q.job.is_some(), "PG 脚本恒后台");
+                });
+                qid
+            })
+            .unwrap();
+        cx.run_until_parked();
+        app.update(cx, |a, _| {
+            let q = a.opened.last().unwrap().qstate.as_ref().unwrap();
+            assert!(q.job.is_none());
+            let o = &q.outcomes[0];
+            assert_eq!(o.columns[0].name, "n");
+            assert_eq!(o.result.as_deref(), Some(&[vec!["3".to_string()]][..]));
+        });
+
+        // 「无主键表」在 UI 口径里拒绝写回：行标识为空，有改动就拦下
+        let nopath_ix = app.update(cx, |a, _| {
+            let tables = catalog::objects(&a.conns[0], TEST_DB, "public", 0);
+            tables.iter().position(|t| *t == "nopath").unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| a.open_object(Act::Obj(0, db_ix, schema_ix, 0, nopath_ix), cx));
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, cx| {
+            let ix = a.opened.len() - 1;
+            a.active_tab = ix + 1;
+            assert!(a.opened[ix].row_keys.iter().all(|k| k.is_empty()), "无主键表没有行标识");
+            a.opened[ix].data[0][0] = "改不动".into();
+            a.grid_apply(cx);
+            assert_eq!(a.opened[ix].data[0][0], "改不动", "写回被拦下，工作集保持原样");
+        });
+
+        app.update(cx, |a, _| backend::close_connection(&a.conns[0]));
+    }
+
+    /// 真库脚本走后台：运行时页签挂任务、旧结果清空；「停止」在语句开跑前
+    /// 置标志就按「已停止」收尾；任务摘除后能立刻再跑。
+    #[gpui_kit::test]
+    fn sqlite_query_runs_off_ui_thread_and_stops(cx: &mut TestAppContext) {
+        isolate_store("sqlite-bg");
+        let db = std::env::temp_dir().join(format!("daro_rs_bg_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let path = db.to_string_lossy().to_string();
+        crate::sqlite_driver::open("bg-seed", &path).unwrap();
+        crate::sqlite_driver::execute_stmt("bg-seed", "CREATE TABLE t(a INTEGER)", 1).unwrap();
+        crate::sqlite_driver::close("bg-seed");
+
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![mock::Connection::new(
+                    "后台查询",
+                    DbKind::SQLite,
+                    "",
+                    0,
+                    path.clone(),
+                    "",
+                    "",
+                    "",
+                    false,
+                )];
+                a.groups.clear();
+                a.sel = Act::Conn(0);
+                a.open_connection(0, cx);
+            });
+            window.render_frame(cx);
+            app.update(cx, |a, cx| a.open_query_tab(None, window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let qid = app.update(cx, |a, _| a.opened.last().unwrap().qid);
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| {
+                let ed = a.opened.last().unwrap().qstate.as_ref().unwrap().editor.clone();
+                ed.update(cx, |s, cx| {
+                    s.set_value("SELECT 1;\nSELECT 2".to_string(), window, cx)
+                });
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| a.query_run(qid, false, window, cx));
+        })
+        .unwrap();
+        app.update(cx, |a, _| {
+            let q = a.opened.last().unwrap().qstate.as_ref().unwrap();
+            assert!(q.job.is_some(), "脚本交给后台线程，页签先挂上任务");
+            assert_eq!(q.prompt, Some("执行中…"), "回执没来前只说实话");
+            assert!(q.outcomes.is_empty(), "上一轮结果不该冒充这一轮");
+        });
+
+        // 「停止」赶在语句开跑前置标志：一条没执行，回执按取消收尾
+        app.update(cx, |a, cx| a.query_cancel(qid, cx));
+        cx.run_until_parked();
+        app.update(cx, |a, _| {
+            let q = a.opened.last().unwrap().qstate.as_ref().unwrap();
+            assert!(q.job.is_none(), "回执落地即摘牌");
+            assert!(q.outcomes.is_empty());
+            assert_eq!(q.prompt, Some("已停止"));
+        });
+
+        // 摘牌后能立刻再跑，两条语句都出网格
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| a.query_run(qid, false, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        app.update(cx, |a, _| {
+            let q = a.opened.last().unwrap().qstate.as_ref().unwrap();
+            assert_eq!(q.outcomes.len(), 2);
+            assert_eq!(
+                q.outcomes[0].result.as_deref(),
+                Some(&[vec!["1".to_string()]][..])
+            );
+            assert_eq!(
+                q.outcomes[1].result.as_deref(),
+                Some(&[vec!["2".to_string()]][..])
+            );
+            assert_eq!(q.pane, 2, "自动停在最新的结果页");
+        });
+
+        crate::sqlite_driver::close("后台查询");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// 真库分页：网格只持有当前页，翻页 / 排序 / 筛选全部下推成 SQL；
+    /// 有未应用修改时拦住翻页，避免工作集被下一次取数悄悄覆盖。
+    #[gpui_kit::test]
+    fn sqlite_remote_paging_sort_and_filter(cx: &mut TestAppContext) {
+        isolate_store("sqlite-page");
+        let db = std::env::temp_dir().join(format!("daro_rs_page_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let path = db.to_string_lossy().to_string();
+        crate::sqlite_driver::open("sqlite-page-seed", &path).unwrap();
+        crate::sqlite_driver::with_raw("sqlite-page-seed", |raw| {
+            raw.execute_batch(
+                r#"
+                CREATE TABLE big(id INTEGER PRIMARY KEY, name TEXT, grp INTEGER);
+                INSERT INTO big(id, name, grp)
+                WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 1200)
+                SELECT n, 'r' || n, n % 4 FROM c;
+                "#,
+            )
+            .unwrap();
+        });
+        crate::sqlite_driver::close("sqlite-page-seed");
+
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![mock::Connection::new(
+                    "本地分页",
+                    DbKind::SQLite,
+                    "",
+                    0,
+                    path.clone(),
+                    "",
+                    "",
+                    "",
+                    false,
+                )];
+                a.groups.clear();
+                a.open_connection(0, cx);
+            });
+        })
+        .unwrap();
+        // 目录（库 / 表清单）先在后台补齐，再谈「双击第 0 张表」
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let _ = catalog::objects(&a.conns[0], "main", "", 0);
+        });
+        settle(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx));
+        })
+        .unwrap();
+        settle(cx, handle);
+
+        // 首屏：只装一页，总数另取 COUNT
+        app.update(cx, |a, _| {
+            let t = &a.opened[0];
+            assert_eq!(t.data.len(), REMOTE_PAGE_SIZE, "只取当前页");
+            let p = t.page.as_ref().unwrap();
+            assert_eq!((p.page_no, p.page_size, p.total), (0, REMOTE_PAGE_SIZE, 1200));
+            let (sql, status) = a.table_page_status(t);
+            assert!(sql.contains("LIMIT 1000 OFFSET 0"), "{sql}");
+            assert!(status.contains("共 1200 条"), "{status}");
+        });
+
+        // 表头排序下推：升序首行 id=1，再点降序首行 id=1200
+        cx.update_window(handle, |_, window, cx| {
+            window.click("th/0", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let t = &a.opened[0];
+            assert_eq!(t.sort, Some((0, true)));
+            assert_eq!(t.data[0][0], "1");
+            let (sql, _) = a.table_page_status(t);
+            assert!(sql.contains("ORDER BY \"id\" ASC"), "{sql}");
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.click("th/0", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            assert_eq!(a.opened[0].data[0][0], "1200", "降序后首行变了");
+        });
+
+        // 末页只有 200 行
+        app.update(cx, |a, cx| a.grid_page_to(1, cx));
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let t = &a.opened[0];
+            assert_eq!(t.page.as_ref().unwrap().page_no, 1);
+            assert_eq!(t.data.len(), 200);
+            let (_, status) = a.table_page_status(t);
+            assert!(status.contains("于第 2 页"), "{status}");
+        });
+
+        // 脏页拦住翻页（改了会被下一次取数覆盖）
+        app.update(cx, |a, _| a.opened[0].data[0][1] = "脏".into());
+        app.update(cx, |a, cx| a.grid_page_to(0, cx));
+        app.update(cx, |a, cx| {
+            assert_eq!(
+                a.opened[0].page.as_ref().unwrap().page_no,
+                1,
+                "未应用修改时不翻页"
+            );
+            a.grid_revert(cx);
+        });
+        settle(cx, handle);
+
+        // 筛选下推：WHERE 进 SQL，总行数随条件收缩并回到首页
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, _| {
+                let t = &mut a.opened[0];
+                t.filter.model = filter::parse_where(DbKind::SQLite, &t.cols, "grp = 1").unwrap();
+            });
+            app.update(cx, |a, cx| a.filter_apply(window, cx));
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let t = &a.opened[0];
+            let p = t.page.as_ref().unwrap();
+            assert_eq!((p.page_no, p.total), (0, 300), "条件变了回首页");
+            assert_eq!(t.data.len(), 300);
+            assert!(t.data.iter().all(|r| r[2] == "1"), "只留 grp=1");
+            let (sql, _) = a.table_page_status(t);
+            assert!(sql.contains("WHERE \"grp\" = 1"), "{sql}");
+        });
+
+        crate::sqlite_driver::close("本地分页");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// 「美化 SQL」钮真的改写编辑器正文（不再是个灰摆设）。
+    #[gpui_kit::test]
+    fn query_prettify_button_rewrites_editor(cx: &mut TestAppContext) {
+        isolate_store("qpretty");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| a.open_query_tab(None, window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            let ed = app.update(cx, |a, _| a.opened[0].qstate.as_ref().unwrap().editor.clone());
+            ed.update(cx, |s, cx| {
+                s.set_value("select a,b from t where a>1 and b<2", window, cx)
+            });
+            window.render_frame(cx);
+            window.click("qp/pretty", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, cx| {
+            let q = a.opened[0].qstate.as_ref().unwrap();
+            assert_eq!(
+                q.editor.read(cx).value().to_string(),
+                "SELECT a,\n  b\nFROM t\nWHERE a > 1\n  AND b < 2"
+            );
+            assert!(q.dirty, "美化算一次编辑");
+        });
+    }
 }
 
 /// 树右键菜单接线背后的模型逻辑：分组增删、库开合。
@@ -22811,36 +25038,11 @@ mod designer_tests {
 #[cfg(test)]
 mod tree_menu_tests {
     use super::*;
+    use crate::ui_test_support::{isolate_store, open_app, settle};
     use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt;
 
     use core::prelude::v1::test;
-
-    fn isolate_store(tag: &str) {
-        let dir =
-            std::env::temp_dir().join(format!("daro_rs_test_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: 用例由 --test-threads=1 串行执行，且写 env 先于任何 DaroApp 构造
-        unsafe { std::env::set_var("DARO_DATA_DIR", &dir) };
-    }
-
-    fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<DaroApp>) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Default::default(),
-                        size: size(px(1440.), px(900.)),
-                    })),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| cx.new(|cx| DaroApp::new(window, cx)),
-            )
-            .expect("open test window")
-        })
-    }
 
     #[gpui_kit::test]
     fn group_add_dedup_and_delete_falls_back(cx: &mut TestAppContext) {
@@ -22875,10 +25077,10 @@ mod tree_menu_tests {
         isolate_store("menudb");
         let (handle, app) = open_app(cx);
         cx.update_window(handle, |_, _, cx| {
-            app.update(cx, |a, _| {
+            app.update(cx, |a, cx| {
                 let kind = a.conns[0].kind;
                 let db = mock::databases(kind)[0];
-                a.open_db(0, 0);
+                a.open_db(0, 0, cx);
                 let key = node_key(&a.conns[0].name, db);
                 assert!(a.visited_dbs.contains(&key), "打开后图标转绿");
                 assert!(a.expanded.contains(&key));
@@ -22888,5 +25090,247 @@ mod tree_menu_tests {
             });
         })
         .unwrap();
+    }
+
+    /// 树右键「刷新」重查真库目录：外部往库里加表后，不刷看不见、刷了看得见。
+    #[gpui_kit::test]
+    fn refresh_catalog_rereads_real_db(cx: &mut TestAppContext) {
+        isolate_store("menurefresh");
+        let db = std::env::temp_dir().join(format!("daro_rs_refresh_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let path = db.to_string_lossy().to_string();
+        crate::sqlite_driver::open("refresh-seed", &path).unwrap();
+        crate::sqlite_driver::execute_stmt("refresh-seed", "CREATE TABLE one(a INTEGER)", 1).unwrap();
+        crate::sqlite_driver::close("refresh-seed");
+
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![mock::Connection::new(
+                    "刷新测试",
+                    DbKind::SQLite,
+                    "",
+                    0,
+                    path.clone(),
+                    "",
+                    "",
+                    "",
+                    false,
+                )];
+                a.groups.clear();
+                a.open_connection(0, cx);
+            });
+        })
+        .unwrap();
+        // 先等目录进缓存，之后外部建表才谈得上「不刷新看不见」
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let _ = catalog::objects(&a.conns[0], "main", "", 0);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            assert_eq!(
+                catalog::objects(&a.conns[0], "main", "", 0),
+                &["one"],
+                "连接后目录只有已存在的表"
+            );
+        });
+
+        // 外部（另一个连接）建表：缓存不动，刷新后才进树
+        crate::sqlite_driver::open("refresh-seed2", &path).unwrap();
+        crate::sqlite_driver::execute_stmt("refresh-seed2", "CREATE TABLE two(a INTEGER)", 1)
+            .unwrap();
+        crate::sqlite_driver::close("refresh-seed2");
+        app.update(cx, |a, _| {
+            let conn = &a.conns[0];
+            assert_eq!(catalog::objects(conn, "main", "", 0), &["one"], "未刷新仍走缓存");
+        });
+        app.update(cx, |a, cx| a.refresh_catalog(cx));
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let conn = &a.conns[0];
+            assert_eq!(catalog::objects(conn, "main", "", 0), &["one", "two"]);
+        });
+
+        crate::sqlite_driver::close("刷新测试");
+        let _ = std::fs::remove_file(&db);
+    }
+}
+
+/// 自动化 UI 流程：不用直接调模型方法，而是像用户一样点控件走完整条链路。
+#[cfg(test)]
+mod ui_flows {
+    use super::*;
+    use crate::ui_test_support::{
+        isolate_store, open_app, settle, sqlite_fixture, with_failure_dump,
+    };
+    use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt;
+
+    use core::prelude::v1::test;
+
+    /// 改动流程：选连接 → 对象面板双击开表 → 双击格子改值 → 回车提交 →
+    /// 点导航条 ✓ 写回真库。断言同时看模型、界面元素和驱动里的真行。
+    #[gpui_kit::test]
+    fn sqlite_edit_cell_and_apply_through_ui(cx: &mut TestAppContext) {
+        isolate_store("flowedit");
+        let (conn, path) = sqlite_fixture(
+            "flowedit",
+            &[
+                "CREATE TABLE member (id INTEGER PRIMARY KEY, name TEXT, score REAL)",
+                "INSERT INTO member (name, score) VALUES ('阿离', 88.5), ('老张', 60)",
+            ],
+        );
+        let (handle, app) = open_app(cx);
+        with_failure_dump(cx, handle, |cx| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                app.update(cx, |a, cx| {
+                    a.conns = vec![conn];
+                    a.groups.clear();
+                    a.sel = Act::Conn(0);
+                    a.open_connection(0, cx);
+                });
+            })
+            .unwrap();
+            settle(cx, handle);
+            // 对象面板按需拉目录：先排一次请求，等列表落地再点
+            app.update(cx, |a, _| {
+                assert!(a.conns[0].connected, "测试库连接成功");
+                let _ = catalog::objects(&a.conns[0], "main", "", 0);
+            });
+            settle(cx, handle);
+
+            // 选中库节点，对象面板才挂上这条路径的清单
+            cx.update_window(handle, |_, window, cx| {
+                window.click("db/0/0", cx);
+            })
+            .unwrap();
+            settle(cx, handle);
+            cx.update_window(handle, |_, window, _| {
+                assert!(window.try_find(("obj", 0usize)).is_some(), "库里的对象已列出");
+            })
+            .unwrap();
+
+            // 对象面板双击 = 打开表（两次单击命中应用自己的双击时间窗）
+            cx.update_window(handle, |_, window, cx| {
+                window.click(("obj", 0usize), cx);
+                window.click(("obj", 0usize), cx);
+            })
+            .unwrap();
+            settle(cx, handle);
+            cx.update_window(handle, |_, window, _| {
+                assert!(window.try_find("cell/0/1").is_some(), "表已打开并渲染格子");
+                assert!(window.try_find("nav/ok").is_some(), "数据页带导航条");
+            })
+            .unwrap();
+
+            // 双击格子 → 改值 → 回车提交
+            cx.update_window(handle, |_, window, cx| {
+                window.double_click("cell/0/1", cx);
+            })
+            .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                app.update(cx, |a, cx| {
+                    let input = a
+                        .cell_editing
+                        .as_ref()
+                        .expect("双击后进入编辑")
+                        .input
+                        .clone();
+                    input.update(cx, |s, cx| s.set_value("阿离改", window, cx));
+                });
+                window.press("enter", cx);
+            })
+            .unwrap();
+            settle(cx, handle);
+
+            // ✓ 只在 dirty 时可点；点了才走真库写回
+            cx.update_window(handle, |_, window, cx| {
+                window.click("nav/ok", cx);
+            })
+            .unwrap();
+            settle(cx, handle);
+
+            app.update(cx, |a, _| {
+                assert_eq!(a.opened[0].data[0][1], "阿离改");
+                assert!(!a.opened[0].dirty(), "应用后工作集无变更");
+                let page = crate::sqlite_driver::select_table(
+                    "本地 SQLite",
+                    "main",
+                    "member",
+                    None,
+                    &[],
+                    0,
+                    10,
+                )
+                .unwrap();
+                assert_eq!(page.rows[0][1], "阿离改", "真库已更新");
+            });
+        });
+        crate::sqlite_driver::close("本地 SQLite");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 查询流程：缎带新建查询 → 编辑器键入 SQL → 点运行 → 后台回执落到结果网格。
+    #[gpui_kit::test]
+    fn sqlite_query_run_through_ui(cx: &mut TestAppContext) {
+        isolate_store("flowquery");
+        let (conn, path) = sqlite_fixture(
+            "flowquery",
+            &[
+                "CREATE TABLE member (id INTEGER PRIMARY KEY, name TEXT, score REAL)",
+                "INSERT INTO member (name, score) VALUES ('阿离', 88.5), ('老张', 60)",
+            ],
+        );
+        let (handle, app) = open_app(cx);
+        with_failure_dump(cx, handle, |cx| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                app.update(cx, |a, cx| {
+                    a.conns = vec![conn];
+                    a.groups.clear();
+                    a.sel = Act::Conn(0);
+                    a.open_connection(0, cx);
+                });
+            })
+            .unwrap();
+            settle(cx, handle);
+
+            cx.update_window(handle, |_, window, cx| {
+                window.click("新建查询", cx);
+                window.render_frame(cx);
+                assert!(window.try_find("qedit").is_some(), "查询页已打开");
+                window.click("qedit", cx);
+                window.input("SELECT count(*) AS n FROM member", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+
+            cx.update_window(handle, |_, window, cx| {
+                window.click_at("qrun-wrap", point(px(10.), px(11.)), cx);
+            })
+            .unwrap();
+            settle(cx, handle);
+
+            app.update(cx, |a, _| {
+                let q = a.opened[0].qstate.as_ref().unwrap();
+                assert!(q.job.is_none(), "回执已落地");
+                assert_eq!(q.outcomes.len(), 1);
+                let o = &q.outcomes[0];
+                assert_eq!(o.sql, "SELECT count(*) AS n FROM member");
+                assert_eq!(o.result.as_deref(), Some(&[vec!["2".to_string()]][..]));
+                assert_eq!(o.columns[0].name, "n");
+                assert!(DaroApp::query_status_text(q).starts_with("执行成功 · "));
+            });
+            cx.update_window(handle, |_, window, _| {
+                assert!(window.try_find("qtab/1").is_some(), "结果页签已出现");
+                assert!(window.try_find("qcell/0/0/0").is_some(), "结果网格已渲染");
+            })
+            .unwrap();
+        });
+        crate::sqlite_driver::close("本地 SQLite");
+        let _ = std::fs::remove_file(&path);
     }
 }

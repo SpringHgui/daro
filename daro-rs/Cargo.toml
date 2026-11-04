@@ -1,6 +1,6 @@
-﻿[package]
+[package]
 name = "daro-rs"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 
 [dependencies]
@@ -15,6 +15,17 @@ aes = "0.8"
 cbc = "0.1"
 base64 = "0.22"
 rfd = "0.17.2"
+rusqlite = { version = "0.41.1", features = ["bundled", "column_decltype"] }
+postgres = { version = "0.19", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # headless 测试台（真建窗口 + 派发点击/键入）；feature 只在 cargo test 时统一进来，
 # 正常 cargo build 不受影响（test_support() 退化为恒等）

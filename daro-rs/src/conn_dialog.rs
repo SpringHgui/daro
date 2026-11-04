@@ -35,7 +35,7 @@ const TILES: [TypeTile; 9] = [
     TypeTile { name: "PostgreSQL", kind: Some(DbKind::PostgreSql), color: 0x336791, mark: "Pg" },
     TypeTile { name: "SQL Server", kind: Some(DbKind::SqlServer), color: 0xcc2927, mark: "Ss" },
     TypeTile { name: "Oracle", kind: None, color: 0xc74634, mark: "Or" },
-    TypeTile { name: "SQLite", kind: None, color: 0x003b57, mark: "Sq" },
+    TypeTile { name: "SQLite", kind: Some(DbKind::SQLite), color: 0x003b57, mark: "Sq" },
     TypeTile { name: "MariaDB", kind: None, color: 0x003545, mark: "Ma" },
     TypeTile { name: "MongoDB", kind: Some(DbKind::MongoDb), color: 0x4faa41, mark: "Mo" },
     TypeTile { name: "Redis", kind: Some(DbKind::Redis), color: 0xd82c20, mark: "Re" },
@@ -107,6 +107,8 @@ pub struct NewConnectionDialog {
     last_title: Option<String>,
     save_password: bool,
     status: Option<SharedString>,
+    /// 探针在后台跑：期间按钮置灰，避免连点堆出多个探测连接。
+    testing: bool,
     search: Entity<InputState>,
     uri: Entity<InputState>,
     name: Entity<InputState>,
@@ -198,6 +200,7 @@ impl NewConnectionDialog {
             last_title: None,
             save_password,
             status: None,
+            testing: false,
             search,
             uri,
             name,
@@ -279,7 +282,80 @@ impl NewConnectionDialog {
         if self.uri_mode {
             return !self.uri.read(cx).value().trim().is_empty();
         }
+        if self.kind == DbKind::SQLite {
+            return !self.database.read(cx).value().trim().is_empty();
+        }
         !self.host.read(cx).value().trim().is_empty() && self.port.read(cx).value().parse::<u16>().is_ok()
+    }
+
+    /// 表单 → 连接参数：「确定」和「测试连接」共用一套取字段口径。
+    fn form_parts(&self, cx: &Context<Self>) -> Option<UriParts> {
+        if self.uri_mode {
+            return parse_uri(self.uri.read(cx).value().trim());
+        }
+        Some((
+            self.kind,
+            self.host.read(cx).value().trim().to_string(),
+            self.port.read(cx).value().parse::<u16>().unwrap_or(self.kind.default_port()),
+            self.database.read(cx).value().trim().to_string(),
+            self.user.read(cx).value().trim().to_string(),
+            self.password.read(cx).value().to_string(),
+        ))
+    }
+
+    /// 「测试连接」：按当前表单临时连一次，跑一条探针语句就走。
+    /// 探针会阻塞（TCP 超时 / 认证往返），必须丢后台，否则整个窗口白屏。
+    /// 不注册进驱动的连接表，也不写回列表——点了测试不保存同样不留痕。
+    fn test_connection(&mut self, cx: &mut Context<Self>) {
+        if self.testing {
+            return;
+        }
+        let say = |this: &mut Self, text: String, cx: &mut Context<Self>| {
+            this.status = Some(text.into());
+            cx.notify();
+        };
+        let Some((kind, host, port, database, user, password)) = self.form_parts(cx) else {
+            say(self, "无法识别的连接字符串".into(), cx);
+            return;
+        };
+        if !crate::backend::is_real(kind) {
+            say(self, "尚未接入数据库驱动，无法测试连接".into(), cx);
+            return;
+        }
+        if kind == DbKind::SQLite && database.trim().is_empty() {
+            say(self, "请填写数据库文件路径".into(), cx);
+            return;
+        }
+        let conn = Connection::new(
+            String::new(),
+            kind,
+            host,
+            port,
+            database,
+            user,
+            password,
+            "",
+            false,
+        );
+        // 约定：先把「测试中」推上屏，再去后台占线程
+        self.testing = true;
+        say(self, "测试中…".into(), cx);
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { crate::backend::probe(&conn) })
+                .await;
+            let text = match res {
+                Ok(()) => "连接成功".to_string(),
+                Err(e) => format!("连接失败：{e}"),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.testing = false;
+                this.status = Some(text.into());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -287,25 +363,13 @@ impl NewConnectionDialog {
             return;
         }
         let name = self.name.read(cx).value().trim().to_string();
-        let (kind, host, port, database, user, password) = if self.uri_mode {
-            let raw = self.uri.read(cx).value().trim().to_string();
-            match parse_uri(&raw) {
-                Some(parts) => parts,
-                None => {
-                    self.status = Some("无法识别的连接字符串".into());
-                    cx.notify();
-                    return;
-                }
+        let (kind, host, port, database, user, password) = match self.form_parts(cx) {
+            Some(parts) => parts,
+            None => {
+                self.status = Some("无法识别的连接字符串".into());
+                cx.notify();
+                return;
             }
-        } else {
-            (
-                self.kind,
-                self.host.read(cx).value().trim().to_string(),
-                self.port.read(cx).value().parse::<u16>().unwrap_or(self.kind.default_port()),
-                self.database.read(cx).value().trim().to_string(),
-                self.user.read(cx).value().trim().to_string(),
-                self.password.read(cx).value().to_string(),
-            )
         };
         match self.mode {
             ConnDialogMode::Create => {
@@ -730,7 +794,7 @@ impl NewConnectionDialog {
                         s.child(field("连接字符串", &fg, Input::new(&self.uri).h(px(24.))))
                     })
                     .child(field("连接名称", &fg, Input::new(&self.name).h(px(24.))))
-                    .when(!self.uri_mode, |s| {
+                    .when(!self.uri_mode && self.kind != DbKind::SQLite, |s| {
                         s.child(field("主机", &fg, Input::new(&self.host).h(px(24.))))
                             .child(field("端口", &fg, Input::new(&self.port).h(px(24.))))
                             .child(field("初始数据库", &fg, Input::new(&self.database).h(px(24.))))
@@ -762,6 +826,52 @@ impl NewConnectionDialog {
                                     ),
                             )
                     })
+                    .when(!self.uri_mode && self.kind == DbKind::SQLite, |s| {
+                        s.child(
+                            h_flex()
+                                .gap(px(10.))
+                                .items_center()
+                                .child(
+                                    div()
+                                        .w(px(84.))
+                                        .text_xs()
+                                        .text_color(fg)
+                                        .child("数据库文件"),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(340.))
+                                        .child(Input::new(&self.database).h(px(24.))),
+                                )
+                                .child(
+                                    Button::new("browse-db")
+                                        .label("浏览...")
+                                        .h(px(26.))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            let picked = rfd::FileDialog::new()
+                                                .set_title("选择 SQLite 数据库文件")
+                                                .add_filter(
+                                                    "SQLite 数据库",
+                                                    &["db", "sqlite", "sqlite3"],
+                                                )
+                                                .pick_file();
+                                            if let Some(path) = picked {
+                                                let text = path.display().to_string();
+                                                this.database.update(cx, |s, cx| {
+                                                    s.set_value(text, window, cx)
+                                                });
+                                                cx.notify();
+                                            }
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(subtle)
+                                .child("填写已有 .db / .sqlite 文件路径；文件不存在会新建空库"),
+                        )
+                    })
                     .child(
                         div()
                             .h(px(18.))
@@ -783,9 +893,9 @@ impl NewConnectionDialog {
                         Button::new("test")
                             .label("测试连接")
                             .h(px(26.))
+                            .disabled(self.testing)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.status = Some("尚未接入数据库驱动，无法测试连接".into());
-                                cx.notify();
+                                this.test_connection(cx);
                             })),
                     )
                     // 编辑态没有类型选择这一步，就不留「上一步」的死键

@@ -9,7 +9,8 @@
 use gpui_kit::component::input::TextareaState;
 use gpui_kit::Entity;
 
-use crate::mock::{DbKind, MOCK_COLUMNS};
+use crate::mock::DbKind;
+use crate::db_types::ColMeta;
 
 /// 筛选算子。顺序 = Navicat Lite 算子菜单的实测顺序（23 项）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,8 +110,8 @@ impl FOp {
 
 /// 默认算子按列类型：文本列「包含」、其余「=」（Navicat 实测 varchar→包含、
 /// int8→=；bool / 数值同按「=」走）。
-pub fn default_op(col: usize) -> FOp {
-    match MOCK_COLUMNS.get(col) {
+pub fn default_op(cols: &[ColMeta], col: usize) -> FOp {
+    match cols.get(col) {
         Some(c) if !c.numeric && c.ty != "bool" => FOp::Contains,
         _ => FOp::Eq,
     }
@@ -128,10 +129,10 @@ pub struct FCrit {
 }
 
 impl FCrit {
-    pub fn new(col: usize) -> Self {
+    pub fn new(cols: &[ColMeta], col: usize) -> Self {
         Self {
             col,
-            op: default_op(col),
+            op: default_op(cols, col),
             v1: String::new(),
             v2: String::new(),
             custom: String::new(),
@@ -260,8 +261,8 @@ fn quote_ident(kind: DbKind, name: &str) -> String {
     }
 }
 
-fn is_numeric_col(col: usize) -> bool {
-    MOCK_COLUMNS.get(col).is_some_and(|c| c.numeric)
+fn is_numeric_col(cols: &[ColMeta], col: usize) -> bool {
+    cols.get(col).is_some_and(|c| c.numeric)
 }
 
 /// 值字面量：数值列且解析得出数 → 裸值；否则单引号（内部 ' 双写）。
@@ -281,14 +282,14 @@ fn like_lit(v: &str, pre: &str, post: &str) -> String {
 /// 一条准则的 SQL 片段。PG 的不区分大小写走 ILIKE；其余方言没有通用
 /// ILIKE，退化成 LIKE（解析按方言归属回对应算子：MySQL 侧 LIKE 恒回
 /// 区分大小写档，SQL Server 侧同文——mock 档记录在案）。
-pub fn crit_sql(kind: DbKind, c: &FCrit) -> String {
-    let col = MOCK_COLUMNS
+pub fn crit_sql(kind: DbKind, cols: &[ColMeta], c: &FCrit) -> String {
+    let col = cols
         .get(c.col)
-        .map(|m| quote_ident(kind, m.name))
+        .map(|m| quote_ident(kind, &m.name))
         .unwrap_or_default();
     let (need1, _) = c.op.arity();
     let v1 = if need1 { c.v1.trim() } else { "" };
-    let num = is_numeric_col(c.col);
+    let num = is_numeric_col(cols, c.col);
     match c.op {
         FOp::Eq => format!("{col} = {}", sql_lit(num, v1)),
         FOp::Ne => format!("{col} <> {}", sql_lit(num, v1)),
@@ -351,8 +352,8 @@ pub fn crit_sql(kind: DbKind, c: &FCrit) -> String {
 }
 
 /// WHERE 正文；None = 模型为空或全部禁用（不加 WHERE）。
-pub fn where_sql(kind: DbKind, m: &FilterModel) -> Option<String> {
-    let sql = emit_model(kind, &m.items, &m.conns);
+pub fn where_sql(kind: DbKind, cols: &[ColMeta], m: &FilterModel) -> Option<String> {
+    let sql = emit_model(kind, cols, &m.items, &m.conns);
     if sql.trim().is_empty() {
         None
     } else {
@@ -364,11 +365,11 @@ pub fn where_sql(kind: DbKind, m: &FilterModel) -> Option<String> {
 /// 多簇时每个单条目簇加括号（`a OR b` → `(a) OR (b)`），已有括号的簇
 /// （组 / 多条目簇）不重复包。这个口径保证 gen(parse(gen(m))) 恒等于
 /// gen(m)（文本模式往返幂等）。禁用项剔除，连接词沿用条目原位前隙。
-fn emit_model(kind: DbKind, nodes: &[FNode], conns: &[bool]) -> String {
+fn emit_model(kind: DbKind, cols: &[ColMeta], nodes: &[FNode], conns: &[bool]) -> String {
     let kept: Vec<(usize, String)> = nodes
         .iter()
         .enumerate()
-        .filter_map(|(i, n)| node_sql(kind, n).map(|s| (i, s)))
+        .filter_map(|(i, n)| node_sql(kind, cols, n).map(|s| (i, s)))
         .collect();
     if kept.is_empty() {
         return String::new();
@@ -414,18 +415,18 @@ fn emit_model(kind: DbKind, nodes: &[FNode], conns: &[bool]) -> String {
         .join(" OR ")
 }
 
-fn node_sql(kind: DbKind, n: &FNode) -> Option<String> {
+fn node_sql(kind: DbKind, cols: &[ColMeta], n: &FNode) -> Option<String> {
     match n {
         FNode::Crit(c) => {
             if c.enabled {
-                Some(crit_sql(kind, c))
+                Some(crit_sql(kind, cols, c))
             } else {
                 None
             }
         }
         FNode::Group { conns, children } => {
             let inner: Vec<String> =
-                children.iter().filter_map(|c| node_sql(kind, c)).collect();
+                children.iter().filter_map(|c| node_sql(kind, cols, c)).collect();
             if inner.is_empty() {
                 return None;
             }
@@ -447,16 +448,15 @@ fn node_sql(kind: DbKind, n: &FNode) -> Option<String> {
 }
 
 /// ORDER BY 子句（含 " ORDER BY " 前缀）；空排序 → None。
-pub fn order_by_sql(kind: DbKind, sorts: &[(usize, bool)]) -> Option<String> {
+pub fn order_by_sql(kind: DbKind, cols: &[ColMeta], sorts: &[(usize, bool)]) -> Option<String> {
     if sorts.is_empty() {
         return None;
     }
     let dirs: Vec<String> = sorts
         .iter()
         .filter_map(|(c, asc)| {
-            MOCK_COLUMNS
-                .get(*c)
-                .map(|m| format!("{} {}", quote_ident(kind, m.name), if *asc { "ASC" } else { "DESC" }))
+            cols.get(*c)
+                .map(|m| format!("{} {}", quote_ident(kind, &m.name), if *asc { "ASC" } else { "DESC" }))
         })
         .collect();
     if dirs.is_empty() {
@@ -468,8 +468,8 @@ pub fn order_by_sql(kind: DbKind, sorts: &[(usize, bool)]) -> Option<String> {
 // ── 行匹配（mock 网格） ───────────────────────────────────────
 
 /// 单条准则对一个单元格值的判定。null / 空串在 mock 档同义（单元格空串）。
-pub fn crit_matches(cell: &str, c: &FCrit) -> bool {
-    let num = is_numeric_col(c.col);
+pub fn crit_matches(cell: &str, cols: &[ColMeta], c: &FCrit) -> bool {
+    let num = is_numeric_col(cols, c.col);
     let cmp = |a: &str, b: &str| -> std::cmp::Ordering {
         if num
             && let (Ok(x), Ok(y)) = (a.trim().parse::<f64>(), b.trim().parse::<f64>())
@@ -524,8 +524,8 @@ pub fn crit_matches(cell: &str, c: &FCrit) -> bool {
 }
 
 /// 一行数据是否过得了整个模型（自定义准则按通过处理，调用方负责提示）。
-pub fn row_matches(row: &[String], m: &FilterModel) -> bool {
-    fn nodes_match(row: &[String], nodes: &[FNode], conns: &[bool]) -> bool {
+pub fn row_matches(row: &[String], cols: &[ColMeta], m: &FilterModel) -> bool {
+    fn nodes_match(row: &[String], cols: &[ColMeta], nodes: &[FNode], conns: &[bool]) -> bool {
         if nodes.is_empty() {
             return true;
         }
@@ -534,7 +534,7 @@ pub fn row_matches(row: &[String], m: &FilterModel) -> bool {
         let mut cluster_ok = true;
         let mut any = false;
         for (i, n) in nodes.iter().enumerate() {
-            cluster_ok = cluster_ok && node_matches(row, n);
+            cluster_ok = cluster_ok && node_matches(row, cols, n);
             let is_last = i + 1 == nodes.len();
             if is_last || !conns.get(i).copied().unwrap_or(true) {
                 any = any || cluster_ok;
@@ -543,14 +543,14 @@ pub fn row_matches(row: &[String], m: &FilterModel) -> bool {
         }
         any
     }
-    fn node_matches(row: &[String], n: &FNode) -> bool {
+    fn node_matches(row: &[String], cols: &[ColMeta], n: &FNode) -> bool {
         match n {
             FNode::Crit(c) => {
                 if !c.enabled {
                     return true;
                 }
                 match row.get(c.col) {
-                    Some(cell) => crit_matches(cell, c),
+                    Some(cell) => crit_matches(cell, cols, c),
                     None => true,
                 }
             }
@@ -558,11 +558,11 @@ pub fn row_matches(row: &[String], m: &FilterModel) -> bool {
                 if children.is_empty() {
                     return true;
                 }
-                nodes_match(row, children, conns)
+                nodes_match(row, cols, children, conns)
             }
         }
     }
-    nodes_match(row, &m.items, &m.conns)
+    nodes_match(row, cols, &m.items, &m.conns)
 }
 
 /// 多键排序：返回 (data 里的) 行下标序。sorts 逐键比较，数值列按数值。
@@ -570,12 +570,13 @@ pub fn multi_sort_order(
     data: &[Vec<String>],
     picks: &[usize],
     sorts: &[(usize, bool)],
+    cols: &[ColMeta],
 ) -> Vec<usize> {
     let cell = |r: usize, c: usize| data.get(r).and_then(|row| row.get(c)).map(|s| s.as_str()).unwrap_or("");
     let mut order: Vec<usize> = picks.to_vec();
     order.sort_by(|&a, &b| {
         for (c, asc) in sorts {
-            let numeric = is_numeric_col(*c);
+            let numeric = is_numeric_col(cols, *c);
             let mut ord = crate::compare_cells(cell(a, *c), cell(b, *c), numeric);
             if !asc {
                 ord = ord.reverse();
@@ -762,9 +763,8 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
     Ok(out)
 }
 
-fn col_index(name: &str) -> Result<usize, String> {
-    MOCK_COLUMNS
-        .iter()
+fn col_index(cols: &[ColMeta], name: &str) -> Result<usize, String> {
+    cols.iter()
         .position(|c| c.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| format!("未知列「{name}」"))
 }
@@ -772,7 +772,7 @@ fn col_index(name: &str) -> Result<usize, String> {
 /// LIKE 模式归类：`%x%` → 包含、`x%` → 开头是、`%x` → 结尾是、
 /// 无 % → 等值、中间带 % 的复杂模式解析失败（mock 档不硬解）。
 /// ILIKE 的不区分大小写只在「包含」档有对应算子，其余档忽略。
-fn classify_like(col: usize, v: &str, ci: bool, neg: bool) -> Result<FNode, String> {
+fn classify_like(cols: &[ColMeta], col: usize, v: &str, ci: bool, neg: bool) -> Result<FNode, String> {
     let op = match (v.starts_with('%'), v.ends_with('%'), v.len()) {
         (_, _, 0) => return Err("LIKE 缺少模式".into()),
         (true, true, 1) => return Err("只有通配符的 LIKE 模式".into()),
@@ -793,18 +793,19 @@ fn classify_like(col: usize, v: &str, ci: bool, neg: bool) -> Result<FNode, Stri
     } else {
         op
     };
-    let mut c = FCrit::new(col);
+    let mut c = FCrit::new(cols, col);
     c.op = op;
     c.v1 = v.trim_matches('%').to_string();
     Ok(FNode::Crit(c))
 }
 
-struct Parser {
+struct Parser<'a> {
     toks: Vec<Tok>,
     pos: usize,
+    cols: &'a [ColMeta],
 }
 
-impl Parser {
+impl Parser<'_> {
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
     }
@@ -863,12 +864,12 @@ impl Parser {
         let Some(Tok::Ident(col)) = self.next() else {
             return Err("条件应当以列名开头".into());
         };
-        let cix = col_index(&col)?;
+        let cix = col_index(self.cols, &col)?;
         let mut neg = false;
         if self.eat(&Tok::Not) {
             neg = true;
         }
-        let mut c = FCrit::new(cix);
+        let mut c = FCrit::new(self.cols, cix);
         match self.next() {
             Some(Tok::Cmp(k)) => {
                 let Some(Tok::Lit(v)) = self.next() else {
@@ -894,13 +895,13 @@ impl Parser {
                 let Some(Tok::Lit(v)) = self.next() else {
                     return Err("LIKE 缺少模式".into());
                 };
-                return classify_like(cix, &v, false, neg);
+                return classify_like(self.cols, cix, &v, false, neg);
             }
             Some(Tok::ILike) => {
                 let Some(Tok::Lit(v)) = self.next() else {
                     return Err("ILIKE 缺少模式".into());
                 };
-                return classify_like(cix, &v, true, neg);
+                return classify_like(self.cols, cix, &v, true, neg);
             }
             Some(Tok::Is) => {
                 if neg {
@@ -953,9 +954,9 @@ impl Parser {
 }
 
 /// 文本模式 WHERE 正文 → 模型。解析失败给中文原因（面板红字）。
-pub fn parse_where(_kind: DbKind, text: &str) -> Result<FilterModel, String> {
+pub fn parse_where(_kind: DbKind, cols: &[ColMeta], text: &str) -> Result<FilterModel, String> {
     let toks = tokenize(text)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser { toks, pos: 0, cols };
     p.parse_list(true)
 }
 
@@ -979,12 +980,21 @@ mod tests {
         FCrit { v2: v2.into(), ..crit(col, op, v1) }
     }
 
+    /// 与 mock 档同形的列元数据（测试口径）。
+    fn cols() -> Vec<ColMeta> {
+        crate::mock::MOCK_COLUMNS
+            .iter()
+            .map(|m| ColMeta::new(m.name, m.ty, m.numeric))
+            .collect()
+    }
+
     #[test]
     fn default_op_follows_column_type() {
-        assert_eq!(default_op(3), FOp::Contains, "name varchar → 包含");
-        assert_eq!(default_op(0), FOp::Eq, "id int8 → =");
-        assert_eq!(default_op(7), FOp::Eq, "enabled bool → =");
-        assert_eq!(default_op(99), FOp::Eq, "越界列防御 → =");
+        let c = cols();
+        assert_eq!(default_op(&c, 3), FOp::Contains, "name varchar → 包含");
+        assert_eq!(default_op(&c, 0), FOp::Eq, "id int8 → =");
+        assert_eq!(default_op(&c, 7), FOp::Eq, "enabled bool → =");
+        assert_eq!(default_op(&c, 99), FOp::Eq, "越界列防御 → =");
     }
 
     #[test]
@@ -1002,69 +1012,72 @@ mod tests {
     #[test]
     fn crit_sql_pg_all_shapes() {
         let k = DbKind::PostgreSql;
-        assert_eq!(crit_sql(k, &crit(0, FOp::Eq, "42")), "\"id\" = 42");
-        assert_eq!(crit_sql(k, &crit(0, FOp::Ne, "7")), "\"id\" <> 7");
-        assert_eq!(crit_sql(k, &crit(3, FOp::Eq, "x")), "\"name\" = 'x'");
+        let c = cols();
+        assert_eq!(crit_sql(k, &c, &crit(0, FOp::Eq, "42")), "\"id\" = 42");
+        assert_eq!(crit_sql(k, &c, &crit(0, FOp::Ne, "7")), "\"id\" <> 7");
+        assert_eq!(crit_sql(k, &c, &crit(3, FOp::Eq, "x")), "\"name\" = 'x'");
         assert_eq!(
-            crit_sql(k, &crit(3, FOp::Contains, "报")),
+            crit_sql(k, &c, &crit(3, FOp::Contains, "报")),
             "\"name\" LIKE '%报%'"
         );
         assert_eq!(
-            crit_sql(k, &crit(3, FOp::ContainsCi, "a")),
+            crit_sql(k, &c, &crit(3, FOp::ContainsCi, "a")),
             "\"name\" ILIKE '%a%'"
         );
         assert_eq!(
-            crit_sql(k, &crit(3, FOp::StartsWith, "a")),
+            crit_sql(k, &c, &crit(3, FOp::StartsWith, "a")),
             "\"name\" LIKE 'a%'"
         );
         assert_eq!(
-            crit_sql(k, &crit(3, FOp::EndsWith, "a")),
+            crit_sql(k, &c, &crit(3, FOp::EndsWith, "a")),
             "\"name\" LIKE '%a'"
         );
-        assert_eq!(crit_sql(k, &crit(0, FOp::IsNull, "")), "\"id\" IS NULL");
-        assert_eq!(crit_sql(k, &crit(0, FOp::IsNotBlank, "")), "\"id\" <> ''");
+        assert_eq!(crit_sql(k, &c, &crit(0, FOp::IsNull, "")), "\"id\" IS NULL");
+        assert_eq!(crit_sql(k, &c, &crit(0, FOp::IsNotBlank, "")), "\"id\" <> ''");
         assert_eq!(
-            crit_sql(k, &crit2(0, FOp::Between, "1", "9")),
+            crit_sql(k, &c, &crit2(0, FOp::Between, "1", "9")),
             "\"id\" BETWEEN 1 AND 9"
         );
         assert_eq!(
-            crit_sql(k, &crit2(0, FOp::NotBetween, "1", "9")),
+            crit_sql(k, &c, &crit2(0, FOp::NotBetween, "1", "9")),
             "\"id\" NOT BETWEEN 1 AND 9"
         );
         assert_eq!(
-            crit_sql(k, &crit(3, FOp::InList, "a, b,c")),
+            crit_sql(k, &c, &crit(3, FOp::InList, "a, b,c")),
             "\"name\" IN ('a', 'b', 'c')"
         );
         assert_eq!(
-            crit_sql(k, &crit(3, FOp::NotInList, "a")),
+            crit_sql(k, &c, &crit(3, FOp::NotInList, "a")),
             "\"name\" NOT IN ('a')"
         );
-        assert_eq!(crit_sql(k, &crit(3, FOp::InList, "")), "1 = 0");
+        assert_eq!(crit_sql(k, &c, &crit(3, FOp::InList, "")), "1 = 0");
         let mut cu = crit(0, FOp::Custom, "");
         cu.custom = "MOD(\"id\", 2) = 1".to_string();
-        assert_eq!(crit_sql(k, &cu), "MOD(\"id\", 2) = 1");
+        assert_eq!(crit_sql(k, &c, &cu), "MOD(\"id\", 2) = 1");
         // 单引号转义
-        assert_eq!(crit_sql(k, &crit(3, FOp::Eq, "o'x")), "\"name\" = 'o''x'");
+        assert_eq!(crit_sql(k, &c, &crit(3, FOp::Eq, "o'x")), "\"name\" = 'o''x'");
     }
 
     #[test]
     fn crit_sql_mysql_backticks() {
         let k = DbKind::MySql;
-        assert_eq!(crit_sql(k, &crit(0, FOp::Eq, "42")), "`id` = 42");
-        assert_eq!(crit_sql(k, &crit(3, FOp::Contains, "a")), "`name` LIKE '%a%'");
+        let c = cols();
+        assert_eq!(crit_sql(k, &c, &crit(0, FOp::Eq, "42")), "`id` = 42");
+        assert_eq!(crit_sql(k, &c, &crit(3, FOp::Contains, "a")), "`name` LIKE '%a%'");
         // MySQL 侧不区分大小写档与区分大小写档同文（方言无 ILIKE）
-        assert_eq!(crit_sql(k, &crit(3, FOp::ContainsCi, "a")), "`name` LIKE '%a%'");
+        assert_eq!(crit_sql(k, &c, &crit(3, FOp::ContainsCi, "a")), "`name` LIKE '%a%'");
     }
 
     #[test]
     fn where_sql_grouping_and_pruning() {
         let k = DbKind::PostgreSql;
+        let c = cols();
         // 单条
         let m = FilterModel {
             items: vec![FNode::Crit(crit(0, FOp::Eq, "1"))],
             conns: vec![],
         };
-        assert_eq!(where_sql(k, &m).as_deref(), Some("\"id\" = 1"));
+        assert_eq!(where_sql(k, &c, &m).as_deref(), Some("\"id\" = 1"));
         // 全 AND：结成一个簇，单簇不加括号（文本往返保持平展模型）
         let m = FilterModel {
             items: vec![
@@ -1074,7 +1087,7 @@ mod tests {
             conns: vec![true],
         };
         assert_eq!(
-            where_sql(k, &m).as_deref(),
+            where_sql(k, &c, &m).as_deref(),
             Some("\"id\" = 1 AND \"name\" = 'a'")
         );
         // 混合连接词：AND 簇、OR 分隔，单条目簇加括号、多条件簇不重包
@@ -1087,7 +1100,7 @@ mod tests {
             conns: vec![true, false],
         };
         assert_eq!(
-            where_sql(k, &m).as_deref(),
+            where_sql(k, &c, &m).as_deref(),
             Some("(\"id\" = 1 AND \"name\" = 'a') OR (\"url\" = 'b')")
         );
         // 组：恒加括号，组内连接词逐间隙
@@ -1105,7 +1118,7 @@ mod tests {
             conns: vec![true],
         };
         assert_eq!(
-            where_sql(k, &m).as_deref(),
+            where_sql(k, &c, &m).as_deref(),
             Some("\"id\" = 1 AND (\"name\" = 'a' OR \"url\" = 'b')")
         );
         // 禁用准则剔除；全禁用 → None
@@ -1118,25 +1131,26 @@ mod tests {
             ],
             conns: vec![true],
         };
-        assert_eq!(where_sql(k, &m).as_deref(), Some("\"name\" = 'a'"));
+        assert_eq!(where_sql(k, &c, &m).as_deref(), Some("\"name\" = 'a'"));
         let m = FilterModel {
             items: vec![FNode::Crit(off)],
             conns: vec![],
         };
-        assert_eq!(where_sql(k, &m), None);
-        assert_eq!(where_sql(k, &FilterModel::default()), None);
+        assert_eq!(where_sql(k, &c, &m), None);
+        assert_eq!(where_sql(k, &c, &FilterModel::default()), None);
     }
 
     #[test]
     fn order_by_sql_multi_key() {
         let k = DbKind::PostgreSql;
-        assert_eq!(order_by_sql(k, &[]), None);
+        let c = cols();
+        assert_eq!(order_by_sql(k, &c, &[]), None);
         assert_eq!(
-            order_by_sql(k, &[(3, true), (0, false)]).as_deref(),
+            order_by_sql(k, &c, &[(3, true), (0, false)]).as_deref(),
             Some(" ORDER BY \"name\" ASC, \"id\" DESC")
         );
         assert_eq!(
-            order_by_sql(DbKind::MySql, &[(0, true)]).as_deref(),
+            order_by_sql(DbKind::MySql, &c, &[(0, true)]).as_deref(),
             Some(" ORDER BY `id` ASC")
         );
     }
@@ -1144,6 +1158,7 @@ mod tests {
     #[test]
     fn text_mode_round_trip() {
         let k = DbKind::PostgreSql;
+        let c = cols();
         // 平展模型（无括号歧义）：往返后模型逐字段一致
         let flat = FilterModel {
             items: vec![
@@ -1152,8 +1167,8 @@ mod tests {
             ],
             conns: vec![true],
         };
-        let sql = where_sql(k, &flat).unwrap();
-        let back = parse_where(k, &sql).unwrap_or_else(|e| panic!("解析失败 {e}: {sql}"));
+        let sql = where_sql(k, &c, &flat).unwrap();
+        let back = parse_where(k, &c, &sql).unwrap_or_else(|e| panic!("解析失败 {e}: {sql}"));
         assert_eq!(back, flat);
         // 混合连接词的平展模型会被簇括号规整成组：SQL 幂等 + 行判定等价
         let mixed = FilterModel {
@@ -1164,11 +1179,11 @@ mod tests {
             ],
             conns: vec![false, true],
         };
-        let sql = where_sql(k, &mixed).unwrap();
-        let norm = parse_where(k, &sql).unwrap_or_else(|e| panic!("解析失败 {e}: {sql}"));
-        let sql2 = where_sql(k, &norm).expect("回读后再生成");
+        let sql = where_sql(k, &c, &mixed).unwrap();
+        let norm = parse_where(k, &c, &sql).unwrap_or_else(|e| panic!("解析失败 {e}: {sql}"));
+        let sql2 = where_sql(k, &c, &norm).expect("回读后再生成");
         assert_eq!(sql2, sql, "生成不幂等: {sql}");
-        let norm2 = parse_where(k, &sql2).unwrap();
+        let norm2 = parse_where(k, &c, &sql2).unwrap();
         assert_eq!(norm2, norm, "第二次往返模型稳定");
         // 组模型（含不区分大小写 / NOT / null / between / in）：发射器会把
         // AND 簇规整加括号，回读是**等价**模型而非逐字段相同——
@@ -1189,11 +1204,11 @@ mod tests {
             ],
             conns: vec![true, false, true, true],
         };
-        let sql = where_sql(k, &grouped).unwrap();
-        let norm = parse_where(k, &sql).unwrap_or_else(|e| panic!("解析失败 {e}: {sql}"));
-        let sql2 = where_sql(k, &norm).expect("回读后再生成");
+        let sql = where_sql(k, &c, &grouped).unwrap();
+        let norm = parse_where(k, &c, &sql).unwrap_or_else(|e| panic!("解析失败 {e}: {sql}"));
+        let sql2 = where_sql(k, &c, &norm).expect("回读后再生成");
         assert_eq!(sql2, sql, "生成不幂等: {sql}");
-        let norm2 = parse_where(k, &sql2).unwrap();
+        let norm2 = parse_where(k, &c, &sql2).unwrap();
         assert_eq!(norm2, norm, "第二次往返模型稳定");
         let row = |id: &str, name: &str| -> Vec<String> {
             let mut r: Vec<String> = (0..11).map(|_| String::new()).collect();
@@ -1206,8 +1221,8 @@ mod tests {
         {
             let r = row(id, name);
             assert_eq!(
-                row_matches(&r, &grouped),
-                row_matches(&r, &norm),
+                row_matches(&r, &c, &grouped),
+                row_matches(&r, &c, &norm),
                 "行判定等价 id={id:?} name={name:?}"
             );
         }
@@ -1217,20 +1232,21 @@ mod tests {
             items: vec![FNode::Crit(crit(3, FOp::ContainsCi, "a"))],
             conns: vec![],
         };
-        let sql = where_sql(km, &ci).unwrap();
-        let back = parse_where(km, &sql).unwrap();
+        let sql = where_sql(km, &c, &ci).unwrap();
+        let back = parse_where(km, &c, &sql).unwrap();
         assert_eq!(back.items[0], FNode::Crit(crit(3, FOp::Contains, "a")));
     }
 
     #[test]
     fn text_mode_rejects_garbage() {
         let k = DbKind::PostgreSql;
-        assert!(parse_where(k, "SELECT 1").is_err());
-        assert!(parse_where(k, "\"nosuch\" = 1").is_err(), "未知列");
-        assert!(parse_where(k, "\"id\" =").is_err(), "缺值");
-        assert!(parse_where(k, "\"id\" = 1 AND").is_err(), "悬空连接词");
-        assert!(parse_where(k, "\"id\" = 'x' extra").is_err(), "尾部多余");
-        assert!(parse_where(k, "(\"id\" = 1").is_err(), "括号不配对");
+        let c = cols();
+        assert!(parse_where(k, &c, "SELECT 1").is_err());
+        assert!(parse_where(k, &c, "\"nosuch\" = 1").is_err(), "未知列");
+        assert!(parse_where(k, &c, "\"id\" =").is_err(), "缺值");
+        assert!(parse_where(k, &c, "\"id\" = 1 AND").is_err(), "悬空连接词");
+        assert!(parse_where(k, &c, "\"id\" = 'x' extra").is_err(), "尾部多余");
+        assert!(parse_where(k, &c, "(\"id\" = 1").is_err(), "括号不配对");
     }
 
     #[test]
@@ -1239,29 +1255,30 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect();
+        let c = cols();
         // 数值列数值比较
         let m = FilterModel {
             items: vec![FNode::Crit(crit(0, FOp::Lt, "200"))],
             conns: vec![],
         };
-        assert!(row_matches(&row, &m));
+        assert!(row_matches(&row, &c, &m));
         let m = FilterModel {
             items: vec![FNode::Crit(crit(0, FOp::Lt, "100"))],
             conns: vec![],
         };
-        assert!(!row_matches(&row, &m));
+        assert!(!row_matches(&row, &c, &m));
         // "9" 与 "101" 数值比 9 < 101（字符串比会反过来）
         let m = FilterModel {
             items: vec![FNode::Crit(crit(0, FOp::Gt, "9"))],
             conns: vec![],
         };
-        assert!(row_matches(&row, &m));
+        assert!(row_matches(&row, &c, &m));
         // 文本包含
         let m = FilterModel {
             items: vec![FNode::Crit(crit(3, FOp::Contains, "面板"))],
             conns: vec![],
         };
-        assert!(row_matches(&row, &m));
+        assert!(row_matches(&row, &c, &m));
         // AND 簇 + OR
         let m = FilterModel {
             items: vec![
@@ -1270,7 +1287,7 @@ mod tests {
             ],
             conns: vec![false],
         };
-        assert!(row_matches(&row, &m), "OR 右臂命中");
+        assert!(row_matches(&row, &c, &m), "OR 右臂命中");
         let m = FilterModel {
             items: vec![
                 FNode::Crit(crit(0, FOp::Gt, "500")),
@@ -1278,7 +1295,7 @@ mod tests {
             ],
             conns: vec![false],
         };
-        assert!(!row_matches(&row, &m));
+        assert!(!row_matches(&row, &c, &m));
         // 组 OR
         let m = FilterModel {
             items: vec![FNode::Group {
@@ -1290,7 +1307,7 @@ mod tests {
             }],
             conns: vec![],
         };
-        assert!(row_matches(&row, &m));
+        assert!(row_matches(&row, &c, &m));
         // 禁用准则视为通过
         let mut off = crit(0, FOp::Lt, "1");
         off.enabled = false;
@@ -1298,14 +1315,14 @@ mod tests {
             items: vec![FNode::Crit(off), FNode::Crit(crit(4, FOp::Eq, "/home"))],
             conns: vec![true],
         };
-        assert!(row_matches(&row, &m));
+        assert!(row_matches(&row, &c, &m));
         // 空单元格（null/空串）
         let empty_row: Vec<String> = vec![String::new(); 11];
         let m = FilterModel {
             items: vec![FNode::Crit(crit(3, FOp::IsNull, ""))],
             conns: vec![],
         };
-        assert!(row_matches(&empty_row, &m));
+        assert!(row_matches(&empty_row, &c, &m));
         // 自定义准则不参与判定（恒通过）
         let mut cu = crit(0, FOp::Custom, "");
         cu.custom = "MOD(\"id\", 2) = 1".to_string();
@@ -1313,7 +1330,7 @@ mod tests {
             items: vec![FNode::Crit(cu), FNode::Crit(crit(4, FOp::Eq, "/home"))],
             conns: vec![true],
         };
-        assert!(row_matches(&row, &m));
+        assert!(row_matches(&row, &c, &m));
     }
 
     #[test]
@@ -1328,8 +1345,9 @@ mod tests {
                 row
             })
             .collect();
+        let c = cols();
         // flags ASC 主键、id DESC 次键
-        let order = multi_sort_order(&data, &(0..12).collect::<Vec<_>>(), &[(6, true), (0, false)]);
+        let order = multi_sort_order(&data, &(0..12).collect::<Vec<_>>(), &[(6, true), (0, false)], &c);
         assert_eq!(order.len(), 12);
         let key = |i: usize| (data[i][6].parse::<i64>().unwrap(), data[i][0].parse::<i64>().unwrap());
         for w in order.windows(2) {
@@ -1337,7 +1355,7 @@ mod tests {
             assert!(a.0 < b.0 || (a.0 == b.0 && a.1 >= b.1), "{a:?} 应排在 {b:?} 前");
         }
         // 稳定：同键保持 picks 原相对次序（这里 id 次键已唯一，用单键验证稳定性）
-        let order = multi_sort_order(&data, &(0..12).collect::<Vec<_>>(), &[(6, true)]);
+        let order = multi_sort_order(&data, &(0..12).collect::<Vec<_>>(), &[(6, true)], &c);
         for w in order.windows(2) {
             let a = data[w[0]][6].parse::<i64>().unwrap();
             let b = data[w[1]][6].parse::<i64>().unwrap();

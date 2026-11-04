@@ -408,6 +408,7 @@ fn brand(kind: DbKind) -> (u32, u32) {
         DbKind::MySql => (0x1f86c8, 0x0f5f96),
         DbKind::PostgreSql => (0x39709b, 0x244f72),
         DbKind::SqlServer => (0xc0392b, 0x8e2a1f),
+        DbKind::SQLite => (0x0f80b0, 0x003b57),
         DbKind::MongoDb => (0x4db33d, 0x357a2a),
         DbKind::Redis => (0xd0342c, 0x952018),
     }

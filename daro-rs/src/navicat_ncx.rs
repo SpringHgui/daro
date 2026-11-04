@@ -395,6 +395,7 @@ fn build_entry(
         DbKind::MySql => "MYSQL",
         DbKind::PostgreSql => "POSTGRESQL",
         DbKind::SqlServer => "SQLSERVER",
+        DbKind::SQLite => "SQLITE",
         DbKind::MongoDb => "MONGODB",
         DbKind::Redis => "REDIS",
     };
@@ -402,6 +403,7 @@ fn build_entry(
         DbKind::MySql => "MySQL",
         DbKind::PostgreSql => "PostgreSQL",
         DbKind::SqlServer => "SQL Server",
+        DbKind::SQLite => "SQLite",
         DbKind::MongoDb => "MongoDB",
         DbKind::Redis => "Redis",
     };

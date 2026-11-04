@@ -1,8 +1,13 @@
 ﻿//! 「导出表数据」对话框（迁移自 Flutter `lib/data/db_export.dart` 的导出表路径）。
 //!
-//! 与「导出结果」的区别：这里多 SQL 格式，且写盘走 [table_export] 的分块写入接口
-//! （进度 / 取消能力已在模块层实现并有单测；mock 数据量下导出瞬时完成，UI 暂不显示
-//! 进度条，待真实驱动接入后再接）。
+//! 与「导出结果」的区别：这里多 SQL 格式，且写盘走 [table_export] 的分块写入接口。
+//! 远程表的整表取数和写盘都在后台线程跑：取数按页回填进度，写盘把
+//! [table_export::export_table] 现成的 progress / cancel 参数接上——界面只负责
+//! 定时读进度和推取消标志，一行数据都不在这条线程上搬。
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::*;
@@ -12,17 +17,29 @@ use gpui_kit::*;
 use crate::export_format::DelimitedStyle;
 use crate::palette::Palette;
 use crate::table_export::{self, ExportError, TableExportSettings, TableFormat};
-use crate::{to_hsla, ui, DaroApp};
+use crate::{db_types, FetchAbort, load_all_table_rows, mock, to_hsla, ui, DaroApp};
 
 use crate::ui::{FOOTER_H, TITLE_H};
 
-fn default_path(table: &str, format: TableFormat) -> String {
-    let name = format!("{}.{}", safe_file_stem(table), format.ext());
-    dirs::desktop_dir()
-        .map(|p| p.join(&name).display().to_string())
-        .unwrap_or(name)
+/// 对话框要自己在后台取的整表：打开时只带列名和取数条件，行稍后到。
+#[derive(Clone)]
+pub struct ExportFetch {
+    pub conn: mock::Connection,
+    pub db: String,
+    pub schema: String,
+    pub table: String,
+    pub where_sql: Option<String>,
+    pub orders: Vec<(String, bool)>,
 }
 
+/// 后台正在干什么（决定状态行文案和按钮可用性）。
+#[derive(Clone, Copy, PartialEq)]
+enum Busy {
+    Fetch,
+    Export,
+}
+
+/// 导出文件名：去掉 Windows 不允许的路径字符。
 fn safe_file_stem(name: &str) -> String {
     name.chars()
         .map(|c| match c {
@@ -32,12 +49,21 @@ fn safe_file_stem(name: &str) -> String {
         .collect()
 }
 
+fn default_path(table: &str, format: TableFormat) -> String {
+    let name = format!("{}.{}", safe_file_stem(table), format.ext());
+    dirs::desktop_dir()
+        .map(|p| p.join(&name).display().to_string())
+        .unwrap_or(name)
+}
+
 pub fn open_table_export(
     parent: Entity<DaroApp>,
     dark: bool,
+    is_mysql: bool,
     table: String,
     columns: Vec<String>,
     rows: Vec<Vec<String>>,
+    fetch: Option<ExportFetch>,
     cx: &mut App,
 ) {
     let mut options = TitleBar::window_options();
@@ -47,7 +73,9 @@ pub fn open_table_export(
         titlebar.title = Some("导出表数据".into());
     }
     let opened = gpui_kit::open_window(options, cx, move |window, cx| {
-        cx.new(|cx| TableExportDialog::new(parent, dark, table, columns, rows, window, cx))
+        cx.new(|cx| {
+            TableExportDialog::new(parent, dark, is_mysql, table, columns, rows, fetch, window, cx)
+        })
     });
     if opened.is_err() {
         eprintln!("failed to open table export window");
@@ -59,7 +87,20 @@ struct TableExportDialog {
     dark: bool,
     table: String,
     columns: Vec<String>,
-    rows: Vec<Vec<String>>,
+    /// 整表行：后台取回来之后可能很长，克隆一次就是几十 MB，故按 Arc 共享
+    rows: Arc<Vec<Vec<String>>>,
+    /// 还没取回的行（远程整表）；None = 行已经在手
+    fetch: Option<ExportFetch>,
+    /// 行是否已就绪（空表也是「就绪」，不能拿 rows.is_empty() 判断）
+    fetched: bool,
+    /// 后台在跑什么：取数 / 写盘 / 空
+    busy: Option<Busy>,
+    /// 后台任务的取消标志（界面上按「取消」置位）
+    cancel: Arc<AtomicBool>,
+    /// 后台进度 (已处理行, 总行数)，后台线程写、界面定时读
+    progress: Arc<Mutex<(usize, usize)>>,
+    // SQL 档的标识符引号：只有 MySQL 用反引号，SQLite / PG 都走双引号
+    is_mysql: bool,
     format: TableFormat,
     style: DelimitedStyle,
     with_header: bool,
@@ -69,15 +110,19 @@ struct TableExportDialog {
     auto_path: bool,
     error: Option<String>,
     done: Option<String>,
+    /// 本窗口句柄：回执落地用它，`active_window()` 失焦时可能为空
+    win: AnyWindowHandle,
 }
 
 impl TableExportDialog {
     fn new(
         parent: Entity<DaroApp>,
         dark: bool,
+        is_mysql: bool,
         table: String,
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
+        fetch: Option<ExportFetch>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -95,12 +140,19 @@ impl TableExportDialog {
             }
         })
         .detach();
-        Self {
+        let fetched = fetch.is_none();
+        let mut this = Self {
             parent,
             dark,
             table,
             columns,
-            rows,
+            rows: Arc::new(rows),
+            fetch,
+            fetched,
+            busy: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new((0, 0))),
+            is_mysql,
             format,
             style: DelimitedStyle::STANDARD,
             with_header: true,
@@ -110,7 +162,10 @@ impl TableExportDialog {
             auto_path: true,
             error: None,
             done: None,
-        }
+            win: window.window_handle(),
+        };
+        this.start_fetch(window, cx);
+        this
     }
 
     fn pal(&self) -> Palette {
@@ -156,12 +211,82 @@ impl TableExportDialog {
             pretty_json: self.pretty_json,
             quote_all: false,
             batch_rows: 200,
-            is_mysql: true,
+            is_mysql: self.is_mysql,
         }
     }
 
+    /// 远程整表取数：打开对话框就开跑，行回来之前导出按钮不亮。
+    fn start_fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.fetch.clone() else {
+            return;
+        };
+        let handle = window.window_handle();
+        let entity = cx.entity().downgrade();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new((0, 0)));
+        let finished = Arc::new(AtomicBool::new(false));
+        self.busy = Some(Busy::Fetch);
+        self.cancel = cancel.clone();
+        self.progress = progress.clone();
+        // 约定：先 notify 再占后台——按钮和「取数中」要在取数开始前就画出来
+        cx.notify();
+
+        {
+            let cancel = cancel.clone();
+            let progress = progress.clone();
+            let finished = finished.clone();
+            cx.spawn(async move |_, cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let out = load_all_table_rows(
+                            &job.conn,
+                            &job.db,
+                            &job.schema,
+                            &job.table,
+                            job.where_sql.as_deref(),
+                            &job.orders,
+                            &mut |done, total| *progress.lock().unwrap() = (done, total),
+                            &cancel,
+                        );
+                        finished.store(true, Ordering::Relaxed);
+                        out
+                    })
+                    .await;
+                let _ = handle.update(cx, |_, _, app| {
+                    let Some(ent) = entity.upgrade() else { return };
+                    ent.update(app, |d, cx| d.fetch_done(res, cx));
+                });
+            })
+            .detach();
+        }
+        self.track_progress(handle, finished, cx);
+    }
+
+    fn fetch_done(&mut self, res: Result<db_types::SelectPage, FetchAbort>, cx: &mut Context<Self>) {
+        self.busy = None;
+        match res {
+            Ok(page) => {
+                self.rows = Arc::new(page.rows);
+                self.fetched = true;
+                self.fetch = None;
+                self.error = None;
+            }
+            Err(FetchAbort::Cancelled) => self.error = Some("已取消取数，数据未就绪".into()),
+            Err(FetchAbort::Failed(e)) => self.error = Some(format!("取数失败：{e}")),
+        }
+        cx.notify();
+    }
+
+    /// 写盘：`export_table` 的分块写入本身带 progress / cancel，这里只把它
+    /// 挪到后台，并定时把进度搬上屏。
     fn export(&mut self, cx: &mut Context<Self>) {
-        if self.done.is_some() {
+        if self.done.is_some() || self.busy.is_some() {
+            return;
+        }
+        if !self.fetched {
+            self.error = Some("数据还没取回来".into());
+            cx.notify();
             return;
         }
         let settings = self.settings(cx);
@@ -178,29 +303,95 @@ impl TableExportDialog {
             cx.notify();
             return;
         }
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        match table_export::export_table(
-            &settings,
-            &self.columns,
-            &self.rows,
-            &mut |_, _| {},
-            &cancel,
-        ) {
+        let handle = cx.active_window().unwrap_or(self.win);
+        let entity = cx.entity().downgrade();
+        let columns = self.columns.clone();
+        let rows = self.rows.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new((0, self.rows.len())));
+        let finished = Arc::new(AtomicBool::new(false));
+        self.busy = Some(Busy::Export);
+        self.cancel = cancel.clone();
+        self.progress = progress.clone();
+        self.error = None;
+        cx.notify();
+
+        {
+            let cancel = cancel.clone();
+            let progress = progress.clone();
+            let finished = finished.clone();
+            let path = settings.path.clone();
+            cx.spawn(async move |_, cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let out = table_export::export_table(
+                            &settings,
+                            &columns,
+                            rows.as_slice(),
+                            &mut |done, total| *progress.lock().unwrap() = (done, total),
+                            &cancel,
+                        );
+                        finished.store(true, Ordering::Relaxed);
+                        out
+                    })
+                    .await;
+                let _ = handle.update(cx, |_, _, app| {
+                    let Some(ent) = entity.upgrade() else { return };
+                    ent.update(app, |d, cx| d.export_done(res, &path, cx));
+                });
+            })
+            .detach();
+        }
+        self.track_progress(handle, finished, cx);
+    }
+
+    fn export_done(
+        &mut self,
+        res: Result<table_export::ExportOutcome, ExportError>,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.busy = None;
+        match res {
             Ok(outcome) => {
                 self.done = Some(format!(
                     "已导出 {} 行 × {} 列（{} 字节）到 {}",
                     outcome.rows,
                     self.columns.len(),
                     outcome.bytes,
-                    settings.path
+                    path
                 ));
                 self.error = None;
-                self.parent.update(cx, |_, cx| cx.notify());
+                let parent = self.parent.clone();
+                parent.update(cx, |_, cx| cx.notify());
             }
             Err(ExportError::Cancelled) => self.error = Some("已取消".into()),
             Err(ExportError::Io(e)) => self.error = Some(format!("写出文件失败：{e}")),
         }
         cx.notify();
+    }
+
+    /// 后台有活在跑时，每 120ms 通知界面重绘一次，把共享的进度原子量画出来。
+    /// 跨线程进度只能是「后台写共享量 + 界面定时读」，不必自造事件队列。
+    fn track_progress(
+        &mut self,
+        handle: AnyWindowHandle,
+        finished: Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            while !finished.load(Ordering::Relaxed) {
+                cx.background_executor().timer(Duration::from_millis(120)).await;
+                let _ = handle.update(cx, |_, _, app| {
+                    let Some(ent) = entity.upgrade() else { return };
+                    ent.update(app, |_, cx| cx.notify());
+                });
+            }
+            // 收尾那次重绘由 fetch_done / export_done 负责
+        })
+        .detach();
     }
 
     fn title_bar(&self) -> impl IntoElement {
@@ -331,13 +522,30 @@ impl Render for TableExportDialog {
             to_hsla(p.muted_foreground),
             to_hsla(p.selection),
         );
-        let status = self
-            .done
-            .clone()
-            .or_else(|| self.error.clone())
-            .unwrap_or_default();
-        let is_error = self.error.is_some() && self.done.is_none();
+        let status = match self.busy {
+            Some(kind) => {
+                let (done, total) = *self.progress.lock().unwrap();
+                let what = if kind == Busy::Fetch { "取数中" } else { "导出中" };
+                if total == 0 {
+                    format!("{what}…")
+                } else {
+                    format!("{what}… {done} / {total} 行")
+                }
+            }
+            None => self
+                .done
+                .clone()
+                .or_else(|| self.error.clone())
+                .unwrap_or_default(),
+        };
+        let busy = self.busy.is_some();
+        let is_error = !busy && self.error.is_some() && self.done.is_none();
         let finished = self.done.is_some();
+        let count = if self.fetched {
+            format!("{} 行", self.rows.len())
+        } else {
+            "取数中…".to_string()
+        };
 
         v_flex()
             .id("table-export-root")
@@ -346,7 +554,12 @@ impl Render for TableExportDialog {
             .text_color(fg)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
-                    window.remove_window();
+                    if this.busy.is_some() {
+                        this.cancel.store(true, Ordering::Relaxed);
+                        cx.notify();
+                    } else {
+                        window.remove_window();
+                    }
                     cx.stop_propagation();
                 } else if ev.keystroke.key == "enter" {
                     this.export(cx);
@@ -360,10 +573,10 @@ impl Render for TableExportDialog {
                     .p(px(16.))
                     .gap(px(10.))
                     .child(div().text_xs().text_color(accent).child(format!(
-                        "导出 {}：{} 列 × {} 行",
+                        "导出 {}：{} 列 × {}",
                         self.table,
                         self.columns.len(),
-                        self.rows.len()
+                        count
                     )))
                     .child(
                         h_flex()
@@ -406,6 +619,7 @@ impl Render for TableExportDialog {
                             self.dark,
                             cx,
                         )
+                        .disabled(busy || (!finished && !self.fetched))
                         .on_click(cx.listener(|this, _, window, cx| {
                             if this.done.is_some() {
                                 window.remove_window();
@@ -415,16 +629,19 @@ impl Render for TableExportDialog {
                         })),
                     )
                     .child(
-                        ui::secondary_button("table-export-cancel", "取消")
-                            .on_click(|_, window, _| window.remove_window()),
+                        ui::secondary_button("table-export-cancel", "取消").on_click(
+                            cx.listener(|this, _, window, cx| match this.busy {
+                                // 后台在跑时「取消」只置标志位，等回执回来再收尾
+                                Some(_) => {
+                                    this.cancel.store(true, Ordering::Relaxed);
+                                    cx.notify();
+                                }
+                                None => window.remove_window(),
+                            }),
+                        ),
                     )
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("{} 行", self.rows.len())),
-                    ),
+                    .child(div().text_xs().text_color(muted).child(count)),
             )
     }
 }
