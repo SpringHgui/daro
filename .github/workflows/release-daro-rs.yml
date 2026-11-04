@@ -1,0 +1,81 @@
+name: release daro-rs (pre-release)
+
+on:
+  push:
+    tags:
+      - 'rust-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-daro-rs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: daro-rs
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 tag 与 Cargo.toml 版本一致
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if [[ "$tag" != rust-v* ]]; then
+            echo "::error::发布必须在 rust-v* 标签上触发，当前 ref 为 $tag"
+            exit 1
+          fi
+          want="${tag#rust-v}"
+          have="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [[ "$want" != "$have" ]]; then
+            echo "::error::tag 版本 $want 与 Cargo.toml 版本 $have 不一致"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daro-rs
+
+      - name: 测试
+        run: cargo test --release --locked --bin daro-rs -- --test-threads=1
+
+      - name: 构建
+        run: cargo build --release --locked --bin daro-rs
+
+      - name: 打包
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#rust-v}"
+          name="daro-rs-${version}-windows-x64"
+          mkdir -p "dist/${name}"
+          cp target/release/daro-rs.exe "dist/${name}/"
+          (cd dist && 7z a -tzip "${name}.zip" "${name}/" > /dev/null)
+          rm -rf "dist/${name}"
+          (cd dist && sha256sum ./*.zip > SHA256SUMS.txt)
+
+      - name: 发布 pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" dist/*.zip dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$tag" \
+              dist/*.zip dist/SHA256SUMS.txt \
+              --title "daro-rs ${tag#rust-v} (pre-release)" \
+              --prerelease \
+              --generate-notes \
+              --verify-tag
+          fi
