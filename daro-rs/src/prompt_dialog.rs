@@ -1,4 +1,4 @@
-﻿//! 单行文本输入小窗（新建组 / 复制连接）。参考客户端里这类确认框都是独立窗口，
+﻿//! 单行文本输入小窗（新建组 / 复制连接）。参考界面里这类确认框都是独立窗口，
 //! 这里同样开顶层窗口，避免在主窗口里叠遮罩。
 
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -65,7 +65,7 @@ impl TextPrompt {
         let window_handle = window.window_handle();
         cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
-                // 订阅回调拿不到 Window，靠窗口句柄关窗（参考客户端的确认框 Enter = 确定）
+                // 订阅回调拿不到 Window，靠窗口句柄关窗（参考界面的确认框 Enter = 确定）
                 if this.take_value(cx).is_some() {
                     let _ = cx.update_window(window_handle, |_, window, _| window.remove_window());
                 }
@@ -77,7 +77,7 @@ impl TextPrompt {
         cx.defer_in(window, |this, window, cx| {
             this.input.update(cx, |state, cx| {
                 state.focus(window, cx);
-                // 参考客户端的预填框打开时是全选态：直接打字即替换，不用先退格
+                // 参考界面的预填框打开时是全选态：直接打字即替换，不用先退格
                 state.select_all(window, cx);
             });
         });
@@ -179,8 +179,7 @@ impl Render for TextPrompt {
                 ui::footer_bar(self.dark)
                     .child(div().flex_1())
                     .child(
-                        ui::primary_button("ok", "确定", self.dark, cx)
-                            .disabled(!can_submit)
+                        ui::primary_button_enabled("ok", "确定", self.dark, can_submit, cx)
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     )
                     .child(

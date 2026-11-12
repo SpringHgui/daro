@@ -117,7 +117,7 @@ pub fn connections() -> Vec<Connection> {
     ]
 }
 
-/// 连接展开后列出的数据库。参考客户端按名称排序，初始库并不置顶，
+/// 连接展开后列出的数据库。参考界面按名称排序，初始库并不置顶，
 /// 只是图标颜色不同（打开过的绿、没打开过的灰）。
 pub fn databases(kind: DbKind) -> &'static [&'static str] {
     match kind {
@@ -144,7 +144,7 @@ pub fn databases(kind: DbKind) -> &'static [&'static str] {
     }
 }
 
-/// 数据库下面是否有「模式」这一层。实测参考客户端：PostgreSQL 有
+/// 数据库下面是否有「模式」这一层。实测参考界面：PostgreSQL 有
 /// （public 等），SQL Server 也有（dbo 等），MySQL 系没有，库即模式。
 pub fn has_schemas(kind: DbKind) -> bool {
     matches!(kind, DbKind::PostgreSql | DbKind::SqlServer)
@@ -204,7 +204,7 @@ pub fn objects(conn: &Connection, db: &str, cat: usize) -> &'static [&'static st
     &pool[..spread(db, pool.len())]
 }
 
-/// 演示连接的账号清单（照参考客户端实测的 `mysql.user` 排序：先按用户名，
+/// 演示连接的账号清单（照参考界面实测的 `mysql.user` 排序：先按用户名，
 /// 同名再按 host）。真连接走驱动查，这里只服务演示树。
 const USERS: [&str; 12] = [
     "agent@%",
@@ -225,7 +225,7 @@ pub fn users() -> &'static [&'static str] {
     &USERS
 }
 
-/// 演示连接的 PG 角色清单：照参考客户端截图那台集群（PG 17 的预定义角色 +
+/// 演示连接的 PG 角色清单：照参考界面截图那台集群（PG 17 的预定义角色 +
 /// `postgres`，共 17 条），顺序也按 `ORDER BY rolname` 排好。
 /// MySQL 那边是 `mysql.user` 的「用户名@主机」形态，PG 只有角色名。
 const PG_ROLES: [&str; 17] = [
@@ -252,7 +252,7 @@ pub fn pg_roles() -> &'static [&'static str] {
     &PG_ROLES
 }
 
-/// 演示库里的定时事件。参考客户端只有 MySQL / MariaDB 的事件清单，
+/// 演示库里的定时事件。参考界面只有 MySQL / MariaDB 的事件清单，
 /// 其它方言在面板里按「该连接类型没有事件」提示。
 const DEMO_EVENTS: [&str; 2] = ["ev_archive_sys_log", "ev_purge_expired_sessions"];
 
@@ -394,7 +394,7 @@ pub const TABLES: [&str; 113] = [
     "bx_report_goods",
 ];
 
-/// 对象列表按名称排序（参考客户端的列表就是字母序），排一次存着，别每帧再排
+/// 对象列表按名称排序（参考界面的列表就是字母序），排一次存着，别每帧再排
 pub static SORTED_TABLES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     let mut v = TABLES.to_vec();
     v.sort_unstable();
@@ -437,7 +437,7 @@ pub const ROUTINES: [&str; 8] = [
     "trg_stock_update",
 ];
 
-/// 打开表数据页的假列。列形（名称 / 类型 / 列宽）照参考客户端打开
+/// 打开表数据页的假列。列形（名称 / 类型 / 列宽）照参考界面打开
 /// PostgreSQL 表的实测复制的，全部表共用——行内容本来就是虚构的。
 pub struct MockColumn {
     pub name: &'static str,
@@ -520,7 +520,7 @@ pub fn mock_cell(table: &str, row: usize, col: usize) -> String {
     }
 }
 
-/// 打开表时状态栏里展示的取数 SQL，照参考客户端的方言格式拼；
+/// 打开表时状态栏里展示的取数 SQL，照参考界面的方言格式拼；
 /// 筛选面板应用的 WHERE 与多键排序按方言引号拼进子句
 /// （MongoDB / Redis 无 ORDER BY 语法，照 MySQL 系反引号口径走——
 /// mock 档这三类引擎共用同一套取数文案）。

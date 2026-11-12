@@ -1,4 +1,4 @@
-//! 「另存为」保存查询对话框，样式按参考客户端截图 1:1 复刻。
+//! 「另存为」保存查询对话框，样式按参考界面截图 1:1 复刻。
 //!
 //! 收起态（402×187）只有查询名称与保存位置；点位置行右侧箭头后窗口向下
 //! 长到 402×321，露出连接 / 目录 / 模式三个下拉，箭头翻转朝上。
@@ -210,7 +210,7 @@ pub fn open(
     let mut options = ui::dialog_options();
     options.window_min_size = Some(size(px(WIN_W), px(WIN_H)));
     options.window_bounds = Some(WindowBounds::centered(size(px(WIN_W), px(WIN_H)), cx));
-    // 参考客户端的另存为不可拉伸，标题栏也只有 ×
+    // 参考界面的另存为不可拉伸，标题栏也只有 ×
     options.is_resizable = false;
     if let Some(titlebar) = options.titlebar.as_mut() {
         titlebar.title = Some(title.into());
@@ -521,7 +521,7 @@ impl SaveAsDialog {
         .detach();
         cx.subscribe(&name, move |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
-                // 订阅回调拿不到 Window，靠窗口句柄关窗（参考客户端的确认框 Enter = 确定）
+                // 订阅回调拿不到 Window，靠窗口句柄关窗（参考界面的确认框 Enter = 确定）
                 if this.combo.is_none() && this.commit(cx) {
                     let _ = cx.update_window(window_handle, |_, window, _| window.remove_window());
                 }
@@ -1341,17 +1341,25 @@ impl SaveAsDialog {
             .items_center()
             .justify_center()
             .rounded(px(ui::RADIUS))
-            .when(primary, |el| {
+            .when(primary && enabled, |el| {
                 el.bg(to_hsla(s.accent)).text_color(to_hsla(s.on_accent))
             })
+            // 禁用态不能整块降透明度：白字叠在半透明蓝底上会一起洗掉，
+            // 换成灰面 + muted 字，跟其他对话框的主按钮禁用态一致
+            .when(primary && !enabled, |el| {
+                el.bg(to_hsla(s.btn)).text_color(to_hsla(s.muted))
+            })
             .when(!primary, |el| {
-                el.bg(to_hsla(s.btn)).text_color(to_hsla(s.text))
+                el.bg(to_hsla(s.btn)).text_color(if enabled {
+                    to_hsla(s.text)
+                } else {
+                    to_hsla(s.muted)
+                })
             })
             .text_xs()
             .when(enabled, |el| {
                 el.cursor_pointer().hover(|el| el.bg(to_hsla(s.hover)))
             })
-            .when(!enabled, |el| el.opacity(0.55))
             .child(label)
             .on_click(cx.listener(move |this, _, window, cx| {
                 if enabled {
@@ -1499,7 +1507,7 @@ mod tests {
         *windows.last().unwrap()
     }
 
-    /// 关键尺寸与参照截图（参考客户端另存为，2× 截图折半后的逻辑像素）对齐：
+    /// 关键尺寸与参照截图（参考界面另存为，2× 截图折半后的逻辑像素）对齐：
     /// 收起态 187 高，展开后 321 高、三行下拉顶边 154 / 201 / 248。
     #[gpui_kit::test]
     fn save_as_layout_matches_reference_shot(cx: &mut TestAppContext) {

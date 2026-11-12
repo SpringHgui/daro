@@ -4,8 +4,8 @@
 //! （文件/数据库类型字形），按 16×16 线稿绘制，渲染时由 `text_color` 整体着色。
 //! 资源路径统一为 `icons/zed/<name>.svg`，由 [`AppAssets`] 与 Lucide 资源合并提供。
 //!
-//! 数据库品牌图标（PostgreSQL / MySQL / SQLite）与信息卡大图仍走参考客户端位图，
-//! 那属于内容标识而不是控件字形。
+//! 数据库品牌图标与信息卡大图不走这里，见 `db_icons`：品牌用厂商开源 SVG，
+//! 信息卡大图直接复用本模块的控件字形。
 
 use std::borrow::Cow;
 

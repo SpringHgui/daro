@@ -1,13 +1,13 @@
 //! 表设计器「SQL 预览」页的逻辑层：行级 diff、「更改」增量脚本、行内高亮。
 //!
-//! 参考工具口径（参考客户端 18，`cameras @daowei_dev.public` 屏实测）：
+//! 参考口径（`cameras @daowei_dev.public` 屏实测）：
 //!
 //! - 「DDL」子页：「之前： / 之后：」两栏并排行号对比。改动行整行铺绿底
 //!   （取样 `#D6F0EA`），行号灰 `#A9A9A9`；两栏各自滚动，不插占位行对齐——
 //!   标准行级 LCS 的着色就能复现参考图（改一行 + 插一行 → 左一行绿、右两行绿）。
 //! - 「更改」子页：增量脚本 = `ALTER TABLE … ADD/DROP …` + `CREATE/DROP INDEX …`，
 //!   末尾固定追加触发器 / 规则的生成段——设计器里一条触发器都没有时照出
-//!   `CREATE TRIGGER BEFORE ON … EXECUTE PROCEDURE ;` 空模板（参考工具原样），
+//!   `CREATE TRIGGER BEFORE ON … EXECUTE PROCEDURE ;` 空模板（参考界面原样），
 //!   规则段只有 PostgreSQL 出；右上角复制按钮把脚本抄进剪贴板。
 //! - 新增的排除约束行即使名称 / 元素还空着也出形状：`EXCLUDE USING btree`。
 
@@ -96,7 +96,7 @@ pub fn diff_lines(before: &str, after: &str) -> (Vec<bool>, Vec<bool>) {
 
 /// 一行 SQL 的行内高亮 span。复用 [`crate::sql_highlight`] 的词法与配色；
 /// 双引号 / 反引号 / 方括号引起来的是**标识符**（预览 DDL 里全是这类），
-/// 词法器把它们归为 String，这里按参考工具口径回落正文色——单引号才是真字符串。
+/// 词法器把它们归为 String，这里按参考界面口径回落正文色——单引号才是真字符串。
 pub fn sql_code_spans(line: &str, dark: bool, fg: Hsla) -> Vec<AnyElement> {
     use crate::sql_highlight::{Kind, color_for, lex_sql};
     let span = |text: &str, color: Hsla| {
@@ -133,7 +133,7 @@ pub fn sql_code_spans(line: &str, dark: bool, fg: Hsla) -> Vec<AnyElement> {
 /// 「更改」子页的增量脚本：拿工作集和保存基线逐组比，新增的出
 /// `ALTER TABLE … ADD …` / `CREATE INDEX …`，删掉的出 `DROP …`；
 /// 字段按名字比（改类型的 ALTER 动作接真库后再补，mock 档不出），
-/// 约束同名即算未变。末尾按参考工具口径追加触发器 / 规则的生成段。
+/// 约束同名即算未变。末尾按参考界面口径追加触发器 / 规则的生成段。
 /// 没有任何改动时返回空串（页面留白，不显示复制按钮）。
 pub fn design_change_sql(kind: DbKind, schema: &str, table: &str, ds: &DesignerState) -> String {
     if !crate::design_dirty(ds) {
@@ -230,7 +230,7 @@ pub fn design_change_sql(kind: DbKind, schema: &str, table: &str, ds: &DesignerS
     }
     // 排除：PG 专属，和 CREATE TABLE 的口径一致（空行也出形状）。
     // 种子空白行不算数：按名字配对且每条基线只消费一次，多出来的行
-    // （哪怕还是空行）就是新增——参考工具的更改脚本对加一行空排除
+    // （哪怕还是空行）就是新增——参考界面的更改脚本对加一行空排除
     // 照样出 `ADD EXCLUDE USING btree`。
     if is_pg {
         let mut taken = vec![false; ds.baseline_excludes.len()];
@@ -293,7 +293,7 @@ pub fn design_change_sql(kind: DbKind, schema: &str, table: &str, ds: &DesignerS
         };
         stmts.push(drop);
     }
-    // 触发器 / 规则段：参考工具的更改脚本永远带——有真实行出生成的语句，
+    // 触发器 / 规则段：参考界面的更改脚本永远带——有真实行出生成的语句，
     // 没有（或行还空着）就出空模板；规则只有 PostgreSQL 有。
     if matches!(kind, DbKind::MySql | DbKind::PostgreSql | DbKind::SqlServer) {
         let trig = crate::design_triggers_sql_at(kind, schema, table, &ds.triggers);
@@ -321,7 +321,7 @@ pub fn design_change_sql(kind: DbKind, schema: &str, table: &str, ds: &DesignerS
     stmts.join("\n\n")
 }
 
-/// 空触发器模板（PG 形态，参考工具原样）：
+/// 空触发器模板（PG 形态，参考界面原样）：
 /// `CREATE TRIGGER BEFORE ON "public"."cameras"` + `FOR EACH ROW` +
 /// `EXECUTE PROCEDURE ;`。设计器里有草稿行时行上的时机 / 函数跟着走。
 fn trigger_template(kind: DbKind, schema: &str, table: &str, row: Option<&crate::DesignTrigger>) -> String {
@@ -390,7 +390,7 @@ fn trigger_template(kind: DbKind, schema: &str, table: &str, row: Option<&crate:
     }
 }
 
-/// 空规则模板（参考工具原样）：`CREATE RULE  AS ON INSERT TO "public"."cameras" DO NOTHING;`
+/// 空规则模板（参考界面原样）：`CREATE RULE  AS ON INSERT TO "public"."cameras" DO NOTHING;`
 /// ——名字空着所以 RULE 后面是两个空格，事件回落 INSERT，动作回落 DO NOTHING。
 fn rule_template(kind: DbKind, schema: &str, table: &str, row: Option<&crate::DesignRule>) -> String {
     let name = row.map(|r| r.name.trim()).unwrap_or("");
@@ -496,7 +496,7 @@ mod sql_preview_tests {
         assert!(cb.iter().all(|c| !c) && ca.iter().all(|c| !c));
     }
 
-    /// PG 空触发器模板（参考工具原样，注意事件段为空、EXECUTE PROCEDURE 后空函数）
+    /// PG 空触发器模板（参考界面原样，注意事件段为空、EXECUTE PROCEDURE 后空函数）
     #[test]
     fn trigger_template_matches_reference_shape() {
         let t = trigger_template(

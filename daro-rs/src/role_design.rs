@@ -1,7 +1,7 @@
 //! 角色 / 用户设计器的逻辑层：`pg_roles` 反查、行解析、`ALTER ROLE` 拼装，
 //! 加上「成员属于 / 成员」两页的 `pg_auth_members` 反查与 `GRANT/REVOKE` 拼装。
 //!
-//! 口径来自参考客户端的 PG 角色设计器截图（见 MIGRATION.md「角色设计器」）：
+//! 口径来自参考界面的 PG 角色设计器截图（见 MIGRATION.md「角色设计器」）：
 //! MySQL 那边叫「用户」、PG 这边叫「角色」，同一套界面，字段按 PG 的十个属性铺。
 //! 口令从不回填，只把用户这次新输的那条带进 `ALTER ROLE`。
 
@@ -48,7 +48,7 @@ impl RoleModel {
     }
 
     /// 新建角色的初值：PG 的 `CREATE ROLE` 默认全是 NO*，界面上只有
-    /// 继承权限按参考客户端给成勾着。
+    /// 继承权限按参考界面给成勾着。
     pub fn demo_new() -> Self {
         Self {
             inherit: true,
@@ -131,7 +131,7 @@ pub fn validate(now: &RoleModel, confirm: &str) -> Option<&'static str> {
     None
 }
 
-/// 改口令时参考客户端先选哈希算法：PG 的开关是 `password_encryption`，
+/// 改口令时参考界面先选哈希算法：PG 的开关是 `password_encryption`，
 /// 必须排在同一条会话里 `PASSWORD` 之前才作用到这条口令上。
 fn pw_encryption_stmt(enc: &str) -> Option<String> {
     (!enc.is_empty()).then(|| format!("SET password_encryption = '{}'", sql_literal(enc)))
@@ -265,7 +265,7 @@ fn until_sql(s: &str) -> String {
 
 /// 「成员属于」/「成员」网格里的一行：集群里的一个角色 + 两个勾选。
 ///
-/// 口径照参考客户端：两页都列出**全部**角色（不是只列有关系的那些），
+/// 口径照参考界面：两页都列出**全部**角色（不是只列有关系的那些），
 /// 勾选表示关系是否存在，所以取消勾选就是发 REVOKE。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemberRow {

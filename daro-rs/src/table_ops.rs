@@ -38,7 +38,7 @@ impl ObjKind {
 pub enum TableOp {
     /// DROP TABLE / DROP VIEW
     Drop,
-    /// DELETE FROM ——参考客户端的「清空表」，逐行删除，触发器照走、自增计数不动
+    /// DELETE FROM ——参考界面的「清空表」，逐行删除，触发器照走、自增计数不动
     Clear,
     /// TRUNCATE TABLE —— 整表清空并复位自增；SQLite 无该语法，退成 DELETE FROM
     Truncate,
@@ -59,7 +59,7 @@ impl TableOp {
         }
     }
 
-    /// 菜单项与确认框标题用的动作名（照参考客户端的「删除表 / 删除视图」文案）。
+    /// 菜单项与确认框标题用的动作名（照参考界面的「删除表 / 删除视图」文案）。
     /// 返回 `&'static str`：弹窗标题那侧的接口就是这个签名，文案又是固定几条，
     /// 拼 `format!` 反而要把对话框签名一起改。
     pub fn label(self, kind: ObjKind) -> &'static str {

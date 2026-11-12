@@ -612,13 +612,13 @@ impl Render for TableExportDialog {
             .child(
                 ui::footer_bar(self.dark)
                     .child(
-                        ui::primary_button(
+                        ui::primary_button_enabled(
                             "table-export-ok",
                             if finished { "关闭" } else { "导出" },
                             self.dark,
+                            !(busy || (!finished && !self.fetched)),
                             cx,
                         )
-                        .disabled(busy || (!finished && !self.fetched))
                         .on_click(cx.listener(|this, _, window, cx| {
                             if this.done.is_some() {
                                 window.remove_window();

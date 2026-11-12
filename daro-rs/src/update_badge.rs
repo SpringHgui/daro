@@ -507,18 +507,16 @@ impl DaroApp {
                     .on_click(cx.listener(|this, _, _, cx| this.start_update_download(cx))),
             ),
             Phase::Downloading => footer.child(
-                ui::primary_button("update-badge-downloading", "下载中…", self.dark, cx)
-                    .loading(true)
-                    .disabled(true),
+                ui::primary_button_enabled("update-badge-downloading", "下载中…", self.dark, false, cx)
+                    .loading(true),
             ),
             Phase::Ready => footer.child(
                 ui::primary_button("update-badge-install", "重启并更新", self.dark, cx)
                     .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
             ),
             Phase::Installing => footer.child(
-                ui::primary_button("update-badge-installing", "安装中…", self.dark, cx)
-                    .loading(true)
-                    .disabled(true),
+                ui::primary_button_enabled("update-badge-installing", "安装中…", self.dark, false, cx)
+                    .loading(true),
             ),
             Phase::Failed => footer.child(
                 ui::primary_button("update-badge-retry", "重试", self.dark, cx)

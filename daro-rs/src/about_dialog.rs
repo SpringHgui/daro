@@ -97,8 +97,7 @@ impl Render for AboutDialog {
             );
 
         let link_btn = |label: &'static str, url: &'static str| {
-            ui::secondary_button(label, label)
-                .text_color(to_hsla(p.accent))
+            ui::link_button(label, label, dark)
                 .on_click(cx.listener(move |_, _, _, _cx| {
                     open_link(url);
                 }))

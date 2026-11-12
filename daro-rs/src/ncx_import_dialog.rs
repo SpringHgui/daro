@@ -1,4 +1,4 @@
-﻿//! 参考客户端 `.ncx` 导入向导（迁移自 Flutter 版
+﻿//! `.ncx` 兼容格式 导入向导（迁移自 Flutter 版
 //! `lib/widgets/ncx_import_dialog.dart`）。
 //!
 //! 流程与 Flutter 版一致：选文件 → 解析 + 解密已保存密码 → 勾选条目 → 写入连接树。
@@ -482,8 +482,7 @@ impl Render for ImportDialog {
             .child(
                 ui::footer_bar(self.dark)
                     .child(
-                        ui::primary_button("import-ok", "导入", self.dark, cx)
-                            .disabled(!can_import)
+                        ui::primary_button_enabled("import-ok", "导入", self.dark, can_import, cx)
                             .on_click(cx.listener(|this, _, _, cx| this.do_import(cx))),
                     )
                     .child(

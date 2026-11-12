@@ -67,7 +67,7 @@ fn handle(key: &str) -> Result<Arc<Mutex<RawConn>>, String> {
         .ok_or_else(|| format!("连接「{key}」未打开"))
 }
 
-/// 打开（或重开）一个 SQLite 库文件。文件不存在会新建——与参考客户端
+/// 打开（或重开）一个 SQLite 库文件。文件不存在会新建——与参考界面
 /// 「连上空库再建表」的习惯一致；打不开（目录 / 权限 / 非库文件延迟到
 /// 首条查询才报）在这里返回 Err。
 ///

@@ -888,9 +888,14 @@ impl ImportDialog {
                     .gap(px(8.))
                     .items_center()
                     .child(
-                        ui::primary_button("imp-run", "开始导入", self.dark, cx)
-                            .disabled(self.busy || self.mapping.is_empty())
-                            .on_click(cx.listener(|this, _, _, cx| this.run(cx))),
+                        ui::primary_button_enabled(
+                            "imp-run",
+                            "开始导入",
+                            self.dark,
+                            !(self.busy || self.mapping.is_empty()),
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.run(cx))),
                     )
                     .child(
                         ui::secondary_button("imp-cancel-run", "停止")
@@ -1045,12 +1050,17 @@ impl Render for ImportDialog {
                             })),
                     )
                     .child(
-                        ui::primary_button("imp-next", "下一步", self.dark, cx)
-                            .disabled(self.step >= 2 || self.source.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.step = (this.step + 1).min(2);
-                                cx.notify();
-                            })),
+                        ui::primary_button_enabled(
+                            "imp-next",
+                            "下一步",
+                            self.dark,
+                            !(self.step >= 2 || self.source.is_none()),
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.step = (this.step + 1).min(2);
+                            cx.notify();
+                        })),
                     )
                     .child(ui::secondary_button("imp-close", "关闭").on_click(
                         |_, window, _| window.remove_window(),

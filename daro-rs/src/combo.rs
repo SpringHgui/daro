@@ -251,7 +251,7 @@ pub fn panel(rows: Vec<AnyElement>, fit: PanelFit, colors: Colors) -> AnyElement
     sized.children(rows).into_any_element()
 }
 
-/// 命中段铺黄底的标签文本（参考客户端搜索的浏览器式高亮）。
+/// 命中段铺黄底的标签文本（参考界面搜索的浏览器式高亮）。
 pub fn highlighted_label(label: &str, range: Range<usize>, hl: Hsla) -> StyledText {
     StyledText::new(label.to_string()).with_highlights([(
         range,

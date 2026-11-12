@@ -27,7 +27,6 @@ mod move_paint_skip;
 mod menu;
 mod mysql_driver;
 mod ncx_export_dialog;
-mod nv_icons;
 mod sqlite_driver;
 mod pg_driver;
 mod redis_driver;
@@ -38,7 +37,9 @@ mod snippet;
 mod sql_format;
 mod sql_highlight;
 mod sql_preview;
+mod table_copy;
 mod table_ops;
+mod table_paste_dialog;
 mod ui;
 mod update;
 mod update_dialog;
@@ -131,12 +132,12 @@ use conn_dialog::{ConnDialogMode, open_connection_dialog, open_new_connection};
 use crate::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use mock::{Connection, DbKind};
 use palette::Palette;
-use prompt_dialog::{open_confirm, open_text_prompt};
+use prompt_dialog::{open_confirm, open_notice, open_text_prompt};
 
-/// 行高：参考客户端里左侧树是 20px，中部对象列表更密（约 16.5px），分别取值
-/// 树行高。参考客户端实测：行距 40 物理像素 @200% = 20 逻辑像素
+/// 行高：参考界面里左侧树是 20px，中部对象列表更密（约 16.5px），分别取值
+/// 树行高。参考界面实测：行距 40 物理像素 @200% = 20 逻辑像素
 /// （截图 nv_base.png 连续行文字带 334/374/414… 间距 40）。2026-10-31 前
-/// 这里写 17.5，比参考工具密 12.5%，已按实测改回 20。
+/// 这里写 17.5，比参考界面密 12.5%，已按实测改回 20。
 const ROW_H: f32 = 22.;
 const LIST_ROW_H: f32 = 22.;
 const LEFT_W: f32 = 250.;
@@ -161,7 +162,7 @@ const MENU_H: f32 = 26.;
 const STATUS_BAR_H: f32 = 24.;
 const WIN_BTN_W: f32 = 46.;
 
-// ── 数据页密度档（照参考客户端数据页 1:1：工具条 27 / 表头两行 20+17 / 行 20）──
+// ── 数据页密度档（照参考界面数据页 1:1：工具条 27 / 表头两行 20+17 / 行 20）──
 /// 数据页工具条高（图标 + 文字）
 const T_TOOLBAR_H: f32 = 28.;
 /// 表头「列名」行高
@@ -183,7 +184,7 @@ const T_GUTTER_W: f32 = 9.;
 /// 底部记录导航条高
 const T_BAR_H: f32 = 27.;
 
-// ── 底部「单元格编辑器」抽屉（参考客户端数据页同名工具条开关）──
+// ── 底部「单元格编辑器」抽屉（参考界面数据页同名工具条开关）──
 /// 页签条高（文本 / JSON / 十六进制 / 图像 / 网页）
 const CV_HEAD_H: f32 = 28.;
 /// 展开时的内容高度（参考截图约 220 逻辑像素）
@@ -197,7 +198,7 @@ const CV_LINE_H: f32 = 18.;
 /// JSON / 十六进制一次最多铺多少行：超长单元格不能每帧建上万棵树。
 const CV_MAX_LINES: usize = 400;
 
-/// 数据页默认每页多少行（参考客户端默认 1000）。实际页大小按页签的
+/// 数据页默认每页多少行（参考界面默认 1000）。实际页大小按页签的
 /// 「限制记录」设置走：齿轮里可以按表改，未勾选时整表一页。
 const PAGE_SIZE: usize = 1000;
 
@@ -209,7 +210,7 @@ const T_COL_W_SCAN: usize = 120;
 
 // ── 设计器密度档 ──────────────────────────────────────────
 // 照 Flutter 版 table_designer_page.dart 的实测常量整批搬来，每个值都有
-// 参考工具出处（见 Flutter 仓 AGENTS.md「设计器密度档」），别凭手感调。
+// 参考界面出处（见 Flutter 仓 AGENTS.md「设计器密度档」），别凭手感调。
 const D_ROW_EXTENT: f32 = 21.; // 字段行高（RowExtent）
 const D_HEADER_H: f32 = 30.; // 表头高
 const D_GUTTER_W: f32 = 12.; // 行首「当前行」槽
@@ -231,9 +232,9 @@ const D_FIELD_WIDTHS: [f32; 7] = [200., 120., 60., 60., 60., 60., 300.];
 /// 函数设计器「参数」子页列宽：名称 / 类型 / 模式 / 默认值 / 删除
 const D_PARAM_WIDTHS: [f32; 5] = [150., 130., 96., 160., 30.];
 /// 索引子页主表格列宽：名称 / 字段 / 索引方法 / 唯一键 / 并发 / 注释
-/// （照参考工具 1:1 量：273/589/185/112/148/314 物理像素 ÷ 1.75 后按窗口宽度压一档）
+/// （照参考界面 1:1 量：273/589/185/112/148/314 物理像素 ÷ 1.75 后按窗口宽度压一档）
 const D_INDEX_WIDTHS: [f32; 6] = [148., 300., 96., 58., 80., 168.];
-/// 索引「字段」浮层（参考工具点「字段」格弹出的小表格）整体宽
+/// 索引「字段」浮层（参考界面点「字段」格弹出的小表格）整体宽
 /// （七列 700 + 每列 1px 网格线，留 10px 余量免得最后一列被裁）
 const D_IDX_POPUP_W: f32 = 710.;
 /// 浮层七列列宽：名称 / 排序规则模式 / 排序规则 / 运算符类别模式 / 运算符类别 /
@@ -247,11 +248,11 @@ const D_IDX_POPUP_BODY_H: f32 = 240.;
 /// 浮层底栏高（↑↓+− + 确定/取消）
 const D_IDX_POPUP_FOOT_H: f32 = 40.;
 /// 外键子页主表格列宽：名称 / 字段 / 被引用的模式 / 被引用的表 / 被引用的字段 /
-/// 删除时 / 更新时 / 注释（参考工具 1:1 量：180/260×4/160×2/214 物理像素 ÷ 1.75 =
+/// 删除时 / 更新时 / 注释（参考界面 1:1 量：180/260×4/160×2/214 物理像素 ÷ 1.75 =
 /// 103/148×4/91×2/122，合计 999；设计器窗格默认 876 扣掉行首槽只剩 864，
 /// 按索引页同款口径整体压一档 0.865）
 const D_FK_WIDTHS: [f32; 8] = [89., 128., 128., 128., 128., 79., 79., 105.];
-/// 外键子页底部属性区（参考工具那三行：符合全部 / 可延迟 / 延迟）：
+/// 外键子页底部属性区（参考界面那三行：符合全部 / 可延迟 / 延迟）：
 /// 行距 30（52 物理像素 ÷ 1.75）、控件列自 230 起（403 物理像素 ÷ 1.75）、
 /// 下拉框 342×20（598×36 物理像素 ÷ 1.75）、整块高 198（346 物理像素 ÷ 1.75，
 /// 行下的留白属于这块面板 —— 参考图属性行与状态条之间还有一段白）
@@ -264,15 +265,15 @@ const D_FK_PROPS_H: f32 = 198.;
 const D_FK_BAR: u32 = 0x4DA0E1;
 /// 视图「规则」子页当前格的实心态（参考取样 #0078D7：整格铺满，字色转白）
 const D_RULE_CELL_CUR: u32 = 0x0078D7;
-/// 唯一键子页主表格列宽：名称 / 字段 / 注释（参考工具 1:1 量：300/800/512
+/// 唯一键子页主表格列宽：名称 / 字段 / 注释（参考界面 1:1 量：300/800/512
 /// 物理像素 ÷ 1.75 = 171/457/293，合计 921；窗格 876 扣行首槽放不下，
 /// 按外键页同款口径压一档 0.938）
 const D_UNIQUE_WIDTHS: [f32; 3] = [161., 429., 274.];
-/// 检查子页主表格列宽：名称 / 表达式 / 无继承 / 注释（参考工具 1:1 量：
+/// 检查子页主表格列宽：名称 / 表达式 / 无继承 / 注释（参考界面 1:1 量：
 /// 300/800/160/558+ 物理像素 ÷ 1.75 = 171/457/91/注释被窗口裁切，
 /// 按窗格宽压 0.848）
 const D_CHECK_WIDTHS: [f32; 4] = [145., 387., 77., 254.];
-/// 排除子页主表格列宽：名称 / 索引方法 / 元素 / 注释（参考工具 1:1 量：
+/// 排除子页主表格列宽：名称 / 索引方法 / 元素 / 注释（参考界面 1:1 量：
 /// 300/200/800/600 物理像素 ÷ 1.75 = 171/114/457/343，合计 1085 → 窗格放不下
 /// 压 0.79）
 const D_EXCLUDE_WIDTHS: [f32; 4] = [135., 90., 361., 271.];
@@ -281,15 +282,15 @@ const D_EXCLUDE_WIDTHS: [f32; 4] = [135., 90., 361., 271.];
 const D_RL_PROP_ROW_H: f32 = 38.;
 const D_RL_PROP_LABEL_W: f32 = 203.;
 const D_RL_PROP_FIELD_W: f32 = 357.;
-/// 规则子页主表格列宽：名称 / 事件 / 代替运行 / 启用 / 注释（参考工具 1:1 量：
+/// 规则子页主表格列宽：名称 / 事件 / 代替运行 / 启用 / 注释（参考界面 1:1 量：
 /// 500/160/160/100/600 物理像素 ÷ 1.75 = 286/91/91/57/343，合计 868，
 /// 窗格 876 扣行首槽刚好放下，注释削 4）
 const D_RULE_WIDTHS: [f32; 5] = [285., 90., 91., 56., 338.];
-/// 视图「规则」子页列宽：名称 / OID / 事件 / 代替运行 / 注释（参考客户端视图规则
+/// 视图「规则」子页列宽：名称 / OID / 事件 / 代替运行 / 注释（参考界面视图规则
 /// 截图 1:1 量：501/201/161/161/601 物理像素 ÷ 2 = 250/100/80/80/300，
 /// 加行首槽 12 正好铺满 822 的窗格）
 const D_VIEW_RULE_WIDTHS: [f32; 5] = [250., 100., 80., 80., 300.];
-/// 视图「高级」子页量（参考客户端视图高级截图 1:1 量，物理像素 ÷ 2）：标签列
+/// 视图「高级」子页量（参考界面视图高级截图 1:1 量，物理像素 ÷ 2）：标签列
 /// 383→191、字段 482×39→241×20、行距 52→26、首格上边距 20→10、复选框 26→13。
 /// 行高取 26 并把字段垂直居中，首行上边距补 3（(26-20)/2）后正好落在 10。
 const D_VADV_LABEL_W: f32 = 191.;
@@ -299,7 +300,7 @@ const D_VADV_ROW_H: f32 = 26.;
 const D_VADV_PAD_L: f32 = 10.;
 const D_VADV_TOP: f32 = 7.;
 // ── 角色 / 用户设计器密度档 ────────────────────────────────
-// 照参考客户端 PG 角色设计器截图 1:1 量（物理像素 ÷ 2 = 逻辑像素）：标签与
+// 照参考界面 PG 角色设计器截图 1:1 量（物理像素 ÷ 2 = 逻辑像素）：标签与
 // 复选框左边距 9、字段列自 200 起、控件高 20、行距 26、宽栏 212 / 窄栏 187，
 // 「…」按钮 20×20 贴窄栏右端（间隔 5，两者合计正好等于宽栏）。
 // 首行上边距 5.5 = 量到的 8.5 扣掉控件在 26 行里的居中余量 3。
@@ -315,11 +316,11 @@ const R_TOOLBAR_H: f32 = 35.;
 /// 角色设计器子页签（照截图顺序）
 const R_SUBTABS: [&str; 6] = ["常规", "成员属于", "成员", "权限", "注释", "SQL 预览"];
 /// 子页签宽度：截图分隔线 0/102/218/314/410/506/629 物理像素 ÷ 2，
-/// 文字居中。参考客户端这几枚不是「文字 + 固定留白」，量出来的宽度对不上
+/// 文字居中。参考界面这几枚不是「文字 + 固定留白」，量出来的宽度对不上
 /// 任何一种留白，所以按分隔线直接铺宽。
 const R_SUBTAB_W: [f32; 6] = [51., 58., 48., 48., 48., 61.5];
 /// 「成员属于 / 成员」网格的列宽与行高：截图分隔线 0/81/723/1035/1179、
-/// 表头底 222、行距 41 物理像素 ÷ 2。网格总宽 590，右边留白和参考客户端一样
+/// 表头底 222、行距 41 物理像素 ÷ 2。网格总宽 590，右边留白和参考界面一样
 /// 不铺满——它是定宽表格，不是自适应列表。
 const R_MCOL: [f32; 4] = [40.5, 320.5, 156., 72.];
 const R_MHEAD_H: f32 = 29.5;
@@ -327,9 +328,9 @@ const R_MROW_H: f32 = 20.5;
 /// 「密码加密」下拉候选：PG 的两种口令哈希
 const PW_HASHES: [&str; 2] = ["md5", "scram-sha-256"];
 /// 触发器子页主表格列宽：名称 / 给每个 / 触发 / 插入 / 更新 / 删除 / 截断 /
-/// 更新字段 / 启用 / 注释（参考工具 1:1 量：240/200/262/120/120/120/120/200/100/
+/// 更新字段 / 启用 / 注释（参考界面 1:1 量：240/200/262/120/120/120/120/200/100/
 /// 600+ 物理像素 ÷ 1.75 = 137/114/150/69/69/69/69/114/57/343，合计 1208 超出
-/// 窗格 —— 整体横向滚动，与参考工具同款裁切）
+/// 窗格 —— 整体横向滚动，与参考界面同款裁切）
 const D_TRIGGER_WIDTHS: [f32; 10] = [
     137., 114., 150., 69., 69., 69., 69., 114., 57., 343.,
 ];
@@ -345,7 +346,7 @@ const D_ICON_DANGER: u32 = 0xFF4A37;
 const D_ICON_KEY: u32 = 0xF5AA00;
 
 // ── 查询页密度档（排期7）──────────────────────────────────
-// 尺寸取 Flutter 版 query_page.dart 照参考客户端实测的量，别凭手感调。
+// 尺寸取 Flutter 版 query_page.dart 照参考界面实测的量，别凭手感调。
 const Q_TOOLBAR_H: f32 = 38.; // 查询页自己的工具条（比数据页高一档，同参考截图）
 const Q_CONNBAR_H: f32 = 30.; // 运行上下文栏高
 /// 组合框的外观尺寸统一由 `combo` 组件提供，两处引用同一份常量。
@@ -359,13 +360,12 @@ const Q_HEADER_H: f32 = 26.; // 结果面板头（状态文案行）
 const Q_TABBAR_H: f32 = 21.; // 结果页签条（同设计器密度）
 const Q_RESULT_BAR_H: f32 = 26.; // 结果页内层条：数据 / 信息 + 右缘按钮
 const Q_RESULT_FOOT_H: f32 = 22.; // 结果网格底条：编辑占位 + 行数
-const Q_ROWNO_W: f32 = 11.; // 行号槽宽（参考客户端结果网格左侧只有一条窄空槽）
+const Q_ROWNO_W: f32 = 11.; // 行号槽宽（参考界面结果网格左侧只有一条窄空槽）
 const Q_ROW_H: f32 = 22.; // 结果网格行高（同表数据页）
-const Q_HEAD_NAME_H: f32 = 24.; // 结果网格表头列名行
-const Q_HEAD_TYPE_H: f32 = 22.; // 结果网格表头类型行（PG 简单协议查不出类型时显示 (N/A)）
-const Q_GRID_HEADER_H: f32 = Q_HEAD_NAME_H + Q_HEAD_TYPE_H; // 结果网格表头总高
+/// 结果网格表头两行沿用数据页密度：列名行 + 类型行贴在同一个表头格里
+const Q_GRID_HEADER_H: f32 = T_HEAD_NAME_H + T_HEAD_TYPE_H;
 const Q_PREVIEW_HEAD_H: f32 = 22.; // 设计预览网格的单行表头（视图预览行高沿用结果网格）
-/// 运行上下文功能强调色（主题无关，Flutter 版照参考客户端实测：蓝三角 / 浅红方块 / 浅蓝图标）
+/// 运行上下文功能强调色（主题无关，Flutter 版照参考界面实测：蓝三角 / 浅红方块 / 浅蓝图标）
 const Q_RUN_BLUE: u32 = 0x0092ff;
 const Q_STOP_IDLE: u32 = 0xF79E95;
 const Q_EXPLAIN_BLUE: u32 = 0x50A0F0;
@@ -378,7 +378,7 @@ const CATEGORIES: [(&str, art::Glyph); 5] = [
     ("查询", art::Glyph::Query),
 ];
 
-/// 表节点展开后的分组（参考客户端口径）。序号同时是 `catalog::TableParts`
+/// 表节点展开后的分组（参考界面口径）。序号同时是 `catalog::TableParts`
 /// 的分组下标：0 字段走列缓存，1..=7 走分组缓存。
 const OBJ_GROUPS: [(&str, art::Glyph); 8] = [
     ("字段", art::Glyph::Column),
@@ -406,7 +406,7 @@ const RIBBON: [(art::Glyph, &str, u32, Option<usize>, bool, bool); 11] = [
     (art::Glyph::RibbonAutoRun, "自动运行", 0xe08a3c, None, false, true),
 ];
 
-/// 工具条磁贴的单色图标：Zed 用线性图标，不再贴参考客户端的彩色位图。
+/// 工具条磁贴的单色图标：Zed 用线性图标，不再贴参考界面的彩色位图。
 fn ribbon_icon(ix: usize) -> ZedIcon {
     match ix {
         0 => ZedIcon::Plug,
@@ -424,7 +424,7 @@ fn ribbon_icon(ix: usize) -> ZedIcon {
     }
 }
 
-/// 主窗格里可切换的只读工具面板（参考客户端的「用户」/「其它 → 表空间、事件」）。
+/// 主窗格里可切换的只读工具面板（参考界面的「用户」/「其它 → 表空间、事件」）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ToolView {
     Users,
@@ -450,7 +450,7 @@ enum FilterConn {
     InGroup { top: usize, ix: usize },
 }
 
-/// 顶栏静态菜单的名称与顺序（参考客户端口径）。条目不在这里登记：分隔线、快捷键提示、
+/// 顶栏静态菜单的名称与顺序（参考界面口径）。条目不在这里登记：分隔线、快捷键提示、
 /// 子菜单与企业版占位项都要真元素，一律由各 `*_bar_menu` 手拼。
 /// 下标同时是展开身份（`BarMenu::key`）与无头用例的断言值（文件=0、编辑=1），调序前先看那两处。
 const MENUS: &[&str] = &["文件", "编辑", "查看", "格式", "收藏夹", "工具", "窗口", "帮助"];
@@ -464,7 +464,7 @@ enum BarMenu {
     Query,
 }
 
-/// 菜单内容的上下文。参考客户端的条目随焦点变：一个页签都没开（刚打开，焦点在连接树）
+/// 菜单内容的上下文。参考界面的条目随焦点变：一个页签都没开（刚打开，焦点在连接树）
 /// 时，「文件」只剩树级条目、「编辑」只剩三条、「查看」换成树那一套、「格式」整栏不出现。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BarCtx {
@@ -486,7 +486,7 @@ impl BarMenu {
     }
 }
 
-/// 导入向导交回主窗口的一条连接（字段已按参考客户端导出口径归一）。
+/// 导入向导交回主窗口的一条连接（字段已按参考界面导出口径归一）。
 pub struct ImportItem {
     pub name: String,
     pub kind: DbKind,
@@ -551,7 +551,7 @@ enum Act {
 /// 这样分类和对象节点不必按引擎分叉出两套元组形状。
 const NO_SCHEMA: usize = usize::MAX;
 
-/// 右键点在空白处时，是哪个窗格的空白。参考客户端实测：中栏对象列表的空白右键 =
+/// 右键点在空白处时，是哪个窗格的空白。参考界面实测：中栏对象列表的空白右键 =
 /// 当前分类那一套（新建表 / 导入导出向导 / 刷新…）；左栏连接树的空白是另一套。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlankPane {
@@ -619,6 +619,24 @@ fn node_key(conn_name: &str, sub: &str) -> String {
     format!("{conn_name}\u{1}{sub}")
 }
 
+/// 粘贴表对话框里给人看的位置：连接 / 库，PostgreSQL 再带上模式。
+fn ctx_label(conn: &str, db: &str, schema: &str) -> String {
+    if schema.is_empty() || schema == db {
+        format!("{conn} / {db}")
+    } else {
+        format!("{conn} / {db} / {schema}")
+    }
+}
+
+/// 表复制只对四种 SQL 引擎成立：Mongo / Redis 的对象不是「表」这一层。
+fn table_copy_ready(conn: &mock::Connection) -> bool {
+    backend::is_real_conn(conn)
+        && matches!(
+            conn.kind,
+            DbKind::SQLite | DbKind::PostgreSql | DbKind::MySql | DbKind::SqlServer
+        )
+}
+
 /// 删光连接后各面板仍要能渲染：拿这个空连接当兜底，而不是在每个取值点判 Option。
 static EMPTY_CONN: mock::Connection = mock::Connection {
     name: String::new(),
@@ -670,7 +688,7 @@ fn default_true() -> bool {
     true
 }
 
-/// 落盘状态（connections.json）。只存参考客户端重启后会还原的东西：
+/// 落盘状态（connections.json）。只存参考界面重启后会还原的东西：
 /// 连接配置、分组、树展开态、主题、视图模式；选中项与打开的页签不存。
 #[derive(Serialize, Deserialize)]
 struct Store {
@@ -742,7 +760,7 @@ fn load_store() -> Option<Store> {
     }
 }
 
-/// 树里给连接上色的七种标签色（参考客户端「颜色」子菜单）
+/// 树里给连接上色的七种标签色（参考界面「颜色」子菜单）
 const CONN_COLORS: [(&str, u32); 7] = [
     ("红", 0xd9534f),
     ("橙", 0xe8913f),
@@ -753,7 +771,7 @@ const CONN_COLORS: [(&str, u32); 7] = [
     ("灰", 0x8d99a6),
 ];
 
-/// 连接标签色派生出的整套底色。参考客户端实测：给连接选了颜色后，连接行铺
+/// 连接标签色派生出的整套底色。参考界面实测：给连接选了颜色后，连接行铺
 /// 饱和色、其下所有子节点铺同色淡底，选中行是掺了连接色的选中灰；该连接
 /// 打开的页签顶边描一条原色细线、页签本身也带淡底。
 #[derive(Clone, Copy)]
@@ -854,7 +872,7 @@ fn blend(a: u32, b: u32, t: f32) -> u32 {
 
 // ── 复制为 SQL / HTML ──────────────────────────────────────────
 
-/// 复制选定行为 INSERT 语句。参考客户端口径：单行一条 INSERT，多行合并成
+/// 复制选定行为 INSERT 语句。参考界面口径：单行一条 INSERT，多行合并成
 /// 一条 INSERT ... VALUES (...), (...), ...；列名用方言引号。
 fn copy_as_insert(kind: DbKind, db: &str, schema: &str, table: &str, cols: &[&str], rows: &[Vec<String>]) -> String {
     if rows.is_empty() {
@@ -889,7 +907,7 @@ fn copy_as_insert(kind: DbKind, db: &str, schema: &str, table: &str, cols: &[&st
     format!("INSERT INTO {qtable} ({col_list}) VALUES {}", val_rows.join(", "))
 }
 
-/// 复制选定行为 UPDATE 语句。参考客户端口径：每行一条 UPDATE，WHERE 用主键
+/// 复制选定行为 UPDATE 语句。参考界面口径：每行一条 UPDATE，WHERE 用主键
 /// （mock 档第一列当主键）。
 fn copy_as_update(kind: DbKind, db: &str, schema: &str, table: &str, cols: &[&str], rows: &[Vec<String>]) -> String {
     if rows.is_empty() || cols.is_empty() {
@@ -931,7 +949,7 @@ fn copy_as_update(kind: DbKind, db: &str, schema: &str, table: &str, cols: &[&st
         .join(";\n")
 }
 
-/// 复制选定行为 SELECT 语句。参考客户端口径：SELECT * FROM table WHERE pk IN (...);
+/// 复制选定行为 SELECT 语句。参考界面口径：SELECT * FROM table WHERE pk IN (...);
 /// 多行用 IN 列表，单行用 =。
 fn copy_as_select(kind: DbKind, db: &str, schema: &str, table: &str, cols: &[&str], rows: &[Vec<String>]) -> String {
     if rows.is_empty() || cols.is_empty() {
@@ -970,7 +988,7 @@ fn copy_as_select(kind: DbKind, db: &str, schema: &str, table: &str, cols: &[&st
     format!("SELECT * FROM {qtable} WHERE {where_clause}")
 }
 
-/// 复制选定行为 HTML 表格。参考客户端口径：<table> 带边框，第一行是表头。
+/// 复制选定行为 HTML 表格。参考界面口径：<table> 带边框，第一行是表头。
 fn copy_as_html(cols: &[&str], rows: &[Vec<String>]) -> String {
     if rows.is_empty() {
         return String::new();
@@ -1005,7 +1023,7 @@ fn wire_global_keys(root: Entity<DaroApp>, win: AnyWindowHandle, cx: &mut App) {
         KeyBinding::new("f2", TreeRename, None),
         KeyBinding::new("escape", TreeCancelRename, None),
         KeyBinding::new("f5", RefreshView, None),
-        // 数据网格：Delete 清空选中格内容，Ctrl+Delete 删记录（参考客户端口径，
+        // 数据网格：Delete 清空选中格内容，Ctrl+Delete 删记录（参考界面口径，
         // 删除键位不是裸 Delete —— 单选一格时按 Delete 不该把整行删掉）。
         KeyBinding::new("delete", DeleteSelected, None),
         KeyBinding::new("ctrl-delete", GridDeleteRows, None),
@@ -1034,15 +1052,15 @@ fn wire_global_keys(root: Entity<DaroApp>, win: AnyWindowHandle, cx: &mut App) {
         // 补全弹层（gpui 编辑器的 ShowCompletions 动作；编辑器只挂了
         // on_action 处理器，键位要在应用层绑上）
         KeyBinding::new("ctrl-space", gpui_kit::component::input::ShowCompletions, None),
-        // 页签条右键菜单里标着这两个键（参考工具同款），绑定让快捷键属实
+        // 页签条右键菜单里标着这两个键（参考界面同款），绑定让快捷键属实
         KeyBinding::new("ctrl-w", CloseTab, None),
         KeyBinding::new("ctrl-shift-w", CloseAllTabs, None),
         // 查询窗口：Ctrl+R 运行（有选区只跑选区），Ctrl+Shift+R 运行当前语句
         KeyBinding::new("ctrl-r", QueryRun, None),
         KeyBinding::new("ctrl-shift-r", QueryRunStmt, None),
-        // Ctrl+T 停止正在跑的脚本（参考客户端同款；没有任务时是空操作）
+        // Ctrl+T 停止正在跑的脚本（参考界面同款；没有任务时是空操作）
         KeyBinding::new("ctrl-t", QueryStop, None),
-        // 编辑菜单：Ctrl+E 选择当前语句、F3 查找下一个（参考客户端查询窗口口径）。
+        // 编辑菜单：Ctrl+E 选择当前语句、F3 查找下一个（参考界面查询窗口口径）。
         // gpui 在 Input 上下文里把 Ctrl+E 绑给了编辑器的 MoveEnd，这里在同一上下文
         // 重绑顶掉它——headless 用例确认按下后只走 EditSelectStmt，光标没有跑到行尾。
         KeyBinding::new("ctrl-e", EditSelectStmt, Some("Input")),
@@ -1052,7 +1070,7 @@ fn wire_global_keys(root: Entity<DaroApp>, win: AnyWindowHandle, cx: &mut App) {
         // 里也能开；两条都落到同一个查找面板，重复触发是幂等的。
         KeyBinding::new("ctrl-f", QueryFind, None),
         KeyBinding::new("ctrl-h", QueryReplace, None),
-        // 收藏夹：Ctrl+1…9 打开对应槽位（参考客户端同款）。空槽位是空操作，
+        // 收藏夹：Ctrl+1…9 打开对应槽位（参考界面同款）。空槽位是空操作，
         // 菜单里的快捷键角标由键位系统按这些绑定渲染。
         KeyBinding::new("ctrl-1", Favorite1, None),
         KeyBinding::new("ctrl-2", Favorite2, None),
@@ -1197,7 +1215,7 @@ fn wire_global_keys(root: Entity<DaroApp>, win: AnyWindowHandle, cx: &mut App) {
         let root = root_paste.clone();
         cx.defer(move |cx| {
             let _ = win.update(cx, |_, _, cx| {
-                root.update(cx, |this, cx| this.grid_paste(cx));
+                root.update(cx, |this, cx| this.edit_paste(cx));
             });
         });
     });
@@ -1638,7 +1656,7 @@ struct OpenTab {
     head_menu: Option<usize>,
     /// 数据页签的取数结果（可编辑工作集）；设计 / 查询页签恒空。
     /// mock 档把它物化成真实二维表：编辑 / 增删改的是这份副本而不是
-    /// 每帧现算的 mock_cell，行为与参考客户端的「改了没保存」一致。
+    /// 每帧现算的 mock_cell，行为与参考界面的「改了没保存」一致。
     data: Vec<Vec<String>>,
     /// 上次「应用」✓ 时的快照；「撤销」× / 刷新把 data 退回这里。
     baseline: Vec<Vec<String>>,
@@ -1649,14 +1667,14 @@ struct OpenTab {
     row_keys: Vec<db_types::RowKey>,
     /// 基线时点的行身份；「应用」时与 row_keys 比对得出删除行。
     baseline_row_keys: Vec<db_types::RowKey>,
-    /// 新增、尚未「应用」的行：显示时永远排在排序结果之后（参考客户端同款——
+    /// 新增、尚未「应用」的行：显示时永远排在排序结果之后（参考界面同款——
     /// 新行贴在网格尾部、行头带 *，「应用」后才并进 data 参与排序）。
     inserted: Vec<Vec<String>>,
     /// 网格撤销 / 重做栈：每步存一份工作集快照。× / 刷新仍是「退回基线」
     /// 的全撤，Ctrl+Z 只退最近一步（改格 / 粘贴 / 增删行都算一步）。
     undo: Vec<GridSnapshot>,
     redo: Vec<GridSnapshot>,
-    /// 数据页签的筛选 / 排序面板（参考客户端网格工具条漏斗）；设计 / 查询页签不用。
+    /// 数据页签的筛选 / 排序面板（参考界面网格工具条漏斗）；设计 / 查询页签不用。
     filter: filter::FilterState,
     /// SQLite 表页的远程分页状态：Some 时 data 只装当前页，筛选 / 排序 /
     /// COUNT 全部下推到驱动；mock 档 None（整表物化在内存里翻页）。
@@ -1669,7 +1687,7 @@ struct OpenTab {
     limit_open: bool,
     /// 勾选「限制记录」时每页取 limit_size 行；不勾选 = 整表一页。
     limit_on: bool,
-    /// 每页记录数（limit_on 时生效），默认照参考客户端的 1000。
+    /// 每页记录数（limit_on 时生效），默认照参考界面的 1000。
     limit_size: usize,
     /// 记录数就地编辑器（点数字进入，回车 / 失焦提交）。
     limit_input: Option<Entity<InputState>>,
@@ -1968,7 +1986,7 @@ impl Default for DesignCol {
     }
 }
 
-/// 索引里的一列。参考工具「索引 → 字段」浮层一行七格：
+/// 索引里的一列。参考界面「索引 → 字段」浮层一行七格：
 /// 名称 / 排序规则模式 / 排序规则 / 运算符类别模式 / 运算符类别 / 排序顺序 /
 /// Nulls 排序，这里一一对应；空串 = 用数据库默认（不写进 DDL）。
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -1988,7 +2006,7 @@ struct IndexField {
     nulls: String,
 }
 
-/// 类型的默认运算符类别：参考工具里 int8 行是 int8_ops、varchar 行是 text_ops。
+/// 类型的默认运算符类别：参考界面里 int8 行是 int8_ops、varchar 行是 text_ops。
 /// 只用来「按类型推默认值」和「跟默认值比，决定要不要写进 DDL」。
 fn index_default_opclass(ty: &str) -> &'static str {
     match ty.trim().to_ascii_lowercase().as_str() {
@@ -2111,7 +2129,7 @@ fn index_field_sql(is_mysql: bool, f: &IndexField, ty: &str) -> String {
     s
 }
 
-/// 索引方法的显示名（参考工具格子里是 B-Tree / Hash / GiST / GIN / BRIN / SP-GiST）。
+/// 索引方法的显示名（参考界面格子里是 B-Tree / Hash / GiST / GIN / BRIN / SP-GiST）。
 fn index_method_label(method: &str) -> String {
     let key = method.trim().to_ascii_lowercase().replace(['-', ' ', '_'], "");
     match key.as_str() {
@@ -2142,7 +2160,7 @@ fn index_method_sql(method: &str) -> Option<String> {
 }
 
 /// 设计表页签里的一个索引：名称 / 字段列表 / 方法 / 唯一 / 并发 / 注释，
-/// 外加参考工具底部那七行索引属性（PG 的存储参数，MySQL 不生成）。
+/// 外加参考界面底部那七行索引属性（PG 的存储参数，MySQL 不生成）。
 #[derive(Clone, Debug, PartialEq)]
 struct DesignIndex {
     name: String,
@@ -2154,14 +2172,14 @@ struct DesignIndex {
     /// 并发建索引（PG 的 CREATE INDEX CONCURRENTLY）
     concurrent: bool,
     comment: String,
-    // ── 索引属性（参考工具「索引」页底部那七行）──
+    // ── 索引属性（参考界面「索引」页底部那七行）──
     tablespace: String,
     fillfactor: String,
     buffering: String,
     fastupdate: String,
     pending_list_limit: String,
     pages_per_range: String,
-    /// 约束：参考工具里这一格带「…」选择器；mock 档只记录，不生成 DDL
+    /// 约束：参考界面里这一格带「…」选择器；mock 档只记录，不生成 DDL
     constraint: String,
 }
 
@@ -3672,7 +3690,7 @@ pub(crate) fn design_triggers_sql_at(
 }
 
 /// 外键行是否整行空白（种子空行：名称 / 字段 / 引用表 / 引用字段都没填）。
-/// 空白行不参与校验、不进 DDL、不计入「外键数」—— 参考工具的空行常驻在
+/// 空白行不参与校验、不进 DDL、不计入「外键数」—— 参考界面的空行常驻在
 /// 表格里等着输入，不算一条外键。
 fn design_fk_blank(fk: &DesignForeignKey) -> bool {
     fk.name.trim().is_empty()
@@ -3682,7 +3700,7 @@ fn design_fk_blank(fk: &DesignForeignKey) -> bool {
 }
 
 /// 索引行是否整行空白（种子空行：名称 / 字段 / 方法 / 注释 / 属性都没填）。
-/// 空白行不参与校验、不进 DDL、不计入「索引数」—— 参考工具的空行常驻在表格里
+/// 空白行不参与校验、不进 DDL、不计入「索引数」—— 参考界面的空行常驻在表格里
 /// 等着直接输入，不算一条索引。
 fn design_index_blank(idx: &DesignIndex) -> bool {
     idx.name.trim().is_empty()
@@ -3781,7 +3799,7 @@ fn design_param_modes(kind: mock::DbKind) -> &'static [&'static str] {
     }
 }
 
-/// 设计器浮层弹层要写回哪个字段（参考工具点格子右边的 … 弹出面板）。
+/// 设计器浮层弹层要写回哪个字段（参考界面点格子右边的 … 弹出面板）。
 #[derive(Clone, Copy, PartialEq)]
 enum PickTarget {
     /// 索引的「字段」：勾选列表面板（勾上的列即索引字段）
@@ -4232,7 +4250,7 @@ pub(crate) fn design_unique_sql(is_mysql: bool, uk: &DesignPair) -> Option<Strin
 
 /// 排除约束子句：`CONSTRAINT name EXCLUDE USING method (elements) WHERE (predicate)`
 /// （表内约束；方法为空时省 USING，谓词为空时省 WHERE）。
-/// 行存在就出形状（参考工具口径：新加的空行出 `EXCLUDE USING btree`）——
+/// 行存在就出形状（参考界面口径：新加的空行出 `EXCLUDE USING btree`）——
 /// 名字空着不带 CONSTRAINT 前缀、元素空着不带括号；完整性仍由
 /// design_excludes_validation 把守，预览不挡。
 fn design_exclude_sql(ex: &DesignExclude) -> Option<String> {
@@ -4294,7 +4312,7 @@ fn design_rule_sql(rule: &DesignRule, to: &str) -> Option<String> {
 }
 
 /// 视图 / 实体化视图的 DDL 预览：正文为空时直接收尾成 `AS;`
-/// （照参考客户端：新对象预览 `CREATE … "public"."Untitled"\nAS;`），
+/// （照参考界面：新对象预览 `CREATE … "public"."Untitled"\nAS;`），
 /// 否则 `CREATE <keyword> <name> AS <body>;`。
 pub fn design_view_sql(keyword: &str, name: &str, body: &str) -> String {
     let body = body.trim();
@@ -4552,7 +4570,7 @@ fn design_len_display(ty: &str, len: &str) -> String {
     known.to_string()
 }
 
-/// 索引「字段」浮层（参考工具点「字段」格弹出的小表格）的工作状态：
+/// 索引「字段」浮层（参考界面点「字段」格弹出的小表格）的工作状态：
 /// 草稿与选中行，确定才写回模型。
 #[derive(Clone)]
 struct IndexFieldsEditor {
@@ -4608,7 +4626,7 @@ pub(crate) struct DesignerState {
     pub(crate) fk_sel: usize,
     pub(crate) fk_cur: usize,
     pub(crate) baseline_fks: Vec<DesignForeignKey>,
-    /// 唯一键子页：常驻一行空白种子行（参考工具口径：空行等着输入，不算数据）。
+    /// 唯一键子页：常驻一行空白种子行（参考界面口径：空行等着输入，不算数据）。
     pub(crate) uniques: Vec<DesignPair>,
     pub(crate) unique_edits: Vec<[Option<Entity<InputState>>; 3]>,
     pub(crate) unique_sel: usize,
@@ -4727,7 +4745,7 @@ pub(crate) struct RoleState {
     /// 「成员」页工作集 / 基线（列出的是子角色）
     pub(crate) members: Vec<role_design::MemberRow>,
     pub(crate) members_base: Vec<role_design::MemberRow>,
-    /// 成员网格里选中的行（参考客户端整行铺蓝，只为键盘定位，不参与保存）
+    /// 成员网格里选中的行（参考界面整行铺蓝，只为键盘定位，不参与保存）
     pub(crate) member_sel: Option<usize>,
     /// SQL 预览子页：0 = 更改、1 = DDL（与表 / 视图设计器同一口径）
     pub(crate) sql_sub: usize,
@@ -4749,7 +4767,7 @@ const R_FLAG_REPLICATION: usize = 5;
 const R_FLAG_BYPASSRLS: usize = 6;
 
 /// 视图 / 实体化视图设计器「预览」的执行回执：底部消息 / 预览面板的数据。
-/// 口径对齐查询页（参考客户端行为：预览跑「定义」正文的 SELECT，不是 DDL）。
+/// 口径对齐查询页（参考界面行为：预览跑「定义」正文的 SELECT，不是 DDL）。
 #[derive(Clone)]
 pub(crate) struct DesignPreview {
     /// 单条语句的结果（列形 + 行 + 消息 + 当前格）
@@ -4771,7 +4789,7 @@ pub(crate) struct DesignPopup {
     pub(crate) items: Vec<(String, bool)>,
     /// 高亮行（↑↓ − 作用在它上面）
     pub(crate) sel: usize,
-    /// 检查约束的「表达式」面板：多行输入框（参考工具是一个空文本域 + 确定/取消）
+    /// 检查约束的「表达式」面板：多行输入框（参考界面是一个空文本域 + 确定/取消）
     pub(crate) expr: Option<Entity<TextareaState>>,
 }
 
@@ -4834,7 +4852,7 @@ fn design_validation(
         }
     }
     // 外键子页：四个必填项 + 名称不能重复；整行空白的种子行跳过
-    // （参考工具的空行常驻在表格里，不算待保存的数据）
+    // （参考界面的空行常驻在表格里，不算待保存的数据）
     for (i, fk) in fks.iter().enumerate() {
         if design_fk_blank(fk) {
             continue;
@@ -5557,7 +5575,7 @@ fn explain_target_stmts(text: &str, selected: &str, cursor: usize) -> Vec<String
 }
 
 /// 光标落在哪条语句（字节区间）：命中区间取该条；落在语句之间的空白 / 注释里
-/// 取距离最近的一条（参考客户端「运行 / 选择当前语句」的直觉）。「解释」与
+/// 取距离最近的一条（参考界面「运行 / 选择当前语句」的直觉）。「解释」与
 /// 「选择当前语句」共用这套判定，别两处各扫一遍。
 fn stmt_span_at(text: &str, cursor: usize) -> Option<std::ops::Range<usize>> {
     let mut search = 0usize;
@@ -5610,7 +5628,7 @@ fn mock_query_rows(stmt: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// 查询消息页 / 摘要页的耗时口径：秒 + 三位小数（参考客户端同为 `0.016s`）。
+/// 查询消息页 / 摘要页的耗时口径：秒 + 三位小数（参考界面同为 `0.016s`）。
 fn query_secs_text(ms: u128) -> String {
     format!("{:.3}s", ms as f64 / 1000.0)
 }
@@ -5711,7 +5729,7 @@ fn tab_schema(conn: &mock::Connection, t: &OpenTab) -> &'static str {
         .unwrap_or("")
 }
 
-/// 查询上下文的默认落点 (库下标, 模式下标)：库取连接配置里那一个（参考客户端
+/// 查询上下文的默认落点 (库下标, 模式下标)：库取连接配置里那一个（参考界面
 /// 新建查询就落在配置的库上），模式优先 public（PG 的清单按字母序，public
 /// 排在 information_schema 之后）。
 fn default_query_context(conn: &mock::Connection) -> (usize, usize) {
@@ -6831,14 +6849,14 @@ struct QueryOutcome {
     sel: Option<GridSel>,
     /// 这一页是「解释」出的执行计划（页签 / 状态栏文案与普通结果区分）
     explain: bool,
-    /// 固定结果：重新执行时保留、页签置最左并显示图钉（参考客户端「固定」）
+    /// 固定结果：重新执行时保留、页签置最左并显示图钉（参考界面「固定」）
     pinned: bool,
     /// 固定先后（0 = 未固定）；固定页签按此升序从左到右排
     pin_seq: u64,
 }
 
 /// 查询页顶部可展开的矩形下拉（连接 / 库 / 模式 / 运行 / AI）。
-/// 参考截图里的菜单是参考客户端平铺样式，gpui-component 的圆角浮层对不上，
+/// 参考截图里的菜单是参考界面平铺样式，gpui-component 的圆角浮层对不上，
 /// 这里自绘一层。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum QPopup {
@@ -6869,7 +6887,7 @@ struct QueryState {
     schema: usize,
     /// 页签序号：标题「查询-N」，全局递增不复用
     seq: usize,
-    /// 编辑过未保存 → 标题前「*」（参考客户端习惯）
+    /// 编辑过未保存 → 标题前「*」（参考界面习惯）
     dirty: bool,
     /// 编辑器里是否有选区：工具条「运行 / 解释」据此变成「…已选择的」
     has_selection: bool,
@@ -6897,7 +6915,7 @@ struct QueryState {
     stopping: bool,
     /// 本轮是被「停止」收场的（结果头要说明，不能冒充正常完成）
     stopped: bool,
-    /// 运行下拉里的「遇到错误时继续」；默认不勾，参考客户端口径：遇错即停
+    /// 运行下拉里的「遇到错误时继续」；默认不勾，参考界面口径：遇错即停
     continue_on_error: bool,
     /// 结果面板高度（可拖动调整，默认 Q_PANEL_H）
     panel_h: f32,
@@ -6957,7 +6975,7 @@ impl KvState {
     }
 }
 
-/// 代码段参数标绿：浅绿填充 + 细框，对应参考客户端里待填参数的绿底。
+/// 代码段参数标绿：浅绿填充 + 细框，对应参考界面里待填参数的绿底。
 fn ph_decorations(
     ranges: &[std::ops::Range<usize>],
     dark: bool,
@@ -6989,7 +7007,7 @@ fn ph_ranges(coll: &RangeDecorationCollection, cx: &App) -> Vec<std::ops::Range<
     ranges
 }
 
-/// 折叠外观浮层（参考客户端口径）：行号槽里常显的方形 +/−，以及折叠块首行
+/// 折叠外观浮层（参考界面口径）：行号槽里常显的方形 +/−，以及折叠块首行
 /// 末尾的方框「⋯」。gpui-base 自带的是只在悬停 / 当前行 / 已折叠时露出的
 /// 雪佛龙，而且 gpui-component 每帧把图标渲染器重置成内置样式，应用层改不动。
 /// 这层浮层盖在编辑器上但不带热区：滚轮 / 点击都穿透到底下的折叠按钮，
@@ -7248,10 +7266,10 @@ struct DaroApp {
     collapsed_groups: HashSet<String>,
     /// 星标与标签色按连接名记：删连接会让索引整体前移
     starred: HashSet<String>,
-    /// 展开态同样按名字记。参考客户端里「连着」和「展开着」是两件事：
+    /// 展开态同样按名字记。参考界面里「连着」和「展开着」是两件事：
     /// 选中另一条连接不会把已打开的连接收起来。
     expanded: HashSet<String>,
-    /// 打开过的库：参考客户端用绿色圆柱标出，没打开过的是灰色
+    /// 打开过的库：参考界面用绿色圆柱标出，没打开过的是灰色
     visited_dbs: HashSet<String>,
     /// 正在后台载入的目录节点（键 = `catalog::Pending::key`）。渲染只读缓存，
     /// 未命中的项进队列，由 [DaroApp::pump_catalog] 投后台跑，这里记着把对应
@@ -7278,6 +7296,12 @@ struct DaroApp {
     /// 起不了后台任务，所以先排在这里，帧尾和 catalog 一起投到后台线程
     /// （见 [Self::pump_table_ops]）。
     table_ops: Vec<TableOpJob>,
+    /// 对象页 Ctrl+C 复制的表：源上下文 + 表名。None = 剪贴板里没有表。
+    table_clip: Option<table_copy::TableClip>,
+    /// 已确认的粘贴批次（可能多张表）：帧尾和表操作一起投到后台。
+    table_copies: Vec<table_copy::CopyBatch>,
+    /// 状态栏左侧的一次性反馈（已复制 / 已粘贴 N 张表）；None = 显示默认统计。
+    pane_note: Option<String>,
     list_view: bool,
     show_info: bool,
     /// 左侧对象树是否显示（状态栏 / 查看菜单的窗格开关）
@@ -7343,7 +7367,7 @@ struct DaroApp {
     query: String,
     /// 树底筛选弹层（三道杠图标）的开关与勾选态。只影响树的显示，不落盘。
     tree_filter_open: bool,
-    /// 只列有打开页签的连接（参考客户端的「活动对象」）
+    /// 只列有打开页签的连接（参考界面的「活动对象」）
     tree_active_only: bool,
     tree_type_filters: [bool; TREE_TYPE_COUNT],
     /// 「只显示星标」开关（星形图标）
@@ -7425,7 +7449,7 @@ struct DaroApp {
     last_tool_click: Option<(usize, Instant)>,
     /// Ribbon「其它」下拉是否展开。
     other_menu_open: bool,
-    /// 没有打开任何数据库时对象面板显示的分类（参考客户端口径：Ribbon 分类
+    /// 没有打开任何数据库时对象面板显示的分类（参考界面口径：Ribbon 分类
     /// 按钮仍可点、面板跟着切分类，只是没有库上下文、动作条一律不可用）。
     /// 纯界面瞬时状态，不落盘。
     idle_cat: usize,
@@ -7493,7 +7517,7 @@ impl DaroApp {
             conns,
         ) = match store {
                 Some(s) => {
-                    // 参考客户端习惯：重启后连接一律是关闭态（要手动打开）。
+                    // 参考界面习惯：重启后连接一律是关闭态（要手动打开）。
                     // 子树展开态同样不恢复：连接是关着的，留着这些键等于下次
                     // 一打开连接就自动展开一堆库，看着像应用自己点的。
                     // （`expanded` / `visited_dbs` 仍写进存档，只是启动时不读）
@@ -7543,7 +7567,7 @@ impl DaroApp {
                     )
                 }
             };
-        // 树底部的搜索框（参考客户端的「搜索」框）。输入实时过滤树，
+        // 树底部的搜索框（参考界面的「搜索」框）。输入实时过滤树，
         // Change 里把文本镜像进 self.query 驱动重渲染。
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
         cx.subscribe(&search_input, |this, _, ev: &InputEvent, cx| {
@@ -7630,6 +7654,9 @@ impl DaroApp {
             ctx_blank: None,
             ctx_row_hit: false,
             table_ops: Vec::new(),
+            table_clip: None,
+            table_copies: Vec::new(),
+            pane_note: None,
             list_view,
             show_info,
             show_tree,
@@ -7924,7 +7951,7 @@ impl DaroApp {
         self.sel.conn().filter(|ix| *ix < self.conns.len())
     }
 
-    /// 选中节点的库名。没选中库层以下时返回 None（参考客户端此时对象区是空的）。
+    /// 选中节点的库名。没选中库层以下时返回 None（参考界面此时对象区是空的）。
     fn sel_db_name(&self) -> Option<&'static str> {
         let (c, d) = (self.sel_conn_ix()?, self.sel.db()?);
         catalog::databases(&self.conns[c]).get(d).copied()
@@ -8010,7 +8037,7 @@ impl DaroApp {
     }
 
     /// 面板里当前分类的对象清单；没选中库层以下、或连接还没打开时就是空
-    ///（参考客户端就是这样：没有打开的连接就看不到任何对象）。
+    ///（参考界面就是这样：没有打开的连接就看不到任何对象）。
     fn pane_objects(&self) -> &'static [&'static str] {
         let (Some(conn), Some(db), Some(cat)) = (
             self.sel_conn_ix().map(|ix| &self.conns[ix]),
@@ -8082,7 +8109,7 @@ impl DaroApp {
             backend::close_named(&old_name, old_kind);
             catalog::invalidate();
         }
-        // 编辑完连接是断开的，旧展开态直接丢掉，重连时按参考客户端重新展开
+        // 编辑完连接是断开的，旧展开态直接丢掉，重连时按参考界面重新展开
         self.expanded.remove(&old_name);
         self.expanded.remove(&node_key(&old_name, &old_db));
         if old_name != conn.name {
@@ -8285,7 +8312,7 @@ impl DaroApp {
                 backend::close_connection(conn);
                 catalog::invalidate();
             }
-            // 参考客户端断开时子树整棵收掉，重连后要重新展开
+            // 参考界面断开时子树整棵收掉，重连后要重新展开
             self.drop_tree_state(&name);
             // 关之前已经在跑的目录任务回来才会摘标记，这里先摘：否则连接行一直转圈
             self.drop_loading(&name);
@@ -8527,7 +8554,7 @@ impl DaroApp {
             .cloned()
     }
 
-    /// 「复制」：把对象名写进剪贴板。参考客户端这项复制的是对象本身（等着别处
+    /// 「复制」：把对象名写进剪贴板。参考界面这项复制的是对象本身（等着别处
     /// 「粘贴」），对象级粘贴还没做，先按老版 daro 的口径复制名字。
     fn copy_object_name(&self, act: Act, cx: &mut Context<Self>) {
         if let Some((_, _, _, _, name)) = self.object_ref(act) {
@@ -8564,6 +8591,316 @@ impl DaroApp {
         if !names.is_empty() {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(names.join("\n")));
         }
+    }
+
+    /// 对象页 Ctrl+C：真库里的表记住「源上下文 + 表名」，切到别的库 Ctrl+V
+    /// 就能粘出副本（Navicat 口径）；演示连接 / 非表分类返回 false，退回
+    /// 原来的「复制对象名」。
+    fn copy_tables(&mut self, acts: &[Act], cx: &mut Context<Self>) -> bool {
+        let mut ctx: Option<(usize, String, String)> = None;
+        let mut tables = Vec::new();
+        for &act in acts {
+            let Some((conn_name, db, schema, cat, table)) = self.object_ref(act) else {
+                return false;
+            };
+            if cat != 0 {
+                return false;
+            }
+            let Some(cix) = self.conns.iter().position(|c| c.name == conn_name) else {
+                return false;
+            };
+            if !table_copy_ready(&self.conns[cix]) {
+                return false;
+            }
+            match &ctx {
+                None => ctx = Some((cix, db, schema)),
+                Some((c, d, s)) if *c == cix && *d == db && *s == schema => {}
+                Some(_) => return false,
+            }
+            tables.push(table);
+        }
+        let Some((cix, db, schema)) = ctx else {
+            return false;
+        };
+        let conn = self.conns[cix].name.clone();
+        let count = tables.len();
+        self.table_clip = Some(table_copy::TableClip {
+            conn: conn.clone(),
+            db: db.clone(),
+            schema: schema.clone(),
+            tables: tables.clone(),
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(tables.join("\n")));
+        self.pane_note = Some(format!("已复制 {count} 张表，Ctrl+V 粘贴为副本"));
+        cx.notify();
+        true
+    }
+
+    /// 右键「复制表 ▸ 结构和数据 / 仅结构」：在当前库里另起一张，先问新表名
+    /// （预填 `_copy` 规划出来的落点）。
+    fn ask_capture_table(&mut self, act: Act, mode: table_copy::PasteMode, cx: &mut Context<Self>) {
+        let Some((conn_name, db, schema, cat, table)) = self.object_ref(act) else {
+            return;
+        };
+        if cat != 0 {
+            return;
+        }
+        let Some(conn) = self.conns.iter().find(|c| c.name == conn_name) else {
+            return;
+        };
+        if !table_copy_ready(conn) {
+            return;
+        }
+        let existing: Vec<String> = catalog::objects(conn, &db, &schema, 0)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let planned = table_copy::plan_names(
+            &existing,
+            std::slice::from_ref(&table),
+            table_copy::name_limit(conn.kind),
+        )
+        .into_iter()
+        .next()
+        .map(|(_, target)| target)
+        .unwrap_or_else(|| format!("{table}_copy"));
+        let dark = self.dark;
+        open_text_prompt(
+            cx.entity(),
+            dark,
+            "复制表",
+            "新表名",
+            planned,
+            move |app, name| {
+                let name = name.trim().to_string();
+                if name.is_empty() || name == table {
+                    return;
+                }
+                let Some(conn) = app.conns.iter().find(|c| c.name == conn_name) else {
+                    return;
+                };
+                let Some(src) = backend::Target::of(conn, &db, &schema) else {
+                    return;
+                };
+                let Some(dst) = backend::Target::of(conn, &db, &schema) else {
+                    return;
+                };
+                let src_path = (conn.kind == DbKind::SQLite).then(|| catalog::sqlite_path(conn));
+                app.queue_table_copy(table_copy::CopyBatch {
+                    src,
+                    dst,
+                    src_path,
+                    dst_conn: conn_name.clone(),
+                    dst_db: db.clone(),
+                    dst_schema: schema.clone(),
+                    items: vec![table_copy::CopyItem {
+                        source: table.clone(),
+                        target: name,
+                    }],
+                    mode,
+                });
+            },
+            cx,
+        );
+    }
+
+    /// 把规划好的表复制任务排进队列；帧尾由 [Self::pump_table_copies] 投到后台。
+    fn queue_table_copy(&mut self, batch: table_copy::CopyBatch) {
+        self.table_copies.push(batch);
+    }
+
+    /// Ctrl+V（对象页）：把 Ctrl+C 记住的表粘到当前库。目标连接没开 / 没有
+    /// 目标库 / 跨引擎时直接说明，不进确认框。
+    fn paste_tables(&mut self, cx: &mut Context<Self>) {
+        if self.sel.db().is_none() {
+            open_notice(
+                self.dark,
+                "粘贴表",
+                "请先在左侧选中目标数据库或表，再粘贴。".to_string(),
+                cx,
+            );
+            return;
+        }
+        let (c, d, s, _) = self.pane_path();
+        self.paste_tables_at(c, d, s, cx);
+    }
+
+    /// 指定落点的粘贴：分类 / 空白菜单右键时也走这一份。
+    fn paste_tables_at(&mut self, c: usize, d: usize, s: usize, cx: &mut Context<Self>) {
+        let Some(clip) = self.table_clip.clone() else {
+            return;
+        };
+        let Some(conn) = self.conns.get(c) else {
+            return;
+        };
+        if !conn.connected || !table_copy_ready(conn) {
+            open_notice(
+                self.dark,
+                "粘贴表",
+                format!("请先打开目标连接「{}」再粘贴。", conn.name),
+                cx,
+            );
+            return;
+        }
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
+            open_notice(
+                self.dark,
+                "粘贴表",
+                "请先在左侧选中目标数据库或表，再粘贴。".to_string(),
+                cx,
+            );
+            return;
+        };
+        let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
+        let Some(src_conn) = self.conns.iter().find(|x| x.name == clip.conn) else {
+            open_notice(
+                self.dark,
+                "粘贴表",
+                format!("复制表所在的连接「{}」已不存在。", clip.conn),
+                cx,
+            );
+            return;
+        };
+        if src_conn.kind != conn.kind {
+            open_notice(
+                self.dark,
+                "粘贴表",
+                format!(
+                    "暂不支持跨数据库类型粘贴表（{} → {}）。",
+                    src_conn.kind.label(),
+                    conn.kind.label()
+                ),
+                cx,
+            );
+            return;
+        }
+        let Some(src) = backend::Target::of(src_conn, &clip.db, &clip.schema) else {
+            return;
+        };
+        let Some(dst) = backend::Target::of(conn, db, schema) else {
+            return;
+        };
+
+        // 同库粘贴时源表本身就在目标清单里，先塞进去让规划器直接挑 `_copy`。
+        let same_ctx = clip.conn == conn.name && clip.db == db && clip.schema == schema;
+        let mut existing: Vec<String> = catalog::objects(conn, db, schema, 0)
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        if same_ctx {
+            existing.extend(clip.tables.iter().cloned());
+        }
+        let names = table_copy::plan_names(
+            &existing,
+            &clip.tables,
+            table_copy::name_limit(conn.kind),
+        );
+        let src_path =
+            (src_conn.kind == DbKind::SQLite).then(|| catalog::sqlite_path(src_conn));
+        let request = table_paste_dialog::PasteRequest {
+            source: ctx_label(&clip.conn, &clip.db, &clip.schema),
+            target: ctx_label(&conn.name, db, schema),
+            names: names.clone(),
+        };
+        let batch = table_copy::CopyBatch {
+            src,
+            dst,
+            src_path,
+            dst_conn: conn.name.clone(),
+            dst_db: db.to_string(),
+            dst_schema: schema.to_string(),
+            items: names
+                .into_iter()
+                .map(|(source, target)| table_copy::CopyItem { source, target })
+                .collect(),
+            mode: table_copy::PasteMode::Data,
+        };
+        let dark = self.dark;
+        table_paste_dialog::open_table_paste(
+            cx.entity(),
+            dark,
+            request,
+            move |app, mode| {
+                let mut batch = batch.clone();
+                batch.mode = mode;
+                app.queue_table_copy(batch);
+            },
+            cx,
+        );
+    }
+
+    /// 帧尾把粘贴批次投到后台：整批串行跑，回执一次落地（成功只改状态栏，
+    /// 失败列成一张清单，不按表弹一串窗口）。
+    fn pump_table_copies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let batches = std::mem::take(&mut self.table_copies);
+        if batches.is_empty() {
+            return;
+        }
+        let win = window.window_handle();
+        let entity = cx.entity().downgrade();
+        for batch in batches {
+            // 内存库只活在 UI 线程那条连接上，换线程打开是空库，只能同步跑
+            if !batch.dst.background_ok() {
+                let results = table_copy::run_batch(&batch);
+                self.table_copy_done(&batch, results, cx);
+                continue;
+            }
+            let work = batch.clone();
+            let info = batch;
+            let ent = entity.clone();
+            cx.spawn(async move |_, cx| {
+                let results = cx
+                    .background_executor()
+                    .spawn(async move { table_copy::run_batch(&work) })
+                    .await;
+                let _ = win.update(cx, |_, _, app| {
+                    let Some(ent) = ent.upgrade() else { return };
+                    ent.update(app, |a, cx| a.table_copy_done(&info, results, cx));
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// 粘贴回执：成功失效目标库目录，失败把逐表原因合成一个说明框。
+    fn table_copy_done(
+        &mut self,
+        batch: &table_copy::CopyBatch,
+        results: Vec<(String, Result<(), String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+        let failed: Vec<(String, String)> = results
+            .into_iter()
+            .filter_map(|(name, r)| r.err().map(|e| (name, e)))
+            .collect();
+        if ok > 0 {
+            catalog::invalidate_objects(
+                &batch.dst_conn,
+                &batch.dst_db,
+                &batch.dst_schema,
+                0,
+            );
+            if let Some(conn) = self.conns.iter().find(|c| c.name == batch.dst_conn) {
+                let _ = catalog::objects(conn, &batch.dst_db, &batch.dst_schema, 0);
+            }
+        }
+        self.pane_note = Some(format!("已粘贴创建 {ok} 张表"));
+        if !failed.is_empty() {
+            let mut lines = vec![format!("已粘贴创建 {ok} 张表，{} 张失败：", failed.len())];
+            for (name, err) in failed {
+                lines.push(format!("{name}：{err}"));
+            }
+            open_confirm(
+                cx.entity(),
+                self.dark,
+                "粘贴表",
+                lines.join("\n"),
+                |_| {},
+                cx,
+            );
+        }
+        cx.notify();
     }
 
     /// 顶栏「编辑 ▸ 全选」：对象面板当前分类的可见对象（含搜索过滤）全部进
@@ -8754,7 +9091,7 @@ impl DaroApp {
     }
 
     /// 建连回执落回界面：按名字定位（中途删掉这条连接时不能把回执落到别人身上），
-    /// 标记已连接并展开到库那一层（实测参考客户端：库不跟着展开）。
+    /// 标记已连接并展开到库那一层（实测参考界面：库不跟着展开）。
     fn apply_connected(&mut self, name: &str, cx: &mut Context<Self>) {
         let Some(ix) = self.conns.iter().position(|c| c.name == name) else {
             return;
@@ -8788,7 +9125,7 @@ impl DaroApp {
         self.active_tab = 0;
     }
 
-    /// 库节点：展开即「打开」这个库（参考客户端里图标会从灰转绿并一直保持）
+    /// 库节点：展开即「打开」这个库（参考界面里图标会从灰转绿并一直保持）
     fn toggle_db(&mut self, c: usize, d: usize, cx: &mut Context<Self>) {
         let Some(conn) = self.conns.get(c) else {
             return;
@@ -8822,7 +9159,7 @@ impl DaroApp {
         }
     }
 
-    /// 右键「打开数据库」：只展开并把库标记为已打开（参考客户端里图标转绿）
+    /// 右键「打开数据库」：只展开并把库标记为已打开（参考界面里图标转绿）
     fn open_db(&mut self, c: usize, d: usize, cx: &mut Context<Self>) {
         let Some(conn) = self.conns.get(c) else {
             return;
@@ -9090,7 +9427,7 @@ impl DaroApp {
         double
     }
 
-    /// 双击树节点 = 参考客户端的「打开表」：表 / 视图开数据网格页签，
+    /// 双击树节点 = 参考界面的「打开表」：表 / 视图开数据网格页签，
     /// 已打开过的直接切过去（不重复开）。
     fn open_object(&mut self, act: Act, cx: &mut Context<Self>) {
         // 打开对象 = 回到分类视图：工具面板让位给新页签
@@ -9595,7 +9932,7 @@ impl DaroApp {
         let did = self.next_did;
         self.next_did += 1;
         let empty = vec![DesignCol::default()];
-        // 实体化视图「高级」起始为空白（参考客户端新建时所有者 / 表空间都不预填）
+        // 实体化视图「高级」起始为空白（参考界面新建时所有者 / 表空间都不预填）
         let opts = if k == 2 {
             DesignOptions::default()
         } else {
@@ -10131,7 +10468,7 @@ impl DaroApp {
         cx.notify();
     }
 
-    /// 成员网格整行选中（只为参考客户端那个蓝底，不参与保存）。
+    /// 成员网格整行选中（只为参考界面那个蓝底，不参与保存）。
     fn role_pick_member(&mut self, role_id: u64, ix: usize, cx: &mut Context<Self>) {
         if let Some(rs) = Self::role_state_mut(&mut self.opened, role_id) {
             rs.member_sel = Some(ix);
@@ -10362,7 +10699,7 @@ impl DaroApp {
         cx.notify();
     }
 
-    /// 角色设计器整页：工具条（参考客户端这里只有「保存」）+ 子页签条 + 正文。
+    /// 角色设计器整页：工具条（参考界面这里只有「保存」）+ 子页签条 + 正文。
     fn role_page(&self, tab: &OpenTab, cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
         let (bg, border, soft, chrome, fg, muted, subtle, hover) = (
@@ -10503,7 +10840,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 「常规」页：照参考客户端 PG 角色设计器截图 1:1 的十四行。字段列自
+    /// 「常规」页：照参考界面 PG 角色设计器截图 1:1 的十四行。字段列自
     /// [R_FIELD_X] 起、行距 [R_ROW_H]、控件高 [R_FIELD_H]；宽栏 212（名称 /
     /// 两枚口令），窄栏 187（角色 ID / 密码加密 / 连接限制），过期日期 =
     /// 窄栏 + 5 间隔 + 一枚 20×20 的「…」（合计正好等于宽栏）。
@@ -11003,7 +11340,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 「成员属于」/「成员」页：参考客户端的定宽四列网格（图标 / 角色名 / 授予 /
+    /// 「成员属于」/「成员」页：参考界面的定宽四列网格（图标 / 角色名 / 授予 /
     /// 管理选项）。两页只差表头第一列的文字和取哪组行，所以共用一个渲染。
     /// 网格总宽按截图固定 590，右侧不铺满。
     fn role_members_tab(
@@ -11160,7 +11497,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 还没复刻的子页：权限。参考客户端的权限矩阵要按库逐个对象展开，
+    /// 还没复刻的子页：权限。参考界面的权限矩阵要按库逐个对象展开，
     /// 先给一句实话。
     fn role_placeholder_tab(&self, sub: usize, fg: Hsla, subtle: Hsla, bg: Hsla) -> AnyElement {
         let name = R_SUBTABS.get(sub).copied().unwrap_or("子页");
@@ -11175,7 +11512,7 @@ impl DaroApp {
                 div()
                     .text_size(px(14.))
                     .text_color(fg)
-                    .child(format!("「{name}」页还没有照参考客户端复刻。")),
+                    .child(format!("「{name}」页还没有实现。")),
             )
             .child(
                 div()
@@ -11207,8 +11544,8 @@ impl DaroApp {
     }
 
     /// 打开「新建查询」页签（Ribbon / 文件菜单 / 连接右键菜单共用入口）。
-    /// 查询页签不去重：每触发一次就是一张新页签（参考客户端同款）。
-    /// 运行上下文：优先树选中的连接，否则第一条连接；库取其第一个。
+    /// 查询页签不去重：每触发一次就是一张新页签（参考界面同款）。
+    /// 运行上下文：优先树选中的连接，否则第一条连接；库跟着树上最后激活的库走。
     fn open_query_tab(&mut self, conn_ix: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         self.tool_view = None;
         let ix = conn_ix
@@ -11230,9 +11567,29 @@ impl DaroApp {
         let seq = self.next_qseq;
         self.next_qid += 1;
         self.next_qseq += 1;
-        // 运行上下文默认落在连接配置的那个库（参考客户端口径）；模式默认 public
-        let (db0_ix, schema0_ix) = default_query_context(conn);
-        let db0 = catalog::databases(conn).get(db0_ix).copied().unwrap_or("");
+        // 运行上下文跟着左侧树最后激活的节点走（打开库、选中表都算）：新查询
+        // 就落在当前正在看的库 / 模式上。树上没有可用落点（未选中 / 选中项
+        // 属于别的连接 / 下标已过期）时退回连接配置的库，再退到库清单第一项。
+        let dbs = catalog::databases(conn);
+        let tree_db = self
+            .sel
+            .db()
+            .filter(|_| self.sel.conn() == Some(ix))
+            .filter(|d| *d < dbs.len());
+        let (db0_ix, schema0_ix) = match tree_db {
+            Some(d) => {
+                let schemas = catalog::schemas(conn, dbs[d]);
+                let s = self
+                    .sel
+                    .schema()
+                    .filter(|s| *s < schemas.len())
+                    .or_else(|| schemas.iter().position(|s| *s == "public"))
+                    .unwrap_or(0);
+                (d, s)
+            }
+            None => default_query_context(conn),
+        };
+        let db0 = dbs.get(db0_ix).copied().unwrap_or("");
         let schema0 = catalog::schemas(conn, db0).get(schema0_ix).copied().unwrap_or("");
         let comp_tables: Vec<String> = catalog::objects(conn, db0, schema0, 0)
             .iter()
@@ -11274,7 +11631,7 @@ impl DaroApp {
                 Some(sql_completion::provider_for(schema_snapshot.clone()));
             state
         });
-        // 编辑过未保存 → 页签标题前「*」（参考客户端习惯）。写回按 qid 定位页签。
+        // 编辑过未保存 → 页签标题前「*」（参考界面习惯）。写回按 qid 定位页签。
         cx.subscribe(&editor, move |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change)
                 && let Some(t) = this.opened.iter_mut().find(|t| t.qid == qid)
@@ -11286,7 +11643,7 @@ impl DaroApp {
             }
         })
         .detach();
-        // 工具条文案跟着选区走（参考客户端：有选区时「运行 / 解释」变成
+        // 工具条文案跟着选区走（参考界面：有选区时「运行 / 解释」变成
         // 「…已选择的」）。编辑器光标闪烁也会 notify，所以只在「空 ↔ 非空」
         // 翻转时重绘，击键 / 移动光标不重排整个页面。
         cx.observe(&editor, move |this, editor, cx| {
@@ -12494,7 +12851,7 @@ impl DaroApp {
     }
 
     /// 「表 > 查询表...」：新开查询页签，上下文落在表所在的库 / 模式，
-    /// 并带出 `SELECT * FROM 限定表名;`（参考客户端同款入口）。
+    /// 并带出 `SELECT * FROM 限定表名;`（参考界面同款入口）。
     fn query_active_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active_table() else { return };
         if tab.design || tab.query || tab.role || tab.cat != 0 {
@@ -12716,7 +13073,7 @@ impl DaroApp {
     }
 
     /// 编辑菜单「查找下一个」/ F3：跳到查找面板当前关键词的下一处并选中它。
-    /// 还没搜过（会话里没有命中）时不动，和参考客户端空查找按 F3 一致。
+    /// 还没搜过（会话里没有命中）时不动，和参考界面空查找按 F3 一致。
     fn query_find_next(&mut self, cx: &mut Context<Self>) {
         let Some(qid) = self.active_query_id() else {
             return;
@@ -13894,7 +14251,7 @@ impl DaroApp {
         q.last_ms = total_ms;
         q.finished_at = Some(local_timestamp());
         // 固定结果：上一轮固定的页签冻结保留，按固定先后排在新结果之前
-        // （参考客户端「Pin Query Result」：重新执行不清空已固定页签）。
+        // （参考界面「Pin Query Result」：重新执行不清空已固定页签）。
         let mut kept: Vec<QueryOutcome> = q.outcomes.iter().filter(|o| o.pinned).cloned().collect();
         kept.sort_by_key(|o| o.pin_seq);
         let kept_len = kept.len();
@@ -13908,7 +14265,7 @@ impl DaroApp {
                 None => 0,
             },
         };
-        // 消息日志整份重写（可拖选复制的只读文本）。口径对齐参考客户端：
+        // 消息日志整份重写（可拖选复制的只读文本）。口径对齐参考界面：
         // 语句原文 + `> 结果` + `> 查询时间: 0.016s`。
         let mut log = String::new();
         for o in outcomes.iter() {
@@ -14198,6 +14555,8 @@ impl DaroApp {
                 .map(|c| c.name.clone())
                 .collect(),
         });
+        // 复制了单元格，对象级剪贴板就让位：Navicat 里两者共用一个剪贴板
+        self.table_clip = None;
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
     }
 
@@ -14229,7 +14588,7 @@ impl DaroApp {
         );
     }
 
-    /// 固定 / 取消固定当前结果页签（参考客户端「Pin Query Result」）：
+    /// 固定 / 取消固定当前结果页签（参考界面「Pin Query Result」）：
     /// 固定后重新执行不清空、页签移到最左并显示图钉；再点解除。
     fn query_toggle_pin(&mut self, qid: u64, cx: &mut Context<Self>) {
         let Some(q) = Self::query_state_mut(&mut self.opened, qid) else {
@@ -14480,7 +14839,7 @@ impl DaroApp {
             if row < ds.index_edits.len() {
                 ds.index_edits.remove(row);
             }
-            // 空行常驻（参考工具口径）：删光后补一行空白种子行
+            // 空行常驻（参考界面口径）：删光后补一行空白种子行
             if ds.indexes.is_empty() {
                 ds.indexes.push(DesignIndex::default());
                 ds.index_edits.clear();
@@ -15542,7 +15901,7 @@ impl DaroApp {
         {
             ds.checks.remove(row);
             ds.check_edits.clear();
-            // 空行常驻（参考工具口径）：删光后补一行空白种子行
+            // 空行常驻（参考界面口径）：删光后补一行空白种子行
             if ds.checks.is_empty() {
                 ds.checks.push(DesignPair::default());
             }
@@ -15846,7 +16205,7 @@ impl DaroApp {
                 .child(footer)
                 .into_any_element();
         }
-        // 索引的「字段」面板：左起空白格（勾选框，表头无字）+ 名称 + 参考工具那六列
+        // 索引的「字段」面板：左起空白格（勾选框，表头无字）+ 名称 + 参考界面那六列
         // 列参数。勾上的列就是索引的字段，顺序按列表顺序（↑↓ 可调）。
         let is_index = popup.target == PickTarget::IndexCols;
         // 网格样式的勾选面板（外键 / 唯一键）：表头勾选列整格浅蓝 + 「名称」、
@@ -16347,7 +16706,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 子页底部的属性区（参考工具每个子页底下都有一组「标签 + 控件」）
+    /// 子页底部的属性区（参考界面每个子页底下都有一组「标签 + 控件」）
     fn design_prop_panel(
         &self,
         rows: Vec<(&'static str, AnyElement)>,
@@ -16383,7 +16742,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 属性区里「空着的输入框 / 下拉框」：参考工具未接元数据时就是这个样子
+    /// 属性区里「空着的输入框 / 下拉框」：参考界面未接元数据时就是这个样子
     fn design_prop_field(&self, w: f32, text: &str, dark: bool) -> AnyElement {
         let p = Palette::of(dark);
         let (fg, border) = (to_hsla(p.foreground), to_hsla(p.border));
@@ -16411,7 +16770,7 @@ impl DaroApp {
     }
 
     /// 下拉单元格：整个格子就是一个下拉按钮（左对齐的值 + 右缘小箭头），
-    /// 点格子里任何地方都弹菜单。参考工具这些列（索引方法 / 表空间 / 排序规则…）
+    /// 点格子里任何地方都弹菜单。参考界面这些列（索引方法 / 表空间 / 排序规则…）
     /// 都是「格子 + 小箭头」的形态。
     fn drop_cell(
         &self,
@@ -16464,7 +16823,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 索引子页（照参考工具 1:1）：索引表格（名称 / 字段 / 索引方法 / 唯一键 /
+    /// 索引子页（照参考界面 1:1）：索引表格（名称 / 字段 / 索引方法 / 唯一键 /
     /// 并发 / 注释）+ 底部的索引属性（表空间 … 约束）。点「字段」格弹七列浮层。
     fn indexes_tab(
         &self,
@@ -16761,7 +17120,7 @@ impl DaroApp {
                                     summary.join(", ")
                                 }),
                         )
-                        // 参考工具那一格右缘的「…」：点它/点格都开字段选择浮层
+                        // 参考界面那一格右缘的「…」：点它/点格都开字段选择浮层
                         .child(
                             div()
                                 .flex_none()
@@ -16776,7 +17135,7 @@ impl DaroApp {
                 )
                 .test_support()
                 .into_any_element();
-            // 索引方法：下拉（参考工具显示 B-Tree / Hash / GiST / GIN / BRIN / SP-GiST）
+            // 索引方法：下拉（参考界面显示 B-Tree / Hash / GiST / GIN / BRIN / SP-GiST）
             let me_m = me.clone();
             let method_cell = self.drop_cell(
                 format!("idx-method/{r}"),
@@ -16878,7 +17237,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 索引子页底部的索引属性（参考工具那七行：表空间 / 填充因子 / 正在缓冲 /
+    /// 索引子页底部的索引属性（参考界面那七行：表空间 / 填充因子 / 正在缓冲 /
     /// 快速更新 / 待处理列表限制 / 每范围页数 / 约束）。都是**选中索引**的属性。
     fn index_props(
         &self,
@@ -16899,13 +17258,13 @@ impl DaroApp {
         let me = cx.entity().clone();
         let idx = ds.indexes.get(sel);
         let edits = ds.index_edits.get(sel).cloned().unwrap_or_default();
-        // 缓冲类参数只对 GiST / GIN 有意义：参考工具在 B-Tree 索引下把这两格灰掉
+        // 缓冲类参数只对 GiST / GIN 有意义：参考界面在 B-Tree 索引下把这两格灰掉
         let method_key = idx
             .map(|i| i.method.trim().to_ascii_lowercase().replace(['-', ' ', '_'], ""))
             .unwrap_or_default();
         let bufferable = matches!(method_key.as_str(), "gist" | "gin");
 
-        // 空 / 禁用时的占位框：参考工具未接元数据时就是这个样子
+        // 空 / 禁用时的占位框：参考界面未接元数据时就是这个样子
         let flat = |text: &str| -> AnyElement {
             div()
                 .w(px(D_PROP_FIELD_W))
@@ -16959,7 +17318,7 @@ impl DaroApp {
                      prop: u8|
          -> AnyElement {
             let me = me.clone();
-            // 参考工具里下拉也是「带边框的格子」：和输入框同一个壳
+            // 参考界面里下拉也是「带边框的格子」：和输入框同一个壳
             div()
                 .w(px(D_PROP_FIELD_W))
                 .h(px(20.))
@@ -17356,7 +17715,7 @@ impl DaroApp {
         {
             ds.uniques.remove(row);
             ds.unique_edits.clear();
-            // 空行常驻（参考工具口径）：删光后补一行空白种子行
+            // 空行常驻（参考界面口径）：删光后补一行空白种子行
             if ds.uniques.is_empty() {
                 ds.uniques.push(DesignPair::default());
             }
@@ -17405,7 +17764,7 @@ impl DaroApp {
         {
             ds.fks.remove(row);
             ds.fk_edits.clear();
-            // 空行常驻（参考工具口径）：删光后补一行空白种子行
+            // 空行常驻（参考界面口径）：删光后补一行空白种子行
             if ds.fks.is_empty() {
                 ds.fks.push(DesignForeignKey::default());
             }
@@ -17416,7 +17775,7 @@ impl DaroApp {
         self.spawn_fk_editors(did, window, cx);
     }
 
-    /// 外键子页（照参考工具 1:1）：行首槽 + 八列表格（名称 / 字段 / 被引用的模式 /
+    /// 外键子页（照参考界面 1:1）：行首槽 + 八列表格（名称 / 字段 / 被引用的模式 /
     /// 被引用的表 / 被引用的字段 / 删除时 / 更新时 / 注释）+ 底部「符合全部 / 可延迟 /
     /// 延迟」属性区。锚点行只有行首槽铺浅蓝（参考图整行不铺色），当前格深蓝反白；
     /// 「字段 / 被引用的字段」点格弹列选择浮层，「删除时 / 更新时」整格下拉。
@@ -17824,7 +18183,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 唯一键子页（照参考工具 1:1）：三列表格（名称 / 字段 / 注释）+ 底部四行属性
+    /// 唯一键子页（照参考界面 1:1）：三列表格（名称 / 字段 / 注释）+ 底部四行属性
     /// （表空间 / 填充因子 / 可延迟 / 延迟）。当前格是白底 + 2px 强调边
     /// （参考图字段格聚焦态），字段格当前态带 … 浮层入口。
     fn uniques_tab(
@@ -18201,7 +18560,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 检查子页（照参考工具 1:1）：四列表格（名称 / 表达式 / 无继承 / 注释）。
+    /// 检查子页（照参考界面 1:1）：四列表格（名称 / 表达式 / 无继承 / 注释）。
     /// 当前格是白底 + 2px 强调边（参考图表达式格聚焦态），表达式格当前态带 …
     /// 浮层入口（独立小窗），无继承格点勾选框即切换。
     fn checks_tab(
@@ -18584,7 +18943,7 @@ impl DaroApp {
         {
             ds.excludes.remove(row);
             ds.exclude_edits.clear();
-            // 空行常驻（参考工具口径）：删光后补一行空白种子行
+            // 空行常驻（参考界面口径）：删光后补一行空白种子行
             if ds.excludes.is_empty() {
                 ds.excludes.push(DesignExclude::default());
             }
@@ -18595,7 +18954,7 @@ impl DaroApp {
         self.spawn_exclude_editors(did, window, cx);
     }
 
-    /// 排除子页（照参考工具 1:1）：四列表格（名称 / 索引方法 / 元素 / 注释）+
+    /// 排除子页（照参考界面 1:1）：四列表格（名称 / 索引方法 / 元素 / 注释）+
     /// 底部六行属性（表空间 / 填充因子 / 正在缓冲 / 位置 / 可延迟 / 延迟）。
     /// 当前格是白底 + 2px 强调边，元素格当前态带 … 浮层入口（七列草稿编辑）。
     fn excludes_tab(
@@ -18929,7 +19288,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 排除「元素」浮层（参考工具那块七列可编辑表格）：锚在元素格正下方，
+    /// 排除「元素」浮层（参考界面那块七列可编辑表格）：锚在元素格正下方，
     /// 草稿在 [DesignerState::exclude_editor]，确定才写回 elements。
     fn exclude_elements_panel(
         &self,
@@ -19394,7 +19753,7 @@ impl DaroApp {
     }
 
     /// 排除「位置」（谓词）小窗「确定」：写回 excludes[row].predicate
-    /// 排除「元素」浮层（参考工具那块七列可编辑表格）：锚在元素格正下方，
+    /// 排除「元素」浮层（参考界面那块七列可编辑表格）：锚在元素格正下方，
     /// 控件列自 230 起、下拉 342×20，属性行下留白（整块高 198，见常量出处）。
     /// 可延迟 / 延迟是显示占位：模型里还没这两项，接真库后随 pg_constraint 回填。
     fn fk_props(&self, dark: bool) -> AnyElement {
@@ -20629,7 +20988,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// 「规则」子页：一行 名称 / 事件 / 条件 / 动作 / 语句 / ×，仅 PostgreSQL 生成。
-    /// 规则子页（照参考工具 1:1）：五列表格（名称 / 事件 / 代替运行 / 启用 /
+    /// 规则子页（照参考界面 1:1）：五列表格（名称 / 事件 / 代替运行 / 启用 /
     /// 注释）。当前格是白底 + 2px 强调边，代替运行当前态带 ▼ 下拉（ALSO /
     /// INSTEAD），启用格点勾选框即切换；底部「位置（条件）/ 定义（语句）」两行
     /// 属性，… 打开独立小窗。
@@ -21000,7 +21359,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .into_any_element()
     }
 
-    /// 视图「规则」子页（参考客户端的 PostgreSQL 视图口径）：五列表格
+    /// 视图「规则」子页（参考界面的 PostgreSQL 视图口径）：五列表格
     /// 名称 / OID / 事件 / 代替运行 / 注释，OID 是库里的对象号、界面只读；
     /// 当前格整块铺实蓝（与表页规则格的「白底 + 强调边」不同，按视图截图取样）。
     /// 底部复用表页那套「位置（条件）/ 定义（语句）」属性区。
@@ -21328,7 +21687,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .into_any_element()
     }
 
-    /// 视图「高级」子页（参考客户端的 PostgreSQL 视图口径）：所有者 / 检查选项 /
+    /// 视图「高级」子页（参考界面的 PostgreSQL 视图口径）：所有者 / 检查选项 /
     /// 安全屏障三行。所有者是可输入组合框（与实体化视图「高级」同一套编辑器），
     /// 检查选项是固定三项下拉（LOCAL / CASCADED，空 = 不写），安全屏障是勾选框。
     fn view_advanced_tab(
@@ -21495,7 +21854,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .into_any_element()
     }
 
-    /// 视图「注释」子页：一枚铺满内容区的多行正文（参考客户端视图注释截图口径——
+    /// 视图「注释」子页：一枚铺满内容区的多行正文（参考界面视图注释截图口径——
     /// 没有标签、没有边框，光标离内容区左上角约 5~6 逻辑像素，滚动条就是它自己的）。
     fn view_comment_tab(&self, tab: &OpenTab, _cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
@@ -21882,11 +22241,11 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// 「触发器」子页：一行 名称 / 时机 / 事件 / 级 / 函数 / 主体 / ×。
-    /// 触发器子页（照参考工具 1:1）：十列表格（名称 / 给每个 / 触发 / 插入 /
+    /// 触发器子页（照参考界面 1:1）：十列表格（名称 / 给每个 / 触发 / 插入 /
     /// 更新 / 删除 / 截断 / 更新字段 / 启用 / 注释）。给每个与触发是下拉，
     /// 插入～截断是事件勾选格，更新字段当前态带 … 浮层（勾选列，确定写回
     /// update_fields），启用默认勾上；底部「常规」属性区（当 / 触发函数 / 参数）。
-    /// 整体超出窗格宽度，横向滚动（与参考工具同款裁切）。
+    /// 整体超出窗格宽度，横向滚动（与参考界面同款裁切）。
     fn triggers_tab(
         &self,
         did: u64,
@@ -22624,7 +22983,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .is_some_and(|n| n.is_empty());
         if unnamed_new {
             // 新建对象还没有名字：先弹「表名 / 视图名 / 函数名」输入框（独立窗口，
-            // 与参考客户端的确认框一致），取消 = 放弃这次保存，主窗口状态不动
+            // 与参考界面的确认框一致），取消 = 放弃这次保存，主窗口状态不动
             let cat = self
                 .opened
                 .iter()
@@ -22952,7 +23311,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         }
     }
 
-    /// 页签标题，照参考客户端的「对象 @库[.模式]（连接）」拼。
+    /// 页签标题，照参考界面的「对象 @库[.模式]（连接）」拼。
     fn tab_title(&self, t: &OpenTab) -> String {
         self.tab_title_named(t, None)
     }
@@ -23528,7 +23887,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         cx.notify();
     }
 
-    /// 齿轮：展开 / 收起「限制记录」设置条（参考客户端同款，按表设置）。
+    /// 齿轮：展开 / 收起「限制记录」设置条（参考界面同款，按表设置）。
     fn toggle_record_limit(&mut self, k: TabIdent, cx: &mut Context<Self>) {
         let Some(ix) = self.opened.iter().position(|t| same_tab(t, &k)) else {
             return;
@@ -23704,7 +24063,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// 双击格子进就地编辑：先提交还开着的上一格，用当前值预填编辑器并
-    /// 全选（参考客户端同款），回车 / 失焦提交（commit_cell_edit）、Esc 取消。
+    /// 全选（参考界面同款），回车 / 失焦提交（commit_cell_edit）、Esc 取消。
     fn start_cell_edit(
         &mut self,
         disp: usize,
@@ -23975,7 +24334,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// 导航条 −：删除当前格所在行。新增未应用的行直接移除；已有行从
-    /// 工作集移除，「应用」前 × 都能反悔（mock 档不做参考客户端的删除标记态）。
+    /// 工作集移除，「应用」前 × 都能反悔（mock 档不做参考界面的删除标记态）。
     fn grid_delete_row(&mut self, cx: &mut Context<Self>) {
         if self.active_tab == 0 {
             return;
@@ -24208,15 +24567,29 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         }
     }
 
-    /// Ctrl+C / 「编辑 ▸ 复制」的统一落点：0 号「对象」页复制选中对象名，
-    /// 其它页仍把网格选区拼成 TSV。
+    /// Ctrl+C / 「编辑 ▸ 复制」的统一落点：0 号「对象」页优先把选中的表
+    /// 记进对象级剪贴板，其余对象（视图 / 演示库）仍复制名字；其它页把
+    /// 网格选区拼成 TSV。
     fn edit_copy(&mut self, cx: &mut Context<Self>) {
         if self.active_tab == 0 {
-            self.copy_selected_objects(cx);
+            let acts = self.selected_object_acts();
+            if !self.copy_tables(&acts, cx) {
+                self.copy_selected_objects(cx);
+            }
         } else if self.query_grid_ready().is_some() {
             self.query_copy(cx);
         } else {
             self.grid_copy(cx);
+        }
+    }
+
+    /// Ctrl+V / 「编辑 ▸ 粘贴」的统一落点：0 号「对象」页粘贴表，其它页
+    /// 仍走网格粘贴。
+    fn edit_paste(&mut self, cx: &mut Context<Self>) {
+        if self.active_tab == 0 {
+            self.paste_tables(cx);
+        } else {
+            self.grid_paste(cx);
         }
     }
 
@@ -24281,6 +24654,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 .map(|&cix| t.cols.get(cix).map(|c| c.name.clone()).unwrap_or_default())
                 .collect(),
         });
+        // 复制了单元格，对象级剪贴板就让位：Navicat 里两者共用一个剪贴板
+        self.table_clip = None;
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
     }
 
@@ -24594,7 +24969,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// 右键按下：把当前格挪到这一格，菜单里的「复制 / 删除记录 / 设为…」
-    /// 才有着落。落在已有选区内时保留多选（参考客户端同款：右键不改块选）。
+    /// 才有着落。落在已有选区内时保留多选（参考界面同款：右键不改块选）。
     fn grid_cell_right_press(
         &mut self,
         disp: usize,
@@ -24678,7 +25053,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         cx.notify();
     }
 
-    /// 按住左键划过单元格：选区焦点跟手，当前格也挪到焦点 ——参考客户端里
+    /// 按住左键划过单元格：选区焦点跟手，当前格也挪到焦点 ——参考界面里
     /// 颜色最深的是最后选中的那格（松手处），不是按下的锚点。从行首槽拖进来
     /// 时仍按整行扩，别半路变成块选。
     fn grid_cell_hover(&mut self, disp: usize, dc: usize, cx: &mut Context<Self>) {
@@ -25045,7 +25420,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             // 退回基线 = 整段修改作废，撤销历史也一并清掉
             t.undo.clear();
             t.redo.clear();
-            // 筛选面板的应用态刻意保留：参考客户端的「刷新」= 重发带 WHERE 的
+            // 筛选面板的应用态刻意保留：参考界面的「刷新」= 重发带 WHERE 的
             // 取数，面板条件不清
             let total = visible_data_order(t).len();
             t.cell.0 = t.cell.0.min(total.saturating_sub(1));
@@ -25077,7 +25452,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         }
     }
 
-    /// Delete 键：清空选区里格子的内容（参考客户端口径：删除记录是 Ctrl+Delete，
+    /// Delete 键：清空选区里格子的内容（参考界面口径：删除记录是 Ctrl+Delete，
     /// 裸 Delete 只清内容，单选一格时不能把整行删掉）。树 / 对象面板 / 设计器
     /// 没有可清的内容，仅消费按键避免冒泡到系统产生蜂鸣。
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
@@ -25133,7 +25508,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         cx.notify();
     }
 
-    /// Ctrl+Delete：删除选区覆盖的记录（参考客户端的记录删除键位）。单个格 =
+    /// Ctrl+Delete：删除选区覆盖的记录（参考界面的记录删除键位）。单个格 =
     /// 它所在那行；块选 / 全选 = 范围内所有行。− 按钮与右键「删除记录」仍只删
     /// 当前格所在行。
     fn grid_delete_selected_rows(&mut self, cx: &mut Context<Self>) {
@@ -25266,7 +25641,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// 「查看 ▸ 结果」子菜单的数据：当前查询页的结果页签（顺序与标题同页签条，
-    /// 消息/摘要不在这里列，参考客户端这栏只列结果）+ 正在显示的页签号。
+    /// 消息/摘要不在这里列，参考界面这栏只列结果）+ 正在显示的页签号。
     /// 没有查询页签、或还没执行出结果时返回 None，菜单只剩置灰的说明行。
     fn active_result_panes(&self) -> Option<(Vec<(usize, String, bool)>, usize)> {
         let qid = self.active_query_id()?;
@@ -25303,7 +25678,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// 「查看 ▸ 信息窗格」选页签：常规 = 0、代码段 = 1，顺带把窗格打开
-    /// （参考客户端里选页签就等于要看见它）。
+    /// （参考界面里选页签就等于要看见它）。
     fn set_info_page(&mut self, page: u8, cx: &mut Context<DaroApp>) {
         self.info_page = page;
         self.snip_open = false;
@@ -25321,7 +25696,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     // ── 筛选面板（数据网格工具条漏斗） ────────────────────────────────
-    // 参考客户端实测：漏斗图标 + 4 态徽标（无徽标 / 已编辑铅笔 / 应用成功绿勾
+    // 参考界面实测：漏斗图标 + 4 态徽标（无徽标 / 已编辑铅笔 / 应用成功绿勾
     // / 应用失败红 ! / 带排序的排序线）；面板分「创建工具」与「文本」两模式，
     // 准则行 = ☑ 启用 + 列名下拉 + 算子下拉 + 值点击弹窗 + × 删除；组行 =
     // 「(」+ 缩进子行 + 「)」，× 整组删；连接词 "and"/"or" 在行间可点切换。
@@ -27488,7 +27863,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         Some(conn_tint_of(rgb, self.dark))
     }
 
-    /// 新建组后把连接挪进去：参考客户端的「管理组 > 新建组」就是一次搬移 + 建组
+    /// 新建组后把连接挪进去：参考界面的「管理组 > 新建组」就是一次搬移 + 建组
     /// 现有连接名（导入向导判重用）。
     fn conn_names(&self) -> Vec<String> {
         self.conns.iter().map(|c| c.name.clone()).collect()
@@ -27520,7 +27895,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     /// 导入一批连接（迁移自 Flutter `AppState` 的 `_uniqueNamed` 口径）：
     /// - 重名追加 " (2)"、" (3)"… 直到不重名；
     /// - 文件里出现、本地没有的分组顺带登记（即「分组不存在则重建」）；
-    /// - 导入的连接一律是未打开态，和参考客户端一致。
+    /// - 导入的连接一律是未打开态，和参考界面一致。
     fn import_connections(&mut self, items: Vec<ImportItem>) -> ImportOutcome {
         let mut outcome = ImportOutcome {
             imported: 0,
@@ -27698,7 +28073,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         Some((c, d))
     }
 
-    /// Ribbon 上的分类按钮：参考客户端里它切的是「当前库」的分类，
+    /// Ribbon 上的分类按钮：参考界面里它切的是「当前库」的分类，
     /// 选中还停在连接节点时会自动落到初始库并把路径展开出来。
     fn select_category(&mut self, cat: usize) {
         self.tool_view = None;
@@ -27948,7 +28323,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             to_hsla(p.hover),
         );
         let row_sel = to_hsla(p.selection);
-        // 按钮顺序照参考客户端：编辑 / 新建 / 删除，用户面板多一个权限管理员。
+        // 按钮顺序照参考界面：编辑 / 新建 / 删除，用户面板多一个权限管理员。
         let buttons: &[(&'static str, art::Glyph, u32, &'static str)] = match view {
             ToolView::Users => &[
                 ("tool-edit", art::Glyph::Asset("TB_User"), 0x3f8fbf, "编辑用户"),
@@ -27983,7 +28358,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         for (id, icon, tint, label) in buttons {
             let label = *label;
             let id = *id;
-            // 编辑 / 删除跟着选区亮灭（参考客户端同口径）：没选中行点了也没东西可改
+            // 编辑 / 删除跟着选区亮灭（参考界面同口径）：没选中行点了也没东西可改
             let enabled = !matches!(id, "tool-edit" | "tool-del") || self.tool_sel.is_some();
             let item = action_item(id, *icon, *tint, label, false, enabled, fg, hover, muted);
             let item = if enabled {
@@ -28025,7 +28400,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                     .when(selected, move |s| s.bg(row_sel))
                     .when(!selected, move |s| s.hover(move |s| s.bg(hover)))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        // 双击 = 参考客户端的进设计器；其它面板 / 引擎还没有对应
+                        // 双击 = 参考界面的进设计器；其它面板 / 引擎还没有对应
                         // 界面，单击只选中，不做第二件事。
                         let double = this.is_tool_double_click(ix);
                         this.tool_sel = Some(ix);
@@ -28092,7 +28467,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .into_any_element()
     }
 
-    /// Ribbon「其它」下拉：表空间 / 事件，顺序照参考客户端。
+    /// Ribbon「其它」下拉：表空间 / 事件，顺序照参考界面。
     fn other_popup(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
         v_flex()
@@ -28172,7 +28547,7 @@ fn tool_unsupported(view: ToolView) -> &'static str {
     }
 }
 
-/// 真连接的用户 / 表空间 / 事件清单 SQL。参考客户端只给 MySQL / MariaDB 事件；
+/// 真连接的用户 / 表空间 / 事件清单 SQL。参考界面只给 MySQL / MariaDB 事件；
 /// 用户清单 MySQL 查 `mysql.user`、PostgreSQL 查 `pg_roles`。
 fn tool_sql(view: ToolView, kind: DbKind, db: &str) -> Option<String> {
     match (view, kind) {
@@ -28309,6 +28684,10 @@ impl Render for DaroApp {
         // 右键菜单里确认过的表操作也在这一帧尾投出去（同一个时机、同一套回执）
         cx.defer_in(window, |this, window, cx| {
             this.pump_table_ops(window, cx)
+        });
+        // 粘贴表批次同样在帧尾起后台任务
+        cx.defer_in(window, |this, window, cx| {
+            this.pump_table_copies(window, cx)
         });
         let (bg, fg) = {
             let t = cx.theme();
@@ -28739,14 +29118,14 @@ impl DaroApp {
         let dark = self.dark;
         let (list_view, show_tree, show_info) = (self.list_view, self.show_tree, self.show_info);
         let open_menu = self.open_menu;
-        // 参考客户端口径：激活的页签是表（数据页）时，顶栏在「查看」与「格式」
+        // 参考界面口径：激活的页签是表（数据页）时，顶栏在「查看」与「格式」
         // 之间多出一个「表」菜单；查询页签则在同一位置换成「查询」菜单。
         // 设计 / 角色页签两个都不算。
         let show_table_menu = self
             .active_table()
             .is_some_and(|t| !t.design && !t.query && !t.role && t.cat == 0);
         let show_query_menu = self.active_query_id().is_some();
-        // 一个页签都没有＝参考客户端「刚打开」态：文件/编辑/查看换成树级条目。
+        // 一个页签都没有＝参考界面「刚打开」态：文件/编辑/查看换成树级条目。
         let ctx = if self.opened.is_empty() {
             BarCtx::Bare
         } else {
@@ -29093,7 +29472,7 @@ impl DaroApp {
                         ),
                 )
             })
-            // 筛选弹层挂在整块正文上：宽度和高度都照参考工具展开，
+            // 筛选弹层挂在整块正文上：宽度和高度都照参考界面展开，
             // 左侧起点跟着当前左栏宽度走。下面先垫一层透明背板接住外部点击。
             .when(self.tree_filter_open, |s| {
                 s.child(
@@ -29251,7 +29630,7 @@ impl DaroApp {
             selected: self.sel,
         };
 
-        // 搜索词非空 = 过滤态。参考客户端实测的语义：
+        // 搜索词非空 = 过滤态。参考界面实测的语义：
         //   命中的节点整棵按普通态渲染（内容不筛，展开键照旧）；
         //   未命中但子树里有命中 = 只当路径，展开到命中处；
         //   分类行（表 / 视图…）是结构行：父级显示时全留，没命中的折叠；
@@ -29424,38 +29803,38 @@ impl DaroApp {
         (rows, positions)
     }
 
-    /// 树顶的搜索条：输入即过滤。
-    /// 🔍 空态灰 / 有词蓝；右端的 ✕ 用 Input 自带 cleanable（空串时隐藏，同实测）。
+    /// 树顶的搜索条：输入即过滤。搜索框和树工具按钮同在顶行；
+    /// 有词时 🔍 让位，右端的 ✕ 用 Input 自带 cleanable（空串时隐藏，同实测）。
     fn search_bar(&self, ink: &TreeInk, cx: &mut Context<Self>) -> impl IntoElement {
         let border = to_hsla(self.pal().border_soft);
         let has_text = !self.query.is_empty();
         h_flex()
-            .h(px(32.))
-            .px(px(8.))
-            .gap(px(6.))
+            .h(px(30.))
+            .pl(px(2.))
+            .pr(px(4.))
+            .gap(px(4.))
             .items_center()
             .flex_shrink_0()
             .border_b_1()
             .border_color(border)
-            .child(
-                h_flex()
-                    .id("search-icon")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(input) = this.search_input.clone() {
-                            input.update(cx, |s, cx| s.focus(window, cx));
-                        }
-                    }))
-                    .child(art::icon(
-                        art::Glyph::Asset("BTN_SEARCH"),
-                        16.,
-                        if has_text {
-                            to_hsla(0x2f8fd8)
-                        } else {
-                            ink.muted
-                        },
-                    )),
-            )
+            .when(!has_text, |s| {
+                s.child(
+                    h_flex()
+                        .id("search-icon")
+                        .test_support()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(input) = this.search_input.clone() {
+                                input.update(cx, |s, cx| s.focus(window, cx));
+                            }
+                        }))
+                        .child(art::icon(
+                            art::Glyph::Asset("BTN_SEARCH"),
+                            16.,
+                            ink.muted,
+                        )),
+                )
+            })
             .when_some(self.search_input.clone(), |s, input| {
                 s.child(
                     div().flex_1().min_w_0().child(
@@ -29463,10 +29842,22 @@ impl DaroApp {
                             .h(px(24.))
                             .appearance(false)
                             .bordered(false)
-                            .cleanable(true),
+                            .cleanable(true)
+                            // 组件默认左右各留 10px、13px 字号，树里行距紧，各压一档
+                            .px(px(2.))
+                            .text_size(px(12.)),
                     ),
                 )
             })
+            .child(self.tree_tools(&ink, cx))
+    }
+
+    /// 树顶工具按钮组：筛选 / 星标 / 定位 / 折叠，跟在搜索框右端。
+    fn tree_tools(&self, ink: &TreeInk, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap(px(2.))
+            .items_center()
+            .flex_shrink_0()
             .child({
                 let hover = ink.hover;
                 let active = self.tree_filter_active();
@@ -29484,7 +29875,7 @@ impl DaroApp {
                         this.tree_filter_open = !this.tree_filter_open;
                         cx.notify();
                     }))
-                    // 参考客户端树底的筛选按钮是三道横杠（FILTER），不是漏斗
+                    // 参考界面树底的筛选按钮是三道横杠（FILTER），不是漏斗
                     .child(art::icon(
                         art::Glyph::Asset("FILTER"),
                         16.,
@@ -29531,7 +29922,7 @@ impl DaroApp {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.locate_active_conn(window, cx)
                     }))
-                    // 参考客户端树底的定位按钮：圆圈 + 十字刻度 + 中心点
+                    // 参考界面树底的定位按钮：圆圈 + 十字刻度 + 中心点
                     .child(art::icon(
                         art::Glyph::Asset("REVEAL_ACTIVE_TAB"),
                         16.,
@@ -29550,7 +29941,7 @@ impl DaroApp {
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
                     .on_click(cx.listener(|this, _, _, cx| this.collapse_tree(cx)))
-                    // 参考客户端树底的折叠按钮：上下双箭头
+                    // 参考界面树底的折叠按钮：上下双箭头
                     .child(art::icon(
                         art::Glyph::Asset("COLLAPSE_ALL"),
                         16.,
@@ -29559,7 +29950,7 @@ impl DaroApp {
             })
     }
 
-    /// 筛选弹层：参考客户端树底三道杠按钮弹出的下拉，锚在树底工具条右上方的小浮层，
+    /// 筛选弹层：参考界面树底三道杠按钮弹出的下拉，锚在树底工具条右上方的小浮层，
     /// 只列 daro 已接入的连接类型。
     fn tree_filter_popup(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
@@ -30077,9 +30468,9 @@ impl DaroApp {
     }
 
     /// 一条连接连同它下面所有层的行（普通态）。
-    /// 参考客户端实测的固定层级：连接 → 数据库 →（模式）→ 分类 → 对象。
+    /// 参考界面实测的固定层级：连接 → 数据库 →（模式）→ 分类 → 对象。
     /// `base` 是连接行自己的缩进：组内连接比分组深一级（30），
-    /// 未分组连接与分组同级（17.5）——参考客户端里分组只是根下的一个文件夹节点，
+    /// 未分组连接与分组同级（17.5）——参考界面里分组只是根下的一个文件夹节点，
     /// 以下各层全部相对 `base` 递进 12.5。
     fn conn_rows(
         &self,
@@ -30091,14 +30482,14 @@ impl DaroApp {
     ) -> Vec<AnyElement> {
         let conn = &self.conns[ix];
         let expanded = self.is_expanded(ix);
-        // 参考客户端：未连接的连接没有三角（子树还没加载，没东西可展开）
+        // 参考界面：未连接的连接没有三角（子树还没加载，没东西可展开）
         let caret_icon = if conn.connected {
             Some(caret(expanded))
         } else {
             None
         };
         // 选了颜色标签的连接：连接行饱和档，其下整棵子树铺淡档，
-        // 一直连到下一个连接为止（参考客户端的整块染色）。
+        // 一直连到下一个连接为止（参考界面的整块染色）。
         let tint = self.conn_tint_for(&conn.name);
         let head_ink = tint.map_or(*ink, |t| ink.tinted_header(t));
         let body_ink = tint.map_or(*ink, |t| ink.tinted_rows(t));
@@ -30582,7 +30973,7 @@ impl DaroApp {
         .into_any_element()
     }
 
-    /// 分组下的成员行（索引名 / 外键名…）。参考客户端这一层没有图标，留出同宽空位。
+    /// 分组下的成员行（索引名 / 外键名…）。参考界面这一层没有图标，留出同宽空位。
     #[allow(clippy::too_many_arguments)]
     fn sub_row_elem(
         &self,
@@ -30751,7 +31142,7 @@ impl DaroApp {
                 .min_h_0()
                 .overflow_y_scrollbar()
                 // 菜单挂在滚动容器上（不是内容那一层）：行数不满一屏时，下面的
-                // 空白也得能右键出分类菜单，和参考客户端一致。
+                // 空白也得能右键出分类菜单，和参考界面一致。
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _, _, _| this.blank_for_context(BlankPane::Objects)),
@@ -30769,10 +31160,9 @@ impl DaroApp {
             .child(panel)
     }
 
-    /// 页签图标：查询 / 角色 / 设计 / 数据各按对象类型取参考客户端位图。
-    /// 设计页签用对应对象的 `*_Design` 图标（铅笔）：这套位图参考客户端 18 只给
-    /// 表 / 视图 / 实体化视图三档，函数没有设计档，仍用函数图标；角色页签走
-    /// 用户对象图标（`FB_User` 是功能区大图标，不进页签）。
+    /// 页签图标：查询 / 角色 / 设计 / 数据各按对象类型取字形。
+    /// 设计页签用铅笔图标（表 / 视图 / 实体化视图三档），函数没有设计档，
+    /// 仍用函数图标；角色页签走用户对象图标（`FB_User` 是功能区大图标，不进页签）。
     fn tab_glyph(t: &OpenTab) -> art::Glyph {
         if t.notes.is_some() {
             art::Glyph::Zed(ZedIcon::File)
@@ -30812,7 +31202,7 @@ impl DaroApp {
             return format!("{} ({})", t.db, t.conn_name);
         }
         if t.query {
-            // 参考客户端查询页签：「查询-N」，编辑过未保存前缀「*」
+            // 参考界面查询页签：「查询-N」，编辑过未保存前缀「*」
             let star = if t.qstate.as_ref().is_some_and(|q| q.dirty) { "*" } else { "" };
             let seq = t.qstate.as_ref().map(|q| q.seq).unwrap_or(0);
             return format!("{star}查询-{seq}");
@@ -30842,7 +31232,7 @@ impl DaroApp {
         };
         if t.design {
             match t.dstate.as_ref().and_then(|d| d.new_name.as_deref()) {
-                // 新建实体化视图照参考客户端显示「无标题 @库.模式（连接）」
+                // 新建实体化视图照参考界面显示「无标题 @库.模式（连接）」
                 Some("") if t.cat == 2 => {
                     return format!("{star}{}", self.tab_title_named(t, Some("无标题")));
                 }
@@ -30860,7 +31250,7 @@ impl DaroApp {
     }
 
     /// 中部的页签条：0 号「对象」页常驻，双击树节点追加数据页签。
-    /// 活动页签铺 accent 淡底（参考客户端实测 #d7cdff，从这里按 accent 派生）。
+    /// 活动页签铺 accent 淡底（参考界面实测 #d7cdff，从这里按 accent 派生）。
     /// 旧单栏页签条（分栏版在 [dock::DaroApp::pane_tab_bar]）。
     #[allow(dead_code)]
     fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -30872,7 +31262,7 @@ impl DaroApp {
             to_hsla(p.subtle_foreground),
             p.accent,
         );
-        // 参考客户端取样：页签条 #f0f0f0、活动页签纯白并压住下边线、非活动页签同条底
+        // 参考界面取样：页签条 #f0f0f0、活动页签纯白并压住下边线、非活动页签同条底
         let strip = to_hsla(p.chrome);
         let active_bg = to_hsla(p.background);
         let tab_line = to_hsla(p.border);
@@ -31438,7 +31828,7 @@ impl DaroApp {
     }
 
     /// 「打开表」的数据页：工具条 + 双行表头的网格 + 底部记录导航条，
-    /// 布局与密度照参考客户端实测（行高 17.5、表头 40、列宽数值）。
+    /// 布局与密度照参考界面实测（行高 17.5、表头 40、列宽数值）。
     fn table_page(&self, t: &OpenTab, cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
         let (bg, border, fg, muted, subtle, accent, selection) = (
@@ -31451,13 +31841,13 @@ impl DaroApp {
             to_hsla(p.selection),
         );
         let hover = to_hsla(p.hover);
-        // 数据页配色照参考客户端取样：表头白底、当前列两行各铺一档浅蓝、
+        // 数据页配色照参考界面取样：表头白底、当前列两行各铺一档浅蓝、
         // 选中行 #cde4f6 一档、当前格深蓝反白、竖向分隔线比外框浅一档。
         // 表头 / 页码框的「纸底」：亮色主题就是纯白，暗色跟内容底同色
         let paper = to_hsla(p.background);
         // 明色主题往白里调（≈#afd4f1），暗色主题往底色调（深蓝格），否则白字压浅蓝看不见
         let head_cur = to_hsla(blend(accent, p.background, 0.74));
-        // 选区覆盖的列头 / 行槽再浅一档（参考客户端实机取样 #d9ebf9），
+        // 选区覆盖的列头 / 行槽再浅一档（参考界面实机取样 #d9ebf9），
         // 当前列 / 当前行仍用 head_cur 压深
         let head_sel = to_hsla(blend(accent, p.background, 0.86));
         // 类型行照 DBeaver 实测：钢蓝笔画，选中列浅蓝底上也同色；暗色提亮一档
@@ -31468,18 +31858,18 @@ impl DaroApp {
         } else {
             accent
         });
-        // 多选区块：参考参考客户端实机取样 #4da0e3，整块实心 + 白字；
+        // 多选区块：参考参考界面实机取样 #4da0e3，整块实心 + 白字；
         // 暗色压深一档，白字不刺眼
         let sel_cell = to_hsla(if self.dark {
             blend(accent, 0x000000, 0.28)
         } else {
             0x4da0e3
         });
-        // 分隔线照参考客户端暗色实机取样：竖线 #595a5a、横线 #a6a6a6（暗底上
+        // 分隔线照参考界面暗色实机取样：竖线 #595a5a、横线 #a6a6a6（暗底上
         // 横线反而更亮）；亮色主题两者同为 #dcdcdc，比外框深一档。
         let line = to_hsla(if self.dark { 0x595a5a } else { 0xdcdcdc });
         let row_line = to_hsla(if self.dark { 0xa6a6a6 } else { 0xdcdcdc });
-        // 待应用状态：改动过的格铺淡琥珀、新增行铺淡绿。参考客户端只靠行头
+        // 待应用状态：改动过的格铺淡琥珀、新增行铺淡绿。参考界面只靠行头
         // * 区分新增；这里把「还没应用的改动」显式标出来（应用后消失）。
         let dirty_cell = to_hsla(if self.dark {
             blend(p.background, 0xffc857, 0.16)
@@ -31493,9 +31883,9 @@ impl DaroApp {
         });
 
         // 工作集（可编辑）行数 = 筛选后的已有数据 + 新增未应用；排序只作用于
-        // data（应用面板多键优先，否则表头单键），新增行永远贴在尾部（参考客户端同款）
+        // data（应用面板多键优先，否则表头单键），新增行永远贴在尾部（参考界面同款）
         // 视图页（cat != 0）：表头只有列名一行（视图没有声明类型），
-        // 工具条也没有「导入」（参考工具实测，见 DETAILS.md「数据页 1:1」）
+        // 工具条也没有「导入」（参考界面实测，见 DETAILS.md「数据页 1:1」）
         let is_view = t.cat != 0;
         let order = visible_data_order(t);
         let rows = order.len() + t.inserted.len();
@@ -31524,7 +31914,7 @@ impl DaroApp {
         });
         let cols = &t.cols;
         // 列宽按「表头名 / 类型 / 该列最长的值」自适应，再夹到 [56, 320]：
-        // 参考工具里 parent_id 这类列不会被截成 parent…，长 id 也放得下。
+        // 参考界面里 parent_id 这类列不会被截成 parent…，长 id 也放得下。
         // 只采样前 T_COL_W_SCAN 行：远程一页 1000 行，逐行量宽每帧都要
         // 跑满整页；采样后宽度也不随翻页抖动。
         let col_w = grid_auto_col_widths(t);
@@ -31606,7 +31996,7 @@ impl DaroApp {
             local_rows,
         );
 
-        // ── 工具条：图标 + 文字（参考客户端数据页；企业版项入口全通，点击弹「敬请期待」）──
+        // ── 工具条：图标 + 文字（参考界面数据页；企业版项入口全通，点击弹「敬请期待」）──
         let tbtn = |id: &'static str, glyph: art::Glyph, label: &'static str, enabled: bool| {
             h_flex()
                 .id(rid(&format!("tp/{id}")))
@@ -31859,7 +32249,7 @@ impl DaroApp {
                                     to_hsla(accent),
                                 )))
                             })
-                            // 悬停列的右缘「…」：排序 / 筛选快捷菜单（参考工具同款）
+                            // 悬停列的右缘「…」：排序 / 筛选快捷菜单（参考界面同款）
                             .when(hovered, |s| {
                                 let me = me.clone();
                                 let me_open = me.clone();
@@ -32053,7 +32443,7 @@ impl DaroApp {
                     .when(!row_tint, move |s| s.hover(move |s| s.bg(hover)))
                     .border_b_1()
                     .border_color(row_line)
-                    // 行首槽：选中行铺表头同款浅蓝 + 左端 3px 强调条（参考客户端没有行号）；
+                    // 行首槽：选中行铺表头同款浅蓝 + 左端 3px 强调条（参考界面没有行号）；
                     // 点它选中整行，当前列保持不变
                     .child(
                         div()
@@ -32272,7 +32662,7 @@ impl DaroApp {
                 s.child(div().flex_none().h(px((local_rows - last_row) as f32 * T_ROW_H)))
             })
             // 空表占位行：没有数据也画一行灰色「(N/A)」，行首槽与当前格按
-            // 选中样式铺色，参考工具同款。占位行可直接点选；双击某格 =
+            // 选中样式铺色，参考界面同款。占位行可直接点选；双击某格 =
             // 先补一条待新增行再就地编辑，等于替用户点了「+」（始终为空
             // 的话提交 / Esc 时收回该行）。取数中的页签不画，避免闪一行
             // 假数据。
@@ -32441,7 +32831,7 @@ impl DaroApp {
             let ghost = |id: &'static str, glyph: art::Glyph| {
                 tool_icon(rid(&format!("nav/{id}")), glyph, subtle, hover, false)
             };
-            // 记录编辑组（参考客户端导航条左组）：+ 新增 / − 删除恒可用；
+            // 记录编辑组（参考界面导航条左组）：+ 新增 / − 删除恒可用；
             // ✓ 应用 / × 撤销只在工作集有变化时可用；刷新 = 重新取数（= 撤销）。
             // 图标统一用 Zed 线稿：与右侧翻页箭头同size同色，禁用态压到 subtle。
             let edit_btn = |id: &'static str, glyph: ZedIcon, enabled: bool| {
@@ -32614,7 +33004,7 @@ impl DaroApp {
                 .child(art::icon(art::Glyph::Asset("TB_Tools"), 13., muted))
                 .test_support();
 
-            // 数据视图切换（参考客户端数据页右下角两枚）：网格视图恒选中；
+            // 数据视图切换（参考界面数据页右下角两枚）：网格视图恒选中；
             // 表单视图在 Lite 是企业版功能，入口保留、点击弹「敬请期待」。
             let (grid_glyph, form_glyph) = if self.dark {
                 ("GLYPH_GRIDVIEW_DARK", "GLYPH_FORMVIEW_DARK")
@@ -32961,7 +33351,7 @@ impl DaroApp {
         let pk_ord =
             |r: usize| ds.cols.iter().take(r + 1).filter(|c| c.pk).count();
 
-        // 工具栏按钮：图标 + 文字（参考工具是「保存 | 添加字段 删除字段 | 主键 ▾」）
+        // 工具栏按钮：图标 + 文字（参考界面是「保存 | 添加字段 删除字段 | 主键 ▾」）
         let tbtn = |id: &'static str,
                     icon: AnyElement,
                     label: &'static str,
@@ -33020,7 +33410,7 @@ impl DaroApp {
                 })
         };
 
-        // 企业版「询问 AI」：参考客户端每个设计器子页工具条末尾都挂着它，
+        // 企业版「询问 AI」：参考界面每个设计器子页工具条末尾都挂着它，
         // 这里入口全通，点击弹「敬请期待」。
         let ai_ent = |cx: &mut Context<Self>| {
             h_flex()
@@ -33041,7 +33431,7 @@ impl DaroApp {
                 .test_support()
         };
 
-        // 工具栏按子页分流：参考工具「索引」页是「保存 | 添加索引 删除索引」，
+        // 工具栏按子页分流：参考界面「索引」页是「保存 | 添加索引 删除索引」，
         // 「外键」页是「保存 | 添加外键 删除外键」，字段页是
         // 「保存 | 添加字段 删除字段 | 主键 ▾」。AI 项按用户要求不放。
         let toolbar = if ds.sub == 2 {
@@ -34005,7 +34395,7 @@ impl DaroApp {
             .child(props)
             .into_any_element();
 
-        // ── SQL 预览页（参考工具 cameras 屏口径）────────────────
+        // ── SQL 预览页（参考界面 cameras 屏口径）────────────────
         // 「更改」子页 = 增量脚本（ALTER … ADD/DROP + CREATE/DROP INDEX），
         //   末尾固定带触发器 / 规则的生成段，右上角复制按钮；
         // 「DDL」子页 = 「之前：/之后：」并排行号对比，改动行整行铺绿底。
@@ -34355,10 +34745,10 @@ impl DaroApp {
         } else {
             None
         };
-        // 新建页签还没落名字，保存要能点开命名框（参考客户端同款）
+        // 新建页签还没落名字，保存要能点开命名框（参考界面同款）
         let can_save = (dirty || ds.new_name.is_some()) && invalid.is_none();
 
-        // 工具栏按钮（参考客户端视图设计器口径：图标 + 文字，同查询页工具条密度）
+        // 工具栏按钮（参考界面视图设计器口径：图标 + 文字，同查询页工具条密度）
         let dbtn = |id: &'static str,
                     glyph: art::Glyph,
                     label: &'static str,
@@ -34624,7 +35014,7 @@ impl DaroApp {
 
     /// 视图 / 实体化视图设计器的「预览」/「解释」：跑「定义」正文的 SELECT
     /// （explain = true 时改跑它的执行计划），结果落到底部消息 / 预览面板
-    /// （参考客户端口径：预览执行正文本身，不是 DDL）。
+    /// （参考界面口径：预览执行正文本身，不是 DDL）。
     fn design_preview(
         &mut self,
         did: u64,
@@ -34748,7 +35138,7 @@ impl DaroApp {
         cx.notify();
     }
 
-    /// 点预览网格的格子：整行铺当前行色（参考客户端预览口径：灰底，不做反白）。
+    /// 点预览网格的格子：整行铺当前行色（参考界面预览口径：灰底，不做反白）。
     fn design_pick_cell(&mut self, did: u64, r: usize, c: usize, cx: &mut Context<Self>) {
         if let Some(ds) = self
             .opened
@@ -34834,7 +35224,7 @@ impl DaroApp {
                 )
                 .into_any_element()
         } else if is_plan && dp.outcome.columns.len() <= 1 {
-            // PostgreSQL 的计划是一列文本行：参考客户端原样铺在页签里，不套网格表头
+            // PostgreSQL 的计划是一列文本行：参考界面原样铺在页签里，不套网格表头
             // （SQLite 传统 EXPLAIN / MySQL EXPLAIN 是多列表格，仍走下面的网格）
             let text = dp
                 .outcome
@@ -34875,7 +35265,7 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 预览结果网格：列名单行表头 + 斑马纹行 + 灰色当前行（取样参考客户端
+    /// 预览结果网格：列名单行表头 + 斑马纹行 + 灰色当前行（取样参考界面
     /// 视图预览：选中行浅灰铺满、行首槽压一块深灰，不做深蓝反白）。
     fn design_preview_grid(
         &self,
@@ -35472,7 +35862,7 @@ impl DaroApp {
     }
 
     /// 实体化视图「高级」子页：所有者 / 表空间 / 填充因子 / 配备数据
-    /// （版式照参考客户端：左列标签宽约 250，字段 372×24，行距 36）。
+    /// （版式照参考界面：左列标签宽约 250，字段 372×24，行距 36）。
     fn matview_advanced_tab(&self, tab: &OpenTab, cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
         let (bg, fg, muted) = (
@@ -35508,7 +35898,7 @@ impl DaroApp {
                 None => div().w(px(372.)).h(px(24.)).into_any_element(),
             }
         };
-        // 普通输入框：只描边、不带下拉箭头（填充因子照参考客户端原样）
+        // 普通输入框：只描边、不带下拉箭头（填充因子照参考界面原样）
         let plain = |state: Option<Entity<InputState>>| -> AnyElement {
             match state {
                 Some(state) => div()
@@ -35621,7 +36011,7 @@ impl DaroApp {
     }
 
     /// 设计器的 SQL 预览页：视图 / 实体化视图 / 函数按类型分别生成 DDL，
-    /// 页内再分「更改 | DDL」两子页（照参考客户端，默认「更改」）。
+    /// 页内再分「更改 | DDL」两子页（照参考界面，默认「更改」）。
     fn designer_sql_preview(&self, tab: &OpenTab, cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
         let fg = to_hsla(p.foreground);
@@ -35636,7 +36026,7 @@ impl DaroApp {
             .find(|c| c.name == tab.conn_name)
             .cloned()
             .unwrap_or_else(|| EMPTY_CONN.clone());
-        // 新建对象还没进目录：保存时输入的名字优先；未命名照参考客户端出 Untitled
+        // 新建对象还没进目录：保存时输入的名字优先；未命名照参考界面出 Untitled
         let obj_name = ds
             .new_name
             .as_ref()
@@ -35751,7 +36141,7 @@ impl DaroApp {
             .child(subtab(1, "DDL", ds.sql_sub == 1));
 
         // 两子页各自有正文：「DDL」铺满高亮脚本，「更改」只放增量语句——
-        // 截图里那页整片留白（无改动可列时参考客户端也是空的）。
+        // 截图里那页整片留白（无改动可列时参考界面也是空的）。
         let body: AnyElement = if ds.sql_sub == 1 {
             div()
                 .id(rid("dsql-ddl"))
@@ -35797,7 +36187,7 @@ impl DaroApp {
 
     /// 「新建查询」页：运行上下文栏（连接 / 库 / 模式下拉 + 运行 / 停止 / 解释）
     /// + SQL 编辑器（行号 + 等宽）+ 结果面板（状态头 + 消息 / 结果页签）。
-    /// 布局与量照 Flutter 版 query_page.dart 复刻参考客户端查询窗口的实测。
+    /// 布局与量照 Flutter 版 query_page.dart 复刻参考界面查询窗口的实测。
     fn query_page(&self, tab: &OpenTab, cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
         let (bg, border, soft, fg, muted) = (
@@ -35830,7 +36220,7 @@ impl DaroApp {
 
         // ── 运行上下文栏 ─────────────────────────────────────
         // 参考截图：三个等宽白底方角下拉（图标贴左、箭头钉右），打开时边框
-        // 变 Windows 蓝；菜单是自绘的平铺面板。连接 / 库 / 模式是参考客户端
+        // 变 Windows 蓝；菜单是自绘的平铺面板。连接 / 库 / 模式是参考界面
         // 那种可输入的组合框：打开后正文变成输入框，键入即过滤候选。
         let combo_input = q.combo_input.clone();
         let mut q_trigger = |cx: &mut Context<Self>,
@@ -36112,7 +36502,7 @@ impl DaroApp {
             .child(
                 qbtn("snippet", art::Glyph::CodeSnippet, "代码段").on_click(cx.listener(
                     |this, _, _, cx| {
-                        // 再点一次回到信息卡，和参考工具里的页签切换一致
+                        // 再点一次回到信息卡，和参考界面里的页签切换一致
                         this.snip_open = !this.snip_open;
                         this.snip_tag_menu_open = false;
                         this.show_info = true;
@@ -36180,7 +36570,7 @@ impl DaroApp {
             .test_support();
 
         // 结果页签条：固定结果最左（按固定先后）→ 消息 → 摘要 → 其余结果。
-        // 固定页签显示图钉 + 「固定 N」，悬停给出执行时间与 SQL（参考客户端行为）。
+        // 固定页签显示图钉 + 「固定 N」，悬停给出执行时间与 SQL（参考界面行为）。
         // 顺序与标题走 pane_tabs，和「查看 ▸ 结果」子菜单同一份口径。
         let tabbar = if n_out > 0 {
             h_flex()
@@ -36499,7 +36889,7 @@ impl DaroApp {
                         false,
                         None,
                         move |this, window, cx| {
-                            // 「询问 AI」整套是参考客户端企业版能力，先给统一说明窗
+                            // 「询问 AI」整套是参考界面企业版能力，先给统一说明窗
                             ent_coming_soon(this.dark, cx);
                             this.query_close_popup(qid, window, cx);
                         },
@@ -36508,7 +36898,7 @@ impl DaroApp {
                 }
             }
         }
-        // 参考客户端实测：下拉面板与触发器同宽（候选名超长就截断），不随内容撑宽
+        // 参考界面实测：下拉面板与触发器同宽（候选名超长就截断），不随内容撑宽
         let menu_left = match kind {
             QPopup::Conn => Q_BAR_PAD,
             QPopup::Db => Q_BAR_PAD + Q_TRIGGER_W + Q_TRIGGER_GAP,
@@ -36521,7 +36911,7 @@ impl DaroApp {
             QPopup::Run => 200.,
             QPopup::Ai => 150.,
         };
-        // 参考客户端口径：面板上沿压在触发器下沿上，不隔出上下文栏那 8px 灰底。
+        // 参考界面口径：面板上沿压在触发器下沿上，不隔出上下文栏那 8px 灰底。
         let menu_top = Q_TOOLBAR_H + Q_TRIGGER_H;
         let backdrop = div()
             .id("qpopup-backdrop")
@@ -36568,7 +36958,7 @@ impl DaroApp {
             .into_any_element()
     }
     /// 摘要页：本轮统计（处理数 / 成功 / 错误 / 起止时间）+ 每句一览。
-    /// 口径对齐参考客户端：只认这一轮的结果，不跨轮累计。
+    /// 口径对齐参考界面：只认这一轮的结果，不跨轮累计。
     fn query_summary(&self, q: &QueryState, qid: u64, cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
         let (fg, muted, soft, chrome) = (
@@ -37021,15 +37411,10 @@ impl DaroApp {
         } else {
             accent
         });
-        // 两行表头、类型行 (N/A)、分隔线配色照参考客户端结果网格取样：列名行白底
-        // 12px 半粗，类型行浅灰底、文案居中且更淡；暗色竖线 #595a5a、横线 #a6a6a6。
+        // 表头照数据页那套：列名 12px 半粗在上、类型 10.5px 在下，两行贴在同一个
+        // 表头格里（中间不画分隔线），当前列 / 选区列两行各铺同档浅蓝。
         let head_bg = to_hsla(p.background);
-        let type_bg = to_hsla(if self.dark {
-            blend(p.background, 0xffffff, 0.06)
-        } else {
-            0xeeeeee
-        });
-        let ty_fg = to_hsla(if self.dark { 0x8fb0d6 } else { 0xa9b4c8 });
+        let ty_fg = to_hsla(if self.dark { 0x8fb0d6 } else { 0x567fab });
         let line = to_hsla(if self.dark { 0x595a5a } else { 0xdcdcdc });
         let row_line = to_hsla(if self.dark { 0xa6a6a6 } else { 0xdcdcdc });
         let head_cur = to_hsla(blend(accent, p.background, 0.74));
@@ -37045,15 +37430,6 @@ impl DaroApp {
                 head_sel
             } else {
                 head_bg
-            }
-        };
-        let type_cell_bg = |dc: usize| {
-            if cell.1 == dc {
-                head_cur
-            } else if sel_cols.is_some_and(|(c0, c1)| dc >= c0 && dc <= c1) {
-                head_sel
-            } else {
-                type_bg
             }
         };
         let col_widths: Vec<f32> = cols.iter().map(|c| c.width).collect();
@@ -37082,7 +37458,55 @@ impl DaroApp {
 
         let name_row = h_flex()
             .w(px(total_w))
-            .h(px(Q_HEAD_NAME_H))
+            .h(px(T_HEAD_NAME_H))
+            .flex_none()
+            .child(
+                div()
+                    .w(px(Q_ROWNO_W))
+                    .h_full()
+                    .flex_none()
+                    .bg(head_bg)
+                    .border_r_1()
+                    .border_color(line),
+            )
+            .when(col_pad_l > 0., |s| {
+                s.child(div().w(px(col_pad_l)).h_full().flex_none())
+            })
+            .children(
+                cols.iter()
+                    .enumerate()
+                    .skip(first_col)
+                    .take(last_col - first_col)
+                    .map(|(dc, col)| {
+                div()
+                    .w(px(col_widths[dc]))
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px(px(7.))
+                    // 类型行在下、两行合成一个表头格：中间不画底边
+                    .bg(head_cell_bg(dc))
+                    .border_r_1()
+                    .border_color(line)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.))
+                            .font_semibold()
+                            .text_color(fg)
+                            .child(col.name.clone()),
+                    )
+                })
+            )
+            .when(col_pad_r > 0., |s| {
+                s.child(div().w(px(col_pad_r)).h_full().flex_none())
+            });
+
+        let type_row = h_flex()
+            .w(px(total_w))
+            .h(px(T_HEAD_TYPE_H))
             .flex_none()
             .child(
                 div()
@@ -37103,72 +37527,27 @@ impl DaroApp {
                     .skip(first_col)
                     .take(last_col - first_col)
                     .map(|(dc, col)| {
-                div()
-                    .w(px(col_widths[dc]))
-                    .h_full()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px(px(6.))
-                    .bg(head_cell_bg(dc))
-                    .border_b_1()
-                    .border_r_1()
-                    .border_color(line)
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.))
-                            .font_semibold()
-                            .text_color(fg)
-                            .child(col.name.clone()),
-                    )
-                })
-            )
-            .when(col_pad_r > 0., |s| {
-                s.child(div().w(px(col_pad_r)).h_full().flex_none())
-            });
-
-        let type_row = h_flex()
-            .w(px(total_w))
-            .h(px(Q_HEAD_TYPE_H))
-            .flex_none()
-            .child(
-                div()
-                    .w(px(Q_ROWNO_W))
-                    .h_full()
-                    .flex_none()
-                    .bg(type_bg)
-                    .border_b_1()
-                    .border_r_1()
-                    .border_color(soft),
-            )
-            .when(col_pad_l > 0., |s| {
-                s.child(div().w(px(col_pad_l)).h_full().flex_none())
-            })
-            .children(
-                cols.iter()
-                    .enumerate()
-                    .skip(first_col)
-                    .take(last_col - first_col)
-                    .map(|(dc, col)| {
                 let ty = if col.ty.trim().is_empty() {
                     "(N/A)".to_string()
                 } else {
                     col.ty.clone()
                 };
+                let cur = cell.1 == dc
+                    || sel_cols.is_some_and(|(c0, c1)| dc >= c0 && dc <= c1);
                 div()
+                    .relative()
                     .w(px(col_widths[dc]))
                     .h_full()
                     .flex_none()
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .px(px(4.))
-                    .bg(type_cell_bg(dc))
+                    .px(px(7.))
+                    .gap(px(3.))
+                    .bg(head_cell_bg(dc))
                     .border_b_1()
                     .border_r_1()
-                    .border_color(soft)
+                    .border_color(line)
+                    .child(ty_icon(col.numeric, col.ty == "bool", ty_fg))
                     .child(
                         div()
                             .min_w_0()
@@ -37177,6 +37556,18 @@ impl DaroApp {
                             .text_color(ty_fg)
                             .child(ty),
                     )
+                    // 强调条压住类型行底边，和数据页一样不额外占高度
+                    .when(cur, |s| {
+                        s.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .h(px(2.))
+                                .bg(to_hsla(accent)),
+                        )
+                    })
                 })
             )
             .when(col_pad_r > 0., |s| {
@@ -37329,7 +37720,7 @@ impl DaroApp {
                 s.child(div().flex_none().h(px((row_count - last_row) as f32 * Q_ROW_H)))
             });
 
-        // 底条：查询结果只读，增删改按参考客户端的形态占位（+ / − 常亮、✓ / ✗ 置灰），行数如实报。
+        // 底条：查询结果只读，增删改按参考界面的形态占位（+ / − 常亮、✓ / ✗ 置灰），行数如实报。
         let mini = |id: &'static str, icon: AnyElement| -> AnyElement {
             h_flex()
                 .id(rid(&format!("qfoot/{id}")))
@@ -37594,7 +37985,7 @@ impl DaroApp {
         // 查询分类的打开 / 删除落在已保存查询上，没有保存过就没有实体可操作。
         let can_open = has_sel && (cat != 4 || saved_query.is_some());
         let can_design = has_sel && cat != 4;
-        // 实体化视图的新建入口与视图同口径（参考客户端里同样是设计器页签）
+        // 实体化视图的新建入口与视图同口径（参考界面里同样是设计器页签）
         let can_new = has_ctx && matches!(cat, 0 | 1 | 2 | 3 | 4);
         let can_delete = match cat {
             0 | 1 => sel.is_some_and(|act| self.table_op_available(act, table_ops::TableOp::Drop)),
@@ -37617,7 +38008,7 @@ impl DaroApp {
             .border_b_1()
             .border_color(border)
             .when(cat != 3, |s| {
-                // 函数没有单独的「打开」：它就是设计页（参考工具函数分类只有
+                // 函数没有单独的「打开」：它就是设计页（参考界面函数分类只有
                 // 设计 / 新建 / 删除 / 运行四项）
                 s.child(
                     action_item(
@@ -37817,12 +38208,12 @@ impl DaroApp {
                     )
             })
             .child(div().flex_1());
-        // 搜索条（Navicat 口径）：点 🔍 后展开成占满剩余宽度的下划线输入，
+        // 搜索条（参考界面口径）：点 🔍 后展开成占满剩余宽度的下划线输入，
         // 右端 × 负责收起清词，🔍 图标此时让位退场。
-        // 输入区是嵌在工具栏里的白底框（Navicat 实测），不是把工具栏灰底
+        // 输入区是嵌在工具栏里的白底框（参考界面实测），不是把工具栏灰底
         // 直接露出来。
         if self.obj_search_open {
-            // 浅色档取 Navicat 实测的下划线蓝（比 accent 深、饱和），
+            // 浅色档取参考界面实测的下划线蓝（比 accent 深、饱和），
             // 暗色没有对应实测值，按主色压深一档。
             let search_line = if self.dark {
                 to_hsla(blend(p.accent, p.foreground, 0.16))
@@ -38664,7 +39055,7 @@ impl DaroApp {
             to_hsla(p.accent),
         );
         let conn = self.active_conn();
-        // 右侧信息卡按选中的节点类型换内容：参考客户端里选中连接、库、模式、
+        // 右侧信息卡按选中的节点类型换内容：参考界面里选中连接、库、模式、
         // 对象各自是一张不同的卡，字段名与顺序照实测截图。
         let card = match self.sel {
             Act::Obj(_, _, _, _, o) | Act::Col(_, _, _, _, o, _) => self
@@ -38681,7 +39072,7 @@ impl DaroApp {
                 Some(name) => Card::Schema(name),
                 None => self.sel_db_name().map_or(Card::Conn, Card::Db),
             },
-            // 根节点没有详情卡：参考客户端里右侧是空的，不放一张假的连接卡
+            // 根节点没有详情卡：参考界面里右侧是空的，不放一张假的连接卡
             Act::Root => Card::None,
             // 分组（虚拟组）有信息卡：文件夹图标 + 名称 + 对象数
             Act::Group(gix) => self
@@ -38693,7 +39084,7 @@ impl DaroApp {
         };
         let (title, kind, tile_icon) = match &card {
             Card::None => ("", String::new(), None),
-            // 信息卡大图标跟参考客户端一致，用功能区那套 FB_*（原生 64px），
+            // 信息卡大图标跟参考界面一致，用功能区那套 FB_*（原生 64px），
             // 按对象分类取图；之前一律贴 32px 的 OV_Table 放大，才发虚。
             Card::Obj(name) => (
                 *name,
@@ -38718,7 +39109,7 @@ impl DaroApp {
                 .to_string(),
                 Some(art::Glyph::HeroEngine(conn.kind)),
             ),
-            // 参考参考客户端：虚拟组的信息卡只有文件夹大图标、名称与对象数
+            // 参考参考界面：虚拟组的信息卡只有文件夹大图标、名称与对象数
             Card::Group(name) => (
                 name.as_str(),
                 format!(
@@ -38730,7 +39121,7 @@ impl DaroApp {
         };
 
         let mut props: Vec<AnyElement> = Vec::new();
-        // 头部下面的「所属连接 / 库 / 模式」两页都保留（参考客户端口径），
+        // 头部下面的「所属连接 / 库 / 模式」两页都保留（参考界面口径），
         // 只有属性列表随信息 / DDL 页切换。
         let mut ctx_rows: Vec<AnyElement> = Vec::new();
         match &card {
@@ -38900,7 +39291,7 @@ impl DaroApp {
                                         .text_color(muted)
                                         .child(kind.clone()),
                                 )
-                                // 虚拟组没有共享链接（参考参考客户端）
+                                // 虚拟组没有共享链接（参考参考界面）
                                 .when(!matches!(card, Card::Group(_)), |s| {
                                     s.child(
                                         h_flex()
@@ -38997,7 +39388,7 @@ impl DaroApp {
                                 if page == 0 { accent } else { muted },
                             )),
                     )
-                    // 「DDL」页签照参考工具出小字胶囊；只有表的 DDL 可读才出现
+                    // 「DDL」页签照参考界面出小字胶囊；只有表的 DDL 可读才出现
                     .when(ddl_cap, |s| {
                         s.child(
                             h_flex()
@@ -39026,7 +39417,7 @@ impl DaroApp {
                                 ),
                         )
                     })
-                    // 「使用 / 被使用」两页照参考工具出两枚箭头图标，只有 PG 表有
+                    // 「使用 / 被使用」两页照参考界面出两枚箭头图标，只有 PG 表有
                     .when(deps_cap, |s| {
                         s.child(self.info_dep_tab(
                             0,
@@ -39061,7 +39452,7 @@ impl DaroApp {
                             .cursor_pointer()
                             .hover(move |s| s.bg(hover))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                // 与参考工具一致：展开到右栏上限，再点回原宽度
+                                // 与参考界面一致：展开到右栏上限，再点回原宽度
                                 match this.info_restore_w.take() {
                                     Some(w) => this.right_w = w,
                                     None => {
@@ -39398,7 +39789,7 @@ impl DaroApp {
             to_hsla(p.muted_foreground),
         );
         let (count, unit) = self.sel_child_count();
-        // 参考客户端在有搜索过滤时追加「（N 个项目已隐藏）」，过滤功能落地前恒为 0
+        // 参考界面在有搜索过滤时追加「（N 个项目已隐藏）」，过滤功能落地前恒为 0
         let status = match count {
             Some(n) => format!("{n} 个 {unit}"),
             None if self.pane_obj().is_some() => "已选择 1 个项目".to_string(),
@@ -39440,12 +39831,16 @@ impl DaroApp {
                 (d.cols.len(), extra)
             })
         });
-        // 数据页签激活时状态栏换成取数 SQL 与记录计数（参考客户端同款两段）
+        // 数据页签激活时状态栏换成取数 SQL 与记录计数（参考界面同款两段）
         let (sql, recinfo) = self
             .active_table()
             .map(|t| self.table_page_status(&t))
             .unwrap_or_default();
         let has_sql = designer.is_none() && !sql.is_empty();
+        // 对象页复制 / 粘贴的临时说明优先于计数（切到别的页签就不显示）
+        let note = (self.active_tab == 0)
+            .then(|| self.pane_note.clone())
+            .flatten();
 
         h_flex()
             .id("status-bar")
@@ -39468,8 +39863,13 @@ impl DaroApp {
                             .text_xs()
                             .text_color(fg)
                             .child(format!("字段数: {ncols}")),
-                        // 数据页签的取数 SQL 不在这一格：参考客户端此格留空，
+                        // 数据页签的取数 SQL 不在这一格：参考界面此格留空，
                         // SQL 从主内容区那段开始（见下面的 has_sql 分支）
+                        None if note.is_some() => div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(fg)
+                            .child(note.unwrap_or_default()),
                         None if has_sql => div(),
                         None => div()
                             .truncate()
@@ -39574,7 +39974,7 @@ impl DaroApp {
                                 cx,
                                 ViewAct::List,
                             ))
-                            // 参考客户端的第三个视图「详细信息」是企业版专属：图标可点但点了弹升级窗，
+                            // 参考界面的第三个视图「详细信息」是企业版专属：图标可点但点了弹升级窗，
                             // 这里同样接通入口，点击弹「敬请期待」
                             .child(status_toggle(
                                 "view-detail",
@@ -39627,13 +40027,13 @@ impl DaroApp {
 
 /// 右侧信息卡的各类内容，对应树上可选节点。
 enum Card {
-    /// 根节点：参考客户端右侧不出卡
+    /// 根节点：参考界面右侧不出卡
     None,
     Conn,
     Db(&'static str),
     Schema(&'static str),
     Obj(&'static str),
-    /// 连接分组（参考客户端里叫「虚拟组」）：文件夹大图标 + 名称 + 对象数
+    /// 连接分组（参考界面里叫「虚拟组」）：文件夹大图标 + 名称 + 对象数
     Group(String),
 }
 
@@ -39669,7 +40069,7 @@ struct TreeInk {
     muted: Hsla,
     hover: Hsla,
     focus_bg: Hsla,
-    /// 搜索命中段的高亮底色（参考客户端是黄底，明暗主题各一档）
+    /// 搜索命中段的高亮底色（参考界面是黄底，明暗主题各一档）
     hl: Hsla,
     /// 连接颜色标签：非选中行的底色。整条连接的子树共用一档淡色，
     /// 连接行自己用饱和档（见 [TreeInk::tinted_header]）。
@@ -39704,8 +40104,7 @@ fn toggle_ink(ink: &TreeInk, active: bool) -> Hsla {
     if active { to_hsla(0x2f8fd8) } else { ink.muted }
 }
 
-/// 树的折叠三角用线稿：参考客户端 18 侧栏里是灰色小箭头，资源包里的
-/// EXPAND_DOWN/RIGHT 是带外框的方块旋钮（用在本体别处），放到 10px 会看成空复选框。
+/// 树的折叠三角用线稿：侧栏里是灰色小箭头；方块形旋钮放到 10px 会看成空复选框。
 fn caret(open: bool) -> art::Glyph {
     if open {
         art::Glyph::Zed(ZedIcon::ChevronDown)
@@ -39714,15 +40113,8 @@ fn caret(open: bool) -> art::Glyph {
     }
 }
 
-/// 树行图标位的转圈：给参考客户端本体那套 20 帧原图（LOADING01…20），
-/// 40ms 一帧、800ms 一圈。占位与图标一致，状态切换时不抖。
+/// 树行图标位的转圈：16px 循环旋转的加载图标，占位与图标一致，状态切换时不抖。
 fn loading_spinner() -> AnyElement {
-    const FRAMES: [&str; 20] = [
-        "LOADING01", "LOADING02", "LOADING03", "LOADING04", "LOADING05", "LOADING06", "LOADING07",
-        "LOADING08", "LOADING09", "LOADING10", "LOADING11", "LOADING12", "LOADING13", "LOADING14",
-        "LOADING15", "LOADING16", "LOADING17", "LOADING18", "LOADING19", "LOADING20",
-    ];
-    let cycle = Duration::from_millis(40 * FRAMES.len() as u64);
     div()
         .flex_none()
         .flex()
@@ -39730,10 +40122,10 @@ fn loading_spinner() -> AnyElement {
         .justify_center()
         .w(px(16.))
         .h(px(16.))
-        .with_animation("tree-loading", Animation::new(cycle).repeat(), |el, delta| {
-            let frame = (delta * FRAMES.len() as f32) as usize;
-            el.child(nv_icons::icon(FRAMES[frame.min(FRAMES.len() - 1)], 16.))
-        })
+        .child(
+            gpui_kit::component::spinner::Spinner::new()
+                .with_size(gpui_kit::component::Size::Size(px(14.))),
+        )
         .into_any_element()
 }
 
@@ -39785,11 +40177,13 @@ fn tree_row(
             s.hover(move |s| s.bg(hover))
         })
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-            // 参考客户端：单击选中，双击展开/收起（连接则是连接/折叠），
+            // 参考界面：单击选中，双击展开/收起（连接则是连接/折叠），
             // 三角只管折叠，不顺手改选中
             // 树的选中是单点语义：面板里框出来的多选到此作废，别等切回面板
             // 又原样复活。
             this.obj_multi = None;
+            // 复制 / 粘贴的说明只在当前这次选择上有效，换节点就收掉
+            this.pane_note = None;
             match action {
                 // Root 只是无选中的哨兵态，树上不再渲染它的行
                 Act::Root => {}
@@ -39839,7 +40233,7 @@ fn tree_row(
                     }
                     this.sel = action;
                 }
-                // 字段 / 分组成员行只能选中：参考客户端里双击不做任何事
+                // 字段 / 分组成员行只能选中：参考界面里双击不做任何事
                 Act::Col(..) | Act::Sub(..) => {
                     this.sel = action;
                 }
@@ -39853,6 +40247,7 @@ fn tree_row(
                 // 字段行没有菜单（实测没做到这一层，先不开空弹层）
                 this.sel = action;
                 this.obj_multi = None;
+                this.pane_note = None;
                 if !matches!(action, Act::Col(..) | Act::Sub(..) | Act::ObjGroup(..)) {
                     this.ctx = Some(action);
                     this.ctx_blank = None;
@@ -39914,7 +40309,7 @@ fn tree_row(
                 )
                 .into_any_element(),
             None => match q.and_then(|needle| find_ci(label, needle)) {
-                // 搜索命中：命中段铺黄底（参考客户端浏览器式高亮）
+                // 搜索命中：命中段铺黄底（参考界面浏览器式高亮）
                 Some(range) => div()
                     .id(label_id)
                     .test_support()
@@ -40027,7 +40422,7 @@ fn wired_item(
     })
 }
 
-/// 树节点右键菜单的总分发。条目、顺序、分隔线都按参考客户端实测还原；
+/// 树节点右键菜单的总分发。条目、顺序、分隔线都按参考界面实测还原；
 /// 未实现的动作一律置灰（不留「点了没反应」的假入口），
 /// 企业版专属项点击弹「敬请期待」。
 fn node_context_menu(
@@ -40061,7 +40456,7 @@ fn node_context_menu(
     }
 }
 
-/// 连接树空白处右键。参考客户端这块没有可只读实测的样本，按标准行为推断：
+/// 连接树空白处右键。参考界面这块没有可只读实测的样本，按标准行为推断：
 /// 新建连接 / 新建组是这一层的两个真入口，粘贴要等对象级剪贴板，刷新重读目录。
 fn tree_blank_menu(
     me: Entity<DaroApp>,
@@ -40084,12 +40479,23 @@ fn tree_blank_menu(
             cx.notify();
         });
     }));
-    // 粘贴要的是「剪贴板里有一个已复制的对象」，对象级剪贴板还没做
-    menu = menu.item(mi("粘贴").disabled(true));
+    // 粘贴要的是「剪贴板里有一个已复制的表」+ 当前有一个可落的目标库
+    let paste_ok = {
+        let app = me.read(cx);
+        app.table_clip.is_some() && app.sel.db().is_some()
+    };
+    if paste_ok {
+        let target = me.clone();
+        menu = menu.item(mi("粘贴").on_click(move |_, _, cx| {
+            target.update(cx, |app, cx| app.paste_tables(cx));
+        }));
+    } else {
+        menu = menu.item(mi("粘贴").disabled(true));
+    }
     menu.separator().item(refresh_item(me.clone()))
 }
 
-/// 表头类型行的小图标（参考工具同款灰度三态）：数值「#」、字符串「ABC」
+/// 表头类型行的小图标（参考界面同款灰度三态）：数值「#」、字符串「ABC」
 /// （B 上标 / C 下标）、布尔「°/°」（两个小圆夹一条斜线）。
 fn ty_icon(numeric: bool, is_bool: bool, color: Hsla) -> AnyElement {
     if numeric {
@@ -40140,12 +40546,12 @@ fn ty_icon(numeric: bool, is_bool: bool, color: Hsla) -> AnyElement {
 }
 
 /* ------------------------------------------------------------------ */
-/*  顶栏菜单：条目、顺序、分隔线照参考客户端截图逐个手拼。没有落点的保持     */
+/*  顶栏菜单：条目、顺序、分隔线照参考界面截图逐个手拼。没有落点的保持     */
 /*  死标签（`menu.label`），缺上下文才置灰（`todo_item`），企业版专属走     */
 /*  `ent_item`。快捷键提示由菜单按全局绑定自动补，别在文字里写。            */
 /* ------------------------------------------------------------------ */
 
-/// 顶栏「文件」菜单。参考客户端分两种上下文，两张截图各一张：
+/// 顶栏「文件」菜单。参考界面分两种上下文，两张截图各一张：
 /// - 刚打开（[`BarCtx::Bare`]，没有页签）：新建项目… / 新建连接… / 新建 ▸ /
 ///   使用 URI 打开… / 打开文件 ▸ / 打开最近使用过的 ▸ / 导入连接… /
 ///   导出连接… / 管理云… / 关闭窗口 / 关闭选项卡（灰）/ 退出。
@@ -40266,7 +40672,7 @@ fn file_bar_menu(
         sub
     });
 
-    // 编辑器级的那几行（保存 / 另存为 / 导出结果）按参考客户端
+    // 编辑器级的那几行（保存 / 另存为 / 导出结果）按参考界面
     // 「刚打开」截图整组消失——没有页签就没有落点，留着就是假入口。
     if !bare {
         menu = menu.separator();
@@ -40306,7 +40712,7 @@ fn file_bar_menu(
     menu = menu.item(
         PopupMenuItem::new("关闭窗口").on_click(|_, window, _| window.remove_window()),
     );
-    // 没有页签可关＝置灰（参考客户端刚打开的截图这行就是灰的）。
+    // 没有页签可关＝置灰（参考界面刚打开的截图这行就是灰的）。
     menu = menu.item(
         PopupMenuItem::new("关闭选项卡")
             .action(Box::new(CloseTab))
@@ -40375,12 +40781,12 @@ fn active_query_editor(
 
 /// 顶栏「编辑」菜单。分两种上下文：
 /// - 激活的是「对象」页（[`BarCtx::Bare`]，或开着其它页签但切回 0 号对象页）：
-///  参考客户端只有 复制 / 粘贴 / 全选 三条，作用对象是连接树和对象面板。全选把
+///  参考界面只有 复制 / 粘贴 / 全选 三条，作用对象是连接树和对象面板。全选把
 ///   面板当前分类的可见对象全部选上（有对象时可点），复制在选中了对象时可点
 ///   （对象名进剪贴板）；对象级粘贴还没做，保持灰。菜单随焦点走，和有没有
 ///   开着别的数据 / 查询页无关。
 
-/// - 开着页签（[`BarCtx::Tab`]，照参考客户端查询窗口截图 1:1）：撤消 / 重做 ─ 剪切 /
+/// - 开着页签（[`BarCtx::Tab`]，照参考界面查询窗口截图 1:1）：撤消 / 重做 ─ 剪切 /
 ///   复制 / 含引号复制 ▸ / 粘贴 / 从剪贴板堆栈粘贴 / 线条 ▸ ─ 选择当前语句 /
 ///   全选 ─ 查找 / 查找下一个 / 替换 ─ 代码补全 ▸ / 创建片段。
 ///
@@ -40505,7 +40911,7 @@ fn edit_bar_menu(
     menu.label("创建片段")
 }
 
-/// 「对象」页的「编辑」菜单：复制 / 粘贴 ─ 全选（照参考客户端截图，含分隔线）。
+/// 「对象」页的「编辑」菜单：复制 / 粘贴 ─ 全选（照参考界面截图，含分隔线）。
 /// 三项都挂全局动作，行尾的 Ctrl+C / Ctrl+V / Ctrl+A 由菜单按绑定渲染；点击
 /// 走各自的 handler，不经动作派发（派发会先把焦点交回菜单，这里用不上）。
 /// 灰态按真状态定：面板空清单时全选不可点，没有选中对象时复制不可点，
@@ -40515,13 +40921,14 @@ fn objects_edit_bar_menu(
     menu: PopupMenu,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
-    let (has_sel, has_objects) = {
+    let (has_sel, has_objects, has_clip) = {
         let app = me.read(cx);
         (
             app.selected_object_acts()
                 .iter()
                 .any(|&act| app.object_ref(act).is_some()),
             !app.pane_objects_visible().is_empty(),
+            app.table_clip.is_some(),
         )
     };
     // 自绘行 + 固定 id：headless 用例能精确点到某一项，不用数分隔线下标。
@@ -40534,7 +40941,7 @@ fn objects_edit_bar_menu(
         });
     let paste = mi_with_id("粘贴", Some(rid("edit-menu/objects-paste")))
         .action(Box::new(GridPaste))
-        .disabled(true);
+        .disabled(!has_clip);
     let all_target = me;
     let all = mi_with_id("全选", Some(rid("edit-menu/objects-select-all")))
         .action(Box::new(GridSelectAll))
@@ -40545,7 +40952,7 @@ fn objects_edit_bar_menu(
     menu.item(copy).item(paste).separator().item(all)
 }
 
-/// 「含引号复制 ▸」的一档：选中文字用指定引号包起来送进剪贴板（参考客户端里拿它
+/// 「含引号复制 ▸」的一档：选中文字用指定引号包起来送进剪贴板（参考界面里拿它
 /// 把值粘进 SQL）。没有查询编辑器、或没有选区时置灰。
 fn quote_copy_item(
     target: Option<Entity<EditorState>>,
@@ -40643,7 +41050,7 @@ fn info_pane_submenu(
 /// - 刚打开（[`BarCtx::Bare`]，焦点在连接树）：导航窗格 ▸ / 信息窗格 ▸ / 列表 /
 ///   详细信息 / ER 图表 / 隐藏对象组 / 排序 ▸ / 选择列 / 显示隐藏的项目 /
 ///   显示表配置文件。刷新、查询编辑器、结果、网格视图那一组页签级条目不出现。
-/// - 开着页签（[`BarCtx::Tab`]，照参考客户端查询窗口截图 1:1 重排）：刷新 ─
+/// - 开着页签（[`BarCtx::Tab`]，照参考界面查询窗口截图 1:1 重排）：刷新 ─
 ///   导航窗格 ▸ / 信息窗格 ▸ / 查询编辑器 / 结果 ▸ ─ 网格视图 · 表单视图 ─
 ///   单元格编辑器 / 数据分析 / 显示查询分析和状态 / 自动换行 ─ 显示 ▸。
 /// 三个子菜单都照截图补齐：信息窗格接 `info_page`（常规=信息页、代码段=DDL 页），
@@ -40763,7 +41170,7 @@ fn view_bar_menu(
     menu = menu.item(ent_item(&me, "表单视图"));
 
     menu = menu.separator();
-    // 这四条是参考客户端的真功能、daro 还没做，留死标签。截图里前三条带图标，
+    // 这四条是参考界面的真功能、daro 还没做，留死标签。截图里前三条带图标，
     // PopupMenuItem::label 挂不了图标，所以只有文字。
     menu = menu
         .label("单元格编辑器")
@@ -40774,7 +41181,7 @@ fn view_bar_menu(
     menu = menu.separator();
     // 显示 ▸：截图那七条（备注 / 图像 / 冻结列 / 解除所有冻结列 / 设置列宽 /
     // 设置行高 / 缩放 ▸）daro 全没做，留死标签；标签末尾的 (T)(U)(V)(W)(X)(Y)(Z)
-    // 是参考客户端的 Alt 访问键，我们没有这些键位，不照抄（死标签带键提示是假的）。
+    // 是参考界面的 Alt 访问键，我们没有这些键位，不照抄（死标签带键提示是假的）。
     // 分隔线之后是 daro 自己的四档：视图模式三档 + 切换主题，全是已有真功能，
     // 只搬家不删。
     let me_grid = me.clone();
@@ -40834,7 +41241,7 @@ fn view_bar_menu(
     })
 }
 
-/// 顶栏「格式」菜单，照参考客户端查询窗口截图：缩进 ▸ / 注释 ▸ / 转换大小写 ▸ ─
+/// 顶栏「格式」菜单，照参考界面查询窗口截图：缩进 ▸ / 注释 ▸ / 转换大小写 ▸ ─
 /// 美化 SQL / 美化 SQL 选项... / 简化 SQL ─ 重构 ▸。
 ///
 /// 真功能只有两档：缩进 ▸ 派 gpui 编辑器自带的 `Indent` / `Outdent`（键位提示由
@@ -41004,7 +41411,7 @@ fn favorites_bar_menu(
     })
 }
 
-/// 顶栏「工具」菜单，照参考客户端截图逐行：数据传输 / 数据生成 / 数据脱敏 /
+/// 顶栏「工具」菜单，照参考界面截图逐行：数据传输 / 数据生成 / 数据脱敏 /
 /// 数据字典 / 数据同步 / 结构同步 / 命令列界面（灰）/ 服务器监控（子菜单）/
 /// 在数据库或模式中查找 ─ 历史日志 ─ 选项。
 ///
@@ -41105,7 +41512,7 @@ fn panel_layout_submenu(
     )
 }
 
-/// 顶栏「窗口」菜单（参考客户端：最小化 / 全屏 ─ 关闭所有选项卡）。
+/// 顶栏「窗口」菜单（参考界面：最小化 / 全屏 ─ 关闭所有选项卡）。
 /// 「关闭选项卡」按截图归文件菜单，这里不重复挂。
 fn window_bar_menu(menu: PopupMenu, window: &mut Window) -> PopupMenu {
     menu.item(
@@ -41122,7 +41529,7 @@ fn window_bar_menu(menu: PopupMenu, window: &mut Window) -> PopupMenu {
 
 /// 顶栏「帮助」菜单，只保留三条真实落点的项：
 /// 提供 daro 反馈意见（系统浏览器开 daro 的 issue 页）、检查更新（开更新中心并立即查）、
-/// 关于（开关于窗）。其余参考客户端的占位项——帮助主题 / 在线文档 / 客户服务中心 /
+/// 关于（开关于窗）。其余参考界面的占位项——帮助主题 / 在线文档 / 客户服务中心 /
 /// 注册 / 立即购买 / 新功能介绍——已按需求移除，它们原本也都是没有行为、纯占位的死标签。
 fn help_bar_menu(
     me: Entity<DaroApp>,
@@ -41151,7 +41558,7 @@ fn help_bar_menu(
         }))
 }
 
-/// 顶栏「表」菜单（参考客户端：激活表数据页签时出现）。条目照实测：
+/// 顶栏「表」菜单（参考界面：激活表数据页签时出现）。条目照实测：
 /// 开始事务 / 设计表 / 查询表 / 筛选 / 排序 / 移除所有筛选 & 排序 /
 /// AI 自动填充 / 刷新。动作全部复用网格右键菜单那几条通路。
 fn table_bar_menu(
@@ -41248,7 +41655,7 @@ fn table_bar_menu(
     )
 }
 
-/// 顶栏「查询」菜单：只在激活查询页签时出现，条目对齐参考客户端的
+/// 顶栏「查询」菜单：只在激活查询页签时出现，条目对齐参考界面的
 /// 运行 / 运行当前语句 / 停止 / 遇到错误时继续 · 解释 · 询问 AI。
 /// 快捷键提示由菜单按 QueryRun / QueryRunStmt / QueryStop 的全局绑定自动补。
 fn query_bar_menu(
@@ -41320,9 +41727,9 @@ fn query_bar_menu(
     })
 }
 
-/// 数据网格右键菜单（非编辑态）。条目与分组照参考客户端的单元格菜单：
+/// 数据网格右键菜单（非编辑态）。条目与分组照参考界面的单元格菜单：
 /// 改值 / 单元格编辑器 · 增删记录 · 复制粘贴 · 筛选排序 · 刷新。
-/// 「生成 UUID」在参考工具里是子菜单，这里只有一种算法就平铺；「缩放」
+/// 「生成 UUID」在参考界面里是子菜单，这里只有一种算法就平铺；「缩放」
 /// 本版本没有对应能力，不画假入口。
 fn grid_context_menu(
     me: Entity<DaroApp>,
@@ -41585,7 +41992,7 @@ fn uuid_v4_text() -> String {
 }
 
 /// 设计器网格右键菜单：插入行 / 删除行 / 复制行。
-/// 参考客户端实测口径：字段页右键有「插入行」「删除行」「复制行」三项。
+/// 参考界面实测口径：字段页右键有「插入行」「删除行」「复制行」三项。
 fn designer_context_menu(
     me: Entity<DaroApp>,
     did: u64,
@@ -41829,7 +42236,7 @@ fn cell_text_menu(
     ))
 }
 
-/// 库节点右键菜单（参考客户端实测，PostgreSQL；关闭态的置灰差异同样实测）。
+/// 库节点右键菜单（参考界面实测，PostgreSQL；关闭态的置灰差异同样实测）。
 fn db_menu(
     me: Entity<DaroApp>,
     c: usize,
@@ -41924,7 +42331,7 @@ fn db_menu(
     menu.separator().item(refresh_item(me.clone()))
 }
 
-/// 模式节点右键菜单（参考客户端实测，PostgreSQL public）。
+/// 模式节点右键菜单（参考界面实测，PostgreSQL public）。
 fn schema_menu(
     me: Entity<DaroApp>,
     c: usize,
@@ -41970,7 +42377,7 @@ fn schema_menu(
     menu.separator().item(refresh_item(me.clone()))
 }
 
-/// 分类节点（表 / 视图 / …）右键菜单，五个分类逐个按参考客户端实测还原
+/// 分类节点（表 / 视图 / …）右键菜单，五个分类逐个按参考界面实测还原
 /// （函数 / 查询等分类在样本库里是空的，但分类节点本身右键得到）。
 fn cat_menu(
     me: Entity<DaroApp>,
@@ -42077,10 +42484,32 @@ fn cat_menu(
         }
     }
     menu = menu.separator();
-    // 分类级「新建组」管的是对象分组，本体没实现；粘贴永远灰（无可粘贴对象）
-    menu = menu
-        .item(todo_item("新建组"))
-        .item(mi("粘贴").disabled(true));
+    // 分类级「新建组」管的是对象分组，本体没实现；表分类上的「粘贴」走
+    // 对象级剪贴板，落点就是这一栏的连接 / 库 / 模式。
+    menu = menu.item(todo_item("新建组"));
+    let paste_ok = k == 0 && {
+        let app = me.read(cx);
+        match app.table_clip.as_ref() {
+            Some(clip) => app.conns.get(c).is_some_and(|conn| {
+                conn.connected
+                    && table_copy_ready(conn)
+                    && app
+                        .conns
+                        .iter()
+                        .find(|x| x.name == clip.conn)
+                        .is_some_and(|src| src.kind == conn.kind)
+            }),
+            None => false,
+        }
+    };
+    if paste_ok {
+        let target = me.clone();
+        menu = menu.item(mi("粘贴").on_click(move |_, _, cx| {
+            target.update(cx, |app, cx| app.paste_tables_at(c, d, s, cx));
+        }));
+    } else {
+        menu = menu.item(mi("粘贴").disabled(true));
+    }
     if k == 4 {
         menu = menu
             .separator()
@@ -42090,7 +42519,7 @@ fn cat_menu(
     menu.separator().item(refresh_item(me.clone()))
 }
 
-/// 对象级「管理组」子菜单：参考客户端是 新建组 / 移动到▸ / 从组中排除（不在组内时灰）。
+/// 对象级「管理组」子菜单：参考界面是 新建组 / 移动到▸ / 从组中排除（不在组内时灰）。
 /// 对象分组本体没实现，三个入口都置灰。
 fn obj_group_submenu(sub: PopupMenu) -> PopupMenu {
     sub.item(todo_item("新建组"))
@@ -42098,7 +42527,7 @@ fn obj_group_submenu(sub: PopupMenu) -> PopupMenu {
         .item(todo_item("从组中排除"))
 }
 
-/// 对象（表 / 视图 / …）节点右键菜单。表 / 视图逐项按参考客户端实测还原；
+/// 对象（表 / 视图 / …）节点右键菜单。表 / 视图逐项按参考界面实测还原；
 /// 实体化视图 / 函数 / 查询的对象菜单没有样本可量（样本库这几类是空的），
 /// 按视图的骨架推断填充。
 fn obj_menu(
@@ -42145,9 +42574,31 @@ fn obj_menu(
             .item(table_ddl_item(&me, act, table_ops::TableOp::Drop, cx))
             .item(table_ddl_item(&me, act, table_ops::TableOp::Clear, cx))
             .item(table_ddl_item(&me, act, table_ops::TableOp::Truncate, cx));
-        menu = menu.submenu("复制表", window, cx, |sub, _, _| {
-            sub.item(todo_item("结构和数据"))
-                .item(todo_item("仅结构"))
+        // 复制表在当前库里另起一张；四种 SQL 引擎才有这条路，演示 / NoSQL 置灰
+        let copy_ok = me
+            .read(cx)
+            .conns
+            .get(c)
+            .is_some_and(table_copy_ready);
+        let me_copy = me.clone();
+        menu = menu.submenu("复制表", window, cx, move |sub, _, _| {
+            if !copy_ok {
+                return sub
+                    .item(todo_item("结构和数据"))
+                    .item(todo_item("仅结构"));
+            }
+            let me_data = me_copy.clone();
+            let me_struct = me_copy.clone();
+            sub.item(mi("结构和数据").on_click(move |_, _, cx| {
+                me_data.update(cx, |app, cx| {
+                    app.ask_capture_table(act, table_copy::PasteMode::Data, cx)
+                });
+            }))
+            .item(mi("仅结构").on_click(move |_, _, cx| {
+                me_struct.update(cx, |app, cx| {
+                    app.ask_capture_table(act, table_copy::PasteMode::Structure, cx)
+                });
+            }))
         });
         menu = menu.item(todo_item("设置权限"));
         menu = menu.separator();
@@ -42178,7 +42629,7 @@ fn obj_menu(
                 .item(todo_item("重建表索引..."))
         });
     } else if k == 1 {
-        // 视图对象菜单逐项照参考客户端实测：打开 / 设计 / 新建 / 删除 / 重命名 /
+        // 视图对象菜单逐项照参考界面实测：打开 / 设计 / 新建 / 删除 / 重命名 /
         // 导出向导都有真通路，清空·截断·新建表那些表专属项根本不出现在这一层。
         let me_open = me.clone();
         menu = menu.item(mi("打开视图").on_click(move |_, _, cx| {
@@ -42280,7 +42731,7 @@ fn obj_menu(
     menu.separator().item(refresh_item(me.clone()))
 }
 
-/// 连接节点右键菜单，条目与分组顺序照参考客户端实测结果。
+/// 连接节点右键菜单，条目与分组顺序照参考界面实测结果。
 /// 还没做的功能（新建库 / 命令列 / 运行 SQL 文件 / 共享）先置灰，
 /// 不留「点了没反应」的假入口。
 fn conn_menu(
@@ -42326,7 +42777,7 @@ fn conn_menu_body(
     let mut menu = menu;
 
         let target = me.clone();
-        // 参考客户端的第一项随连接状态换字：断开时是「打开连接」，不是灰掉的「关闭连接」
+        // 参考界面的第一项随连接状态换字：断开时是「打开连接」，不是灰掉的「关闭连接」
         let conn_item = if connected { "关闭连接" } else { "打开连接" };
         menu = menu.item(PopupMenuItem::new(conn_item).on_click(move |_, _, cx| {
             target.update(cx, |app, cx| {
@@ -42359,7 +42810,7 @@ fn conn_menu_body(
         menu = menu.item(PopupMenuItem::new("删除连接").on_click(move |_, _, cx| {
             let target = target.clone();
             let value = name.clone();
-            // 删除要弹窗二次确认（参考客户端也是独立窗口），且按名字定位：
+            // 删除要弹窗二次确认（参考界面也是独立窗口），且按名字定位：
             // 确认框开着时主窗口仍可操作，索引可能已经失效。
             open_confirm(
                 target,
@@ -42403,7 +42854,7 @@ fn conn_menu_body(
         menu = menu.separator();
 
         let target = me.clone();
-        // 实测参考客户端：已星标时菜单项是「移除星标」，不是「删除星标」
+        // 实测参考界面：已星标时菜单项是「移除星标」，不是「删除星标」
         let star_label = if starred { "移除星标" } else { "添加星标" };
         menu = menu.item(PopupMenuItem::new(star_label).on_click(move |_, _, cx| {
             target.update(cx, |app, cx| {
@@ -42444,7 +42895,7 @@ fn conn_menu_body(
                 }))
         });
 
-        // 实测：颜色与管理组之间没有分隔线（参考客户端菜单里 颜色/管理组/共享/刷新 连续排列）
+        // 实测：颜色与管理组之间没有分隔线（参考界面菜单里 颜色/管理组/共享/刷新 连续排列）
         let conn_name = name_group;
         let current_group = group.clone();
         let all_groups: Vec<String> = me.read(cx).groups.clone();
@@ -42507,11 +42958,11 @@ fn conn_menu_body(
         });
 
         menu.item(PopupMenuItem::new("共享...").disabled(true))
-            // 参考客户端里 共享 与 刷新 之间没有分隔线
+            // 参考界面里 共享 与 刷新 之间没有分隔线
             .item(refresh_item(me.clone()))
 }
 
-/// 分组节点右键菜单（参考客户端实测：新建连接... / 新建组 / 删除组 / 重命名 / 刷新）。
+/// 分组节点右键菜单（参考界面实测：新建连接... / 新建组 / 删除组 / 重命名 / 刷新）。
 /// 新建组落成空组并就地进入改名；删除组要二次确认，组内连接回落未分组。
 fn group_menu(
     me: Entity<DaroApp>,
@@ -43546,7 +43997,7 @@ mod designer_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 分组（虚拟组）在参考客户端里也有信息卡：文件夹大图标 + 名称 +
+    /// 分组（虚拟组）在参考界面里也有信息卡：文件夹大图标 + 名称 +
     /// 「虚拟组（N 对象）」；不挂共享链接，也不出 DDL / 依赖页签。
     #[gpui_kit::test]
     fn info_panel_virtual_group_card(cx: &mut TestAppContext) {
@@ -43789,7 +44240,7 @@ mod designer_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 表节点展开后必须是参考客户端的八个分组；字段默认收起，展开字段组才出
+    /// 表节点展开后必须是参考界面的八个分组；字段默认收起，展开字段组才出
     /// 字段行，展开索引组出索引名（演示连接给确定性清单）。
     #[gpui_kit::test]
     fn table_node_expands_to_eight_groups(cx: &mut TestAppContext) {
@@ -43947,7 +44398,7 @@ mod designer_tests {
             mv,
             "CREATE MATERIALIZED VIEW mv_users AS\nSELECT id FROM users;\n"
         );
-        // 空正文照参考客户端直接收尾 AS;（不再给提示注释）
+        // 空正文照参考界面直接收尾 AS;（不再给提示注释）
         let empty = design_view_sql("MATERIALIZED VIEW", "\"public\".\"Untitled\"", "   ");
         assert_eq!(
             empty,
@@ -45091,7 +45542,7 @@ mod designer_tests {
             assert!(window.try_find_by_label("导出向导").is_some(), "实体化视图也能导出");
             assert!(window.try_find_by_label("导入向导").is_none());
 
-            // 函数分类：设计 / 新建 / 删除 / 运行，没有「打开函数」（参考工具这一套）
+            // 函数分类：设计 / 新建 / 删除 / 运行，没有「打开函数」（参考界面这一套）
             app.update(cx, |a, _| a.sel = Act::Cat(0, 0, NO_SCHEMA, 3));
             window.render_frame(cx);
             for label in ["设计函数", "新建函数", "删除函数", "运行函数"] {
@@ -45134,18 +45585,17 @@ mod designer_tests {
                 let ds = t.dstate.as_ref().expect("函数设计页签必有状态");
                 assert_eq!(ds.new_name.as_deref(), Some(""), "等保存时补函数名");
                 assert!(ds.view_body.is_empty() && ds.ret_ty.is_empty());
-                // 参考客户端没有函数设计态位图：页签仍用函数图标，不自造铅笔
+                // 没有函数设计态专属字形：页签仍用函数图标，不自造铅笔
                 assert!(
                     DaroApp::tab_glyph(t) == art::Glyph::Function,
-                    "函数页签用 OV_Function"
+                    "函数页签用函数图标"
                 );
-                assert!(nv_icons::has("OV_Function"), "函数位图要打进包里");
             });
         })
         .unwrap();
     }
 
-    /// 实体化视图分类的「新建实体化视图」：照参考客户端开「无标题 @库.模式（连接）」
+    /// 实体化视图分类的「新建实体化视图」：照参考界面开「无标题 @库.模式（连接）」
     /// 的设计页签，子标签为 定义 / 高级 / 注释 / SQL 预览。
     #[gpui_kit::test]
     fn new_matview_designer_from_action_bar(cx: &mut TestAppContext) {
@@ -45171,15 +45621,11 @@ mod designer_tests {
                     DaroApp::tab_glyph(t) == art::Glyph::DesignMatView,
                     "实体化视图设计页签用实体化视图设计图标"
                 );
-                assert!(
-                    nv_icons::has("OV_Materialized_View_Design"),
-                    "实体化视图设计位图要打进包里"
-                );
                 assert!(ds.view_editor.is_some(), "定义页要有代码编辑器");
                 assert!(ds.matview_with_data, "配备数据默认勾上");
                 assert!(
                     a.tab_label(t).starts_with("无标题 @"),
-                    "标题照参考客户端：{}",
+                    "标题照参考界面：{}",
                     a.tab_label(t)
                 );
             });
@@ -45209,7 +45655,7 @@ mod designer_tests {
             assert_eq!(
                 window.find("dsqlsub/0").bounds().size.height,
                 px(33.),
-                "子条高度对齐参考客户端截图"
+                "子条高度对齐参考界面截图"
             );
             // 实体化视图只属 PG，这条演示连接就是 PG：预览出带模式限定的双引号形态
             let expected = "CREATE MATERIALIZED VIEW \"public\".\"Untitled\"\nAS;\n";
@@ -45586,7 +46032,7 @@ mod designer_tests {
                     "{sql}"
                 );
                 assert!(sql.contains("\"extra_col\""), "{sql}");
-                // 触发器段：参考工具即使一条触发器都没有也照出空模板
+                // 触发器段：参考界面即使一条触发器都没有也照出空模板
                 // （PG 的模板与规则段原文由 sql_preview 的纯函数测试盯住）
                 assert!(sql.contains("CREATE TRIGGER"), "{sql}");
             });
@@ -46074,7 +46520,7 @@ mod designer_tests {
                 assert_eq!(ds.fks.len(), 1);
                 assert_eq!(ds.fk_sel, 0, "锚点夹回");
             });
-            // 删光后空行常驻（参考工具口径）
+            // 删光后空行常驻（参考界面口径）
             window.click("dfk-del", cx);
             app.update(cx, |a, _| {
                 let ds = a.opened[0].dstate.as_ref().unwrap();
@@ -46283,7 +46729,7 @@ mod designer_tests {
             window.render_frame(cx);
 
             assert!(window.try_find("qedit").is_some(), "编辑器区已渲染");
-            // 参考工具：没跑过查询时整块结果面板都不出现（查询页只有编辑区）
+            // 参考界面：没跑过查询时整块结果面板都不出现（查询页只有编辑区）
             assert!(window.try_find("qhead").is_none(), "未执行时没有结果面板");
             assert!(window.try_find("qtab/0").is_none(), "没出结果前没有结果页签");
             app.update(cx, |a, cx| {
@@ -46297,7 +46743,7 @@ mod designer_tests {
                 assert_eq!(q.editor.read(cx).value().to_string(), "");
             });
 
-            // 参考客户端习惯：每次触发都开新页签，不去重
+            // 参考界面习惯：每次触发都开新页签，不去重
             window.click("新建查询", cx);
             window.render_frame(cx);
             app.update(cx, |a, _| {
@@ -46338,6 +46784,61 @@ mod designer_tests {
                 assert_eq!(a.opened[2].db, "master");
                 a.query_set_schema(qid, "dbo", cx);
                 assert_eq!(a.opened[2].qstate.as_ref().unwrap().schema, 0);
+            });
+        })
+        .unwrap();
+    }
+
+    /// 新建查询默认落在左侧树最后激活的库 / 模式上（打开库、选中表都算），
+    /// 而不是永远回到连接表单里的初始库；树选中项属于别的连接时不串库。
+    #[gpui_kit::test]
+    fn query_default_follows_tree_db(cx: &mut TestAppContext) {
+        isolate_store("qtree");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+
+            // 树最后激活「本地 MySQL / bx_mall」（清单第 2 条）
+            app.update(cx, |a, cx| {
+                a.sel = Act::Db(0, 1);
+                a.open_query_tab(None, window, cx);
+            });
+            app.update(cx, |a, _| {
+                let (t, q) = (&a.opened[0], a.opened[0].qstate.as_ref().unwrap());
+                assert_eq!(q.conn, "本地 MySQL");
+                assert_eq!((q.db, t.db), (1, "bx_mall"));
+            });
+
+            // 选中的是表（带库 / 模式坐标）也一样落在它所在的库
+            app.update(cx, |a, cx| {
+                a.sel = Act::Obj(0, 3, NO_SCHEMA, 0, 0);
+                a.open_query_tab(None, window, cx);
+            });
+            app.update(cx, |a, _| {
+                let (t, q) = (&a.opened[1], a.opened[1].qstate.as_ref().unwrap());
+                assert_eq!((q.db, t.db), (3, "mysql"));
+            });
+
+            // SQL Server：树上的模式下标一并带过去；「public」不在清单里就用第 0 个
+            app.update(cx, |a, cx| {
+                a.sel = Act::Obj(1, 2, 0, 0, 0);
+                a.open_query_tab(None, window, cx);
+            });
+            app.update(cx, |a, _| {
+                let (t, q) = (&a.opened[2], a.opened[2].qstate.as_ref().unwrap());
+                assert_eq!(q.conn, "测试 SQL Server");
+                assert_eq!((q.db, q.schema, t.db), (2, 0, "model"));
+            });
+
+            // 树选中项属于另一条连接：不串库，退回这条连接配置的库
+            app.update(cx, |a, cx| {
+                a.sel = Act::Db(1, 3);
+                a.open_query_tab(Some(0), window, cx);
+            });
+            app.update(cx, |a, _| {
+                let (t, q) = (&a.opened[3], a.opened[3].qstate.as_ref().unwrap());
+                assert_eq!(q.conn, "本地 MySQL");
+                assert_eq!((q.db, t.db), (0, "bx11"));
             });
         })
         .unwrap();
@@ -46806,7 +47307,7 @@ mod designer_tests {
                     .as_ref()
                     .unwrap()
                     .continue_on_error),
-                "默认不勾：遇错即停（参考客户端口径）"
+                "默认不勾：遇错即停（参考界面口径）"
             );
             window.click("qpm/run-continue", cx);
             window.render_frame(cx);
@@ -47721,7 +48222,7 @@ mod designer_tests {
         .unwrap();
     }
 
-    /// 非编辑态右键任意格：弹参考客户端口径的应用菜单（不是系统菜单），
+    /// 非编辑态右键任意格：弹参考界面口径的应用菜单（不是系统菜单），
     /// 右键的那格成为当前格；设为 NULL / 复制字段名 / 添加记录直接生效。
     #[gpui_kit::test]
     fn grid_right_click_opens_cell_menu(cx: &mut TestAppContext) {
@@ -47936,7 +48437,7 @@ mod designer_tests {
     }
 
     /// 数据页签的取数 SQL 从主内容区那段开始排：树面板那一格留空
-    /// （参考客户端底栏口径），记录数在 SQL 右侧。
+    /// （参考界面底栏口径），记录数在 SQL 右侧。
     #[gpui_kit::test]
     fn table_status_sql_sits_in_main_area(cx: &mut TestAppContext) {
         isolate_store("statussql");
@@ -48052,10 +48553,9 @@ mod designer_tests {
                     DaroApp::tab_glyph(t) == art::Glyph::DesignTable,
                     "新建表页签用表设计图标"
                 );
-                assert!(nv_icons::has("OV_Table_Design"), "表设计位图要打进包里");
                 did = t.did;
             });
-            // 每次触发都开新页签，不去重（参考客户端同款）
+            // 每次触发都开新页签，不去重（参考界面同款）
             app.update(cx, |a, cx| {
                 a.open_new_designer(Act::Obj(0, 0, NO_SCHEMA, 0, 0), window, cx)
             });
@@ -49008,7 +49508,7 @@ mod designer_tests {
         });
     }
 
-    /// 顶栏「格式」菜单照参考客户端查询窗口截图：缩进 ▸ / 注释 ▸ / 转换大小写 ▸ ─
+    /// 顶栏「格式」菜单照参考界面查询窗口截图：缩进 ▸ / 注释 ▸ / 转换大小写 ▸ ─
     /// 美化 SQL / 美化 SQL 选项... / 简化 SQL ─ 重构 ▸。两档真功能连着行为一起验：
     /// 缩进派编辑器的 Indent / Outdent（正文只多 / 少一层空白），美化 SQL 与工具条
     /// 那颗钮同一个 `query_prettify` 口径。
@@ -49105,7 +49605,7 @@ mod designer_tests {
         });
     }
 
-    /// 顶栏「工具」菜单照参考客户端截图逐行：数据传输 / 数据生成 / 数据脱敏 / 数据字典 /
+    /// 顶栏「工具」菜单照参考界面截图逐行：数据传输 / 数据生成 / 数据脱敏 / 数据字典 /
     /// 数据同步 / 结构同步 / 命令列界面（灰）/ 服务器监控 / 在数据库或模式中查找 ─
     /// 历史日志 ─ 选项。除「选项...」外这些功能 daro 一件都没实现，除子菜单留占位外
     /// 全是死标签；截图上的 F6 / Ctrl+L / Ctrl+, 不搬进来（没有对应绑定，写了就是假提示）。
@@ -50051,7 +50551,7 @@ mod designer_tests {
         assert_eq!(cx.windows().len(), 1, "点「关闭」收回更新中心");
     }
 
-    /// 顶栏「编辑」菜单照参考客户端查询窗口截图：条目、顺序、分隔线都在，
+    /// 顶栏「编辑」菜单照参考界面查询窗口截图：条目、顺序、分隔线都在，
     /// 没有落点的（从剪贴板堆栈粘贴、线条、创建片段）保持死标签也照样上屏。
     #[gpui_kit::test]
     fn edit_bar_menu_matches_reference_query_window(cx: &mut TestAppContext) {
@@ -50281,7 +50781,7 @@ mod designer_tests {
         });
     }
 
-    /// 顶栏「查看」菜单（开着查询页）照参考客户端查询窗口截图：导航窗格 / 信息窗格 /
+    /// 顶栏「查看」菜单（开着查询页）照参考界面查询窗口截图：导航窗格 / 信息窗格 /
     /// 结果 三个子菜单加一条「查询编辑器」死标签打头，视图模式与切换主题收进
     /// 「显示 ▸」，截图里没做的行留死标签。
     #[gpui_kit::test]
@@ -50353,7 +50853,7 @@ mod designer_tests {
         // 信息窗格 ▸（顶层第 4 行）：开关 + 两条真页签（常规=信息页、代码段=DDL 页）
         // + 截图里 daro 没做的「标识符」「AI 对话」。代码段要真库的表对象才可选，
         // 这里没有，所以点「常规」（子菜单第 3 行，含分隔线）验的是另一侧：选页签
-        // 顺带把窗格打开（参考客户端就是这个行为）。
+        // 顺带把窗格打开（参考界面就是这个行为）。
         app.update(cx, |a, _| a.show_info = false);
         cx.update_window(handle, |_, window, cx| {
             window.click("title-menu", cx);
@@ -50377,7 +50877,7 @@ mod designer_tests {
         app.read_with(cx, |a, _| {
             assert!(
                 a.show_info,
-                "选信息窗格的页签要顺带把窗格打开（参考客户端行为）"
+                "选信息窗格的页签要顺带把窗格打开（参考界面行为）"
             );
             assert_eq!(a.info_page, 0, "「常规」落在信息页");
         });
@@ -50411,7 +50911,7 @@ mod designer_tests {
                     "显示子菜单缺「{label}」"
                 );
             }
-            // 截图标签末尾的 (T)(U)… 是参考客户端的 Alt 访问键，daro 没有这些键位，
+            // 截图标签末尾的 (T)(U)… 是参考界面的 Alt 访问键，daro 没有这些键位，
             // 行文字不带括号提示。分隔线之后是真开关：点「列表」（第 12 行，含
             // 分隔线）要落 list_view。
             app.update(cx, |a, _| a.list_view = false);
@@ -50422,7 +50922,7 @@ mod designer_tests {
         .unwrap();
     }
 
-    /// 一个页签都没有＝参考客户端「刚打开」那一套：「格式」整栏不出现，「文件」只剩
+    /// 一个页签都没有＝参考界面「刚打开」那一套：「格式」整栏不出现，「文件」只剩
     /// 树级条目、「编辑」只剩三条、「查看」换成树的那一组。页签级条目（保存 /
     /// 另存为 / 导出结果 / 刷新 / 结果 / 网格视图）没有落点就不该露出来。
     #[gpui_kit::test]
@@ -50900,11 +51400,11 @@ mod designer_tests {
             );
             assert!(
                 (menu.origin.y - trig.origin.y - px(Q_TRIGGER_H)).as_f32().abs() < 0.5,
-                "菜单上沿贴住触发器下沿（参考客户端口径）"
+                "菜单上沿贴住触发器下沿（参考界面口径）"
             );
             assert!(
                 (menu.size.width - trig.size.width).as_f32().abs() < 0.5,
-                "菜单与触发器同宽，候选名超长截断（参考客户端口径）"
+                "菜单与触发器同宽，候选名超长截断（参考界面口径）"
             );
             assert!(
                 (window.find("qpm/db/0").bounds().size.height - px(Q_MENU_ROW_H))
@@ -50925,7 +51425,7 @@ mod designer_tests {
         .unwrap();
     }
 
-    /// 查询页的三个下拉是参考客户端那种可输入组合框：打开时回填当前值并
+    /// 查询页的三个下拉是参考界面那种可输入组合框：打开时回填当前值并
     /// 全选，键入即按子串过滤候选，回车回填高亮项，Esc 收起且不改上下文。
     #[gpui_kit::test]
     fn query_combo_filters_typing_and_enter(cx: &mut TestAppContext) {
@@ -51461,7 +51961,7 @@ mod designer_tests {
             uses.iter().any(|o| o.kind == "TYPE" && o.name == "dep_mood"),
             "{uses:#?}"
         );
-        // 参考工具「使用」页里每张表都有一条到所在模式的 NORMAL 依赖
+        // 参考界面「使用」页里每张表都有一条到所在模式的 NORMAL 依赖
         assert!(
             uses.iter()
                 .any(|o| o.kind == "SCHEMA" && o.name == "public" && o.degree == "NORMAL"),
@@ -51836,6 +52336,105 @@ mod tree_menu_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 对象级复制 / 粘贴：Ctrl+C 记住表，Ctrl+V 弹「粘贴表」，确认后真建出
+    /// 副本（结构和数据），目录随即刷新。
+    #[gpui_kit::test]
+    fn object_copy_paste_creates_a_table_copy(cx: &mut TestAppContext) {
+        isolate_store("objcopypaste");
+        let (seed, path) = sqlite_fixture(
+            "objpaste",
+            &[
+                "CREATE TABLE member (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)",
+                "CREATE INDEX ix_member_name ON member(name)",
+                "INSERT INTO member(name) VALUES ('a'), ('b')",
+            ],
+        );
+        // 目录缓存按连接名建键，这里用只属于本测试的名字
+        let conn = mock::Connection::new(
+            "粘贴表测试",
+            seed.kind,
+            "",
+            0,
+            path.clone(),
+            "",
+            "",
+            "",
+            false,
+        );
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![conn.clone()];
+                a.groups.clear();
+                a.open_connection(0, cx);
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let _ = catalog::objects(&a.conns[0], "main", "", 0);
+        });
+        settle(cx, handle);
+
+        let act = app.update(cx, |a, _| {
+            let objs = catalog::objects(&a.conns[0], "main", "", 0);
+            assert_eq!(objs, &["member"]);
+            Act::Obj(0, 0, NO_SCHEMA, 0, 0)
+        });
+
+        // Ctrl+C：选中真库表 → 记进对象级剪贴板（不是只写名字）
+        app.update(cx, |a, cx| {
+            a.active_tab = 0;
+            a.sel = act;
+            a.obj_multi = None;
+            a.edit_copy(cx);
+        });
+        app.update(cx, |a, _| {
+            let clip = a.table_clip.as_ref().expect("复制的表要留在对象级剪贴板");
+            assert_eq!(clip.tables, vec!["member".to_string()]);
+            assert!(a.pane_note.as_deref().unwrap_or_default().contains("已复制"));
+        });
+
+        // Ctrl+V：弹「粘贴表」确认框
+        app.update(cx, |a, cx| a.paste_tables(cx));
+        let dlg = *cx.windows().last().expect("粘贴表要开一个对话框窗口");
+        assert_eq!(cx.windows().len(), 2, "主窗 + 粘贴表对话框");
+        settle(cx, dlg);
+        cx.update_window(dlg, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("paste-ok", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        settle(cx, handle);
+
+        app.update(cx, |a, _| {
+            assert!(
+                catalog::objects(&a.conns[0], "main", "", 0).contains(&"member_copy"),
+                "粘贴完成后目录里要有副本"
+            );
+        });
+        assert_eq!(
+            crate::sqlite_driver::execute_stmt(
+                "粘贴表测试",
+                "SELECT count(*) FROM main.member_copy",
+                10
+            )
+            .unwrap()
+            .select
+            .and_then(|p| p.rows.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .as_deref(),
+            Some("2"),
+            "默认模式是结构和数据"
+        );
+
+        crate::sqlite_driver::close("粘贴表测试");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 菜单该不该给点：演示连接没有可落库的对象，DDL 项必须置灰、也给不出任务
     /// （点了没反应的假入口是这套房子的规矩）；改名空值或同名不算一次操作。
     #[gpui_kit::test]
@@ -52083,7 +52682,6 @@ mod tree_menu_tests {
                     DaroApp::tab_glyph(t) == art::Glyph::DesignView,
                     "新建视图页签用视图设计图标，不借用表设计"
                 );
-                assert!(nv_icons::has("OV_View_Design"), "视图设计位图要打进包里");
             });
         })
         .unwrap();
@@ -52153,7 +52751,7 @@ mod tree_menu_tests {
         });
     }
 
-    /// 子菜单贴着父菜单：参考客户端实测子菜单左缘压进父菜单右缘 3px、
+    /// 子菜单贴着父菜单：参考界面实测子菜单左缘压进父菜单右缘 3px、
     /// 上缘比高亮行顶再高 2px。回归的是「子菜单飘到父菜单右下方」——
     /// 锚点算的是行内容盒，行左的 24px 文字缩进会整块推进子菜单偏移里。
     #[gpui_kit::test]
@@ -53440,7 +54038,7 @@ mod ui_flows {
         });
     }
 
-    /// 顶栏「表」菜单只在激活的表数据页签上出现（参考客户端同款）；查询 / 设计
+    /// 顶栏「表」菜单只在激活的表数据页签上出现（参考界面同款）；查询 / 设计
     /// 页签上收起。设计表与查询表两个入口接到既有动作上。
     #[gpui_kit::test]
     fn table_menu_appears_only_for_table_tabs(cx: &mut TestAppContext) {
@@ -53536,7 +54134,7 @@ mod ui_flows {
         });
     }
 
-    /// 顶栏「查询」菜单只在激活查询页签时出现（参考客户端同款，位置与「表」菜单
+    /// 顶栏「查询」菜单只在激活查询页签时出现（参考界面同款，位置与「表」菜单
     /// 重合）；运行 / 勾选「遇到错误时继续」接到查询页签的既有状态上。
     #[gpui_kit::test]
     fn query_menu_appears_only_for_query_tabs(cx: &mut TestAppContext) {
@@ -54387,7 +54985,7 @@ mod grid_virtualization_tests {
 }
 
 /// 没有打开任何数据库时 Ribbon 分类按钮仍能切对象面板的分类：分类跟着按钮走，
-/// 清单保持为空、动作条一律不可用（参考客户端口径）。
+/// 清单保持为空、动作条一律不可用（参考界面口径）。
 #[cfg(test)]
 mod idle_category_tests {
     use super::*;
@@ -54611,7 +55209,7 @@ mod tool_view_tests {
     // `use super::*` 会带进 gpui 的同名 test 宏，显式引回标准宏。
     use core::prelude::v1::test;
 
-    /// 「用户」打开只读清单：演示连接走 mock，工具条照参考客户端四项，
+    /// 「用户」打开只读清单：演示连接走 mock，工具条照参考界面四项，
     /// 对象面板那一套动作条不残留；再点页签收回对象清单。
     #[gpui_kit::test]
     fn ribbon_user_opens_readonly_users_panel(cx: &mut TestAppContext) {
@@ -54938,9 +55536,8 @@ mod role_designer_tests {
             assert!(!rs.is_new);
             assert!(
                 DaroApp::tab_glyph(t) == art::Glyph::User,
-                "角色页签用参考客户端用户对象图标，不借功能区 FB_User"
+                "角色页签用用户对象图标，不借功能区图标"
             );
-            assert!(nv_icons::has("OV_User"), "用户对象位图要打进包里");
             assert_eq!(
                 app.read(cx).tab_label(t),
                 format!("pg_read_all_data ({})", t.conn_name)
@@ -55265,7 +55862,8 @@ mod role_designer_tests {
     }
 }
 
-/// 连接树底工具条的筛选弹层：勾选不能穿透到背板把弹层收掉，点背板仍能收起。
+/// 连接树顶：筛选弹层勾选不能穿透到背板把弹层收掉，点背板仍能收起；
+/// 搜索框有词时放大镜让位。
 #[cfg(test)]
 mod tree_filter_tests {
     use super::*;
@@ -55305,6 +55903,33 @@ mod tree_filter_tests {
             window.render_frame(cx);
             assert!(!app.read(cx).tree_filter_open, "点背板应收起弹层");
             assert!(window.try_find("tree-filter-popup").is_none(), "弹层已移除");
+        })
+        .unwrap();
+    }
+
+    /// 有搜索词时 🔍 让位给文字，空态再回来 —— 左栏窄时这 22px 很关键。
+    #[gpui_kit::test]
+    fn search_icon_yields_to_typed_query(cx: &mut TestAppContext) {
+        isolate_store("tree-search-icon");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("search-icon").is_some(), "空态显示放大镜");
+            app.update(cx, |a, cx| {
+                a.query = "本".into();
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(
+                window.try_find("search-icon").is_none(),
+                "有词后放大镜该让位"
+            );
+            app.update(cx, |a, cx| {
+                a.query.clear();
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("search-icon").is_some(), "清词后放大镜回来");
         })
         .unwrap();
     }
@@ -56162,7 +56787,7 @@ mod explain_tests {
 
     /// 视图设计器「预览」/「解释」：预览跑「定义」正文的 SELECT，底部出消息 /
     /// 预览面板并自动激活预览页签渲染结果网格；解释把第二个页签换成执行计划
-    /// （参考客户端 1:1 口径）。
+    /// （参考界面 1:1 口径）。
     #[gpui_kit::test]
     fn view_preview_runs_body_and_fills_grid(cx: &mut TestAppContext) {
         isolate_store("viewprev");
@@ -56252,7 +56877,7 @@ mod explain_tests {
     }
 
     /// PostgreSQL 口径的执行计划是一列文本行：解释页签把正文原样铺成文本，
-    /// 不套网格表头（对齐参考客户端视图设计器「解释」截图）。
+    /// 不套网格表头（对齐参考界面视图设计器「解释」截图）。
     #[gpui_kit::test]
     fn view_explain_single_column_plan_renders_as_text(cx: &mut TestAppContext) {
         isolate_store("viewplan");
@@ -56291,7 +56916,7 @@ mod explain_tests {
 
     /// PostgreSQL 视图设计器的「规则」子页：名称 / OID / 事件 / 代替运行 / 注释
     /// 五列表格 + 底部「位置 / 定义」属性区，工具条多出添加 / 删除规则两个钮，
-    /// 子标签从两个变三个（对齐参考客户端视图规则截图）。
+    /// 子标签从两个变三个（对齐参考界面视图规则截图）。
     #[gpui_kit::test]
     fn view_rules_subtab_grid_and_props(cx: &mut TestAppContext) {
         isolate_store("viewrules");
@@ -56437,7 +57062,7 @@ mod explain_tests {
     }
 
     /// PostgreSQL 视图设计器的「高级」子页：所有者（预填 postgres）/ 检查选项
-    /// 下拉 / 安全屏障勾选三行，非 PG 视图没有这一页（参考客户端视图高级截图口径）。
+    /// 下拉 / 安全屏障勾选三行，非 PG 视图没有这一页（参考界面视图高级截图口径）。
     #[gpui_kit::test]
     fn view_advanced_subtab_rows_and_sql(cx: &mut TestAppContext) {
         use gpui_kit::test::TestQueryExt as _;

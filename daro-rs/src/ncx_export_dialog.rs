@@ -1,11 +1,11 @@
-﻿//! 导出连接为参考客户端 `.ncx`（迁移自 Flutter 版
+﻿//! 导出连接为`.ncx` 兼容格式（迁移自 Flutter 版
 //! `lib/widgets/ncx_export_dialog.dart`）。
 //!
 //! 口径照 Flutter 版：
-//! - 默认全选「参考客户端有对应类型」的连接（Redis 在 .ncx 里没有属性模板，灰显不勾）；
+//! - 默认全选「目标格式有对应类型」的连接（Redis 在 .ncx 里没有属性模板，灰显不勾）；
 //! - 「全选 / 取消全选」语义固定，不做状态取反；
 //! - 默认导出到桌面 `connections.ncx`，可换路径（原生保存对话框）；
-//! - 「导出密码」默认勾上，密文用参考客户端内置算法加密，参考客户端侧可直接解；
+//! - 「导出密码」默认勾上，密文按兼容算法加密，可直接被该格式的工具解；
 //! - 写出失败把原因留在对话框里，不静默吞掉。
 
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -56,7 +56,7 @@ struct ExportDialog {
     conns: Vec<ExportConnection>,
     checked: Vec<bool>,
     include_passwords: bool,
-    /// 导出格式：`.ncx`（参考客户端）/ `.ano`（Another Redis Desktop Manager）
+    /// 导出格式：`.ncx`（兼容连接文件）/ `.ano`（Another Redis Desktop Manager）
     format: ExportFormat,
     path: Entity<InputState>,
     error: Option<String>,
@@ -463,7 +463,7 @@ impl Render for ExportDialog {
                     )
                     .child(ui::checkbox(
                         "export-passwords",
-                        "导出密码（按兼容算法加密，可被参考客户端直接解密）",
+                        "导出密码（按兼容格式加密）",
                         self.include_passwords,
                         true,
                         self.dark,
@@ -487,8 +487,7 @@ impl Render for ExportDialog {
             .child(
                 ui::footer_bar(self.dark)
                     .child(
-                        ui::primary_button("export-ok", "确定", self.dark, cx)
-                            .disabled(!can_export)
+                        ui::primary_button_enabled("export-ok", "确定", self.dark, can_export, cx)
                             .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
                     )
                     .child(

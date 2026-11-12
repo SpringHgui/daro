@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 const CONTEXT: &str = "PopupMenu";
 
-/// 子菜单贴边量，参考客户端（原生菜单）实测：子菜单左缘压进父菜单右缘 3px，
+/// 子菜单贴边量，参考界面（原生菜单）实测：子菜单左缘压进父菜单右缘 3px，
 /// 上缘比高亮行顶再高 2px（200% 下量到 3 物理像素）。向上翻开时左右镜像。
 const SUBMENU_OVERLAP: Pixels = px(3.);
 const SUBMENU_TOP: Pixels = px(-2.);

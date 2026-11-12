@@ -370,9 +370,14 @@ impl Render for RunSqlDialog {
                                 |this, _, _, _cx| this.cancel_run(),
                             ))
                         } else {
-                            ui::primary_button("runsql-start", "开始执行", dark, cx)
-                                .disabled(!has_path)
-                                .on_click(cx.listener(|this, _, _, cx| this.run(cx)))
+                            ui::primary_button_enabled(
+                                "runsql-start",
+                                "开始执行",
+                                dark,
+                                has_path,
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.run(cx)))
                         },
                     )
                     .child(div().flex_1())

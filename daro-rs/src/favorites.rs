@@ -1,7 +1,7 @@
 //! 收藏夹：把当前页签记成 1–9 号快速入口，落盘 `favorites.json`
 //! （与 `connections.json` / `queries.json` 同目录，受 `DARO_DATA_DIR` 覆盖）。
 //!
-//! 参考客户端的收藏夹固定 9 个槽位（Ctrl+1…Ctrl+9），本模块按槽位存
+//! 参考界面的收藏夹固定 9 个槽位（Ctrl+1…Ctrl+9），本模块按槽位存
 //! `Vec<Option<Favorite>>`：空槽序列化成 `null`，读取时补齐到 9 个。
 //! 目标用名字而不是下标（连接增删会让下标漂移），打开时再回查目录。
 

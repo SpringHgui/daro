@@ -675,21 +675,19 @@ impl UpdateWindow {
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_download(cx))),
                     )
                     .child(
-                        ui::primary_button("update-downloading", label, dark, cx).disabled(true),
+                        ui::primary_button_enabled("update-downloading", label, dark, false, cx),
                     );
             }
             Phase::Cancelling => {
                 footer = footer.child(
-                    ui::primary_button("update-cancelling", "正在取消…", dark, cx)
-                        .loading(true)
-                        .disabled(true),
+                    ui::primary_button_enabled("update-cancelling", "正在取消…", dark, false, cx)
+                        .loading(true),
                 );
             }
             Phase::Restarting => {
                 footer = footer.child(
-                    ui::primary_button("update-installing", "正在安装…", dark, cx)
-                        .loading(true)
-                        .disabled(true),
+                    ui::primary_button_enabled("update-installing", "正在安装…", dark, false, cx)
+                        .loading(true),
                 );
             }
             Phase::Failed => {
@@ -719,9 +717,8 @@ impl UpdateWindow {
                             .on_click(|_, window, _| window.remove_window()),
                     )
                     .child(
-                        ui::primary_button("update-checking", "检查中…", dark, cx)
-                            .loading(true)
-                            .disabled(true),
+                        ui::primary_button_enabled("update-checking", "检查中…", dark, false, cx)
+                            .loading(true),
                     );
             }
             Phase::UpToDate | Phase::CheckFailed => {

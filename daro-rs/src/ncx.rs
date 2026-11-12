@@ -1,8 +1,8 @@
-//! 参考客户端 `.ncx` 导入/导出。
+//! `.ncx` 兼容格式 导入/导出。
 //!
 //! 格式与 Flutter 版的 `.ncx` 数据模块完全对齐：
 //! - XML 属性平铺，密码走 AES-128-CBC + PKCS#7（libcc 常量密钥）
-//! - 分组用 daro 私有属性 `Group="..."`，参考客户端侧忽略
+//! - 分组用 daro 私有属性 `Group="..."`，其它工具会忽略
 //! - 支持 MySQL / PostgreSQL / SQL Server；其余类型导出时跳过
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
@@ -13,10 +13,10 @@ use std::io::Cursor;
 
 use crate::mock::DbKind;
 
-/// 参考客户端内置密码加密密钥（libcc 常量，16 字节 ASCII）
+/// 该格式内置密码加密密钥（libcc 常量，16 字节 ASCII）
 const LIBCC_KEY: &[u8; 16] = b"libcckeylibcckey";
 
-/// 参考客户端内置密码加密 IV（libcc 常量，末尾含一个空格，16 字节）
+/// 该格式内置密码加密 IV（libcc 常量，末尾含一个空格，16 字节）
 const LIBCC_IV: &[u8; 16] = b"libcciv libcciv ";
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
@@ -29,13 +29,13 @@ pub enum PasswordState {
     NoPassword,
     /// 密码已解密
     Decrypted,
-    /// 参考客户端端未勾选「保存密码」，导出文件里没有密文
+    /// 导出端未勾选「保存密码」，导出文件里没有密文
     NotSaved,
     /// 有密文但解不出来（旧版加密方式等），导入后需手填
     Undecryptable,
 }
 
-/// 解析自参考客户端导出文件的一条连接
+/// 解析自导出文件的一条连接
 #[derive(Clone, Debug)]
 pub struct NcxConnection {
     /// `<Connection>` 元素上的全部属性（`.ano` 的 JSON 条目也归一到这张表）
@@ -59,7 +59,7 @@ impl NcxConnection {
         self.attr("ConnectionName")
     }
 
-    /// 参考客户端原始类型（MYSQL / POSTGRESQL / SQLSERVER / SQLITE ...）
+    /// 参考界面原始类型（MYSQL / POSTGRESQL / SQLSERVER / SQLITE ...）
     pub fn conn_type(&self) -> &str {
         self.attr("ConnType")
     }
@@ -174,7 +174,7 @@ pub struct NcxFile {
 /// 导出文件格式
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportFormat {
-    /// 参考客户端的 `.ncx`（XML）
+    /// `.ncx` 连接文件（XML）
     Ncx,
     /// Another Redis Desktop Manager 的 `.ano`（base64 JSON）
     Ano,
@@ -470,7 +470,7 @@ pub fn decrypt_ncx_password(cipher_hex: &str, saved: bool) -> (PasswordState, St
     }
 }
 
-/// 用参考客户端的 libcc 常量加密明文口令，输出大写十六进制密文
+/// 用该格式的 libcc 常量加密明文口令，输出大写十六进制密文
 pub fn encrypt_ncx_password(plain: &str) -> String {
     let mut buf = vec![0u8; plain.len() + 16];
     buf[..plain.len()].copy_from_slice(plain.as_bytes());
@@ -485,7 +485,7 @@ pub fn encrypt_ncx_password(plain: &str) -> String {
     hex
 }
 
-/// 参考客户端按 UTF-8 存密码字节，解出的字节必须能按 UTF-8 解码且不含控制字符
+/// 该格式按 UTF-8 存密码字节，解出的字节必须能按 UTF-8 解码且不含控制字符
 fn decode_printable(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return Some(String::new());
@@ -613,7 +613,7 @@ pub struct NcxExportResult {
     pub xml: String,
     /// 实际写进文件的连接名
     pub exported: Vec<String>,
-    /// 因参考客户端无对应类型而跳过的连接（名称 + 原因）
+    /// 因目标格式无对应类型而跳过的连接（名称 + 原因）
     pub skipped: Vec<(String, String)>,
 }
 
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn known_cipher() {
-        // 参考客户端空密码的已知密文
+        // 该格式空密码的已知密文
         let (state, decrypted) =
             decrypt_ncx_password("E191AF42327478CC5F143EF279EC4D81", true);
         assert_eq!(state, PasswordState::Decrypted);

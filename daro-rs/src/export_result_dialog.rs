@@ -1,4 +1,4 @@
-﻿//! 「导出向导」对话框（结果集 / 表数据共用，按参考客户端导出向导第一步）。
+﻿//! 「导出向导」对话框（结果集 / 表数据共用，按参考界面导出向导第一步）。
 //!
 //! 两步：先是格式选择（照参考截图：单选列表，企业版的 Excel / Access / DBase /
 //! Parquet 接通入口、点击弹「敬请期待」但单选位不给选），再是导出路径与格式选项。
@@ -42,7 +42,7 @@ fn default_path(label: &str, format: TableFormat) -> String {
         .unwrap_or(name)
 }
 
-/// 格式名按参考客户端向导的口径写（后缀也一并列出）
+/// 格式名按参考界面向导的口径写（后缀也一并列出）
 fn wizard_label(format: TableFormat) -> &'static str {
     match format {
         TableFormat::Txt => "文本文件 (*.txt)",

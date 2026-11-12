@@ -5,9 +5,10 @@
 //! Zed 的组件绑定它自家 gpui 与 theme crate，这里只搬设计数值与语义色，
 //! 用 gpui-kit 的控件复刻；需要新尺寸先在这里加常量。
 
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{Sizable as _, Size as ComponentSize, TitleBar, h_flex};
+use gpui_kit::base::Disableable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -49,7 +50,8 @@ pub const TAB_H: f32 = 32.;
 pub const TAB_PAD_X: f32 = 11.;
 
 /// 主按钮（确定 / 下一步 / 导入）：Zed `TintColor::Accent` —— info.background 淡蓝底、
-/// info.border 浅蓝边、正文色文字；hover 压暗一档，不是实心品牌蓝配白字。
+/// info.border 浅蓝边、正文色文字；hover 压暗一档。VS Code 2026 两档是实心
+/// button.background，文字色由色板的 `primary_foreground` 给白字。
 pub fn primary_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -61,7 +63,7 @@ pub fn primary_button(
         .custom(
             ButtonCustomVariant::new(cx)
                 .color(to_hsla(p.primary_face))
-                .foreground(to_hsla(p.foreground))
+                .foreground(to_hsla(p.primary_foreground))
                 .hover(to_hsla(p.primary_face_hover))
                 .active(to_hsla(p.primary_face)),
         )
@@ -76,14 +78,55 @@ pub fn primary_button(
         .border_color(to_hsla(p.primary_border))
 }
 
-/// 次按钮（取消 / 关闭 / 浏览…）：Zed Subtle —— 透明底，hover 铺 element.hover。
+/// 可禁用的主按钮：启用时与 [`primary_button`] 一致；禁用时退成次按钮的灰面
+/// 加 muted 字。库里的禁用态文字固定是 `muted_foreground` 的 50%，又会被
+/// 实例上的实心底盖回去，蓝底上读不出来，所以禁用配色在这里自己给。
+pub fn primary_button_enabled(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    dark: bool,
+    enabled: bool,
+    cx: &App,
+) -> Button {
+    let button = primary_button(id, label, dark, cx);
+    if enabled {
+        return button;
+    }
+    let p = Palette::of(dark);
+    button
+        .disabled(true)
+        .bg(to_hsla(p.button_face))
+        .border_color(to_hsla(p.button_border))
+        .text_color(to_hsla(p.muted_foreground))
+}
+
+/// 次按钮（取消 / 关闭 / 浏览…）：白底 + 按钮灰描边，hover 压一档。
+/// 走组件库的 Default 变体——`apply_palette` 已把 button 令牌映射到色板的
+/// `button_face` / `hover` / `selection_focus`；禁用态的底和字也由库按主题给。
 pub fn secondary_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     Button::new(id)
-        .ghost()
+        .with_variant(ButtonVariant::Default)
         .label(label)
         .h(px(CONTROL_H))
         .min_w(px(BUTTON_MIN_W))
         .px(px(CONTROL_PAD_X))
+        .text_size(px(13.))
+        .rounded(px(RADIUS))
+}
+
+/// 链接型操作（GitHub / Gitee / 通过 URI 新建…）：无底面，只留强调色文字。
+pub fn link_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    dark: bool,
+) -> Button {
+    let p = Palette::of(dark);
+    Button::new(id)
+        .ghost()
+        .label(label)
+        .text_color(to_hsla(p.accent))
+        .h(px(CONTROL_H))
+        .px(px(4.))
         .text_size(px(13.))
         .rounded(px(RADIUS))
 }

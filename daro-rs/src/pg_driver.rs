@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
@@ -300,7 +301,7 @@ fn first_cols(msgs: &[SimpleQueryMessage]) -> Vec<String> {
 
 // ── 目录清单 ─────────────────────────────────────────────────────
 
-/// 服务器上的库清单（模板库不列，与参考客户端一致）。
+/// 服务器上的库清单（模板库不列，与参考界面一致）。
 pub fn try_list_databases(key: &str) -> Result<Vec<String>, String> {
     catalog_list(
         key,
@@ -1079,6 +1080,67 @@ pub fn apply_changes(key: &str, schema: &str, ch: &GridChanges<'_>) -> Result<St
     })
 }
 
+// ── 跨库复制表用的独立会话 ────────────────────────────────────────
+
+/// 跨库 / 跨连接复制表时自己开一条连接：不占注册表里的句柄。复制一张大表
+/// 可能搬很久，不能把 UI 正在用的那条连接锁住。
+///
+/// PG 没有「跨库查询」这类服务端语法，跨库复制只能由客户端做：从源库读结构、
+/// 在目标库建表，再经 COPY 文本流把行搬过去（与参考客户端的 transfer 同路）。
+pub struct CopySession {
+    client: Client,
+}
+
+impl CopySession {
+    pub fn connect(p: &Params) -> Result<CopySession, String> {
+        connect(p).map(|client| CopySession { client })
+    }
+
+    /// 执行一条语句（BEGIN / COMMIT / DDL / COMMENT），不取结果。
+    pub fn exec(&mut self, sql: &str) -> Result<(), String> {
+        self.client.batch_execute(sql).map_err(|e| err_text(&e))
+    }
+
+    /// 简单查询，所有列按文本取回（NULL 变空串；调用方自己用 COALESCE 区分）。
+    pub fn query(&mut self, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        let msgs = self.client.simple_query(sql).map_err(|e| err_text(&e))?;
+        Ok(msgs
+            .into_iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => {
+                    Some((0..r.len()).map(|i| r.get(i).unwrap_or("").to_string()).collect())
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// 把 `from`（`COPY … TO STDOUT`）的文本流原样灌进 `into`
+    /// （`COPY … FROM STDIN`）。两端都走文本格式，不逐类型解码。
+    pub fn copy_from(
+        &mut self,
+        src: &mut CopySession,
+        from: &str,
+        into: &str,
+    ) -> Result<u64, String> {
+        let mut reader = src.client.copy_out(from).map_err(|e| err_text(&e))?;
+        let mut writer = self.client.copy_in(into).map_err(|e| err_text(&e))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| format!("从源库读数据失败：{e}"))?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| format!("写入目标库失败：{e}"))?;
+        }
+        writer.finish().map_err(|e| err_text(&e))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1299,6 +1361,14 @@ pub(crate) mod tests {
         }
         close(&k);
         Some(tp)
+    }
+
+    /// 给别的模块的真机用例用：同一把锁 + 重建测试库，返回测试库参数。
+    /// 读不到开发库连接串时返回 None（调用方自行跳过）。
+    pub(crate) fn pg_fixture() -> Option<(std::sync::MutexGuard<'static, ()>, Params)> {
+        let guard = PG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = reset_test_db()?;
+        Some((guard, p))
     }
 
     /// 真机用例的公共开场：拿锁 → 重建库 → 注册一条 UI 口径的连接。

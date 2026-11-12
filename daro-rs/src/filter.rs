@@ -1,10 +1,10 @@
-//! 数据网格筛选器（E节）的纯模型：准则树、参考客户端实测的 23 个算子、
+//! 数据网格筛选器（E节）的纯模型：准则树、参考界面实测的 23 个算子、
 //! WHERE / ORDER BY 生成、「文本」模式的反解析（生成 ↔ 解析往返）、
 //! mock 行匹配。UI 在 main.rs 的 filter_pane / table_page。
 //!
 //! 连接词语义照 SQL 优先级：顶层连续的 AND 结成簇、OR 分隔簇；生成的
 //! SQL 在混合连接词时给 AND 簇加括号，保证文本往返无歧义。组内连接词
-//! 统一同词（组的 and 标志），参考客户端组内行的连接词 chip 切的是整组。
+//! 统一同词（组的 and 标志），参考界面组内行的连接词 chip 切的是整组。
 
 use gpui_kit::component::input::{EditorState, InputState};
 use gpui_kit::Entity;
@@ -12,7 +12,7 @@ use gpui_kit::Entity;
 use crate::mock::DbKind;
 use crate::db_types::ColMeta;
 
-/// 筛选算子。顺序 = 参考客户端算子菜单的实测顺序（23 项）。
+/// 筛选算子。顺序 = 参考界面算子菜单的实测顺序（23 项）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FOp {
     Eq,
@@ -67,7 +67,7 @@ pub const ALL_OPS: [FOp; 23] = [
 ];
 
 impl FOp {
-    /// 算子菜单文案，照参考客户端实测逐字（首项在菜单里带 ✓）。
+    /// 算子菜单文案，照参考界面实测逐字（首项在菜单里带 ✓）。
     pub fn label(self) -> &'static str {
         match self {
             FOp::Eq => "=",
@@ -108,7 +108,7 @@ impl FOp {
     }
 }
 
-/// 默认算子按列类型：文本列「包含」、其余「=」（参考客户端实测 varchar→包含、
+/// 默认算子按列类型：文本列「包含」、其余「=」（参考界面实测 varchar→包含、
 /// int8→=；bool / 数值同按「=」走）。
 pub fn default_op(cols: &[ColMeta], col: usize) -> FOp {
     match cols.get(col) {
@@ -140,7 +140,7 @@ impl FCrit {
         }
     }
 
-    /// 值单元格显示的文本：空值显示占位 <?>（参考客户端同款）。
+    /// 值单元格显示的文本：空值显示占位 <?>（参考界面同款）。
     pub fn value_text(&self, which: usize) -> String {
         if self.op == FOp::Custom {
             let t = self.custom.trim().to_string();
@@ -160,7 +160,7 @@ impl FCrit {
 }
 
 /// 准则节点：单条准则或包了一层括号的组。组内连接词逐间隙存
-/// （参考客户端组内每行的 and / or chip 各自切换）。
+/// （参考界面组内每行的 and / or chip 各自切换）。
 #[derive(Clone, Debug, PartialEq)]
 pub enum FNode {
     Crit(FCrit),

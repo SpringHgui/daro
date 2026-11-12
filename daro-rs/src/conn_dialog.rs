@@ -1,4 +1,4 @@
-//! 新建连接向导。参考客户端里这是独立的顶层窗口，这里同样开新窗口，
+//! 新建连接向导。参考界面里这是独立的顶层窗口，这里同样开新窗口，
 //! 而不是在主窗口内叠一层遮罩。
 
 use gpui_kit::component::button::Button;
@@ -22,7 +22,7 @@ const TILE_W: f32 = 96.;
 const TILE_H: f32 = 92.;
 const COLS: usize = 5;
 
-/// 表单页（参考客户端「常规」页）的布局常量。数值来自参考截图（900×700 内容区）。
+/// 表单页（参考界面「常规」页）的布局常量。数值来自参考截图（900×700 内容区）。
 const TABS: [&str; 7] = ["常规", "高级", "数据库", "SSL", "SSH", "HTTP", "备注"];
 const TABS_SQLITE: [&str; 5] = ["常规", "高级", "附加的数据库", "HTTP", "备注"];
 const SQLITE_TYPES: [&str; 3] = ["现有的数据库文件", "新建 SQLite 3", "新建 SQLite 2"];
@@ -39,7 +39,7 @@ pub(crate) struct TypeTile {
     pub(crate) icon: &'static str,
 }
 
-/// 只有接入了驱动的类型可选；其余照参考客户端摆出来但置灰。
+/// 只有接入了驱动的类型可选；其余照参考界面摆出来但置灰。
 /// 连接树底部的筛选弹层复用同一份清单（见 main.rs）。
 pub(crate) const TILES: [TypeTile; 9] = [
     TypeTile { name: "MySQL", kind: Some(DbKind::MySql), icon: "mysql" },
@@ -59,7 +59,7 @@ enum Step {
     Form,
 }
 
-/// 同一个窗口承担「新建」和「编辑」：参考客户端的连接属性对话框与向导共用一套表单，
+/// 同一个窗口承担「新建」和「编辑」：参考界面的连接属性对话框与向导共用一套表单，
 /// 编辑态只是跳过类型选择、并在保存时回写原连接。
 #[derive(Clone, Copy)]
 pub enum ConnDialogMode {
@@ -196,7 +196,7 @@ impl NewConnectionDialog {
                 .default_value(initial(|c| c.password.clone(), String::new()))
                 .masked(true)
         });
-        // 参考客户端新建连接时「保存密码」默认勾选
+        // 参考界面新建连接时「保存密码」默认勾选
         let save_password = editing
             .as_ref()
             .map(|c| !c.password.is_empty())
@@ -256,7 +256,7 @@ impl NewConnectionDialog {
         Palette::of(self.dark)
     }
 
-    /// 参考客户端在选定类型后把类型名并进窗口标题（新建连接 (MySQL)）；编辑态不带类型。
+    /// 参考界面在选定类型后把类型名并进窗口标题（新建连接 (MySQL)）；编辑态不带类型。
     fn title_text(&self) -> String {
         let base = match self.mode {
             ConnDialogMode::Create | ConnDialogMode::CreateWithKind(_) => "新建连接",
@@ -299,7 +299,7 @@ impl NewConnectionDialog {
         };
         let old_kind = self.kind;
         self.kind = kind;
-        // 参考客户端的习惯：进表单时空字段补上该类型的默认值
+        // 参考界面的习惯：进表单时空字段补上该类型的默认值
         // （主机 localhost、端口按类型，MySQL 再补用户名 root）。
         let port_value = self.port.read(cx).value().to_string();
         if port_value.is_empty() || port_value == old_kind.default_port().to_string() {
@@ -317,7 +317,7 @@ impl NewConnectionDialog {
         self.uri_mode = false;
         self.status = None;
         self.step = Step::Form;
-        // 参考客户端打开表单时把焦点放在连接名称上（聚焦底线为蓝）
+        // 参考界面打开表单时把焦点放在连接名称上（聚焦底线为蓝）
         let name = self.name.clone();
         cx.defer_in(window, move |_, window, cx| {
             name.update(cx, |state, cx| state.focus(window, cx));
@@ -769,13 +769,12 @@ impl NewConnectionDialog {
         let enabled = self.selected.and_then(|ix| TILES[ix].kind).is_some();
         ui::footer_bar(self.dark)
             .child(
-                ui::secondary_button("uri", "通过 URI 新建连接...")
+                ui::link_button("uri", "通过 URI 新建连接...", self.dark)
                     .on_click(cx.listener(|this, _, window, cx| this.goto_uri_form(window, cx))),
             )
             .child(div().flex_1())
             .child(
-                ui::primary_button("next", "下一步", self.dark, cx)
-                    .disabled(!enabled)
+                ui::primary_button_enabled("next", "下一步", self.dark, enabled, cx)
                     .on_click(cx.listener(|this, _, window, cx| this.goto_form(window, cx))),
             )
             .child(
@@ -1053,8 +1052,7 @@ impl NewConnectionDialog {
                 )
             })
             .child(
-                ui::primary_button("ok", "确定", self.dark, cx)
-                    .disabled(!can_save)
+                ui::primary_button_enabled("ok", "确定", self.dark, can_save, cx)
                     .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
             )
             .child(

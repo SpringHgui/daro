@@ -1,8 +1,7 @@
 //! 图标入口：树 / 功能区 / 工具条统一按 `Glyph` 取图。
 //!
 //! 控件字形统一用 Zed 同款 SVG（`zed_icons`），跟随主题色与 hover 状态；
-//! 数据库品牌图标与信息卡大图继续贴参考客户端位图（按 16/24/32/48/64 分档，
-//! 见 `nv_icons` / `db_icons`），那属于内容标识而非控件字形。
+//! 数据库品牌图标用厂商开源 SVG（见 `db_icons`），属于内容标识而非控件字形。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
@@ -11,7 +10,6 @@ use gpui_kit::*;
 
 use crate::db_icons;
 use crate::mock::DbKind;
-use crate::nv_icons;
 use crate::zed_icons::{self, ZedIcon};
 
 /// 图标种类。树 / 功能区 / 工具条都走这一套，
@@ -77,9 +75,9 @@ pub enum Glyph {
     RibbonAutoRun,
     // ── 对象面板工具条 ──
     OpenTable,
-    /// 工具条「设计」动作：只有一支铅笔（参考客户端 TB_Design）
+    /// 工具条「设计」动作：只有一支铅笔（参考界面 TB_Design）
     Pencil,
-    /// 表设计页签 / 设计器：表格 + 铅笔（参考客户端 OV_Table_Design）
+    /// 表设计页签 / 设计器：表格 + 铅笔（参考界面 OV_Table_Design）
     DesignTable,
     NewTable,
     AiTable,
@@ -128,7 +126,7 @@ pub enum Glyph {
     HeroFolder,
     HeroEngine(DbKind),
     HeroDb,
-    /// 直接指定参考客户端资源名，给一次性工具条按钮用
+    /// 直接指定资源名，给一次性工具条按钮用
     Asset(&'static str),
     /// 单色线稿，颜色由调用方给
     Lucide(IconName),
@@ -144,7 +142,7 @@ impl From<ZedIcon> for Glyph {
 
 impl From<IconName> for Glyph {
     fn from(name: IconName) -> Self {
-        // 常见的几款直接映射到参考客户端位图，其余退回线稿
+        // 常见的几款直接映射到语义变体，其余退回线稿
         match name {
             IconName::Table2 => Glyph::Table,
             IconName::Eye => Glyph::View,
@@ -255,7 +253,11 @@ fn zed_for(glyph: Glyph) -> Option<ZedIcon> {
             "FILTER_MOVE_DOWN" => ZedIcon::ArrowDown,
             "TB_User_Privileges_Manager" | "TB_User" => ZedIcon::Person,
             "TB_Table_Profile" => ZedIcon::Table,
-            "TB_Starred" | "OBJECT_STAR" => ZedIcon::Star,
+            "OBJECT_STAR" => ZedIcon::Star,
+            "TB_Starred" => ZedIcon::StarFilled,
+            "TB_Unstarred" => ZedIcon::Star,
+            "OV_ASCENDING" => ZedIcon::ArrowUp,
+            "OV_DESCENDING" => ZedIcon::ArrowDown,
             "TB_Schema_Analysis" => ZedIcon::Blocks,
             "TB_Refresh" => ZedIcon::RotateCw,
             "TB_Filter_Sort" => ZedIcon::FilterFunnel,
@@ -271,7 +273,7 @@ fn zed_for(glyph: Glyph) -> Option<ZedIcon> {
         },
         Glyph::Lucide(name) => return zed_for_lucide(name),
         Glyph::Zed(icon) => icon,
-        // 品牌连接 / 信息卡大图 / 引擎图标保持参考客户端位图。
+        // 品牌连接 / 信息卡大图 / 引擎图标交给 `db_icons`。
         Glyph::Conn(_)
         | Glyph::HeroDb
         | Glyph::HeroSchema
@@ -354,77 +356,16 @@ fn zed_for_lucide(name: IconName) -> Option<ZedIcon> {
     })
 }
 
-/// 参考客户端资源名。`Conn` 按数据库品牌单独分流；`Lucide` 不走位图。
-fn asset(glyph: Glyph) -> Option<&'static str> {
-    Some(match glyph {
-        // 连接组在参考客户端里是黄色「虚拟组」文件夹，不是带共享标记的目录图标
-        Glyph::Folder => "CLOUD_VIRTUAL_GROUP",
-        Glyph::Db => "OV_Database_On",
-        // 信息卡大图走参考客户端原生 128px 资源，不经位图库
-        Glyph::HeroDb
-        | Glyph::HeroSchema
-        | Glyph::HeroTable
-        | Glyph::HeroView
-        | Glyph::HeroMatView
-        | Glyph::HeroFunction
-        | Glyph::HeroQuery
-        | Glyph::HeroFolder
-        | Glyph::HeroEngine(_) => return None,
-        Glyph::Schema => "OV_Schema_On",
-        // 对象工具条与功能区按钮在参考客户端里走 TB_* 小图标，OV_* 是树节点/信息面板用的
-        Glyph::OpenTable => "TB_Open",
-        Glyph::Table => "OV_Table",
-        Glyph::View => "OV_View",
-        Glyph::MatView => "OV_Materialized_View",
-        Glyph::DesignView => "OV_View_Design",
-        Glyph::DesignMatView => "OV_Materialized_View_Design",
-        Glyph::PreviewEye => "TB_Preview",
-        Glyph::ViewBuilder | Glyph::QueryBuilder => "QUERY_BUILDER",
-        Glyph::Function => "OV_Function",
-        Glyph::Query => "OV_Query",
-        Glyph::User => "OV_User",
-        // 功能区 / 信息面板的大图标走 image_collection_32x32 的 FB_*：
-        // 它们原生就有 48/64，OV_* 只有 32，放大到 64 档会发虚。
-        Glyph::RibbonTable => "FB_Table",
-        Glyph::RibbonView => "FB_View",
-        Glyph::RibbonMatView => "FB_Materialized_View",
-        Glyph::RibbonFunction => "FB_Function",
-        Glyph::RibbonConn => "FB_New_Connection",
-        Glyph::RibbonNewQuery => "FB_New_Query",
-        Glyph::RibbonUser => "FB_User",
-        Glyph::RibbonTools => "FB_Others",
-        Glyph::RibbonBackup => "FB_Backup",
-        Glyph::RibbonAutoRun => "FB_Automation",
-        Glyph::RibbonQuery => "FB_Query",
-        Glyph::Column => "OV_Field",
-        Glyph::IndexGroup => "OV_Index",
-        Glyph::ForeignKeyGroup => "OV_Foreign_Key",
-        Glyph::UniqueKeyGroup => "OV_Unique",
-        Glyph::CheckGroup => "OV_Check",
-        Glyph::ExcludeGroup => "OV_Exclude",
-        Glyph::RuleGroup => "OV_Rule",
-        Glyph::TriggerGroup => "OV_Trigger",
-        Glyph::DesignTable => "OV_Table_Design",
-        Glyph::Pencil => "TB_Design",
-        Glyph::NewTable => "TB_New",
-        Glyph::AiTable | Glyph::AskAi => "TB_AI",
-        Glyph::DropTable => "TB_Delete",
-        Glyph::ImportWizard => "TB_Import",
-        Glyph::ExportWizard => "TB_Export",
-        Glyph::Txn => "TB_Table_Begin_Transaction",
-        Glyph::CellEdit => "TB_Assistant",
-        Glyph::FilterSort => "OV_Filter",
-        Glyph::Columns => "TB_Columns",
-        Glyph::History => "TB_History",
-        Glyph::SaveFile => "TB_Save",
-        Glyph::Beautify => "TB_Beautify_SQL",
-        Glyph::Snippet | Glyph::CodeSnippet => "TB_Snippet",
-        Glyph::PlayOutline => "TB_Execute",
-        Glyph::StopOutline => "TB_Stop",
-        Glyph::ExplainPlan => "TB_Explain",
-        Glyph::KeyGold => "OV_Model_Primary_Key",
-        Glyph::Asset(id) => id,
-        Glyph::Conn(_) | Glyph::Lucide(_) | Glyph::Zed(_) => return None,
+/// 布局类按钮只有资源名、没有 Zed 字形，退回 Lucide 线稿。
+fn lucide_for_asset(id: &str) -> Option<IconName> {
+    Some(match id {
+        "GLYPH_GRIDVIEW" | "GLYPH_GRIDVIEW_DARK" => IconName::LayoutGrid,
+        "GLYPH_LISTVIEW" | "GLYPH_LISTVIEW_DARK" => IconName::LayoutList,
+        "GLYPH_DETAILVIEW" | "GLYPH_DETAILVIEW_DARK" => IconName::Rows3,
+        "GLYPH_FORMVIEW" | "GLYPH_FORMVIEW_DARK" => IconName::TextCursorInput,
+        "GLYPH_LEFTPANEL" | "GLYPH_LEFTPANEL_DARK" => IconName::PanelLeft,
+        "GLYPH_RIGHTPANEL" | "GLYPH_RIGHTPANEL_DARK" => IconName::PanelRight,
+        _ => return None,
     })
 }
 
@@ -435,7 +376,7 @@ pub fn art(glyph: Glyph, size: f32) -> AnyElement {
     }
     match glyph {
         Glyph::Conn(kind) => db_icons::engine(kind, size),
-        // 树/功能区的位图最大 32/64px；信息卡 64px 大图在 200% DPI 下用原生 128px 资源
+        // 信息卡 64px 大图与树节点同一套字形，不再按像素档准备位图。
         Glyph::HeroDb => db_icons::database_hero(size),
         Glyph::HeroSchema => db_icons::hero_schema(size),
         Glyph::HeroTable => db_icons::hero_table(size),
@@ -446,14 +387,16 @@ pub fn art(glyph: Glyph, size: f32) -> AnyElement {
         Glyph::HeroFolder => db_icons::hero_folder(size),
         Glyph::HeroEngine(kind) => db_icons::hero_engine(kind, size),
         Glyph::Lucide(name) => Icon::new(name).with_size(px(size)).into_any_element(),
-        other => match asset(other) {
-            Some(id) => nv_icons::icon(id, size),
+        Glyph::Asset(id) => match lucide_for_asset(id) {
+            Some(name) => Icon::new(name).with_size(px(size)).into_any_element(),
             None => div().flex_none().w(px(size)).h(px(size)).into_any_element(),
         },
+        // 未登记的 Asset 名没有对应字形，留空位。
+        _ => div().flex_none().w(px(size)).h(px(size)).into_any_element(),
     }
 }
 
-/// 有主题色的图标：彩色走参考客户端位图，线稿走 lucide。
+/// 有主题色的图标：统一走同一套字形，颜色由调用方给。
 pub fn icon(glyph: Glyph, size: f32, tint: Hsla) -> AnyElement {
     if let Some(z) = zed_for(glyph) {
         return zed_icons::ic(z, size, tint);
@@ -463,6 +406,13 @@ pub fn icon(glyph: Glyph, size: f32, tint: Hsla) -> AnyElement {
             .with_size(px(size))
             .text_color(tint)
             .into_any_element(),
+        Glyph::Asset(id) => match lucide_for_asset(id) {
+            Some(name) => Icon::new(name)
+                .with_size(px(size))
+                .text_color(tint)
+                .into_any_element(),
+            None => art(glyph, size),
+        },
         other => art(other, size),
     }
 }
