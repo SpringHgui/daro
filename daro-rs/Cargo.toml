@@ -1,6 +1,6 @@
 [package]
 name = "daro-rs"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 
 # 无界面部分（驱动层 + MCP 服务）单独成库：`daro-mcpd` 只依赖这一半，
