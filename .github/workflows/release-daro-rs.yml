@@ -208,7 +208,8 @@ jobs:
           if [[ -n "$prev" ]]; then
             range="${prev}..HEAD"
           else
-            range="HEAD"
+            # 首个发布没有上一个 tag：从根提交之后算，别把 init 本身写进更新列表。
+            range="$(git rev-list --max-parents=0 HEAD)..HEAD"
           fi
           # 分类口径按提交前缀：feat=新功能；fix=Bug 修复；
           # perf/refactor/style/docs/build/ci/test/chore=改进；没按约定的进「其他」。
