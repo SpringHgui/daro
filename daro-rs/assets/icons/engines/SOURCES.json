@@ -1,0 +1,149 @@
+{
+  "access": {
+    "bytes": 2309,
+    "candidates": [
+      "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/microsoftaccess.svg"
+    ],
+    "mark": "磁盘 + A 字",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。图形做单色化，并按视觉包围盒统一缩放；非图形文字（字标）一律裁掉，保证 16px 仍可辨认。Simple Icons 11.1.0（微软系图标在后续版本中已移除，故锁版本）。",
+    "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/microsoftaccess.svg",
+    "trademark_owner": "Microsoft Corporation",
+    "viewBox": "0 0 24 24"
+  },
+  "another-redis-desktop-manager": {
+    "bytes": 108520,
+    "candidates": [
+      "https://raw.githubusercontent.com/qishibo/AnotherRedisDesktopManager/master/pack/electron/icons/icon.png"
+    ],
+    "kind": "tool",
+    "mark": "红色圆角瓦片 + 白色五角星轮廓与圆点(应用图标)",
+    "note": "「导入连接」向导的来源工具标识。原件即方形瓦片且四角透明,整幅取用,等比缩到 128px 后内嵌进 assets/icons/tools/another-redis-desktop-manager.svg。",
+    "pixels": "512x512",
+    "source_url": "https://raw.githubusercontent.com/qishibo/AnotherRedisDesktopManager/master/pack/electron/icons/icon.png",
+    "trademark_owner": "qishibo / Another Redis Desktop Manager(仓库以 MIT 授权,含该图标)",
+    "viewBox": "n/a (PNG)"
+  },
+  "gitee": {
+    "bytes": 606,
+    "candidates": [
+      "https://cdn.simpleicons.org/gitee"
+    ],
+    "kind": "site",
+    "mark": "红色圆弧 G 字标",
+    "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@13/icons/gitee.svg",
+    "trademark_owner": "深圳奥思网络科技有限公司 (OSChina)",
+    "viewBox": "0 0 24 24"
+  },
+  "github": {
+    "bytes": 838,
+    "candidates": [
+      "https://cdn.simpleicons.org/github"
+    ],
+    "kind": "site",
+    "mark": "Invertocat 猫头",
+    "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@13/icons/github.svg",
+    "trademark_owner": "GitHub, Inc. (Microsoft Corporation)",
+    "viewBox": "0 0 24 24"
+  },
+  "mariadb": {
+    "bytes": 1616,
+    "candidates": [
+      "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/mariadb.svg"
+    ],
+    "mark": "海豹",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。图形做单色化，并按视觉包围盒统一缩放；非图形文字（字标）一律裁掉，保证 16px 仍可辨认。",
+    "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/mariadb.svg",
+    "trademark_owner": "MariaDB plc",
+    "viewBox": "0 0 24 24"
+  },
+  "mongodb": {
+    "bytes": 770,
+    "candidates": [
+      "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/mongodb.svg"
+    ],
+    "mark": "叶子",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。图形做单色化，并按视觉包围盒统一缩放；非图形文字（字标）一律裁掉，保证 16px 仍可辨认。",
+    "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/mongodb.svg",
+    "trademark_owner": "MongoDB, Inc.",
+    "viewBox": "0 0 24 24"
+  },
+  "mysql": {
+    "bytes": 3404,
+    "candidates": [
+      "https://api.iconify.design/logos/mysql.svg"
+    ],
+    "mark": "海豚（去掉字标）",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。图形做单色化，并按视觉包围盒统一缩放；非图形文字（字标）一律裁掉，保证 16px 仍可辨认。取自 Iconify「logos」套装的官方组合标，只保留海豚部分。",
+    "source_url": "https://api.iconify.design/logos/mysql.svg",
+    "trademark_owner": "Oracle America, Inc.",
+    "viewBox": "0 0 24 24"
+  },
+  "oracle": {
+    "bytes": 514,
+    "candidates": [
+      "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/oracle.svg"
+    ],
+    "mark": "红色胶囊环",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。图形做单色化，并按视觉包围盒统一缩放；非图形文字（字标）一律裁掉，保证 16px 仍可辨认。",
+    "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/oracle.svg",
+    "trademark_owner": "Oracle Corporation",
+    "viewBox": "0 0 24 24"
+  },
+  "postgresql": {
+    "bytes": 9485,
+    "candidates": [
+      "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/postgresql/postgresql-original.svg"
+    ],
+    "mark": "大象",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。图形做单色化，并按视觉包围盒统一缩放；非图形文字（字标）一律裁掉，保证 16px 仍可辨认。devicon 官方彩色稿只把象身转白，耳/眼/鼻的线条保留品牌色，否则小尺寸会糊成一坨。",
+    "source_url": "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/postgresql/postgresql-original.svg",
+    "trademark_owner": "PostgreSQL Global Development Group",
+    "viewBox": "0 0 24 24"
+  },
+  "redis": {
+    "bytes": 2086,
+    "candidates": [
+      "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/redis/redis-original.svg",
+      "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/redis.svg"
+    ],
+    "mark": "三层立体片 + 顶面星/圆点/三角 + 方块缺口",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。几何取自官方立体图标（三层片身、顶面星/圆点/三角和方块缺口），按明暗面反色：亮面片身转白，暗面、缝隙与顶面标记保留品牌红，缺口作为红色镂空；不描边、不另画结构。图形按视觉包围盒统一缩放；非图形文字（字标）一律裁掉。",
+    "source_url": "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/redis/redis-original.svg",
+    "trademark_owner": "Redis Ltd.",
+    "viewBox": "0 0 24 24"
+  },
+  "snowflake": {
+    "bytes": 2702,
+    "candidates": [
+      "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/snowflake.svg"
+    ],
+    "mark": "六角雪花",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。图形做单色化，并按视觉包围盒统一缩放；非图形文字（字标）一律裁掉，保证 16px 仍可辨认。瓦片用加深一档的 #1D9AD6 以保住白字对比度。",
+    "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/snowflake.svg",
+    "trademark_owner": "Snowflake Inc.",
+    "viewBox": "0 0 24 24"
+  },
+  "sqlite": {
+    "bytes": 1663,
+    "candidates": [
+      "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/sqlite.svg"
+    ],
+    "mark": "羽毛 + 页",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。图形做单色化，并按视觉包围盒统一缩放；非图形文字（字标）一律裁掉，保证 16px 仍可辨认。",
+    "source_url": "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/sqlite.svg",
+    "trademark_owner": "D. Richard Hipp / SQLite project",
+    "viewBox": "0 0 24 24"
+  },
+  "sqlserver": {
+    "bytes": 11145,
+    "candidates": [
+      "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/microsoftsqlserver/microsoftsqlserver-plain.svg",
+      "https://cdn.jsdelivr.net/npm/simple-icons@11.1.0/icons/microsoftsqlserver.svg"
+    ],
+    "mark": "2016 缎带（几何压平）",
+    "note": "统一实心图标：品牌色圆角瓦片 + 白色实心图形。原稿是折面线框（发丝网线），这里按原稿几何压平——缎带外轮廓填白作实心底，原有折线/网线以瓦片色叠回去，不另画折痕；16px 时细线自然合成为缎带剪影，大尺寸仍保留原稿折面结构。图形按视觉包围盒统一缩放；非图形文字（字标）一律裁掉。",
+    "source_url": "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/microsoftsqlserver/microsoftsqlserver-plain.svg",
+    "trademark_owner": "Microsoft Corporation",
+    "viewBox": "0 0 24 24"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "kind": "legacy-18-native-128px",
+    "trademark_owner": "PremiumSoft CyberTech Limited",
+    "source": "参考客户端安装目录\\resxl.dll",
+    "method": "从 resxl.dll 的 RT_RCDATA 里按 PNG 签名扫描出的原生图标（64/96/128 三档），按内容与 image_collection 的 FB_* / CLOUD_VIRTUAL_GROUP 逐像素比对后挑选；这里全部取原生 128×128，未做任何缩放或重绘。信息卡在 200% DPI 下显示 64 逻辑像素 = 128 物理像素，正好 1:1 贴图。",
+    "note": "这些是参考客户端的界面图标，权利归 PremiumSoft；仅用于对照复刻同一套界面，不用于对外品牌。",
+    "slot_ids": "pNNNN 是扫描序号，对应 resxl.dll 中 PNG 数据的出现顺序，用于追溯来源。"
+  },
+  "icons": {
+    "table.png": { "slot": "p0557", "native": 128, "matches": "FB_Table" },
+    "view.png": { "slot": "p0647", "native": 128, "matches": "FB_View" },
+    "matview.png": { "slot": "p0293", "native": 128, "matches": "FB_MaterializedView" },
+    "function.png": { "slot": "p0197", "native": 128, "matches": "FB_Function" },
+    "query.png": { "slot": "p0494", "native": 128, "matches": "FB_Query" },
+    "schema.png": { "slot": "p0527", "native": 128, "matches": "schema 三节点图（同名 svg 已删除）" },
+    "folder.png": { "slot": "p0371", "native": 128, "matches": "CLOUD_VIRTUAL_GROUP" },
+    "engine_mysql.png": { "slot": "p0389", "native": 128, "matches": "OV_MySQL_On" },
+    "engine_postgresql.png": { "slot": "p0464", "native": 128, "matches": "OV_PostgreSQL_On" },
+    "engine_sqlserver.png": { "slot": "p0548", "native": 128, "matches": "OV_SQLserver_On" },
+    "engine_sqlite.png": { "slot": "p0542", "native": 128, "matches": "OV_SQLite_On" },
+    "engine_mongodb.png": { "slot": "p0383", "native": 128, "matches": "OV_MongoDB_On" },
+    "engine_redis.png": { "slot": "p0503", "native": 128, "matches": "OV_Redis_On" }
+  }
+}

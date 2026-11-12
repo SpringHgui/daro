@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 24 24">
+  <!-- oracle:统一实心瓦片——品牌色底 + 白色实心图形;出处见 SOURCES.json -->
+  <rect x="1.2" y="1.2" width="21.6" height="21.6" rx="3.4" fill="#F80000"/>
+  <g transform="translate(3.6000 3.6000) scale(0.70000)" fill="#fff"><path d="M16.412 4.412h-8.82a7.588 7.588 0 0 0-.008 15.176h8.828a7.588 7.588 0 0 0 0-15.176zm-.193 12.502H7.786a4.915 4.915 0 0 1 0-9.828h8.433a4.914 4.914 0 1 1 0 9.828z"/></g>
+</svg>

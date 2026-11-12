@@ -1,0 +1,61 @@
+# 本仓库的 rust 分支只维护 Rust 版 daro-rs；Flutter 版保留在 master 分支。
+
+# 构建产物
+/build/
+/dist/
+/.dart_tool/
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/target/
+
+# 日志、截图等运行临时文件
+*.log
+/.daro-shot.png
+/wtest.txt
+
+# 本机开发临时区（诊断脚本、截图、会话记忆、工具配置）
+/.scratch/
+/.trash/
+/.qoder/
+/.workbuddy/
+/zz_probe/
+/.mongo_probe/
+/.redis_probe/
+/.git-broken-*/
+
+# 一次性导出 / 本地数据
+/tmp_*
+/l10n_untranslated.json
+/menus.csv
+/pr6.diff
+/pr6-comment.md
+/package-lock.json
+/pubspec.lock
+
+# Rust 版构建缓存与本地测试数据
+/daro-rs/target/
+/daro-rs/packaging/dist/
+/daro-rs/packaging/installer/target/
+/daro-rs/.dev-data/
+
+# 构建校验目录与临时探针
+/target-verify/
+/daro-rs/target-verify/
+/daro-rs/target-verify2/
+/daro-rs/target_wb_check/
+/daro-rs/dist/
+/daro-rs/.scratch/
+/daro-rs/_probe_write
+/.skill-archive/
+/vibe_images/
+
+# 调试截图与导出
+/Githubdaro.*.png
+/zz_*.png
+/zz_conns.txt
+/daro-rs/z_*.png
+/daro-rs/zed_*.png
+/daro-rs/zed_mock_*.html
+/daro-rs/zz_*.txt

@@ -1,0 +1,4 @@
+// Windows 任务栏 / 标题栏 / Explorer 里显示的应用图标。
+// gpui 的 Windows 平台固定用 LoadImageW(module, 1, IMAGE_ICON) 取资源，
+// 所以资源 ID 必须是 1。
+1 ICON "assets/icons/ui/logo.ico"

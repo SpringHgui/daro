@@ -1,0 +1,70 @@
+[package]
+name = "daro-rs"
+version = "0.0.15"
+edition = "2024"
+
+# 无界面部分（驱动层 + MCP 服务）单独成库：`daro-mcpd` 只依赖这一半，
+# 不会把 gpui 链接进后台进程。库自身不带测试（驱动单测仍在 bin 目标里跑）。
+[lib]
+name = "daro_rs"
+path = "src/lib.rs"
+test = false
+
+[dependencies]
+gpui-kit = { version = "0.8.1", features = ["test-support"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+quick-xml = "0.37"
+anyhow = "1"
+lsp-types = { version = "0.97", features = ["proposed"] }
+aes = "0.8"
+cbc = "0.1"
+base64 = "0.22"
+rfd = "0.17.2"
+open = "5"
+rusqlite = { version = "0.41.1", features = ["bundled", "column_decltype"] }
+postgres = { version = "0.19", default-features = false }
+mysql = "28"
+redis = "1"
+mongodb = { version = "3.10", features = ["sync"] }
+# 走系统 ODBC：与 Flutter 版同一套驱动查找顺序；关掉 prompt 特性，别把 winit 拖进来
+odbc-api = { version = "30", default-features = false, features = ["odbc_version_3_80"] }
+ureq = { version = "3", features = ["socks-proxy"] }
+async-channel = "2"
+# MCP 服务：后台进程里跑 Streamable HTTP，只监听回环
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "net"] }
+rmcp = { version = "3.8", features = ["transport-streamable-http-server"] }
+axum = "0.8"
+tokio-util = "0.7"
+getrandom = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+# 「Internet 选项」里配的系统代理，ureq 只在开了这个特性时读注册表
+ureq = { version = "3", features = ["socks-proxy", "win-system-proxy"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "3"
+
+# 日常 debug 构建也要求跟手：整帧耗时几乎都在依赖里（gpui 的布局、绘制、
+# 字形），只把依赖编成 opt-level 2；本 crate 保持 0，增量编译速度不变。
+[profile.dev.package."*"]
+opt-level = 2
+
+# headless 测试台（真建窗口 + 派发点击/键入）；feature 只在 cargo test 时统一进来，
+# 正常 cargo build 不受影响（test_support() 退化为恒等）
+[dev-dependencies]
+gpui-kit = { version = "0.8.1", features = ["test-support"] }

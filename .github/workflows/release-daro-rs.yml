@@ -1,0 +1,266 @@
+name: release daro-rs (pre-release)
+
+on:
+  push:
+    tags:
+      - 'daro-rs-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-daro-rs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-15-intel
+            name: macos-x64
+          - os: macos-latest
+            name: macos-arm64
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: daro-rs
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 tag 与 Cargo.toml 版本一致
+        shell: bash
+        run: |
+          set -euo pipefail
+          have="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+            if [[ "$tag" != daro-rs-v* ]]; then
+              echo "::error::发布必须在 daro-rs-v* 标签上触发，当前 ref 为 $tag"
+              exit 1
+            fi
+            want="${tag#daro-rs-v}"
+            if [[ "$want" != "$have" ]]; then
+              echo "::error::tag 版本 $want 与 Cargo.toml 版本 $have 不一致"
+              exit 1
+            fi
+          fi
+
+      - name: 安装 Linux 构建依赖
+        if: runner.os == 'Linux'
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libvulkan-dev libegl1-mesa-dev libfontconfig1-dev libfreetype-dev \
+            libasound2-dev libssl-dev unixodbc-dev libzstd-dev
+
+      - name: 安装 macOS ODBC（驱动层链接 libodbc，libtool 提供 libodbc 依赖的 libltdl）
+        if: runner.os == 'macOS'
+        working-directory: .
+        shell: bash
+        run: brew install unixodbc libtool
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daro-rs
+          key: ${{ matrix.name }}
+
+      - name: 测试（Windows 全量）
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUST_BACKTRACE: '1'
+        run: |
+          set -uo pipefail
+          log="${RUNNER_TEMP:-/tmp}/daro-test.log"
+          if cargo test --release --locked --bin daro-rs -- --test-threads=1 >"$log" 2>&1; then
+            tail -n 15 "$log"
+          else
+            tail -n 40 "$log"
+            grep -v '^[[:space:]]*$' "$log" | tail -n 8 | while IFS= read -r line; do
+              line="${line//'%'/'%25'}"
+              echo "::error file=daro-rs/src/main.rs::${line}"
+            done
+            exit 1
+          fi
+
+      - name: 测试（MCP 集成，各平台）
+        shell: bash
+        env:
+          RUST_BACKTRACE: '1'
+        run: |
+          set -uo pipefail
+          log="${RUNNER_TEMP:-/tmp}/mcp-test.log"
+          if cargo test --release --locked --test mcp -- --test-threads=1 >"$log" 2>&1; then
+            tail -n 15 "$log"
+          else
+            tail -n 40 "$log"
+            grep -v '^[[:space:]]*$' "$log" | tail -n 8 | while IFS= read -r line; do
+              line="${line//'%'/'%25'}"
+              echo "::error file=daro-rs/tests/mcp.rs::${line}"
+            done
+            exit 1
+          fi
+
+      - name: 构建
+        shell: bash
+        run: cargo build --release --locked --bin daro-rs --bin daro-mcpd
+
+      - name: 打包（Windows 绿色版）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#daro-rs-v}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          fi
+          name="daro-rs-${version}-windows-x64-portable"
+          mkdir -p "dist/${name}"
+          cp target/release/daro-rs.exe target/release/daro-mcpd.exe "dist/${name}/"
+          : > "dist/${name}/daro-rs.portable"
+          (cd dist && 7z a -tzip "${name}.zip" "${name}/" > /dev/null)
+          rm -rf "dist/${name}"
+
+      - name: 打安装包（Windows，自动更新靠它，资产名须为 daro-rs-setup-<版本>-x64.exe）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash packaging/build-installer.sh --skip-build
+
+      - name: 打包（macOS .app，随包带 ODBC 运行库）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash packaging/macos/bundle-app.sh --skip-build
+
+      - name: 打包（Linux tar.gz）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#daro-rs-v}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          fi
+          name="daro-rs-${version}-linux-x64"
+          mkdir -p "dist/${name}"
+          cp target/release/daro-rs target/release/daro-mcpd "dist/${name}/"
+          (cd dist && tar -czf "${name}.tar.gz" "${name}")
+          rm -rf "dist/${name}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            daro-rs/dist/*
+            daro-rs/packaging/dist/*.exe
+          if-no-files-found: error
+
+  publish:
+    name: publish pre-release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      # 发布说明按提交生成，要拿完整历史和全部 tag 才能算出上一个发布
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 汇总校验和
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 各作业的 artifact 里目录层级不一样（Windows 作业因为同时传了安装包，
+          # 会保留 packaging/dist/ 这一层），所以按文件平铺，不能 cp artifacts/*。
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          ls -l dist
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+
+      - name: 生成分类发布说明
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          # 上一个发布按祖先关系找，不按日期：工作区里可能有别的分支打的 tag。
+          # 终点用 HEAD（checkout 已在 tag 上），不依赖本地是否建了同名 tag 引用。
+          prev="$(git describe --tags --abbrev=0 --match 'daro-rs-v*' 'HEAD^' 2>/dev/null || true)"
+          if [[ -n "$prev" ]]; then
+            range="${prev}..HEAD"
+          else
+            range="HEAD"
+          fi
+          # 分类口径按提交前缀：feat=新功能；fix=Bug 修复；
+          # perf/refactor/style/docs/build/ci/test/chore=改进；没按约定的进「其他」。
+          prefix_re='^([A-Za-z]+)(\([^)]*\))?(：|:)[[:space:]]*(.+)$'
+          declare -A bullets=( [新功能]="" [改进]="" ["Bug 修复"]="" [其他]="" )
+          while IFS= read -r subject; do
+            subject="${subject%$'\r'}"
+            [[ -z "$subject" ]] && continue
+            group="其他"
+            text="$subject"
+            if [[ "$subject" =~ $prefix_re ]]; then
+              type="${BASH_REMATCH[1],,}"
+              text="${BASH_REMATCH[4]}"
+              case "$type" in
+                feat) group="新功能" ;;
+                fix) group="Bug 修复" ;;
+                perf|refactor|style|docs|build|ci|test|chore) group="改进" ;;
+              esac
+            fi
+            bullets["$group"]+="- ${text}"$'\n'
+          done < <(git log --no-merges --pretty=tformat:%s "$range")
+          {
+            echo "## 本次更新"
+            echo
+            for name in 新功能 改进 "Bug 修复" 其他; do
+              if [[ -n "${bullets[$name]}" ]]; then
+                echo "### ${name}"
+                echo
+                printf '%s' "${bullets[$name]}"
+                echo
+              fi
+            done
+            if [[ -n "$prev" ]]; then
+              echo "**完整变更**：https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${tag}"
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: 发布 pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "daro-rs v${tag#daro-rs-v} (pre-release)" \
+              --prerelease \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi

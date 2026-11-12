@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 打包时把 __VERSION__ 换成 Cargo.toml 里的版本号，见 release 工作流。 -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>zh_CN</string>
+  <key>CFBundleExecutable</key>
+  <string>daro-rs</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.springh.daro</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>daro-rs</string>
+  <key>CFBundleDisplayName</key>
+  <string>daro-rs</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>__VERSION__</string>
+  <key>CFBundleVersion</key>
+  <string>__VERSION__</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>

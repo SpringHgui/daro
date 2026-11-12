@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 32 32">
+  <!-- 信息卡大图：与 database.svg 同一套圆柱几何（椭圆顶盖 + 圆弧底），四周留白，
+       避免色带贴死方框上下沿被看成裁切。128px 栅格化后在 200% DPI 下与 64 逻辑像素 1:1。 -->
+  <defs>
+    <clipPath id="db-body">
+      <path d="M4.5 7.6v16.8a11.5 4.2 0 0 0 23 0V7.6Z"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#db-body)">
+    <rect x="4" y="7" width="24" height="22" fill="#0DBA6A"/>
+    <path d="M4.5 13.2a11.5 4.2 0 0 0 23 0v16H4.5Z" fill="#039753"/>
+    <path d="M4.5 19a11.5 4.2 0 0 0 23 0v12H4.5Z" fill="#00743F"/>
+  </g>
+  <ellipse cx="16" cy="7.6" rx="11.5" ry="4.2" fill="#74DEAD"/>
+</svg>

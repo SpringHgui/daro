@@ -1,0 +1,16 @@
+Zed icon assets
+===============
+
+The SVG files in this directory are copied from the Zed editor repository
+(https://github.com/zed-industries/zed), directories:
+
+  assets/icons/*.svg
+  assets/icons/file_icons/database.svg
+
+Zed is dual-licensed under Apache-2.0 and GPL-3.0 (see Zed's LICENSE-APACHE
+and LICENSE-GPL). Portions of the icon set follow Lucide (ISC License,
+Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part
+of Feather (MIT); all other copyright (c) for Lucide are held by Lucide
+Contributors 2022).
+
+The files are embedded in the application binary at build time.
