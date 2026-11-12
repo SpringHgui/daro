@@ -1,4 +1,4 @@
-name: release daro-rs (pre-release)
+name: release daro-rs
 
 on:
   push:
@@ -170,7 +170,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: publish pre-release
+    name: publish release
     needs: build
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
@@ -247,7 +247,7 @@ jobs:
           } > release-notes.md
           cat release-notes.md
 
-      - name: 发布 pre-release
+      - name: 发布 release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -259,8 +259,10 @@ jobs:
           else
             gh release create "$tag" dist/* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "daro-rs v${tag#daro-rs-v} (pre-release)" \
-              --prerelease \
+              --title "daro-rs v${tag#daro-rs-v}" \
               --notes-file release-notes.md \
               --verify-tag
           fi
+          # 正式版要占住 Latest；gh 的 --latest 各版本支持不一，直接走 API 置位。
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+            -F prerelease=false -F make_latest=true > /dev/null
