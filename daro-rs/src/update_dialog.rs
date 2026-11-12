@@ -89,8 +89,8 @@ fn open_window(
     }
     let opened = gpui_kit::open_window(options, cx, move |window, cx| {
         window.activate_window();
-        let entry = cx.new(|_| {
-            UpdateWindow::new(parent, dark, phase, latest, releases, from_startup)
+        let entry = cx.new(|cx| {
+            UpdateWindow::new(parent, dark, phase, latest, releases, from_startup, window, cx)
         });
         if phase == Phase::Checking {
             let entry = entry.clone();
@@ -134,6 +134,7 @@ enum Tab {
 struct UpdateWindow {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     tab: Tab,
     /// 查到 / 传入的新版本；没有更新时为 None
     latest: Option<Latest>,
@@ -161,13 +162,17 @@ impl UpdateWindow {
         latest: Option<Latest>,
         releases: Vec<ReleaseInfo>,
         from_startup: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Self {
         let install_error = latest
             .as_ref()
             .and_then(|latest| update::install_failure(&latest.version));
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
+            _esc: esc,
             tab: Tab::App,
             latest,
             releases,
@@ -756,11 +761,6 @@ impl Render for UpdateWindow {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(to_hsla(p.foreground))
-            .on_key_down(cx.listener(|_, ev: &KeyDownEvent, window, _cx| {
-                if ev.keystroke.key == "escape" {
-                    window.remove_window();
-                }
-            }))
             .child(title_bar("更新中心", self.dark))
             .child(self.header())
             .child(self.tabs(cx))

@@ -51,10 +51,11 @@ pub fn open_table_paste(
 struct TablePaste {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     req: PasteRequest,
     on_ok: Submit,
     mode: PasteMode,
-    /// 没有输入框，自己占住焦点才能收 Enter / Esc
+    /// 没有输入框，自己占住焦点才能收 Enter
     focus: FocusHandle,
     answered: bool,
 }
@@ -73,9 +74,11 @@ impl TablePaste {
         cx.defer_in(window, move |_, window, app| {
             deferred.focus(window, app);
         });
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
+            _esc: esc,
             req,
             on_ok,
             mode: PasteMode::Data,
@@ -243,9 +246,6 @@ impl Render for TablePaste {
                 let m = ev.keystroke.modifiers;
                 if ev.keystroke.key == "enter" && !m.control && !m.alt && !m.platform {
                     this.accept(window, cx);
-                    cx.stop_propagation();
-                } else if ev.keystroke.key == "escape" {
-                    window.remove_window();
                     cx.stop_propagation();
                 }
             }))

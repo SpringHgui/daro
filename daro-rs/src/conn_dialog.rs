@@ -111,6 +111,7 @@ pub struct NewConnectionDialog {
     parent: Entity<DaroApp>,
     dark: bool,
     mode: ConnDialogMode,
+    _esc: Subscription,
     step: Step,
     selected: Option<usize>,
     list_mode: bool,
@@ -224,10 +225,12 @@ impl NewConnectionDialog {
             });
         }
 
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
             mode,
+            _esc: esc,
             step: if editing.is_some() || matches!(mode, ConnDialogMode::CreateWithKind(_)) {
                 Step::Form
             } else {
@@ -1127,11 +1130,6 @@ impl Render for NewConnectionDialog {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(to_hsla(p.foreground))
-            .on_key_down(cx.listener(|_, ev: &KeyDownEvent, window, _cx| {
-                if ev.keystroke.key == "escape" {
-                    window.remove_window();
-                }
-            }))
             .child(self.title_bar())
             .child(match self.step {
                 Step::Choose => self.choose(cx).into_any_element(),
@@ -1183,4 +1181,33 @@ fn parse_uri(raw: &str) -> Option<UriParts> {
         user,
         password,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui_test_support::{isolate_store, open_app};
+    use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt;
+
+    // 显式引回标准 test 宏：`use super::*` 会把 gpui 的同名 test 宏带进作用域
+    use core::prelude::v1::test;
+
+    #[gpui_kit::test]
+    fn new_connection_dialog_closes_on_escape(cx: &mut TestAppContext) {
+        isolate_store("connesc");
+        let (_main, app) = open_app(cx);
+        let handle = cx
+            .update(|cx| {
+                open_new_connection(app, false, cx);
+                cx.windows().last().copied()
+            })
+            .expect("connection window opened");
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        assert_eq!(cx.windows().len(), 1, "Esc 关连接窗");
+    }
 }

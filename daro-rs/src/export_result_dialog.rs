@@ -91,6 +91,7 @@ pub fn open_export_result(
 struct ExportResultDialog {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     /// 标识符引用风格：MySQL 用反引号，其余用双引号（只影响 SQL 脚本）
     is_mysql: bool,
     label: String,
@@ -158,9 +159,11 @@ impl ExportResultDialog {
             }
         })
         .detach();
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
+            _esc: esc,
             is_mysql,
             label,
             columns,
@@ -581,11 +584,8 @@ impl Render for ExportResultDialog {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(fg)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if ev.keystroke.key == "escape" {
-                    window.remove_window();
-                    cx.stop_propagation();
-                } else if ev.keystroke.key == "enter" {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                if ev.keystroke.key == "enter" {
                     if this.step == 0 {
                         this.set_step(1, cx);
                     } else {

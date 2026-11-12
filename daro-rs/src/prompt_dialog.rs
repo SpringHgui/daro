@@ -41,6 +41,7 @@ pub fn open_text_prompt(
 struct TextPrompt {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     title: &'static str,
     label: &'static str,
     input: Entity<InputState>,
@@ -81,9 +82,11 @@ impl TextPrompt {
                 state.select_all(window, cx);
             });
         });
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
+            _esc: esc,
             title,
             label,
             input,
@@ -155,9 +158,6 @@ impl Render for TextPrompt {
                 if ev.keystroke.key == "enter" && !m.control && !m.alt && !m.platform {
                     this.submit(window, cx);
                     cx.stop_propagation();
-                } else if ev.keystroke.key == "escape" {
-                    window.remove_window();
-                    cx.stop_propagation();
                 }
             }))
             .child(self.title_bar())
@@ -215,10 +215,11 @@ pub fn open_confirm(
 struct ConfirmPrompt {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     title: &'static str,
     message: String,
     on_ok: Confirm,
-    /// 窗口里没有输入框，必须自己占住焦点，否则 Enter / Esc 到不了 on_key_down
+    /// 窗口里没有输入框，必须自己占住焦点，否则 Enter 到不了 on_key_down
     focus: FocusHandle,
     /// Enter 与按钮可能同时到达，只认第一次
     answered: bool,
@@ -239,9 +240,11 @@ impl ConfirmPrompt {
         cx.defer_in(window, move |_, window, app| {
             deferred.focus(window, app);
         });
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
+            _esc: esc,
             title,
             message,
             on_ok,
@@ -284,9 +287,6 @@ impl Render for ConfirmPrompt {
                 let m = ev.keystroke.modifiers;
                 if ev.keystroke.key == "enter" && !m.control && !m.alt && !m.platform {
                     this.accept(window, cx);
-                    cx.stop_propagation();
-                } else if ev.keystroke.key == "escape" {
-                    window.remove_window();
                     cx.stop_propagation();
                 }
             }))
@@ -342,9 +342,10 @@ pub fn open_notice(dark: bool, title: &'static str, message: String, cx: &mut Ap
 
 struct Notice {
     dark: bool,
+    _esc: Subscription,
     title: &'static str,
     message: String,
-    /// 同确认框：没有输入框，得自己占住焦点才能收 Enter / Esc
+    /// 同确认框：没有输入框，得自己占住焦点才能收 Enter
     focus: FocusHandle,
 }
 
@@ -361,8 +362,10 @@ impl Notice {
         cx.defer_in(window, move |_, window, app| {
             deferred.focus(window, app);
         });
+        let esc = ui::close_on_escape(window, cx);
         Self {
             dark,
+            _esc: esc,
             title,
             message,
             focus,
@@ -388,11 +391,9 @@ impl Render for Notice {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(fg)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(|_this, ev: &KeyDownEvent, window, cx| {
                 let m = ev.keystroke.modifiers;
-                if (ev.keystroke.key == "enter" && !m.control && !m.alt && !m.platform)
-                    || ev.keystroke.key == "escape"
-                {
+                if ev.keystroke.key == "enter" && !m.control && !m.alt && !m.platform {
                     window.remove_window();
                     cx.stop_propagation();
                 }

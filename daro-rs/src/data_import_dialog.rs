@@ -62,6 +62,7 @@ struct ImportDialog {
     parent: Entity<DaroApp>,
     dark: bool,
     target: ImportTarget,
+    _esc: Subscription,
     /// 当前步骤（0 源文件 / 1 字段映射 / 2 执行）
     step: usize,
     path: Entity<InputState>,
@@ -137,10 +138,12 @@ impl ImportDialog {
         .detach();
 
         let win = window.window_handle();
+        let esc = ui::close_on_escape(window, cx);
         let mut me = Self {
             parent,
             dark,
             target,
+            _esc: esc,
             step: 0,
             path,
             delimiter_input,
@@ -999,12 +1002,6 @@ impl Render for ImportDialog {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(fg)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if ev.keystroke.key == "escape" {
-                    window.remove_window();
-                    cx.stop_propagation();
-                }
-            }))
             .child(
                 TitleBar::new().h(px(TITLE_H)).border_b_0().child(
                     h_flex()

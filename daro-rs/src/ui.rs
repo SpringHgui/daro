@@ -149,6 +149,19 @@ pub fn dialog_options() -> WindowOptions {
     options
 }
 
+/// 子窗口统一的 Esc 关窗。挂在按键拦截器上而不是内容根的 `on_key_down`：
+/// 无聚焦元素时按键只派发到窗口 Root，内容根收不到；聚焦输入框时 Esc 还可能
+/// 被编辑器的 Escape 动作消费。拦截器跑在动作派发之前，按窗口句柄限定作用域。
+pub fn close_on_escape<T: 'static>(window: &Window, cx: &mut Context<T>) -> Subscription {
+    let this_window = window.window_handle();
+    cx.intercept_keystrokes(move |ev, window, cx| {
+        if ev.keystroke.key == "escape" && window.window_handle() == this_window {
+            cx.stop_propagation();
+            window.remove_window();
+        }
+    })
+}
+
 /// 对话框内容面：面板底，直接贴窗口边，不画外框。
 pub fn dialog_surface(dark: bool) -> Div {
     let p = Palette::of(dark);

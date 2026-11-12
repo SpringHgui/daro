@@ -46,6 +46,7 @@ pub fn open_filter_value(
 struct FilterValueDialog {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     v1: Entity<InputState>,
     v2: Option<Entity<InputState>>,
     distinct: Vec<String>,
@@ -103,9 +104,11 @@ impl FilterValueDialog {
                 state.select_all(window, cx);
             });
         });
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
+            _esc: esc,
             v1,
             v2,
             checked: vec![false; distinct.len()],
@@ -262,9 +265,6 @@ impl Render for FilterValueDialog {
                 let m = ev.keystroke.modifiers;
                 if ev.keystroke.key == "enter" && !m.control && !m.alt && !m.platform {
                     this.submit(window, cx);
-                    cx.stop_propagation();
-                } else if ev.keystroke.key == "escape" {
-                    window.remove_window();
                     cx.stop_propagation();
                 }
             }))

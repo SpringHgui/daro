@@ -58,6 +58,7 @@ struct RunResult {
 struct RunSqlDialog {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     target: RunSqlTarget,
     path: Entity<InputState>,
     stop_on_error: bool,
@@ -84,9 +85,11 @@ impl RunSqlDialog {
             }
         })
         .detach();
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
+            _esc: esc,
             target,
             path,
             stop_on_error: false,
@@ -271,11 +274,6 @@ impl Render for RunSqlDialog {
             .size_full()
             .bg(bg)
             .text_color(fg)
-            .on_key_down(cx.listener(|_, ev: &KeyDownEvent, window, _cx| {
-                if ev.keystroke.key == "escape" && !window.is_fullscreen() {
-                    window.remove_window();
-                }
-            }))
             .child(self.title_bar())
             .child(
                 v_flex()

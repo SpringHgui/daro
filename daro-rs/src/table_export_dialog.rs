@@ -84,6 +84,7 @@ pub fn open_table_export(
 struct TableExportDialog {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     table: String,
     columns: Vec<String>,
     /// 整表行：后台取回来之后可能很长，克隆一次就是几十 MB，故按 Arc 共享
@@ -140,9 +141,30 @@ impl TableExportDialog {
         })
         .detach();
         let fetched = fetch.is_none();
+        // Esc：导出跑着时先叫停，空闲才关窗（与原来挂在内容根上的口径一致）
+        let this_window = window.window_handle();
+        let me = cx.entity().downgrade();
+        let esc = cx.intercept_keystrokes(move |ev, window, cx| {
+            if ev.keystroke.key != "escape" || window.window_handle() != this_window {
+                return;
+            }
+            cx.stop_propagation();
+            let Some(this) = me.upgrade() else {
+                return;
+            };
+            if this.read(cx).busy.is_some() {
+                this.update(cx, |this, cx| {
+                    this.cancel.store(true, Ordering::Relaxed);
+                    cx.notify();
+                });
+            } else {
+                window.remove_window();
+            }
+        });
         let mut this = Self {
             parent,
             dark,
+            _esc: esc,
             table,
             columns,
             rows: Arc::new(rows),
@@ -553,16 +575,8 @@ impl Render for TableExportDialog {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(fg)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if ev.keystroke.key == "escape" {
-                    if this.busy.is_some() {
-                        this.cancel.store(true, Ordering::Relaxed);
-                        cx.notify();
-                    } else {
-                        window.remove_window();
-                    }
-                    cx.stop_propagation();
-                } else if ev.keystroke.key == "enter" {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                if ev.keystroke.key == "enter" {
                     this.export(cx);
                 }
             }))

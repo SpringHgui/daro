@@ -30,8 +30,15 @@ pub fn open_daro_about(parent: Entity<DaroApp>, dark: bool, cx: &mut App) {
     if let Some(titlebar) = options.titlebar.as_mut() {
         titlebar.title = Some("关于 daro".into());
     }
-    let opened = gpui_kit::open_window(options, cx, move |_window, cx| {
-        cx.new(|_cx| AboutDialog { parent, dark })
+    let opened = gpui_kit::open_window(options, cx, move |window, cx| {
+        cx.new(|cx| {
+            let esc = ui::close_on_escape(window, cx);
+            AboutDialog {
+                parent,
+                dark,
+                _esc: esc,
+            }
+        })
     });
     if opened.is_err() {
         eprintln!("failed to open about window");
@@ -41,6 +48,7 @@ pub fn open_daro_about(parent: Entity<DaroApp>, dark: bool, cx: &mut App) {
 struct AboutDialog {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
 }
 
 impl AboutDialog {
@@ -108,11 +116,6 @@ impl Render for AboutDialog {
             .size_full()
             .bg(bg)
             .text_color(fg)
-            .on_key_down(cx.listener(|_, ev: &KeyDownEvent, window, _cx| {
-                if ev.keystroke.key == "escape" {
-                    window.remove_window();
-                }
-            }))
             .child(self.title_bar())
             .child(
                 v_flex()
@@ -179,5 +182,34 @@ impl Render for AboutDialog {
 pub fn open_link(url: &str) {
     if let Err(e) = open::that(url) {
         eprintln!("[about_dialog] 打开链接失败 {url}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui_test_support::{isolate_store, open_app};
+    use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt;
+
+    // 显式引回标准 test 宏：`use super::*` 会把 gpui 的同名 test 宏带进作用域
+    use core::prelude::v1::test;
+
+    #[gpui_kit::test]
+    fn about_dialog_closes_on_escape_without_focus(cx: &mut TestAppContext) {
+        isolate_store("aboutesc");
+        let (_main, app) = open_app(cx);
+        let handle = cx
+            .update(|cx| {
+                open_daro_about(app, false, cx);
+                cx.windows().last().copied()
+            })
+            .expect("about window opened");
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        assert_eq!(cx.windows().len(), 1, "无聚焦元素时 Esc 也要关窗");
     }
 }

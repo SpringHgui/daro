@@ -279,6 +279,7 @@ struct ComboPopup {
     owner: WeakEntity<SaveAsDialog>,
     kind: Combo,
     dark: bool,
+    _esc: Subscription,
     /// 已按筛选词过滤过的行（键入时由对话框推过来）
     rows: Vec<PopupRow>,
     /// 当前高亮行（筛选后的行号）；键入后回到无高亮，与查询窗口一致
@@ -321,10 +322,12 @@ impl ComboPopup {
         .detach();
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        let esc = ui::close_on_escape(window, cx);
         Self {
             owner,
             kind,
             dark,
+            _esc: esc,
             rows,
             active,
             needle,
@@ -390,12 +393,6 @@ impl Render for ComboPopup {
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 // 列表被点中后键盘落在浮层上：行为与对话框里的筛选输入框一致
                 match ev.keystroke.key.as_str() {
-                    "escape" => {
-                        let _ = this.owner.update(cx, |dialog, cx| dialog.cancel_combo(cx));
-                        this.focus_dialog(cx);
-                        window.remove_window();
-                        cx.stop_propagation();
-                    }
                     "enter" => {
                         let _ = this.owner.update(cx, |dialog, cx| dialog.pick_active(cx));
                         this.focus_dialog(cx);
@@ -420,6 +417,7 @@ impl Render for ComboPopup {
 struct SaveAsDialog {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     title: &'static str,
     name: Entity<InputState>,
     conns: Vec<Connection>,
@@ -537,9 +535,31 @@ impl SaveAsDialog {
                 state.select_all(window, cx);
             });
         });
+        // Esc 分层收：先收浮层 / 展开态，都没有才关窗（与原来的冒泡口径一致）
+        let this_window = window.window_handle();
+        let me = cx.entity().downgrade();
+        let esc = cx.intercept_keystrokes(move |ev, window, cx| {
+            if ev.keystroke.key != "escape" || window.window_handle() != this_window {
+                return;
+            }
+            cx.stop_propagation();
+            let Some(this) = me.upgrade() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if this.combo.is_some() {
+                    this.close_combo(window, cx);
+                } else if this.open {
+                    this.set_open(false, window, cx);
+                } else {
+                    window.remove_window();
+                }
+            });
+        });
         let mut this = Self {
             parent,
             dark,
+            _esc: esc,
             title,
             name,
             conns,
@@ -728,15 +748,6 @@ impl SaveAsDialog {
         self.active = None;
         self.close_popup(cx);
         self.name.update(cx, |state, cx| state.focus(window, cx));
-        cx.notify();
-    }
-
-    /// 只收回组合框状态，不动窗口（浮层自己会关，或由调用方关）。
-    fn cancel_combo(&mut self, cx: &mut Context<Self>) {
-        self.combo = None;
-        self.needle.clear();
-        self.active = None;
-        self.popup_entity = None;
         cx.notify();
     }
 
@@ -1385,16 +1396,7 @@ impl Render for SaveAsDialog {
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let m = ev.keystroke.modifiers;
                 let plain = !m.control && !m.alt && !m.platform;
-                if ev.keystroke.key == "escape" {
-                    if this.combo.is_some() {
-                        this.close_combo(window, cx);
-                    } else if this.open {
-                        this.set_open(false, window, cx);
-                    } else {
-                        window.remove_window();
-                    }
-                    cx.stop_propagation();
-                } else if ev.keystroke.key == "enter" && plain {
+                if ev.keystroke.key == "enter" && plain {
                     if this.combo.is_some() {
                         this.pick_active(cx);
                         this.close_combo(window, cx);

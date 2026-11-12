@@ -53,6 +53,7 @@ fn settings_root() -> String {
 struct ExportDialog {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     conns: Vec<ExportConnection>,
     checked: Vec<bool>,
     include_passwords: bool,
@@ -90,9 +91,11 @@ impl ExportDialog {
             .iter()
             .map(|c| ncx_export_blocker(c.kind).is_none())
             .collect();
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
+            _esc: esc,
             conns,
             checked,
             include_passwords: true,
@@ -393,12 +396,6 @@ impl Render for ExportDialog {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(fg)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if ev.keystroke.key == "escape" {
-                    window.remove_window();
-                    cx.stop_propagation();
-                }
-            }))
             .child(self.title_bar())
             .child(
                 v_flex()

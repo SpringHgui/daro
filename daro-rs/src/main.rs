@@ -178,8 +178,9 @@ const T_OVERSCAN: usize = 16;
 const GRID_COL_OVERSCAN: usize = 2;
 /// 数据网格撤销栈上限：每次改格 / 粘贴 / 增删行存一份工作集快照。
 const GRID_UNDO_LIMIT: usize = 20;
-/// 滚轮驱动激活格时，距视口上下边缘还剩几行就提前把视图带走。
-const WHEEL_EDGE: usize = 2;
+/// 滚轮驱动激活格时，允许当前格离视口上下边缘几行还不带动视图。0 = 一格
+/// 出视口就立刻把视图带走，滚动条始终跟住当前格（窗口很高时也不会「滚半天不动」）。
+const WHEEL_EDGE: usize = 0;
 /// 行首槽宽（只放当前行蓝条 / 新增行标记，没有行号）
 const T_GUTTER_W: f32 = 9.;
 /// 底部记录导航条高
@@ -224,6 +225,22 @@ const D_ICON_BTN_W: f32 = 25.; // 14 图标 + 2×5.5 水平留白
 /// 视图设计器底部「预览」面板高（同查询页结果面板默认高）
 const D_PREVIEW_PANEL_H: f32 = 300.;
 const D_PROP_SPLITTER_H: f32 = 3.; // 网格与属性面板之间可拖动的缝
+/// 可拖的缝按位编号：同一张设计器里每个子页各存一份属性面板高
+const D_SPLIT_FIELDS: u32 = 0; // 表设计器「字段」
+const D_SPLIT_INDEX: u32 = 1;
+const D_SPLIT_FK: u32 = 2;
+const D_SPLIT_UNIQUE: u32 = 3;
+const D_SPLIT_EXCLUDE: u32 = 4;
+const D_SPLIT_RULE: u32 = 5;
+const D_SPLIT_VIEW_RULE: u32 = 6;
+const D_SPLIT_TRIGGER: u32 = 7;
+/// 各子页属性面板的固有高（没拖过就用它）：外键 / 唯一 / 检查共用 198，
+/// 索引 = 7 行 × 26 + 上下留白，规则 = 110，触发器 = 150。
+const D_IDX_PROPS_H: f32 = 195.;
+const D_RULE_PROPS_H: f32 = 110.;
+const D_TRIG_PROPS_H: f32 = 150.;
+/// 属性面板拖动后的收口：最矮两行，别让网格整块挤没
+const D_PROPS_MIN_H: f32 = 60.;
 const D_PROP_ROW_H: f32 = 26.;
 const D_PROP_PAD_L: f32 = 11.;
 const D_PROP_LABEL_W: f32 = 190.; // 控件列自 201 起，与网格第一列(200)对齐
@@ -4603,6 +4620,9 @@ pub(crate) struct DesignerState {
     pub(crate) widths: HashMap<(usize, usize), f32>,
     /// 正在拖动表头分割线：(子页, 列序号, 按下时的 x, 按下时的列宽)
     pub(crate) resize: Option<(usize, usize, f32, f32)>,
+    /// 网格与属性面板之间那条缝拖出来的高：key = 缝位（D_SPLIT_*），
+    /// 没拖过的子页保持该属性面板的固有高。
+    pub(crate) props_h: HashMap<u32, f32>,
     pub(crate) cols: Vec<DesignCol>,
     pub(crate) baseline: Vec<DesignCol>,
     /// 锚点行（属性面板显示它的属性）
@@ -6686,7 +6706,8 @@ fn visible_col_window(
 }
 
 /// 滚轮当方向键用：一次滚轮把激活行挪 `dir` 行（±1），视图只在激活行
-/// 贴近上下边缘时才跟着滚。`offset_px` 是「已滚过多少像素」（非负，
+/// 要出视口时才跟着滚（`edge` = 允许离边缘几行，见 [WHEEL_EDGE]）。
+/// `offset_px` 是「已滚过多少像素」（非负，
 /// ScrollHandle 的 y 是负值，取幅度），返回 (新激活行, 新的已滚过像素)。
 /// 抽成纯函数是为了让行换算 / 边缘判定 / 越界收敛都能在 headless 里测。
 fn wheel_active_row(
@@ -6709,8 +6730,6 @@ fn wheel_active_row(
     let off = offset_px.max(0.);
     let top_y = (off - head_h).max(0.);
     let first_vis = (top_y / row_h).floor() as usize;
-    // 行内亚像素偏移：滚动条拖到半行时别把视图吸附回整行边界。
-    let sub = top_y - first_vis as f32 * row_h;
     let vis_rows = ((view_h - head_h).max(row_h) / row_h).floor() as usize;
     let edge = edge.min(vis_rows / 2);
     let lo = first_vis + edge;
@@ -6722,10 +6741,12 @@ fn wheel_active_row(
     } else {
         first_vis
     };
+    // 视图不动时保留原偏移（滚动条拖到半行也别吸附）；一旦跟随就吸附到整行
+    // 边界，保证当前格整行露出来。
     let new_off = if new_first == first_vis {
         off
     } else {
-        head_h + new_first as f32 * row_h + sub
+        head_h + new_first as f32 * row_h
     };
     (next, new_off.max(0.))
 }
@@ -7269,10 +7290,23 @@ struct GridMenuSnapshot {
     rows: usize,
 }
 
-/// 表头列宽拖动（显示位置按原始列下标缓存）
+/// 列宽拖拽的取值范围（数据页与查询结果网格共用同一手感）
+const GRID_COL_MIN_W: f32 = 56.;
+const GRID_COL_MAX_W: f32 = 480.;
+
+/// 拖宽落到哪儿：表数据页和查询结果网格的列宽存法不同，状态机只有这一个
+/// 分叉，其余（起拖、跟手、松手）走同一条路径。
+#[derive(Clone)]
+enum GridResizeAt {
+    /// 表数据页：宽度进 `OpenTab::col_widths`，松手按表布局落盘。
+    Table { tab: TabIdent, key: String },
+    /// 查询结果网格：宽度直接写这条 outcome 的列定义，随结果页签存亡。
+    Query { qid: u64, oi: usize },
+}
+
+/// 表头列宽拖动
 struct GridResize {
-    tab: TabIdent,
-    key: String,
+    at: GridResizeAt,
     cix: usize,
     start_x: f32,
     start_w: f32,
@@ -7456,6 +7490,10 @@ struct DaroApp {
     col_drag: Option<GridColDrag>,
     /// 筛选面板底边拖高的瞬态：(起始指针 y, 起始面板高)
     pane_drag: Option<(f32, f32)>,
+    /// 查询结果面板拖高的瞬态：(页签 qid, 起始指针 y, 起始面板高)
+    q_panel_drag: Option<(u64, f32, f32)>,
+    /// 网格与属性面板那条缝拖高的瞬态：(设计器 did, 缝位, 起始指针 y, 起始面板高)
+    d_prop_drag: Option<(u64, u32, f32, f32)>,
     /// 本帧窗口高度（逻辑像素）：虚拟化算可见行数用，比网格实际高度略大，
     /// 多画的几行正好当上下的缓冲。
     viewport_h: f32,
@@ -7788,6 +7826,8 @@ impl DaroApp {
             col_resize: None,
             col_drag: None,
             pane_drag: None,
+            q_panel_drag: None,
+            d_prop_drag: None,
             viewport_h: 900.,
             viewport_w: 1440.,
             table_layouts,
@@ -9930,6 +9970,7 @@ impl DaroApp {
             popup: None,
             widths: Default::default(),
             resize: None,
+            props_h: Default::default(),
             cols: mock_design_cols(obj),
             baseline: mock_design_cols(obj),
             sel: 0,
@@ -10304,6 +10345,7 @@ impl DaroApp {
                 popup: None,
                 widths: Default::default(),
                 resize: None,
+                props_h: Default::default(),
                 cols: empty.clone(),
                 baseline: empty,
                 sel: 0,
@@ -17594,13 +17636,13 @@ impl DaroApp {
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
-            .child(
-                div()
-                    .h(px(D_PROP_SPLITTER_H))
-                    .flex_none()
-                    .bg(to_hsla(p.chrome)),
-            )
-            .child(self.index_props(did, ds, sel, dark, cx))
+            .children(self.d_split_pair(
+                did,
+                D_SPLIT_INDEX,
+                D_IDX_PROPS_H,
+                self.index_props(did, ds, sel, dark, cx),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -18540,13 +18582,13 @@ impl DaroApp {
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
-            .child(
-                div()
-                    .h(px(D_PROP_SPLITTER_H))
-                    .flex_none()
-                    .bg(to_hsla(p.chrome)),
-            )
-            .child(self.fk_props(dark))
+            .children(self.d_split_pair(
+                did,
+                D_SPLIT_FK,
+                D_FK_PROPS_H,
+                self.fk_props(dark),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -18846,13 +18888,13 @@ impl DaroApp {
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
-            .child(
-                div()
-                    .h(px(D_PROP_SPLITTER_H))
-                    .flex_none()
-                    .bg(to_hsla(p.chrome)),
-            )
-            .child(self.unique_props(dark))
+            .children(self.d_split_pair(
+                did,
+                D_SPLIT_UNIQUE,
+                D_FK_PROPS_H,
+                self.unique_props(dark),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -19645,13 +19687,13 @@ impl DaroApp {
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
-            .child(
-                div()
-                    .h(px(D_PROP_SPLITTER_H))
-                    .flex_none()
-                    .bg(to_hsla(p.chrome)),
-            )
-            .child(self.exclude_props(did, ds, dark, cx))
+            .children(self.d_split_pair(
+                did,
+                D_SPLIT_EXCLUDE,
+                D_FK_PROPS_H,
+                self.exclude_props(did, ds, dark, cx),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -21716,13 +21758,13 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
-            .child(
-                div()
-                    .h(px(D_PROP_SPLITTER_H))
-                    .flex_none()
-                    .bg(to_hsla(p.chrome)),
-            )
-            .child(self.rule_props(did, ds, dark, cx))
+            .children(self.d_split_pair(
+                did,
+                D_SPLIT_RULE,
+                D_RULE_PROPS_H,
+                self.rule_props(did, ds, dark, cx),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -22044,13 +22086,13 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
-            .child(
-                div()
-                    .h(px(D_PROP_SPLITTER_H))
-                    .flex_none()
-                    .bg(to_hsla(p.chrome)),
-            )
-            .child(self.rule_props(did, ds, dark, cx))
+            .children(self.d_split_pair(
+                did,
+                D_SPLIT_VIEW_RULE,
+                D_RULE_PROPS_H,
+                self.rule_props(did, ds, dark, cx),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -23071,13 +23113,13 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
-            .child(
-                div()
-                    .h(px(D_PROP_SPLITTER_H))
-                    .flex_none()
-                    .bg(to_hsla(p.chrome)),
-            )
-            .child(self.trigger_props(did, ds, dark, cx))
+            .children(self.d_split_pair(
+                did,
+                D_SPLIT_TRIGGER,
+                D_TRIG_PROPS_H,
+                self.trigger_props(did, ds, dark, cx),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -25229,7 +25271,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         (!t.undo.is_empty(), !t.redo.is_empty())
     }
 
-    /// 滚轮驱动表数据网格的激活格：一次一格，视图只在贴近上下边缘时跟着走。
+    /// 滚轮驱动表数据网格的激活格：一次一格，当前格要出视口时视图才跟着走。
     /// `page_start` / `local_rows` / `head_h` 直接复用 render 时算好的口径，
     /// 免得回调里重算分页和画出来的行对不上。
     fn data_grid_wheel_step(
@@ -25489,14 +25531,36 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let Some(t) = self.opened.get(ix) else { return };
         let Some(key) = self.grid_layout_key(t) else { return };
         self.col_resize = Some(GridResize {
-            tab: (t.conn_name.clone(), t.db, t.schema, t.cat, t.obj),
-            key,
+            at: GridResizeAt::Table {
+                tab: (t.conn_name.clone(), t.db, t.schema, t.cat, t.obj),
+                key,
+            },
             cix,
             start_x,
             start_w: cur_w,
         });
         // 拖列宽时不许顺手起一个列重排
         self.col_drag = None;
+        cx.notify();
+    }
+
+    /// 查询结果网格表头右缘按下：和数据页同一条拖宽路径，只是落点在这条
+    /// outcome 的列定义上。
+    fn query_col_resize_begin(
+        &mut self,
+        qid: u64,
+        oi: usize,
+        cix: usize,
+        start_x: f32,
+        cur_w: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.col_resize = Some(GridResize {
+            at: GridResizeAt::Query { qid, oi },
+            cix,
+            start_x,
+            start_w: cur_w,
+        });
         cx.notify();
     }
 
@@ -25530,17 +25594,37 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     /// 表头鼠标移动：正在拖列宽就改宽，正在拖列头就算落点
     fn grid_header_move(&mut self, x: f32, cx: &mut Context<Self>) {
         if let Some(r) = &self.col_resize {
-            let w = (r.start_w + (x - r.start_x)).clamp(56., 480.);
-            let (ident, cix, start_w) = (r.tab.clone(), r.cix, r.start_w);
-            let Some(t) = self.opened.iter_mut().find(|t| same_tab(t, &ident)) else {
-                return;
-            };
-            let old = t.col_widths.get(&cix).copied().unwrap_or(start_w);
+            let w = (r.start_w + (x - r.start_x)).clamp(GRID_COL_MIN_W, GRID_COL_MAX_W);
+            let (at, cix, start_w) = (r.at.clone(), r.cix, r.start_w);
             // 取整后宽度没变就不要 notify：整页网格重建是拖动的卡点
-            if old.round() == w.round() {
-                return;
+            match at {
+                GridResizeAt::Table { tab, .. } => {
+                    let Some(t) = self.opened.iter_mut().find(|t| same_tab(t, &tab)) else {
+                        return;
+                    };
+                    let old = t.col_widths.get(&cix).copied().unwrap_or(start_w);
+                    if old.round() == w.round() {
+                        return;
+                    }
+                    t.col_widths.insert(cix, w);
+                }
+                GridResizeAt::Query { qid, oi } => {
+                    let Some(col) = self
+                        .opened
+                        .iter_mut()
+                        .find(|t| t.qid == qid)
+                        .and_then(|t| t.qstate.as_mut())
+                        .and_then(|q| q.outcomes.get_mut(oi))
+                        .and_then(|o| o.columns.get_mut(cix))
+                    else {
+                        return;
+                    };
+                    if col.width.round() == w.round() {
+                        return;
+                    }
+                    col.width = w;
+                }
             }
-            t.col_widths.insert(cix, w);
             cx.notify();
             return;
         }
@@ -25564,10 +25648,12 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         }
     }
 
-    /// 表头松开：拖列宽 → 落盘；拖动过 → 重排；没拖 → 按点击排序。
+    /// 表头松开：拖列宽 → 数据页落盘、结果页就地结束；拖动过 → 重排；没拖 → 按点击排序。
     fn grid_header_up(&mut self, cx: &mut Context<Self>) {
         if let Some(r) = self.col_resize.take() {
-            self.grid_persist_layout(&r.tab, &r.key);
+            if let GridResizeAt::Table { tab, key } = r.at {
+                self.grid_persist_layout(&tab, &key);
+            }
             cx.notify();
             return;
         }
@@ -29109,14 +29195,20 @@ impl Render for DaroApp {
                 }
                 this.import_db_files(&dbs, cx);
             }))
-            // 拖侧栏宽时指针可能划出正文（标题栏 / ribbon / 状态栏）：全局收
-            // move / up，拖动跟手不断、在窗口任何地方松手都能落盘收状态。
+            // 拖侧栏宽 / 结果面板高 / 属性面板高时指针可能划出正文（标题栏 / ribbon /
+            // 状态栏）：全局收 move / up，拖动跟手不断、在窗口任何地方松手都能落盘收状态。
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 this.side_resize_move(ev.position.x.as_f32(), cx);
+                this.q_panel_resize_move(ev.position.y.as_f32(), cx);
+                this.d_prop_resize_move(ev.position.y.as_f32(), cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.side_resize_end(cx)),
+                cx.listener(|this, _, _, cx| {
+                    this.side_resize_end(cx);
+                    this.q_panel_resize_end(cx);
+                    this.d_prop_resize_end(cx);
+                }),
             )
             .child(self.title_bar(window, cx))
             .child(self.ribbon(cx))
@@ -30283,9 +30375,10 @@ impl DaroApp {
                         this.tree_filter_open = !this.tree_filter_open;
                         cx.notify();
                     }))
-                    // 参考界面树底的筛选按钮是三道横杠（FILTER），不是漏斗
+                    // 参考界面这里是三道横杠（FILTER），但它是滑杆造型、读起来像「设置」，
+                    // 这里改用漏斗，和网格工具条的筛选按钮保持同一个语义。
                     .child(art::icon(
-                        art::Glyph::Asset("FILTER"),
+                        art::Glyph::Zed(ZedIcon::FilterFunnel),
                         16.,
                         toggle_ink(ink, active),
                     ))
@@ -32289,10 +32382,10 @@ impl DaroApp {
         } else {
             0x4da0e3
         });
-        // 分隔线照参考界面暗色实机取样：竖线 #595a5a、横线 #a6a6a6（暗底上
-        // 横线反而更亮）；亮色主题两者同为 #dcdcdc，比外框深一档。
-        let line = to_hsla(if self.dark { 0x595a5a } else { 0xdcdcdc });
-        let row_line = to_hsla(if self.dark { 0xa6a6a6 } else { 0xdcdcdc });
+        // 网格分隔线：暗色跟主题的 border（原先照参考界面取样的竖 #595a5a /
+        // 横 #a6a6a6 在深色底上亮得刺眼，而且换主题不跟着变）；亮色仍是
+        // #dcdcdc，比外框深一档。
+        let line = to_hsla(if self.dark { p.border } else { 0xdcdcdc });
         // 待应用状态：改动过的格铺淡琥珀、新增行铺淡绿。参考界面只靠行头
         // * 区分新增；这里把「还没应用的改动」显式标出来（应用后消失）。
         let dirty_cell = to_hsla(if self.dark {
@@ -32866,7 +32959,7 @@ impl DaroApp {
                     .when(row_tint, |s| s.bg(head_sel))
                     .when(!row_tint, move |s| s.hover(move |s| s.bg(hover)))
                     .border_b_1()
-                    .border_color(row_line)
+                    .border_color(line)
                     // 行首槽：选中行铺表头同款浅蓝 + 左端 3px 强调条（参考界面没有行号）；
                     // 点它选中整行，当前列保持不变
                     .child(
@@ -33098,7 +33191,7 @@ impl DaroApp {
                             .flex_none()
                             .h(px(T_ROW_H))
                             .border_b_1()
-                            .border_color(row_line)
+                            .border_color(line)
                             .child(
                                 div()
                                     .id(rid("emptyrowgutter"))
@@ -33651,7 +33744,7 @@ impl DaroApp {
                             .overflow_scroll()
                             .track_scroll(&t.scroll)
                             // 滚轮不再滚视图，改成一格一行地移动激活格；
-                            // 只有激活格贴近上下边缘时才由回调带走视图。
+                            // 当前格要出视口时才由回调带走视图。
                             .when_some(tab_ix, move |d, ix| {
                                 d.on_scroll(move |ev, window, cx| {
                                     let d = ev.delta.pixel_delta(window.line_height());
@@ -34644,6 +34737,10 @@ impl DaroApp {
                 .child(div().w(px(w)).flex_none().flex().child(control))
                 .into_any_element()
         };
+        // 属性面板的固有高：没拖过那条缝时按它排（行数 × 行高 + 上下留白 18，
+        // 末尾一行说明按 28 估——多留几像素宁可空着也别切到底行），并被 232 的
+        // 上限截住，与原来 max_h 的口径一致。
+        let mut props_native = 0.;
         let props: AnyElement = if ds.cols.is_empty() {
             div().into_any_element()
         } else {
@@ -34777,6 +34874,9 @@ impl DaroApp {
             } else {
                 Some("SQL Server 标识列：生成 IDENTITY(开始值, 递增)。")
             };
+            props_native =
+                (18. + D_PROP_ROW_H * prows.len() as f32 + if hint.is_some() { 28. } else { 0. })
+                    .min(232.);
             div()
                 .id("dprops")
                 .test_support()
@@ -34815,8 +34915,13 @@ impl DaroApp {
                     
                     .child(div().w(px(total_w)).child(grid)),
             )
-            .child(div().h(px(D_PROP_SPLITTER_H)).flex_none().bg(to_hsla(p.chrome)))
-            .child(props)
+            .children(self.d_split_pair(
+                tab.did,
+                D_SPLIT_FIELDS,
+                props_native,
+                props,
+                cx,
+            ))
             .into_any_element();
 
         // ── SQL 预览页（参考界面 cameras 屏口径）────────────────
@@ -36609,6 +36714,168 @@ impl DaroApp {
             .into_any_element()
     }
 
+    /// 结果面板拖高：按下分隔条时记住起点 y 与当时的高度。
+    /// 面板高挂在页签的 [`QueryState`] 上，切页签各留各的比例。
+    fn q_panel_resize_begin(&mut self, qid: u64, y: f32, h0: f32, cx: &mut Context<Self>) {
+        self.q_panel_drag = Some((qid, y, h0));
+        cx.notify();
+    }
+
+    /// 拖动中：分隔条是结果面板的上沿，指针每上移 1px 面板长高 1px（下拖就
+    /// 是压矮），上下都收口。上限按窗口高扣掉各条固定 chrome（标题 / ribbon /
+    /// 页签 / 工具条 / 上下文栏 / 状态栏）再给编辑器留 140，免得整块编辑器被挤没。
+    fn q_panel_resize_move(&mut self, y: f32, cx: &mut Context<Self>) {
+        let Some((qid, y0, h0)) = self.q_panel_drag else {
+            return;
+        };
+        let max = (self.viewport_h
+            - TITLE_H
+            - RIBBON_H
+            - D_TABBAR_H
+            - Q_TOOLBAR_H
+            - Q_CONNBAR_H
+            - STATUS_BAR_H
+            - 140.)
+            .max(160.);
+        let h = (h0 - (y - y0)).clamp(120., max);
+        let Some(q) = Self::query_state_mut(&mut self.opened, qid) else {
+            self.q_panel_drag = None;
+            return;
+        };
+        // 同一像素内反复回调（捕获层和根容器都收 move）：值没变就别重建
+        if q.panel_h == h {
+            return;
+        }
+        q.panel_h = h;
+        cx.notify();
+    }
+
+    fn q_panel_resize_end(&mut self, cx: &mut Context<Self>) {
+        if self.q_panel_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 属性面板当前高：拖过用拖出来的值，没拖过用该子页的固有高。
+    fn d_props_h(&self, did: u64, slot: u32, native: f32) -> f32 {
+        self.opened
+            .iter()
+            .find(|t| t.did == did)
+            .and_then(|t| t.dstate.as_ref())
+            .and_then(|ds| ds.props_h.get(&slot).copied())
+            .unwrap_or(native)
+    }
+
+    /// 按下网格与属性面板那条缝：记下起点 y、缝位与当时的面板高。
+    fn d_prop_resize_begin(&mut self, did: u64, slot: u32, y: f32, h0: f32, cx: &mut Context<Self>) {
+        self.d_prop_drag = Some((did, slot, y, h0));
+        cx.notify();
+    }
+
+    /// 拖动中：缝是属性面板的上沿，指针每下移 1px 就是面板压矮 1px（上拖长高），
+    /// 缝本身跟着指针走。上下都收口——上限给网格留 160，免得整块网格被挤没。
+    fn d_prop_resize_move(&mut self, y: f32, cx: &mut Context<Self>) {
+        let Some((did, slot, y0, h0)) = self.d_prop_drag else {
+            return;
+        };
+        let max = (self.viewport_h
+            - TITLE_H
+            - RIBBON_H
+            - D_TABBAR_H
+            - D_TOOLBAR_H
+            - STATUS_BAR_H
+            - 160.)
+            .max(D_PROPS_MIN_H);
+        let h = (h0 - (y - y0)).clamp(D_PROPS_MIN_H, max);
+        let Some(ds) = self
+            .opened
+            .iter_mut()
+            .find(|t| t.did == did)
+            .and_then(|t| t.dstate.as_mut())
+        else {
+            self.d_prop_drag = None;
+            return;
+        };
+        // 同一像素内反复回调（捕获层和根容器都收 move）：值没变就别重建
+        if ds.props_h.get(&slot).copied() == Some(h) {
+            return;
+        }
+        ds.props_h.insert(slot, h);
+        cx.notify();
+    }
+
+    fn d_prop_resize_end(&mut self, cx: &mut Context<Self>) {
+        if self.d_prop_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 「缝 + 属性面板」成对交付：缝按下可拖，属性面板外面套一层高度（拖过用
+    /// 拖出来的值，没拖过用该子页的固有高 native），拖动期间在同一容器里补一层
+    /// 整页捕获板——缝只有 3px，指针一滑就丢，压一层才跟得住。
+    fn d_split_pair(
+        &self,
+        did: u64,
+        slot: u32,
+        native: f32,
+        props: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let p = self.pal();
+        let hot = to_hsla(blend(p.background, p.accent, 0.42));
+        let dragging = self.d_prop_drag.is_some_and(|d| d.0 == did && d.1 == slot);
+        let h = self.d_props_h(did, slot, native);
+        let seam = div()
+            .id(rid(&format!("dsplit-{slot}")))
+            .test_support()
+            .h(px(D_PROP_SPLITTER_H))
+            .flex_none()
+            .bg(to_hsla(p.chrome))
+            .cursor_row_resize()
+            .when(dragging, move |s| s.bg(hot))
+            .when(!dragging, move |s| s.hover(move |s| s.bg(hot)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    this.d_prop_resize_begin(did, slot, ev.position.y.as_f32(), h, cx);
+                }),
+            )
+            .into_any_element();
+        let sized = div()
+            .h(px(h))
+            .flex_none()
+            .overflow_hidden()
+            .child(props)
+            .into_any_element();
+        let mut out = vec![seam, sized];
+        if dragging {
+            out.push(self.d_prop_capture(cx));
+        }
+        out
+    }
+
+    /// 拖动期间的整页捕获层：同一时刻只有一条缝在拖，所以 id 固定。
+    fn d_prop_capture(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("dprop-capture")
+            .test_support()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .w_full()
+            .h_full()
+            .occlude()
+            .cursor_row_resize()
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                this.d_prop_resize_move(ev.position.y.as_f32(), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.d_prop_resize_end(cx)),
+            )
+            .into_any_element()
+    }
+
     /// 「新建查询」页：运行上下文栏（连接 / 库 / 模式下拉 + 运行 / 停止 / 解释）
     /// + SQL 编辑器（行号 + 等宽）+ 结果面板（状态头 + 消息 / 结果页签）。
     /// 布局与量照 Flutter 版 query_page.dart 复刻参考界面查询窗口的实测。
@@ -37127,22 +37394,26 @@ impl DaroApp {
             )
             .when(n_out > 0, |s| {
                 s.child({
-                // 可拖动的分隔条：按下后跟踪鼠标 Y 位移，实时更新面板高度
-                let qid_for_split = qid;
-                div()
-                    .id("qsplit")
-                    .h(px(D_PROP_SPLITTER_H))
-                    .flex_none()
-                    .bg(to_hsla(p.chrome))
-                    .cursor_row_resize()
-                    .hover(|s| s.bg(to_hsla(0xcccccc)))
-                    .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
-                        // 点击分隔条不做任何事，拖动才调整高度
-                    }))
-                    .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
-                        // 鼠标移动时不直接改高度，需要配合鼠标按下状态
-                    }))
-                    .test_support()
+                    // 可拖动的分隔条：按下记起点，拖动期间由下面那层透明捕获板
+                    // 跟踪鼠标 Y，实时更新本签结果面板高度。
+                    let h0 = q.panel_h;
+                    let dragging = self.q_panel_drag.is_some_and(|d| d.0 == qid);
+                    let hot = to_hsla(blend(p.background, p.accent, 0.42));
+                    div()
+                        .id("qsplit")
+                        .test_support()
+                        .h(px(D_PROP_SPLITTER_H))
+                        .flex_none()
+                        .bg(to_hsla(p.chrome))
+                        .cursor_row_resize()
+                        .when(dragging, move |s| s.bg(hot))
+                        .when(!dragging, move |s| s.hover(move |s| s.bg(hot)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                this.q_panel_resize_begin(qid, ev.position.y.as_f32(), h0, cx);
+                            }),
+                        )
                 })
                 .child(
                     v_flex()
@@ -37153,6 +37424,29 @@ impl DaroApp {
                         .child(header)
                         .child(tabbar)
                         .child(div().flex_1().min_h_0().overflow_hidden().child(body)),
+                )
+            })
+            // 拖动期间盖一层透明板压在编辑器 / 网格上：指针划过哪儿都不断，
+            // 也不会误点结果行。
+            .when(self.q_panel_drag.is_some_and(|d| d.0 == qid), |s| {
+                s.child(
+                    div()
+                        .id("qpanel-capture")
+                        .test_support()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .w_full()
+                        .h_full()
+                        .occlude()
+                        .cursor_row_resize()
+                        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                            this.q_panel_resize_move(ev.position.y.as_f32(), cx);
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.q_panel_resize_end(cx)),
+                        ),
                 )
             })
             .into_any_element();
@@ -37839,8 +38133,7 @@ impl DaroApp {
         // 表头格里（中间不画分隔线），当前列 / 选区列两行各铺同档浅蓝。
         let head_bg = to_hsla(p.background);
         let ty_fg = to_hsla(if self.dark { 0x8fb0d6 } else { 0x567fab });
-        let line = to_hsla(if self.dark { 0x595a5a } else { 0xdcdcdc });
-        let row_line = to_hsla(if self.dark { 0xa6a6a6 } else { 0xdcdcdc });
+        let line = to_hsla(if self.dark { p.border } else { 0xdcdcdc });
         let head_cur = to_hsla(blend(accent, p.background, 0.74));
         let head_sel = to_hsla(blend(accent, p.background, 0.86));
         let sel_cols = sel.map(|s| {
@@ -37998,11 +38291,60 @@ impl DaroApp {
                 s.child(div().w(px(col_pad_r)).h_full().flex_none())
             });
 
-        let header = v_flex()
+        // 表头拖宽：把手按列累计偏移铺满整个表头高度，几何和数据页的
+        // `colresize/{cix}`（表头格右缘 5px 通高）一致；跟手 / 松手也走同一条
+        // `grid_header_move` / `grid_header_up`，只是落点在这条 outcome 的列上。
+        let mut header = v_flex()
             .w(px(total_w))
             .flex_none()
+            .relative()
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                this.grid_header_move(ev.position.x.as_f32(), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.grid_header_up(cx)),
+            )
             .child(name_row)
             .child(type_row);
+
+        {
+            let mut acc = Q_ROWNO_W + col_pad_l;
+            for (dc, w) in col_widths
+                .iter()
+                .enumerate()
+                .skip(first_col)
+                .take(last_col - first_col)
+            {
+                let (w, left) = (*w, acc + *w - 5.);
+                header = header.child(
+                    div()
+                        .id(rid(&format!("qcolresize/{oi}/{dc}")))
+                        .absolute()
+                        .left(px(left))
+                        .top_0()
+                        .bottom_0()
+                        .w(px(5.))
+                        .cursor_col_resize()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.query_col_resize_begin(
+                                    qid,
+                                    oi,
+                                    dc,
+                                    ev.position.x.as_f32(),
+                                    w,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .test_support(),
+                );
+                acc += w;
+            }
+        }
 
         let grid = v_flex()
             .w(px(total_w))
@@ -38024,7 +38366,7 @@ impl DaroApp {
                     .when(in_sel_rows, |s| s.bg(row_sel))
                     .when(!in_sel_rows, |s| s.hover(move |s| s.bg(hover)))
                     .border_b_1()
-                    .border_color(row_line)
+                    .border_color(line)
                     .child(
                         div()
                             .id(rid(&format!("qrow/{oi}/{rix}")))
@@ -38205,7 +38547,11 @@ impl DaroApp {
                     .relative()
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, _| this.query_grid_drag_end()),
+                        cx.listener(|this, _, _, cx| {
+                            this.query_grid_drag_end();
+                            // 在表头以外松手也要收掉拖宽状态，否则列宽跟着鼠标一直变
+                            this.grid_header_release(cx);
+                        }),
                     )
                     .child(
                         div()
@@ -38214,7 +38560,7 @@ impl DaroApp {
                             .overflow_scroll()
                             .track_scroll(scroll)
                             // 同表数据页：滚轮移动结果网格的激活格，视图只在
-                            // 贴近上下边缘时才跟着走。
+                            // 当前格要出视口时才跟着走。
                             .on_scroll({
                                 let app = cx.entity().clone();
                                 let handle = scroll.clone();
@@ -43668,6 +44014,7 @@ struct FkCommentPopup {
     row: usize,
     text: Entity<TextareaState>,
     dark: bool,
+    _esc: Subscription,
     submitted: bool,
 }
 
@@ -43683,6 +44030,7 @@ impl FkCommentPopup {
         cx: &mut Context<Self>,
     ) -> Self {
         let text = cx.new(|cx| TextareaState::new(window, cx).default_value(initial));
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             main,
@@ -43690,6 +44038,7 @@ impl FkCommentPopup {
             row,
             text,
             dark,
+            _esc: esc,
             submitted: false,
         }
     }
@@ -43718,6 +44067,7 @@ struct CheckExprPopup {
     row: usize,
     text: Entity<TextareaState>,
     dark: bool,
+    _esc: Subscription,
     submitted: bool,
 }
 
@@ -43733,6 +44083,7 @@ impl CheckExprPopup {
         cx: &mut Context<Self>,
     ) -> Self {
         let text = cx.new(|cx| TextareaState::new(window, cx).default_value(initial));
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             main,
@@ -43740,6 +44091,7 @@ impl CheckExprPopup {
             row,
             text,
             dark,
+            _esc: esc,
             submitted: false,
         }
     }
@@ -43768,6 +44120,7 @@ struct ExcludePredicatePopup {
     row: usize,
     text: Entity<TextareaState>,
     dark: bool,
+    _esc: Subscription,
     submitted: bool,
 }
 
@@ -43783,6 +44136,7 @@ impl ExcludePredicatePopup {
         cx: &mut Context<Self>,
     ) -> Self {
         let text = cx.new(|cx| TextareaState::new(window, cx).default_value(initial));
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             main,
@@ -43790,6 +44144,7 @@ impl ExcludePredicatePopup {
             row,
             text,
             dark,
+            _esc: esc,
             submitted: false,
         }
     }
@@ -43819,6 +44174,7 @@ struct RuleTextPopup {
     field: u8,
     text: Entity<TextareaState>,
     dark: bool,
+    _esc: Subscription,
     submitted: bool,
 }
 
@@ -43836,6 +44192,7 @@ impl RuleTextPopup {
         cx: &mut Context<Self>,
     ) -> Self {
         let text = cx.new(|cx| TextareaState::new(window, cx).default_value(initial));
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             main,
@@ -43844,6 +44201,7 @@ impl RuleTextPopup {
             field,
             text,
             dark,
+            _esc: esc,
             submitted: false,
         }
     }
@@ -43876,12 +44234,6 @@ impl Render for RuleTextPopup {
             .bg(bg)
             .border_1()
             .border_color(border)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, _cx| {
-                if ev.keystroke.key == "escape" {
-                    this.submitted = true;
-                    window.remove_window();
-                }
-            }))
             .child(div().h(px(4.)).flex_none())
             .child(
                 div()
@@ -43932,12 +44284,6 @@ impl Render for ExcludePredicatePopup {
             .bg(bg)
             .border_1()
             .border_color(border)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, _cx| {
-                if ev.keystroke.key == "escape" {
-                    this.submitted = true;
-                    window.remove_window();
-                }
-            }))
             .child(div().h(px(4.)).flex_none())
             .child(
                 div()
@@ -43988,12 +44334,6 @@ impl Render for CheckExprPopup {
             .bg(bg)
             .border_1()
             .border_color(border)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, _cx| {
-                if ev.keystroke.key == "escape" {
-                    this.submitted = true;
-                    window.remove_window();
-                }
-            }))
             .child(div().h(px(4.)).flex_none())
             .child(
                 div()
@@ -44048,12 +44388,6 @@ impl Render for FkCommentPopup {
             .bg(bg)
             .border_1()
             .border_color(border)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, _cx| {
-                if ev.keystroke.key == "escape" {
-                    this.submitted = true;
-                    window.remove_window();
-                }
-            }))
             .child(div().h(px(4.)).flex_none())
             .child(
                 div()
@@ -47611,6 +47945,192 @@ mod designer_tests {
             });
             assert!(window.try_find("qtab/0").is_none(), "清掉结果页签条");
             assert!(window.try_find("qmsg").is_none());
+        })
+        .unwrap();
+    }
+
+    /// 结果面板拖高：按下分隔条下拖，面板长高、编辑器压矮；上下都有夹紧。
+    #[gpui_kit::test]
+    fn query_result_panel_resizes_by_dragging_splitter(cx: &mut TestAppContext) {
+        isolate_store("qpaneldrag");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| a.open_query_tab(None, window, cx));
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.click("qedit", cx);
+            window.input("SELECT 1", cx);
+        })
+        .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.click_at("qrun-wrap", point(px(10.), px(11.)), cx);
+            window.render_frame(cx);
+            let h0 = app.update(cx, |a, _| a.opened[0].qstate.as_ref().unwrap().panel_h);
+            let grab = |window: &mut Window| {
+                let b = window.find("qsplit").bounds();
+                // 取证点取分隔条中段：左端那几像素被侧栏分栏缝压着，按下会被它吃掉。
+                point(
+                    b.origin.x + b.size.width * 0.5,
+                    b.origin.y + b.size.height * 0.5,
+                )
+            };
+            // 分隔条是结果面板的上沿：上拖跟手上移，面板等量长高、编辑器压矮。
+            let from = grab(window);
+            window.drag(from, point(from.x, from.y - px(120.)), cx);
+            window.render_frame(cx);
+            let h1 = app.update(cx, |a, _| a.opened[0].qstate.as_ref().unwrap().panel_h);
+            assert!(
+                (h1 - h0 - 120.).abs() <= 2.,
+                "上拖 120 → 面板长高 120：{h0} → {h1}"
+            );
+            let y1 = window.find("qsplit").bounds().origin.y;
+            assert!(
+                (y1 - (from.y - px(120.))).abs() <= px(2.),
+                "分隔条没跟手停在松手处：{} → {}",
+                from.y,
+                y1
+            );
+            app.update(cx, |a, _| {
+                assert!(a.q_panel_drag.is_none(), "松手后拖动瞬态收掉");
+            });
+            assert!(
+                window.try_find("qpanel-capture").is_none(),
+                "拖动结束撤掉捕获层"
+            );
+
+            // 再下拖 200：压回 100 以上，只到下限 120（300+120-200=220，未夹紧）
+            let from2 = grab(window);
+            window.drag(from2, point(from2.x, from2.y + px(200.)), cx);
+            window.render_frame(cx);
+            let h2 = app.update(cx, |a, _| a.opened[0].qstate.as_ref().unwrap().panel_h);
+            assert!((h2 - (h1 - 200.)).abs() <= 2., "下拖 200 → 面板压矮 200：{h1} → {h2}");
+            let y2 = window.find("qsplit").bounds().origin.y;
+            assert!(
+                (y2 - (from2.y + px(200.))).abs() <= px(2.),
+                "下拖后分隔条没跟手：{} → {}",
+                from2.y,
+                y2
+            );
+        })
+        .unwrap();
+
+        // 夹紧：往上拖到底停在给编辑器留余量的上限，往下拖到底停在下限 120。
+        let qid = app.update(cx, |a, _| a.opened[0].qid);
+        app.update(cx, |a, cx| {
+            let h = a.opened[0].qstate.as_ref().unwrap().panel_h;
+            a.q_panel_resize_begin(qid, 0., h, cx);
+            a.q_panel_resize_move(-(a.viewport_h * 4.), cx);
+            let max = a.opened[0].qstate.as_ref().unwrap().panel_h;
+            assert!(
+                max <= a.viewport_h - 200.,
+                "上限挤不掉编辑器: {max} / 窗口 {}",
+                a.viewport_h
+            );
+            a.q_panel_resize_move(a.viewport_h * 4., cx);
+            let min = a.opened[0].qstate.as_ref().unwrap().panel_h;
+            assert!((min - 120.).abs() <= 0.5, "下限 120: {min}");
+            a.q_panel_resize_end(cx);
+            assert!(a.q_panel_drag.is_none(), "收尾清瞬态");
+        });
+    }
+
+    /// 设计器里网格与属性面板之间那八条缝：按下就拖，缝跟着指针走，属性面板等量
+    /// 增减；拖出来的高按子页各存一份，切来切去互不干扰。
+    #[gpui_kit::test]
+    fn designer_props_seam_resizes_per_subpage(cx: &mut TestAppContext) {
+        isolate_store("propseam");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.open_designer(Act::Obj(0, 0, NO_SCHEMA, 0, 0), window, cx)
+            });
+            window.render_frame(cx);
+
+            let stored = |a: &DaroApp, slot: u32| -> Option<f32> {
+                a.opened[0].dstate.as_ref().unwrap().props_h.get(&slot).copied()
+            };
+            // 没拖过：不落盘，属性面板保持固有高
+            app.update(cx, |a, _| {
+                assert!(stored(a, D_SPLIT_FIELDS).is_none(), "未拖过不留值");
+            });
+            let grab = |window: &mut Window, slot: u32| {
+                let b = window.find(format!("dsplit-{slot}")).bounds();
+                // 取中段：左端那几像素被侧栏分栏缝压着，按下会被它吃掉。
+                point(
+                    b.origin.x + b.size.width * 0.5,
+                    b.origin.y + b.size.height * 0.5,
+                )
+            };
+
+            // 缝是属性面板的上沿：上拖 120 缝跟着上移，面板等量长高
+            let y0 = window.find("dsplit-0").bounds().origin.y;
+            let from = grab(window, 0);
+            window.drag(from, point(from.x, from.y - px(120.)), cx);
+            window.render_frame(cx);
+            let y1 = window.find("dsplit-0").bounds().origin.y;
+            assert!(
+                (y1 - (from.y - px(120.))).abs() <= px(2.),
+                "缝没跟手上移：{y0} → {y1}"
+            );
+            let h_up = app.update(cx, |a, _| stored(a, D_SPLIT_FIELDS).unwrap());
+            assert!(h_up > 0., "上拖后面板高落盘: {h_up}");
+            app.update(cx, |a, _| assert!(a.d_prop_drag.is_none(), "松手后拖动瞬态收掉"));
+            assert!(
+                window.try_find("dprop-capture").is_none(),
+                "拖动结束撤掉捕获层"
+            );
+
+            // 再下拖 120 回到原处：说明加减没记错方向，也没漏累积
+            let from2 = grab(window, 0);
+            window.drag(from2, point(from2.x, from2.y + px(120.)), cx);
+            window.render_frame(cx);
+            let y2 = window.find("dsplit-0").bounds().origin.y;
+            let h_back = app.update(cx, |a, _| stored(a, D_SPLIT_FIELDS).unwrap());
+            assert!(
+                (y2 - y0).abs() <= px(3.),
+                "来回一趟缝没回到原处：{y0} → {y2}"
+            );
+            assert!(
+                (h_back - (h_up - 120.)).abs() <= 3.,
+                "面板高没跟着回到固有值：{h_up} → {h_back}"
+            );
+
+            // 换到「索引」子页拖一把：那边另存一份，字段页那份不动
+            window.click("dsub/1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dsplit-1").is_some(), "索引子页也有可拖的缝");
+            let from3 = grab(window, 1);
+            window.drag(from3, point(from3.x, from3.y - px(80.)), cx);
+            window.render_frame(cx);
+            app.update(cx, |a, _| {
+                let idx = stored(a, D_SPLIT_INDEX).unwrap();
+                let fields = stored(a, D_SPLIT_FIELDS).unwrap();
+                assert!(idx > 0., "索引页单独存一份: {idx}");
+                assert_eq!(fields, h_back, "字段页那份没被动过");
+            });
+
+            // 夹紧：推到极远都停在上下限，上限别把整块网格挤没
+            let did = app.update(cx, |a, _| a.opened[0].did);
+            app.update(cx, |a, cx| {
+                let h = stored(a, D_SPLIT_INDEX).unwrap();
+                a.d_prop_resize_begin(did, D_SPLIT_FIELDS, 0., h, cx);
+                a.d_prop_resize_move(a.viewport_h * 4., cx);
+                let min = stored(a, D_SPLIT_FIELDS).unwrap();
+                assert!((min - D_PROPS_MIN_H).abs() <= 0.5, "下限 {min}");
+                a.d_prop_resize_move(-(a.viewport_h * 4.), cx);
+                let max = stored(a, D_SPLIT_FIELDS).unwrap();
+                assert!(
+                    max <= a.viewport_h - 200.,
+                    "上限挤不掉网格: {max} / 窗口 {}",
+                    a.viewport_h
+                );
+                a.d_prop_resize_end(cx);
+                assert!(a.d_prop_drag.is_none(), "收尾清瞬态");
+            });
         })
         .unwrap();
     }
@@ -55641,26 +56161,27 @@ mod grid_virtualization_tests {
         assert_eq!((first, last, cols_total), (0, 0, 0), "空面板不建列");
     }
 
-    /// 滚轮一格 = 激活行挪一行：中段只动激活格不动视图，贴近上下边缘才
-    /// 把视图带走；首尾和空表都不越界。
+    /// 滚轮一格 = 激活行挪一行：当前格还在视口内时只动格不动视图，一旦要出
+    /// 视口就把视图带走并吸附到整行；首尾和空表都不越界。
     #[test]
     fn wheel_active_row_moves_one_and_only_scrolls_at_edges() {
         let (rh, view_h, head) = (T_ROW_H, 400., 39.);
-        // (400 - 39) / 22 = 16 行可见，edge = 2 → 首屏安全区 [2, 13]。
+        // (400 - 39) / 22 = 16 行可见，edge = 0 → 首屏安全区 [0, 15]。
         let (row, off) = wheel_active_row(0, 1000, 1, 0., head, rh, view_h, WHEEL_EDGE);
-        assert_eq!(row, 1);
-        assert_eq!(off, 0., "中段不该滚视图");
+        assert_eq!((row, off), (1, 0.), "格在视口内只动格");
 
-        let (row, off) = wheel_active_row(13, 1000, 1, 0., head, rh, view_h, WHEEL_EDGE);
-        assert_eq!(row, 14);
-        assert!(off > 0., "贴到下边缘才开始滚视图: {off}");
+        // 最后一行可见格再往下 = 出视口，视图必须立刻跟住当前格。
+        let (row, off) = wheel_active_row(15, 1000, 1, 0., head, rh, view_h, WHEEL_EDGE);
+        assert_eq!(row, 16);
+        assert_eq!(off, head + rh, "滚到第 16 行时视图吸附整行: {off}");
 
         let (row, _) = wheel_active_row(0, 1000, -1, 0., head, rh, view_h, WHEEL_EDGE);
         assert_eq!(row, 0, "首行不越界");
+        // 偏移 440px → 首个可见行 18；从 18 往上就出视口，视图要带回来。
         let (row, off2) =
-            wheel_active_row(20, 1000, -1, 20. * rh, head, rh, view_h, WHEEL_EDGE);
-        assert_eq!(row, 19);
-        assert!(off2 < 20. * rh, "贴上边缘把视图带回来: {off2}");
+            wheel_active_row(18, 1000, -1, 20. * rh, head, rh, view_h, WHEEL_EDGE);
+        assert_eq!(row, 17);
+        assert_eq!(off2, head + 17. * rh, "贴上边缘把视图带回来: {off2}");
 
         let (row, _) = wheel_active_row(999, 1000, 1, 0., head, rh, view_h, WHEEL_EDGE);
         assert_eq!(row, 999, "末行不越界");
@@ -55719,7 +56240,8 @@ mod grid_virtualization_tests {
         .unwrap();
     }
 
-    /// 真派发滚轮：一格把激活格挪一行、视图保持不动；连滚到边缘后才自动跟随。
+    /// 真派发滚轮：一格把激活格挪一行；当前格还在视口内时视图不动，
+    /// 一旦要出视口就立刻被滚动条带回来。
     #[gpui_kit::test]
     fn wheel_moves_active_cell_without_scrolling_view(cx: &mut TestAppContext) {
         isolate_store("gridwheel");
@@ -55743,25 +56265,44 @@ mod grid_virtualization_tests {
                 (a.opened[0].cell.0, a.opened[0].scroll.offset().y)
             });
             assert_eq!(cell, 1, "向下滚一格 = 激活格下一行");
-            assert_eq!(after, before, "中段不该把视图带走");
+            assert_eq!(after, before, "视口内的中段只动格");
 
             window.scroll("table-grid-inner", ScrollDelta::Lines(point(0., 1.)), cx);
             let cell = app.update(cx, |a, _| a.opened[0].cell.0);
             assert_eq!(cell, 0, "反方向滚回上一行");
 
-            for _ in 0..30 {
+            // 连续往下滚：每一格都要看得见，滚动条跟着当前格一路走。步数照
+            // 视口能放几行算，保证一定跨过「当前格出视口」那道线。
+            let view = window.find("table-grid-inner").bounds();
+            let steps = (view.size.height.as_f32() / T_ROW_H).floor() as usize * 2;
+            for step in 1..=steps {
                 window.scroll("table-grid-inner", ScrollDelta::Lines(point(0., -1.)), cx);
+                window.render_frame(cx);
+                let cell = app.update(cx, |a, _| a.opened[0].cell.0);
+                assert_eq!(cell, step, "连续滚轮逐行推进");
+                let cur = window.try_find(rid(&format!("cell/{cell}/0")));
+                assert!(cur.is_some(), "第 {cell} 行要跟着滚进视口");
+                let top = cur.unwrap().bounds().origin.y;
+                assert!(
+                    top >= view.origin.y && top + px(T_ROW_H) <= view.bottom(),
+                    "第 {cell} 行 {top} 不在视口 [{:?}, {:?}] 内",
+                    view.origin.y,
+                    view.bottom()
+                );
             }
-            let (cell, off) = app.update(cx, |a, _| {
-                (a.opened[0].cell.0, a.opened[0].scroll.offset().y)
-            });
-            assert_eq!(cell, 30, "连续滚轮逐行推进");
-            assert!(off.as_f32() < 0., "贴近下边缘后视图自动跟随: {off:?}");
+            let off = app.update(cx, |a, _| a.opened[0].scroll.offset().y);
+            assert!(off.as_f32() < 0., "视图被当前格带走: {off:?}");
+            assert!(
+                window.try_find("cell/0/0").is_none(),
+                "滚走后第 0 行不再建元素"
+            );
         })
         .unwrap();
     }
 
-    /// 结果网格同款接线：滚轮也只移动 outcome 的激活格，不滚视图。
+    /// 结果网格同款接线：滚轮只移动 outcome 的激活格，且当前格要出视口时
+    /// 滚动条必须一路跟住，否则当前行滚出视口就看不见了。
+    /// 走 query_run 造结果，不派发点击。
     #[gpui_kit::test]
     fn wheel_moves_query_result_active_cell(cx: &mut TestAppContext) {
         isolate_store("qgridwheel");
@@ -55775,9 +56316,18 @@ mod grid_virtualization_tests {
         .unwrap();
 
         cx.update_window(handle, |_, window, cx| {
-            window.click("qedit", cx);
-            window.input("SELECT 1", cx);
-            window.click_at("qrun-wrap", point(px(10.), px(11.)), cx);
+            app.update(cx, |a, cx| {
+                let qid = a.opened[0].qid;
+                let editor = a.opened[0].qstate.as_ref().unwrap().editor.clone();
+                editor.update(cx, |s, cx| {
+                    s.set_value("SELECT 1".to_string(), window, cx);
+                });
+                a.query_run(qid, false, window, cx);
+            });
+        })
+        .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             app.update(cx, |a, cx| {
                 if let Some(q) = a.opened[0].qstate.as_mut() {
@@ -55798,13 +56348,146 @@ mod grid_virtualization_tests {
             assert!(window.try_find("qcell/0/0/0").is_some(), "结果网格已渲染");
 
             let before = app.update(cx, |a, _| a.opened[0].scroll.offset().y);
-            window.scroll("qcell/0/0/0", ScrollDelta::Lines(point(0., -1.)), cx);
+            window.scroll("qgrid-scroll/0", ScrollDelta::Lines(point(0., -1.)), cx);
             let (cell, after) = app.update(cx, |a, _| {
                 let o = &a.opened[0].qstate.as_ref().unwrap().outcomes[0];
                 (o.cell.0, a.opened[0].scroll.offset().y)
             });
             assert_eq!(cell, 1, "结果网格滚轮移动激活格");
-            assert_eq!(after, before, "中段不滚视图");
+            assert_eq!(after, before, "视口内的中段只动格");
+
+            // 连续往下滚：每一格都要看得见，滚动条跟着当前格一路走。步数照
+            // 视口能放几行算，保证一定跨过「当前格出视口」那道线。
+            let view = window.find("qgrid-scroll/0").bounds();
+            let steps = (view.size.height.as_f32() / Q_ROW_H).floor() as usize * 2;
+            for step in 1..=steps {
+                window.scroll("qgrid-scroll/0", ScrollDelta::Lines(point(0., -1.)), cx);
+                window.render_frame(cx);
+                let cell = app.update(cx, |a, _| {
+                    a.opened[0].qstate.as_ref().unwrap().outcomes[0].cell.0
+                });
+                assert_eq!(cell, step + 1, "连续滚轮逐行推进");
+                let cur = window.try_find(rid(&format!("qcell/0/{cell}/0")));
+                assert!(cur.is_some(), "第 {cell} 行要跟着滚进视口");
+                let top = cur.unwrap().bounds().origin.y;
+                assert!(
+                    top >= view.origin.y && top + px(Q_ROW_H) <= view.bottom(),
+                    "第 {cell} 行 {top} 不在视口 [{:?}, {:?}] 内",
+                    view.origin.y,
+                    view.bottom()
+                );
+            }
+            let off = app.update(cx, |a, _| a.opened[0].scroll.offset().y);
+            assert!(off.as_f32() < 0., "视图被当前格带走: {off:?}");
+            // 视图跟随时吸附到整行边界，否则当前行只剩半行也说不清「跟住了」。
+            let scrolled = -off.as_f32() - Q_GRID_HEADER_H;
+            assert!(
+                (scrolled / Q_ROW_H).fract().abs() < 1e-3,
+                "跟随后要落在整行边界: {scrolled}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// 结果网格表头右缘拖宽：和数据页共用同一条把手路径（起拖 / 跟手 / 松手都
+    /// 是 grid_header_* 那一套），差别只在落点是这条 outcome 的列定义。
+    /// 播种走 query_run，不派发点击。
+    #[gpui_kit::test]
+    fn query_grid_header_resize_shares_data_grid_path(cx: &mut TestAppContext) {
+        isolate_store("qgridresize");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| a.open_query_tab(None, window, cx));
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| {
+                let qid = a.opened[0].qid;
+                let editor = a.opened[0].qstate.as_ref().unwrap().editor.clone();
+                editor.update(cx, |s, cx| {
+                    s.set_value("SELECT 1".to_string(), window, cx);
+                });
+                a.query_run(qid, false, window, cx);
+            });
+        })
+        .unwrap();
+
+        let col_w_at = |a: &DaroApp| -> f32 {
+            a.opened[0].qstate.as_ref().unwrap().outcomes[0].columns[0].width
+        };
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                if let Some(q) = a.opened[0].qstate.as_mut() {
+                    q.pane = 2;
+                    if let Some(o) = q.outcomes.get_mut(0) {
+                        let n = o.columns.len().max(1);
+                        o.result = Some(
+                            (0..60)
+                                .map(|r| (0..n).map(|c| format!("r{r}c{c}")).collect())
+                                .collect(),
+                        );
+                        o.cell = (0, 0);
+                    }
+                }
+                cx.notify();
+            });
+            window.render_frame(cx);
+
+            let b = window.find("qcolresize/0/0").bounds();
+            assert_eq!(b.size.width, px(5.), "把手就是右缘 5px");
+            let y = b.origin.y + px(8.);
+            let before = app.update(cx, |a, _| col_w_at(a));
+
+            window.drag(
+                point(b.origin.x + px(2.), y),
+                point(b.origin.x + px(42.), y),
+                cx,
+            );
+            window.render_frame(cx);
+            let after = app.update(cx, |a, _| col_w_at(a));
+            assert!(
+                (after - (before + 40.)).abs() <= 2.,
+                "拖 40px 列宽要跟手: before={before} after={after}"
+            );
+            assert!(
+                app.update(cx, |a, _| a.col_resize.is_none()),
+                "表头内松手要收掉拖宽状态"
+            );
+            let cell_w = window.find("qcell/0/0/0").bounds().size.width.as_f32();
+            assert!(
+                (cell_w - after).abs() <= 2.,
+                "重绘后格宽跟着列宽: 格={cell_w} 列={after}"
+            );
+
+            // 拖过下限：夹到 GRID_COL_MIN_W，和数据页同一个取值范围
+            let b2 = window.find("qcolresize/0/0").bounds();
+            window.drag(
+                point(b2.origin.x + px(2.), y),
+                point(b2.origin.x + px(2.) - px(after - GRID_COL_MIN_W + 20.), y),
+                cx,
+            );
+            assert_eq!(
+                app.update(cx, |a, _| col_w_at(a)),
+                GRID_COL_MIN_W,
+                "窄过下限要夹紧，不许把列拖没"
+            );
+
+            // 在表头以外松手：拖宽状态也得收掉，否则鼠标离开表头列宽还在变
+            let b3 = window.find("qcolresize/0/0").bounds();
+            let w3 = app.update(cx, |a, _| col_w_at(a));
+            window.drag(
+                point(b3.origin.x + px(2.), y),
+                point(b3.origin.x + px(2.), y + px(120.)),
+                cx,
+            );
+            assert!(
+                app.update(cx, |a, _| a.col_resize.is_none()),
+                "表头外松手同样结束拖宽"
+            );
+            assert_eq!(app.update(cx, |a, _| col_w_at(a)), w3, "落到表体不该再改列宽");
         })
         .unwrap();
     }

@@ -40,6 +40,7 @@ pub fn open_ncx_import(parent: Entity<DaroApp>, dark: bool, cx: &mut App) {
 struct ImportDialog {
     parent: Entity<DaroApp>,
     dark: bool,
+    _esc: Subscription,
     path: Entity<InputState>,
     ncx: Option<NcxFile>,
     error: Option<String>,
@@ -71,9 +72,11 @@ impl ImportDialog {
             }
         })
         .detach();
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,
+            _esc: esc,
             path,
             ncx: None,
             error: None,
@@ -457,12 +460,6 @@ impl Render for ImportDialog {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(fg)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if ev.keystroke.key == "escape" {
-                    window.remove_window();
-                    cx.stop_propagation();
-                }
-            }))
             .child(self.title_bar())
             .child(
                 v_flex()
@@ -497,5 +494,34 @@ impl Render for ImportDialog {
                             .child(format!("已选 {selected} / 共 {total} 条")),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui_test_support::{isolate_store, open_app};
+    use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt;
+
+    // 显式引回标准 test 宏：`use super::*` 会把 gpui 的同名 test 宏带进作用域
+    use core::prelude::v1::test;
+
+    #[gpui_kit::test]
+    fn ncx_import_dialog_closes_on_escape(cx: &mut TestAppContext) {
+        isolate_store("ncxesc");
+        let (_main, app) = open_app(cx);
+        let handle = cx
+            .update(|cx| {
+                open_ncx_import(app, false, cx);
+                cx.windows().last().copied()
+            })
+            .expect("ncx import window opened");
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        assert_eq!(cx.windows().len(), 1, "Esc 关导入连接窗");
     }
 }
