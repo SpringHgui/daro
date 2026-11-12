@@ -50,11 +50,15 @@ done
 sed "s/__VERSION__/${version}/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
 
 # 由内向外签，最后签 bundle 把嵌套代码封进去。
+# x64 上只签 bundle 不会把 Contents/MacOS 里的 daro-mcpd 一起封进去，
+# --verify --strict 会报嵌套代码未签名（arm64 靠链接器的默认 ad-hoc 签名躲过），
+# 所以 bundle 用 --deep 重签；逐个签名保留，失败时能落到具体文件。
 for bin in "${bins[@]}"; do
   codesign --force --sign - "$app/Contents/MacOS/$bin"
+  codesign --verify --strict "$app/Contents/MacOS/$bin"
 done
-codesign --force --sign - "$app"
-codesign --verify --strict "$app"
+codesign --force --deep --sign - "$app"
+codesign --verify --strict --verbose=2 "$app"
 
 # 收口检查：包里不许再留 Homebrew 绝对路径。哪个依赖又引入了 brew dylib，
 # 这里会直接把构建拦下来，而不是发出去才闪退（issue #13）。

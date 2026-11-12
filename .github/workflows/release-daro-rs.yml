@@ -138,7 +138,18 @@ jobs:
       - name: 打包（macOS .app）
         if: runner.os == 'macOS'
         shell: bash
-        run: bash packaging/macos/bundle-app.sh --skip-build
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/macos-bundle.log"
+          if bash packaging/macos/bundle-app.sh --skip-build >"$log" 2>&1; then
+            tail -n 15 "$log"
+          else
+            tail -n 40 "$log"
+            grep -v '^[[:space:]]*$' "$log" | tail -n 8 | while IFS= read -r line; do
+              line="${line//'%'/'%25'}"
+              echo "::error file=daro-rs/packaging/macos/bundle-app.sh::${line}"
+            done
+            exit 1
+          fi
 
       - name: 打包（Linux tar.gz）
         if: runner.os == 'Linux'
