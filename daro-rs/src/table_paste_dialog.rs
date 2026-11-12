@@ -30,9 +30,13 @@ pub fn open_table_paste(
     on_ok: impl Fn(&mut DaroApp, PasteMode) + 'static,
     cx: &mut App,
 ) {
+    // 高度跟着表数走：列表最多露 8 行，再多就在框内滚动，
+    // 两张表时不留一大片空列表。
+    let list_h = 24.0 * (1.0 + req.names.len().min(8) as f32);
+    let height = (TITLE_H as f32 + 176.0 + list_h).max(280.0);
     let mut options = ui::dialog_options();
-    options.window_min_size = Some(size(px(420.), px(240.)));
-    options.window_bounds = Some(WindowBounds::centered(size(px(520.), px(320.)), cx));
+    options.window_min_size = Some(size(px(460.), px(260.)));
+    options.window_bounds = Some(WindowBounds::centered(size(px(520.), px(height)), cx));
     if let Some(titlebar) = options.titlebar.as_mut() {
         titlebar.title = Some("粘贴表".into());
     }
@@ -105,20 +109,113 @@ impl Render for TablePaste {
         let p = self.pal();
         let fg = to_hsla(p.foreground);
         let muted = to_hsla(p.muted_foreground);
+        let subtle = to_hsla(p.subtle_foreground);
+        let line = to_hsla(p.dialog_line);
         let dark = self.dark;
         let mode = self.mode;
 
-        let mut list = v_flex().gap(px(3.));
+        // 上下文行：标签列固定宽，值单行省略（长连接名不撑破窗口）
+        let ctx_row = |label: &'static str, value: String| {
+            h_flex()
+                .gap(px(8.))
+                .items_center()
+                .child(
+                    div()
+                        .w(px(ui::LABEL_W))
+                        .flex_none()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(fg)
+                        .child(value),
+                )
+        };
+
+        // 表清单：带边框的列表，表头说明「源 → 新名」，名字过长按列省略
+        let mut rows = v_flex().min_h_0().child(
+            h_flex()
+                .h(px(24.))
+                .px(px(10.))
+                .gap(px(8.))
+                .items_center()
+                .border_b(px(ui::HAIRLINE))
+                .border_color(line)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child("源表"),
+                )
+                .child(div().w(px(14.)).flex_none())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child("新表"),
+                ),
+        );
         for (source, target) in &self.req.names {
-            list = list.child(
+            rows = rows.child(
                 h_flex()
-                    .gap(px(6.))
+                    .h(px(24.))
+                    .px(px(10.))
+                    .gap(px(8.))
                     .items_center()
-                    .child(div().text_xs().text_color(muted).child(source.clone()))
-                    .child(div().text_xs().text_color(muted).child("→"))
-                    .child(div().text_xs().text_color(fg).child(target.clone())),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(muted)
+                            .child(source.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_none()
+                            .text_size(px(12.))
+                            .text_color(subtle)
+                            .child("→"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(fg)
+                            .child(target.clone()),
+                    ),
             );
         }
+        let list = div()
+            .flex_1()
+            .min_h_0()
+            .rounded(px(ui::RADIUS))
+            .border(px(ui::HAIRLINE))
+            .border_color(line)
+            .bg(to_hsla(p.background))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("paste-plan")
+                    .test_support()
+                    .size_full()
+                    .overflow_y_scroll()
+                    .child(rows),
+            );
 
         let pick = |this_mode: PasteMode| {
             let checked = mode == this_mode;
@@ -166,34 +263,24 @@ impl Render for TablePaste {
                 v_flex()
                     .flex_1()
                     .min_h_0()
-                    .gap(px(10.))
+                    .gap(px(12.))
                     .p(px(16.))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("从：{}", self.req.source)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("粘贴到：{}", self.req.target)),
-                    )
-                    .child(
-                        v_flex()
-                            .id("paste-plan")
-                            .test_support()
-                            .flex_1()
-                            .min_h_0()
-                            .gap(px(3.))
-                            .overflow_y_scroll()
-                            .child(list),
-                    )
+                    .bg(to_hsla(p.dialog_surface))
+                    .child(ctx_row("从", self.req.source.clone()))
+                    .child(ctx_row("粘贴到", self.req.target.clone()))
+                    .child(list)
                     .child(
                         h_flex()
-                            .gap(px(18.))
+                            .gap(px(16.))
                             .items_center()
+                            .child(
+                                div()
+                                    .w(px(ui::LABEL_W))
+                                    .flex_none()
+                                    .text_size(px(12.))
+                                    .text_color(muted)
+                                    .child("粘贴内容"),
+                            )
                             .child(pick(PasteMode::Data))
                             .child(pick(PasteMode::Structure)),
                     ),

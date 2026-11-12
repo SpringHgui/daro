@@ -691,6 +691,7 @@ fn build_entry(
         DbKind::PostgreSql => "POSTGRESQL",
         DbKind::SqlServer => "SQLSERVER",
         DbKind::SQLite => "SQLITE",
+        DbKind::Access => "ACCESS",
         DbKind::MongoDb => "MONGODB",
         DbKind::Redis => "REDIS",
     };
@@ -699,6 +700,7 @@ fn build_entry(
         DbKind::PostgreSql => "PostgreSQL",
         DbKind::SqlServer => "SQL Server",
         DbKind::SQLite => "SQLite",
+        DbKind::Access => "Access",
         DbKind::MongoDb => "MongoDB",
         DbKind::Redis => "Redis",
     };

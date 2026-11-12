@@ -28,7 +28,10 @@ use std::time::{Duration, Instant};
 use crate::backend;
 use crate::db_types::ColMeta;
 use crate::mock::{self, Connection, DbKind};
-use crate::{mongo_driver, mysql_driver, pg_driver, redis_driver, sqlite_driver, sqlserver_driver};
+use crate::{
+    access_driver, mongo_driver, mysql_driver, pg_driver, redis_driver, sqlite_driver,
+    sqlserver_driver,
+};
 
 /// 瞬时失败补一轮的间隔。
 const RETRY_BACKOFF: Duration = Duration::from_millis(400);
@@ -346,6 +349,21 @@ pub fn sqlite_path(conn: &Connection) -> String {
     conn.database.trim().to_string()
 }
 
+/// Access 档某连接的库文件路径（与 SQLite 同口径：`database` 即文件路径）。
+pub fn access_path(conn: &Connection) -> String {
+    conn.database.trim().to_string()
+}
+
+/// Access 树上「库」节点的名字：文件名（去掉扩展名）。一个文件就是一个库，
+/// 取数并不用这个名字寻址，只给树 / 面包屑显示。
+pub fn access_db_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Access".to_string())
+}
+
 /// 树上连接节点下的库清单。缓存命中即返回，未命中只负责排队。
 pub fn databases(conn: &Connection) -> &'static [&'static str] {
     if !backend::is_real_conn(conn) {
@@ -359,7 +377,7 @@ pub fn databases(conn: &Connection) -> &'static [&'static str] {
 
 /// 是否有「模式」层（SQLite 没有）。
 pub fn has_schemas(kind: DbKind) -> bool {
-    kind != DbKind::SQLite && mock::has_schemas(kind)
+    !matches!(kind, DbKind::SQLite | DbKind::Access) && mock::has_schemas(kind)
 }
 
 /// 该引擎有没有这一类对象（分类序号与界面 `CATEGORIES` 对齐：0 表 / 1 视图 /
@@ -369,6 +387,10 @@ pub fn has_category(kind: DbKind, cat: usize) -> bool {
     // Redis 没有表 / 视图这一层：库节点是叶子，键浏览在独立页签里
     if kind == DbKind::Redis {
         return false;
+    }
+    // Access 目录只有用户表（查询 / 视图不在 jetdb 的表清单里）
+    if kind == DbKind::Access {
+        return cat == 0;
     }
     match cat {
         // 只有 PG 有真正的 MATERIALIZED VIEW（MySQL / SQL Server / Mongo 没有）
@@ -462,6 +484,12 @@ fn query_databases(conn: &Connection) -> Result<Vec<String>, String> {
             }
             Ok(names)
         }
+        // 一个 Access 文件就是一个库：节点名取文件名
+        DbKind::Access => {
+            let path = access_path(conn);
+            access_driver::ensure(&conn.name, &path, backend::conn_password(conn).as_deref())?;
+            Ok(vec![access_db_name(&path)])
+        }
         // MySQL 一条连接看全部库，SHOW DATABASES 直接出清单
         DbKind::MySql => mysql_driver::try_list_databases(&backend::mysql_params(conn)),
         // SQL Server 的登录库只是默认落点，库清单走 sys.databases
@@ -489,8 +517,8 @@ fn query_databases(conn: &Connection) -> Result<Vec<String>, String> {
 
 fn query_schemas(conn: &Connection, db: &str) -> Result<Vec<String>, String> {
     match conn.kind {
-        // MySQL / MongoDB / Redis 没有模式层：库下面直接是对象
-        DbKind::MySql | DbKind::MongoDb | DbKind::Redis => Ok(Vec::new()),
+        // MySQL / Access / MongoDB / Redis 没有模式层：库下面直接是对象
+        DbKind::MySql | DbKind::Access | DbKind::MongoDb | DbKind::Redis => Ok(Vec::new()),
         DbKind::SqlServer => {
             let params = backend::sqlserver_params(conn, db);
             sqlserver_driver::try_list_schemas(&conn.name, &params)
@@ -529,6 +557,14 @@ fn query_objects(conn: &Connection, db: &str, schema: &str, cat: usize) -> Resul
                 _ => Ok(Vec::new()),
             }
         }
+        DbKind::Access => {
+            let path = access_path(conn);
+            access_driver::ensure(&conn.name, &path, backend::conn_password(conn).as_deref())?;
+            match cat {
+                0 => access_driver::try_list_tables(&conn.name),
+                _ => Ok(Vec::new()),
+            }
+        }
         DbKind::MongoDb => {
             let params = backend::mongo_params(conn);
             match cat {
@@ -559,6 +595,11 @@ fn query_columns(conn: &Connection, db: &str, schema: &str, table: &str) -> Resu
             sqlite_driver::ensure(&conn.name, &path)?;
             sqlite_driver::try_table_columns(&conn.name, db, table)
         }
+        DbKind::Access => {
+            let path = access_path(conn);
+            access_driver::ensure(&conn.name, &path, backend::conn_password(conn).as_deref())?;
+            access_driver::try_table_columns(&conn.name, table)
+        }
         DbKind::PostgreSql => {
             let k = pg_conn(conn, db)?;
             pg_driver::try_table_columns(&k, pg_schema(schema), table)
@@ -577,7 +618,6 @@ fn query_columns(conn: &Connection, db: &str, schema: &str, table: &str) -> Resu
             mongo_driver::sample_columns(&conn.name, &params, db, table)
         }
         DbKind::Redis => Ok(Vec::new()),
-        _ => Ok(mock_columns()),
     }
 }
 
@@ -674,9 +714,20 @@ fn query_table_parts(
                  ORDER BY 2"
             )
         }
+        // Access 的索引 / 唯一键直接从 TDEF 读：外键引用不进索引组
+        DbKind::Access => {
+            let path = access_path(conn);
+            access_driver::ensure(&conn.name, &path, backend::conn_password(conn).as_deref())?;
+            let (indexes, uniques) = access_driver::table_parts(&conn.name, table)?;
+            let rows: Vec<Vec<String>> = indexes
+                .into_iter()
+                .map(|n| vec!["index".to_string(), n])
+                .chain(uniques.into_iter().map(|n| vec!["unique".to_string(), n]))
+                .collect();
+            return Ok(parts_from_rows(&rows));
+        }
         // MongoDB / Redis 没有索引 / 约束这一层（Mongo 的索引先不进树）
         DbKind::MongoDb | DbKind::Redis => return Ok(TableParts::default()),
-        _ => return Ok(mock_table_parts(conn.kind, table)),
     };
     let out = tg.execute(&sql, 10_000)?;
     Ok(parts_from_rows(&out.select.map(|p| p.rows).unwrap_or_default()))

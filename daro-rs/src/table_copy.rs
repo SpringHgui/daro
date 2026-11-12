@@ -1042,6 +1042,7 @@ impl TargetNames for Target {
     fn conn_name(&self) -> &str {
         match self {
             Target::Sqlite { conn, .. }
+            | Target::Access { conn, .. }
             | Target::Pg { conn, .. }
             | Target::MySql { conn, .. }
             | Target::SqlServer { conn, .. }

@@ -64,13 +64,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libvulkan-dev libegl1-mesa-dev libfontconfig1-dev libfreetype-dev \
-            libasound2-dev libssl-dev unixodbc-dev libzstd-dev
-
-      - name: 安装 macOS ODBC（驱动层链接 libodbc，libtool 提供 libodbc 依赖的 libltdl）
-        if: runner.os == 'macOS'
-        working-directory: .
-        shell: bash
-        run: brew install unixodbc libtool
+            libasound2-dev libssl-dev libzstd-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -141,7 +135,7 @@ jobs:
         shell: bash
         run: bash packaging/build-installer.sh --skip-build
 
-      - name: 打包（macOS .app，随包带 ODBC 运行库）
+      - name: 打包（macOS .app）
         if: runner.os == 'macOS'
         shell: bash
         run: bash packaging/macos/bundle-app.sh --skip-build

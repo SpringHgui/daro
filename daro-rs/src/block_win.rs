@@ -35,7 +35,7 @@ mod imp {
         CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, RegisterClassExW, SetWindowPos,
         SetWindowTextW, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, WM_ERASEBKGND,
         WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_PRINTCLIENT, WNDCLASSEXW, WS_CHILD,
-        WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_VISIBLE,
+        WS_CLIPSIBLINGS, WS_DISABLED, WS_EX_NOACTIVATE, WS_VISIBLE,
     };
 
     const CLASS: &str = "DaroBlockRegion";
@@ -129,7 +129,10 @@ mod imp {
                 WS_EX_NOACTIVATE,
                 class_name().as_ptr(),
                 text.as_ptr(),
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                // WS_DISABLED：OLE 拖放按光标下的窗口找落点，禁用窗口会被
+                // WindowFromPoint 跳过，拖进来的文件才落得到 gpui 主窗口上。
+                // 禁用不影响枚举 / 改名 / 取矩形，截图工具照样按块识别。
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_DISABLED,
                 x,
                 y,
                 w,

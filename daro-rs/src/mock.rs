@@ -9,6 +9,7 @@ pub enum DbKind {
     PostgreSql,
     SqlServer,
     SQLite,
+    Access,
     MongoDb,
     Redis,
 }
@@ -20,6 +21,7 @@ impl DbKind {
             DbKind::PostgreSql => "PostgreSQL",
             DbKind::SqlServer => "SQL Server",
             DbKind::SQLite => "SQLite",
+            DbKind::Access => "Access",
             DbKind::MongoDb => "MongoDB",
             DbKind::Redis => "Redis",
         }
@@ -30,7 +32,7 @@ impl DbKind {
             DbKind::MySql => 3306,
             DbKind::PostgreSql => 5432,
             DbKind::SqlServer => 1433,
-            DbKind::SQLite => 0,
+            DbKind::SQLite | DbKind::Access => 0,
             DbKind::MongoDb => 27017,
             DbKind::Redis => 6379,
         }
@@ -41,7 +43,7 @@ impl DbKind {
             DbKind::MySql => "root",
             DbKind::PostgreSql => "postgres",
             DbKind::SqlServer => "sa",
-            DbKind::SQLite | DbKind::MongoDb | DbKind::Redis => "",
+            DbKind::SQLite | DbKind::Access | DbKind::MongoDb | DbKind::Redis => "",
         }
     }
 }
@@ -139,8 +141,8 @@ pub fn databases(kind: DbKind) -> &'static [&'static str] {
         DbKind::SqlServer => &["daro", "master", "model", "msdb", "tempdb"],
         DbKind::MongoDb => &["admin", "config", "daro", "local"],
         DbKind::Redis => &["db0", "db1", "db2", "db3"],
-        // SQLite 档的库清单走 catalog（按连接的库文件出），mock 档给空
-        DbKind::SQLite => &[],
+        // SQLite / Access 档的库清单走 catalog（按连接的文件出），mock 档给空
+        DbKind::SQLite | DbKind::Access => &[],
     }
 }
 
@@ -549,6 +551,7 @@ pub fn mock_select_sql(
                             DbKind::PostgreSql | DbKind::SqlServer | DbKind::SQLite => {
                                 format!("\"{}\" {dir}", m.name)
                             }
+                            DbKind::Access => format!("[{}] {dir}", m.name),
                         }
                     })
                 })
@@ -567,5 +570,7 @@ pub fn mock_select_sql(
         DbKind::PostgreSql | DbKind::SqlServer => {
             format!("SELECT * FROM \"{schema}\".\"{table}\"{where_part}{order} LIMIT 1000 OFFSET 0")
         }
+        // Access 不跑 SQL：状态栏给的是等价的整表读取口径
+        DbKind::Access => format!("SELECT * FROM [{table}]{where_part}{order}"),
     }
 }

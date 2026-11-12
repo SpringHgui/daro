@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+pub mod access_driver;
 pub mod backend;
 pub mod catalog;
 pub mod daemon;

@@ -4,6 +4,7 @@
 // debug 保留控制台，否则 eprintln! 的 [dbg]/渲染耗时日志无处可看。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod access_driver;
 mod art;
 mod backend;
 mod block_win;
@@ -2391,6 +2392,7 @@ fn read_design_meta(tg: &backend::Target, table: &str) -> Result<DesignMeta, Str
             Err("SQL Server 表设计暂未接入，请用查询页执行 DDL".to_string())
         }
         backend::Target::Mongo { .. } => Err("MongoDB 集合没有表设计".to_string()),
+        backend::Target::Access { .. } => Err("Access 连接为只读，不支持表设计".to_string()),
     }
 }
 
@@ -5360,6 +5362,11 @@ fn design_type_candidates(kind: mock::DbKind) -> &'static [&'static str] {
         mock::DbKind::Redis => &["string", "list", "set", "zset", "hash", "stream"],
         // SQLite 只有 5 个存储类（类型名随意写，亲和规则决定实际存储）
         mock::DbKind::SQLite => &["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"],
+        // Access 的设计器目前只读（连接恒只读），清单留给后续接入
+        mock::DbKind::Access => &[
+            "Text", "Memo", "Number", "Date/Time", "Yes/No", "Currency",
+            "AutoNumber", "OLE Object", "Hyperlink", "Attachment", "GUID",
+        ],
     }
 }
 
@@ -5708,14 +5715,32 @@ fn tab_orders(t: &OpenTab) -> Vec<(String, bool)> {
 
 /// 「查询表」带出的 SELECT 里表名的限定口径：MySQL 用 `库`.`表`，PG 用
 /// `模式`.`表`，SQLite 这类没有模式层的引擎只有表名一段。
+/// 拖入 / 打开的文件按扩展名认引擎：SQLite 系 `.db/.sqlite/.sqlite3`，
+/// Access 系 `.mdb/.accdb`。其余扩展名不当作库文件。
+fn db_file_kind(path: &std::path::Path) -> Option<DbKind> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "sqlite" | "sqlite3" | "db" => Some(DbKind::SQLite),
+        "mdb" | "accdb" => Some(DbKind::Access),
+        _ => None,
+    }
+}
+
+/// 两条连接是否指着同一个库文件。Windows 路径大小写不敏感，分隔符统一按 `\` 比。
+fn same_db_file(stored: &str, target: &str) -> bool {
+    let norm = |s: &str| s.trim().replace('/', "\\").to_ascii_lowercase();
+    !stored.trim().is_empty() && norm(stored) == norm(target)
+}
+
 fn query_table_name(conn: &mock::Connection, db: &str, schema: &str, table: &str) -> String {
     let q = |name: &str| match conn.kind {
         mock::DbKind::MySql => format!("`{}`", name.replace('`', "``")),
+        mock::DbKind::Access => format!("[{}]", name.replace(']', "]]")),
         _ => format!("\"{}\"", name.replace('"', "\"\"")),
     };
     match conn.kind {
         mock::DbKind::MySql => format!("{}.{}", q(db), q(table)),
-        mock::DbKind::SQLite => q(table),
+        mock::DbKind::SQLite | mock::DbKind::Access => q(table),
         _ if schema.is_empty() => q(table),
         _ => format!("{}.{}", q(schema), q(table)),
     }
@@ -5759,6 +5784,15 @@ fn load_table_page(
     offset: usize,
     limit: usize,
 ) -> Result<(db_types::SelectPage, usize), String> {
+    // Access 是本地文件、没有可下推的 WHERE / ORDER BY：一次整表物化，
+    // 页签拿本地筛选 / 排序（`visible_data_order`）出结果。
+    if conn.kind == DbKind::Access {
+        let path = catalog::access_path(conn);
+        access_driver::ensure(&conn.name, &path, backend::conn_password(conn).as_deref())?;
+        let page = access_driver::select_all(&conn.name, table)?;
+        let total = page.rows.len();
+        return Ok((page, total));
+    }
     if let Some(t) = backend::Target::of(conn, db, schema) {
         let page = t.select_table(table, where_sql, orders, offset, limit)?;
         let total = t
@@ -6324,16 +6358,22 @@ impl ObjectsPane {
             .cursor_pointer()
             .when(selected, move |s| s.bg(sel_bg))
             .when(!selected, move |s| s.hover(move |s| s.bg(hover)))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 // 框选松手时同一格还会补一个 click：吞掉，别把多选打回单选
                 if this.swallow_click || this.rubber.as_ref().is_some_and(|r| r.moved) {
                     return;
                 }
                 let Some(app) = app.upgrade() else { return };
                 app.update(cx, |this, cx| {
-                    // 对象面板双击 = 打开表
+                    // 对象面板双击 = 打开表 / 已保存查询
                     if this.is_double_click(act) {
-                        this.open_object(act, cx);
+                        if act.cat() == Some(4) {
+                            if let Some(sq) = this.saved_query_for(act) {
+                                this.open_saved_query(sq, window, cx);
+                            }
+                        } else {
+                            this.open_object(act, cx);
+                        }
                     }
                     this.sel = act;
                     this.obj_multi = None;
@@ -6501,15 +6541,20 @@ impl Render for ObjectsPane {
             // 空白处右键出分类菜单；行自己在按下时认领目标。
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, _, _, cx| {
+                cx.listener(move |this, _, window, cx| {
+                    window.blur(cx);
                     let Some(app) = this.app.upgrade() else { return };
                     app.update(cx, |a, _| a.blank_for_context(crate::BlankPane::Objects));
                 }),
             )
-            // 框选：按下记起点，按住划过时出矩形并实时预览命中行
+            // 框选：按下记起点，按住划过时出矩形并实时预览命中行。
+            // 点面板同样要离开搜索框，否则 Ctrl+C / Ctrl+V 被 Input 吃掉。
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, _, _| this.rubber_begin(ev.position)),
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    window.blur(cx);
+                    this.rubber_begin(ev.position);
+                }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 if ev.pressed_button == Some(MouseButton::Left) {
@@ -7430,6 +7475,9 @@ struct DaroApp {
     /// 已保存查询（对象面板「查询」分类 + 查询页「已保存」下拉共用同一份），
     /// 落盘 `queries.json`。
     saved_queries: Vec<saved_queries::SavedQuery>,
+    /// (连接, 库, 模式) → 查询分类清单。树 / 对象面板的目录接口只收
+    /// `&'static`，保存 / 删除时整份重建（旧切片随进程结束回收）。
+    saved_query_rows: Vec<(String, String, String, &'static [&'static str])>,
     /// 收藏夹：固定 9 个槽位（Ctrl+1…Ctrl+9），落盘 `favorites.json`。
     favorites: Vec<Option<favorites::Favorite>>,
     /// 主窗格当前显示的工具面板（用户 / 事件）；None = 当前分类的对象清单。
@@ -7455,9 +7503,37 @@ struct DaroApp {
     idle_cat: usize,
 }
 
+/// 已保存查询按 (连接, 库, 模式) 分组，名字与切片都泄漏成 `&'static`：
+/// 树 / 对象面板的目录清单接口只有这一个形状。保存 / 删除时整份重建。
+fn cached_query_rows(
+    queries: &[saved_queries::SavedQuery],
+) -> Vec<(String, String, String, &'static [&'static str])> {
+    let mut grouped: Vec<(String, String, String, Vec<&'static str>)> = Vec::new();
+    for q in queries {
+        let name: &'static str = Box::leak(q.name.clone().into_boxed_str());
+        match grouped.iter_mut().find(|(c, d, s, _)| {
+            *c == q.connection && *d == q.database && *s == q.schema
+        }) {
+            Some((_, _, _, names)) => names.push(name),
+            None => grouped.push((
+                q.connection.clone(),
+                q.database.clone(),
+                q.schema.clone(),
+                vec![name],
+            )),
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(c, d, s, names)| (c, d, s, &*Box::leak(names.into_boxed_slice())))
+        .collect()
+}
+
 impl DaroApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = load_store();
+        let saved_queries = saved_queries::load();
+        let saved_query_rows = cached_query_rows(&saved_queries);
         let ui_font = store
             .as_ref()
             .map(|s| s.ui_font.trim().to_string())
@@ -7720,7 +7796,8 @@ impl DaroApp {
             next_qseq: 1,
             next_rid: 1,
             next_kid: 1,
-            saved_queries: saved_queries::load(),
+            saved_queries,
+            saved_query_rows,
             favorites: favorites::load(),
             tool_view: None,
             tool_conn: String::new(),
@@ -8054,7 +8131,33 @@ impl DaroApp {
             .schema()
             .and_then(|s| catalog::schemas(conn, db).get(s).copied())
             .unwrap_or("");
+        self.objects_of(conn, db, schema, cat)
+    }
+
+    /// 某库某模式某分类的对象清单。「查询」分类在真连接上没有系统表可查，
+    /// 来自己保存查询；演示连接仍用 mock 种子，其余分类走目录缓存。
+    fn objects_of(
+        &self,
+        conn: &mock::Connection,
+        db: &str,
+        schema: &str,
+        cat: usize,
+    ) -> &'static [&'static str] {
+        // 查询分类永远读已保存查询：演示连接也不例外——贴进来的查询要是
+        // 被假数据顶掉，保存了却看不见。
+        if cat == 4 {
+            return self.query_objects(&conn.name, db, schema);
+        }
         catalog::objects(conn, db, schema, cat)
+    }
+
+    /// 已保存查询里归属 (连接, 库, 模式) 的那一组名字。
+    fn query_objects(&self, conn: &str, db: &str, schema: &str) -> &'static [&'static str] {
+        self.saved_query_rows
+            .iter()
+            .find(|(c, d, s, _)| c == conn && d == db && s == schema)
+            .map(|(_, _, _, names)| *names)
+            .unwrap_or(&[])
     }
 
     /// 对象面板的可见清单：(原始下标, 名字)。过滤只影响显示，原始下标继续
@@ -8073,6 +8176,49 @@ impl DaroApp {
         self.conns.push(conn);
         self.sel = Act::Conn(self.conns.len() - 1);
         self.save();
+    }
+
+    /// 拖入的库文件 → 连接：同一路径已建过连接就只定位并连上，否则按文件名
+    /// 新建一条（与既有连接重名时让到「名称 (2)」）并立即打开。
+    fn import_db_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let mut touched = false;
+        for path in paths {
+            let Some(kind) = db_file_kind(path) else { continue };
+            let target = path.to_string_lossy().to_string();
+            if let Some(ix) = self
+                .conns
+                .iter()
+                .position(|c| c.kind == kind && same_db_file(&c.database, &target))
+            {
+                self.sel = Act::Conn(ix);
+                if !self.conns[ix].connected {
+                    self.open_connection(ix, cx);
+                }
+                touched = true;
+                continue;
+            }
+            // 连接名即标识：重名会让星标 / 标签 / 已保存查询串到别人身上
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| kind.label().to_string());
+            let mut name = stem.clone();
+            let mut n = 2usize;
+            while self.conns.iter().any(|c| c.name == name) {
+                name = format!("{stem} ({n})");
+                n += 1;
+            }
+            self.push_connection(mock::Connection::new(
+                name, kind, "", 0, target, "", "", "", false,
+            ));
+            let ix = self.conns.len() - 1;
+            self.open_connection(ix, cx);
+            touched = true;
+        }
+        if touched {
+            cx.notify();
+        }
     }
 
     /// 编辑连接保存：改名时把星标 / 标签色一并迁到新名字上（名称即标识）
@@ -8529,7 +8675,7 @@ impl DaroApp {
         let conn = self.conns.get(c)?;
         let db = catalog::databases(conn).get(d).copied()?;
         let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
-        let name = catalog::objects(conn, db, schema, k).get(o).copied()?;
+        let name = self.objects_of(conn, db, schema, k).get(o).copied()?;
         Some((
             conn.name.clone(),
             db.to_string(),
@@ -8707,6 +8853,206 @@ impl DaroApp {
     /// 把规划好的表复制任务排进队列；帧尾由 [Self::pump_table_copies] 投到后台。
     fn queue_table_copy(&mut self, batch: table_copy::CopyBatch) {
         self.table_copies.push(batch);
+    }
+
+    /// Ctrl+V：资源管理器里复制了 `.sql` 文件时，把它们存成当前连接的
+    /// 已保存查询（查询分类）。剪贴板没有 `.sql` 文件就返回 false，
+    /// 调用方继续走原来的文本 / 表粘贴。
+    fn paste_sql_files(&mut self, cx: &mut Context<Self>) -> bool {
+        let files = sql_assoc::clipboard_sql_files();
+        if files.is_empty() {
+            return false;
+        }
+        self.import_sql_files(&files, cx);
+        true
+    }
+
+    /// 把本地 `.sql` 文件存进已保存查询。同名同归属且内容相同 → 跳过；
+    /// 内容不同 → 名字追加「 (2)」「 (3)」…，不覆盖用户已有的查询。
+    fn import_sql_files(&mut self, files: &[PathBuf], cx: &mut Context<Self>) {
+        let Some((conn, db, schema)) = self.sql_import_context() else {
+            prompt_dialog::open_notice(
+                self.dark,
+                "粘贴 SQL 文件",
+                "请先在左侧选中目标连接（和库），再把 SQL 文件粘进来。".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.import_sql_files_into(files, conn, db, schema, cx);
+    }
+
+    /// 分类菜单「粘贴」：落点固定为右键的那一栏连接 / 库 / 模式。
+    fn import_sql_files_at(
+        &mut self,
+        files: &[PathBuf],
+        c: usize,
+        d: usize,
+        s: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn) = self.conns.get(c) else { return };
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
+            return;
+        };
+        let schema = catalog::schemas(conn, db)
+            .get(s)
+            .copied()
+            .unwrap_or("")
+            .to_string();
+        let (name, db) = (conn.name.clone(), db.to_string());
+        self.import_sql_files_into(files, name, db, schema, cx);
+    }
+
+    fn import_sql_files_into(
+        &mut self,
+        files: &[PathBuf],
+        conn: String,
+        db: String,
+        schema: String,
+        cx: &mut Context<Self>,
+    ) {
+        let mut saved: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for path in files {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("未命名查询")
+                .to_string();
+            let sql = match sql_assoc::read_sql_text(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    failed.push(e);
+                    continue;
+                }
+            };
+            let Some(name) = self.unique_query_name(&conn, &db, &schema, stem, &sql) else {
+                continue;
+            };
+            self.save_named_query(saved_queries::SavedQuery {
+                name: name.clone(),
+                connection: conn.clone(),
+                database: db.clone(),
+                schema: schema.clone(),
+                sql,
+            });
+            saved.push(name);
+        }
+        if !failed.is_empty() {
+            prompt_dialog::open_notice(
+                self.dark,
+                "粘贴 SQL 文件",
+                format!("部分文件没能保存：\n{}", failed.join("\n")),
+                cx,
+            );
+            if saved.is_empty() {
+                return;
+            }
+        }
+        // 粘完直接落在目标的「查询」分类：新查询马上出现在树 / 对象面板里，
+        // 否则保存回执只藏在状态栏，看着像没反应。
+        if !saved.is_empty()
+            && let Some(c) = self.conns.iter().position(|x| x.name == conn)
+            && let Some(d) = catalog::databases(&self.conns[c])
+                .iter()
+                .position(|x| *x == db)
+        {
+            let s = if schema.is_empty() {
+                NO_SCHEMA
+            } else {
+                catalog::schemas(&self.conns[c], &db)
+                    .iter()
+                    .position(|x| *x == schema)
+                    .unwrap_or(NO_SCHEMA)
+            };
+            let key = self.cat_key_of(&self.conns[c], d, s, 4);
+            self.sel = Act::Cat(c, d, s, 4);
+            if let Some(key) = key {
+                self.expanded.insert(key);
+            }
+        }
+        let label = if schema.is_empty() {
+            format!("{conn} / {db}")
+        } else {
+            format!("{conn} / {db} / {schema}")
+        };
+        self.pane_note = Some(match saved.len() {
+            0 => format!("「{label}」里已有同名同内容的查询，未重复保存"),
+            1 => format!("已保存查询「{}」到 {label}", saved[0]),
+            n => format!("已保存 {n} 个查询到 {label}"),
+        });
+        cx.notify();
+    }
+
+    /// 粘贴 SQL 文件的落点：当前查询页签的运行上下文优先，其次树上的
+    /// 选中连接（库按连接的初始库兜底，模式取选中的或第一个）。
+    fn sql_import_context(&self) -> Option<(String, String, String)> {
+        if let Some(qid) = self.active_query_id()
+            && let Some(q) = self
+                .opened
+                .iter()
+                .find(|t| t.qid == qid)
+                .and_then(|t| t.qstate.as_ref())
+            && let Some(c) = self.conns.iter().find(|c| c.name == q.conn)
+            && let Some(db) = catalog::databases(c).get(q.db).copied()
+        {
+            let schema = if catalog::has_schemas(c.kind) {
+                catalog::schemas(c, db)
+                    .get(q.schema)
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                String::new()
+            };
+            return Some((c.name.clone(), db.to_string(), schema));
+        }
+        let (c, d) = self.anchor_db()?;
+        let conn = self.conns.get(c)?;
+        let db = catalog::databases(conn).get(d).copied()?;
+        let schema = if catalog::has_schemas(conn.kind) {
+            self.sel_schema_name()
+                .map(str::to_string)
+                .or_else(|| catalog::schemas(conn, db).first().map(|s| s.to_string()))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Some((conn.name.clone(), db.to_string(), schema))
+    }
+
+    /// 已保存查询的唯一名：同名同归属内容一致 → None（无需重存）；
+    /// 内容不同则依次试「name (2)」「name (3)」…。
+    fn unique_query_name(
+        &self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        base: String,
+        sql: &str,
+    ) -> Option<String> {
+        let find = |name: &str| {
+            self.saved_queries.iter().find(|q| {
+                q.name == name && q.connection == conn && q.database == db && q.schema == schema
+            })
+        };
+        match find(&base) {
+            None => return Some(base),
+            Some(q) if q.sql == sql => return None,
+            Some(_) => {}
+        }
+        let mut i = 2;
+        loop {
+            let cand = format!("{base} ({i})");
+            match find(&cand) {
+                None => return Some(cand),
+                Some(q) if q.sql == sql => return None,
+                Some(_) => i += 1,
+            }
+        }
     }
 
     /// Ctrl+V（对象页）：把 Ctrl+C 记住的表粘到当前库。目标连接没开 / 没有
@@ -8931,7 +9277,7 @@ impl DaroApp {
                 .conns
                 .iter()
                 .find(|c| c.name == conn)
-                .is_some_and(|c| backend::is_real_conn(c))
+                .is_some_and(|c| backend::is_real_conn(c) && !backend::is_read_only(c.kind))
     }
 
     /// 把「哪个对象的哪种操作」解析成一条真库 DDL。改名时新名空着或和原名
@@ -8948,7 +9294,7 @@ impl DaroApp {
             return None;
         }
         let conn = self.conns.iter().find(|c| c.name == conn_name)?;
-        if !backend::is_real_conn(conn) {
+        if !backend::is_real_conn(conn) || backend::is_read_only(conn.kind) {
             return None;
         }
         let new_name = new_name.trim();
@@ -9437,7 +9783,8 @@ impl DaroApp {
         let Some(db) = catalog::databases(conn).get(d).copied() else { return };
         let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
         let obj_name = catalog::objects(conn, db, schema, k).get(o).copied().unwrap_or_default();
-        let remote = backend::is_real_conn(conn);
+        // Access 虽然走真驱动，但取数没有服务端分页：页签用整表物化 + 本地筛选
+        let remote = backend::is_real_conn(conn) && conn.kind != DbKind::Access;
         let size = if remote { REMOTE_PAGE_SIZE } else { PAGE_SIZE };
         let dark = self.dark;
         let mut open_error = None;
@@ -9554,6 +9901,9 @@ impl DaroApp {
         self.tool_view = None;
         let Act::Obj(c, d, s, k, o) = act else { return };
         let Some(conn) = self.conns.get(c) else { return };
+        if backend::is_read_only(conn.kind) {
+            return;
+        }
         let Some(db) = catalog::databases(conn).get(d).copied() else { return };
         let conn_name = conn.name.clone();
         if let Some(ix) = self.opened.iter().position(|t| {
@@ -9928,6 +10278,9 @@ impl DaroApp {
             return;
         };
         let Some(conn) = self.conns.get(c) else { return };
+        if backend::is_read_only(conn.kind) {
+            return;
+        }
         let Some(db) = catalog::databases(conn).get(d).copied() else { return };
         let did = self.next_did;
         self.next_did += 1;
@@ -11553,13 +11906,16 @@ impl DaroApp {
             .filter(|i| *i < self.conns.len())
             .unwrap_or(0);
         let Some(conn) = self.conns.get(ix) else { return };
-        if matches!(conn.kind, DbKind::MongoDb | DbKind::Redis) {
-            prompt_dialog::open_notice(
-                self.dark,
-                "新建查询",
-                format!("{} 连接不支持 SQL 查询页", conn.kind.label()),
-                cx,
-            );
+        if matches!(
+            conn.kind,
+            DbKind::MongoDb | DbKind::Redis | DbKind::Access
+        ) {
+            let why = if conn.kind == DbKind::Access {
+                "Access 连接为只读（纯 Rust 解析库文件），不支持 SQL 查询页".to_string()
+            } else {
+                format!("{} 连接不支持 SQL 查询页", conn.kind.label())
+            };
+            prompt_dialog::open_notice(self.dark, "新建查询", why, cx);
             return;
         }
         let conn_name = conn.name.clone();
@@ -13413,6 +13769,15 @@ impl DaroApp {
         let Some(conn) = self.conns.get(c).cloned() else {
             return;
         };
+        if backend::is_read_only(conn.kind) {
+            prompt_dialog::open_notice(
+                self.dark,
+                "运行 SQL 文件",
+                format!("{} 连接为只读，不能运行 SQL 脚本", conn.kind.label()),
+                cx,
+            );
+            return;
+        }
         let Some(db) = catalog::databases(&conn).get(d).copied() else {
             return;
         };
@@ -13448,12 +13813,14 @@ impl DaroApp {
             self.saved_queries.push(sq);
         }
         saved_queries::save(&self.saved_queries);
+        self.saved_query_rows = cached_query_rows(&self.saved_queries);
     }
 
     /// 删除一条已保存查询（按业务键）并落盘。
     fn delete_saved_query(&mut self, key: &str) {
         self.saved_queries.retain(|q| q.key() != key);
         saved_queries::save(&self.saved_queries);
+        self.saved_query_rows = cached_query_rows(&self.saved_queries);
     }
 
     /// 打开一条已保存查询到新查询页签（带原连接 / 库 / 模式上下文与 SQL 文本）。
@@ -23140,7 +23507,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .iter()
             .map(|m| m.name.clone())
             .collect();
-        let rows = if backend::is_real_conn(conn) {
+        // Access 走本地整表物化（导出对话框的分页 fetch 每次都整表重读）
+        let rows = if backend::is_real_conn(conn) && conn.kind != mock::DbKind::Access {
             fetch = Some(table_export_dialog::ExportFetch {
                 conn: conn.clone(),
                 db: db.to_string(),
@@ -23362,7 +23730,15 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .applied
             .as_ref()
             .and_then(|a| a.where_sql.as_deref());
+        // Access 的筛选 / 排序在本地做，状态栏按物化口径拼
         let sql = match backend::Target::of(conn, t.db, schema) {
+            Some(_) if conn.kind == mock::DbKind::Access => {
+                let orders: Vec<(usize, bool)> = match t.filter.applied.as_ref() {
+                    Some(a) if !a.sorts.is_empty() => a.sorts.clone(),
+                    _ => t.sort.into_iter().collect(),
+                };
+                mock::mock_select_sql(conn.kind, &t.cols, t.db, schema, obj, where_sql, &orders)
+            }
             Some(target) => {
                 let (size, offset) = t
                     .page
@@ -24036,12 +24412,12 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     ///
     /// 不用平台的 click_count：它按屏幕坐标跨控件累计，双击对象列表开表后，
     /// 在网格同一位置单击会继承连击数。命中后清空，三连击不连锁。
-    /// 数据页是否只读：MongoDB 只允许浏览（Flutter 版同口径）。
+    /// 数据页是否只读：MongoDB / Access 只允许浏览。
     fn tab_read_only(&self, t: &OpenTab) -> bool {
         self.conns
             .iter()
             .find(|c| c.name == t.conn_name)
-            .is_some_and(|c| c.kind == DbKind::MongoDb)
+            .is_some_and(|c| backend::is_read_only(c.kind))
     }
 
     /// 同上，按页签身份判断（右键菜单在改动前手里只有 ident）。
@@ -24049,7 +24425,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         self.conns
             .iter()
             .find(|c| c.name == ident.0)
-            .is_some_and(|c| c.kind == DbKind::MongoDb)
+            .is_some_and(|c| backend::is_read_only(c.kind))
     }
 
     fn is_cell_double_click(&mut self, at: (usize, usize)) -> bool {
@@ -24583,9 +24959,12 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         }
     }
 
-    /// Ctrl+V / 「编辑 ▸ 粘贴」的统一落点：0 号「对象」页粘贴表，其它页
-    /// 仍走网格粘贴。
+    /// Ctrl+V / 「编辑 ▸ 粘贴」的统一落点：剪贴板里是资源管理器复制的
+    /// `.sql` 文件就先存成查询；否则 0 号「对象」页粘贴表，其它页走网格粘贴。
     fn edit_paste(&mut self, cx: &mut Context<Self>) {
+        if self.paste_sql_files(cx) {
+            return;
+        }
         if self.active_tab == 0 {
             self.paste_tables(cx);
         } else {
@@ -25453,9 +25832,19 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// Delete 键：清空选区里格子的内容（参考界面口径：删除记录是 Ctrl+Delete，
-    /// 裸 Delete 只清内容，单选一格时不能把整行删掉）。树 / 对象面板 / 设计器
-    /// 没有可清的内容，仅消费按键避免冒泡到系统产生蜂鸣。
+    /// 裸 Delete 只清内容，单选一格时不能把整行删掉）。树 / 对象面板里选中的
+    /// 已保存查询直接删；其它树 / 面板 / 设计器内容没有可清的，只消费按键。
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        if self.active_tab == 0
+            && let Act::Obj(c, d, s, 4, _) = self.sel
+            && let Some(sq) = self.saved_query_for(self.sel)
+        {
+            self.delete_saved_query(&sq.key());
+            self.sel = Act::Cat(c, d, s, 4);
+            self.pane_note = Some(format!("已删除查询「{}」", sq.name));
+            cx.notify();
+            return;
+        }
         let Some(ix) = self.grid_ready() else { return };
         let t = &mut self.opened[ix];
         let order = visible_data_order(t);
@@ -28031,7 +28420,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 let conn = &self.conns[c];
                 let db = catalog::databases(conn).get(d).copied().unwrap_or("");
                 let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
-                (Some(catalog::objects(conn, db, schema, k).len()), CATEGORIES[k].0)
+                (Some(self.objects_of(conn, db, schema, k).len()), CATEGORIES[k].0)
             }
             Act::Obj(..) | Act::Col(..) | Act::ObjGroup(..) | Act::Sub(..) => (None, ""),
         }
@@ -28698,17 +29087,27 @@ impl Render for DaroApp {
             .relative()
             .bg(bg)
             .text_color(fg)
-            // 外部拖入 .sql：整窗接收。窗口内部拖拽的值不是 ExternalPaths，
-            // 两种拖拽按类型分开派发，互不干扰。
+            // 外部拖入 .sql / 库文件：整窗接收。窗口内部拖拽的值不是
+            // ExternalPaths，两种拖拽按类型分开派发，互不干扰。
             .can_drop(|value, _, _| {
-                value
-                    .downcast_ref::<ExternalPaths>()
-                    .is_some_and(|paths| paths.0.iter().any(|p| sql_assoc::is_sql_file(p)))
+                value.downcast_ref::<ExternalPaths>().is_some_and(|paths| {
+                    paths
+                        .0
+                        .iter()
+                        .any(|p| db_file_kind(p).is_some() || sql_assoc::is_sql_file(p))
+                })
             })
             .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                let dbs: Vec<PathBuf> = paths
+                    .0
+                    .iter()
+                    .filter(|p| db_file_kind(p).is_some())
+                    .cloned()
+                    .collect();
                 for path in sql_assoc::sql_files(paths.0.iter().cloned()) {
                     this.open_sql_path_in_editor(path, window, cx);
                 }
+                this.import_db_files(&dbs, cx);
             }))
             // 拖侧栏宽时指针可能划出正文（标题栏 / ribbon / 状态栏）：全局收
             // move / up，拖动跟手不断、在窗口任何地方松手都能落盘收状态。
@@ -29717,7 +30116,16 @@ impl DaroApp {
                 // 「这次按下落在空白」，菜单再按它分派（行认领过就不算空白）。
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(move |this, _, _, _| this.blank_for_context(BlankPane::Tree)),
+                    cx.listener(move |this, _, window, cx| {
+                        window.blur(cx);
+                        this.blank_for_context(BlankPane::Tree)
+                    }),
+                )
+                // 点树 = 离开搜索框。搜索框焦点留着不还的话，Ctrl+C / Ctrl+V
+                // 会被 Input 吃掉，对象页的复制 / 粘贴表快捷键就再也落不下来。
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, window, cx| window.blur(cx)),
                 )
                 .context_menu(node_context_menu(me))
                 // 行直接挂在滚动容器下：ScrollHandle 按子元素记行号，
@@ -30335,7 +30743,7 @@ impl DaroApp {
         let six_val = six.unwrap_or(NO_SCHEMA);
         let schema = catalog::schemas(conn, db).get(six_val).copied().unwrap_or("");
         let cat_key = node_key(parent_key, label);
-        let objs = catalog::objects(conn, db, schema, cix);
+        let objs = self.objects_of(conn, db, schema, cix);
         let indent = cat_base + 12.5;
         // 分类名自己命中：整棵按普通态渲染
         if contains_ci(label, q) {
@@ -30359,7 +30767,8 @@ impl DaroApp {
                     rows.push(self.obj_row_elem(
                         ix, dix, six_val, cix, oix, indent, icon, obj, obj_open, Some(q), ink, cx,
                     ));
-                    if obj_open {
+                    // 查询行没有字段可展开
+                    if obj_open && cix != 4 {
                         if cix == 0 {
                             rows.extend(self.table_obj_children(
                                 ix, dix, six_val, cix, oix, obj, &obj_key, indent, Some(q), ink, cx,
@@ -30388,7 +30797,7 @@ impl DaroApp {
                 let mut r = vec![self.obj_row_elem(
                     ix, dix, six_val, cix, oix, indent, icon, obj, open, Some(q), ink, cx,
                 )];
-                if open {
+                if open && cix != 4 {
                     if cix == 0 {
                         r.extend(self.table_obj_children(
                             ix, dix, six_val, cix, oix, obj, &obj_key, indent, Some(q), ink, cx,
@@ -30405,6 +30814,10 @@ impl DaroApp {
                     }
                 }
                 parts.push(r);
+                continue;
+            }
+            // 查询名没有字段，不按列名去命中
+            if cix == 4 {
                 continue;
             }
             let cols = catalog::table_columns(conn, db, schema, obj);
@@ -30648,7 +31061,7 @@ impl DaroApp {
             }
             let cat_key = node_key(parent_key, label);
             let cat_open = self.expanded.contains(&cat_key);
-            let objs = catalog::objects(conn, db, schema, cix);
+            let objs = self.objects_of(conn, db, schema, cix);
             rows.push(self.cat_row_elem(
                 ix,
                 dix,
@@ -30673,6 +31086,10 @@ impl DaroApp {
                     ix, dix, six_val, cix, oix, indent, *icon, obj, obj_open, q, ink, cx,
                 ));
                 if !obj_open {
+                    continue;
+                }
+                // 查询是已保存的 SQL，没有字段 / 索引这一层可展开
+                if cix == 4 {
                     continue;
                 }
                 if cix == 0 {
@@ -30847,7 +31264,8 @@ impl DaroApp {
         tree_row(
             rid(&format!("obj/{ix}/{dix}/{six_val}/{cix}/{oix}")),
             indent,
-            Some(caret(obj_open)),
+            // 查询行没有下级：不给三角，免得点开一个永远空的展开区
+            (cix != 4).then(|| caret(obj_open)),
             icon,
             obj,
             Act::Obj(ix, dix, six_val, cix, oix),
@@ -31070,11 +31488,17 @@ impl DaroApp {
                         if !catalog::has_category(conn.kind, cix) {
                             continue;
                         }
-                        for obj in catalog::objects(conn, db, schema, cix) {
-                            if contains_ci(obj, q)
-                                || catalog::table_columns(conn, db, schema, obj)
-                                    .iter()
-                                    .any(|col| contains_ci(&col.name, q))
+                        for obj in self.objects_of(conn, db, schema, cix) {
+                            if contains_ci(obj, q) {
+                                return true;
+                            }
+                            // 查询没有字段，别拿查询名去查列
+                            if cix == 4 {
+                                continue;
+                            }
+                            if catalog::table_columns(conn, db, schema, obj)
+                                .iter()
+                                .any(|col| contains_ci(&col.name, q))
                             {
                                 return true;
                             }
@@ -37982,18 +38406,25 @@ impl DaroApp {
         // 打开 / 删除两处回调各持一份（SavedQuery 不是 Copy，闭包得自己拥有）
         let open_saved = saved_query.clone();
         let del_saved = saved_query.clone();
+        // 只读引擎（MongoDB / Access）不开放建表 / 改表 / 导入；
+        // 「查询」分类只是查编辑器的落点，仍可新建（执行时由驱动报只读）。
+        // 演示连接没有真驱动，但设计器是本地编辑，照旧可用。
+        let writable = self
+            .conns
+            .get(c)
+            .is_some_and(|conn| !backend::is_read_only(conn.kind));
         // 查询分类的打开 / 删除落在已保存查询上，没有保存过就没有实体可操作。
         let can_open = has_sel && (cat != 4 || saved_query.is_some());
-        let can_design = has_sel && cat != 4;
+        let can_design = has_sel && cat != 4 && writable;
         // 实体化视图的新建入口与视图同口径（参考界面里同样是设计器页签）
-        let can_new = has_ctx && matches!(cat, 0 | 1 | 2 | 3 | 4);
+        let can_new = has_ctx && matches!(cat, 0 | 1 | 2 | 3 | 4) && (cat == 4 || writable);
         let can_delete = match cat {
             0 | 1 => sel.is_some_and(|act| self.table_op_available(act, table_ops::TableOp::Drop)),
             4 => saved_query.is_some(),
             _ => false,
         };
         // 导入向导只对表成立；导出向导表 / 视图 / 实体化视图都能导（导的是数据）。
-        let can_import = cat == 0 && has_sel;
+        let can_import = cat == 0 && has_sel && writable;
         let can_export = matches!(cat, 0 | 1 | 2) && has_sel;
 
         let mut bar = h_flex()
@@ -38386,10 +38817,16 @@ impl DaroApp {
                     .cursor_pointer()
                     .when(selected, move |s| s.bg(sel))
                     .when(!selected, move |s| s.hover(move |s| s.bg(hover)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        // 对象面板双击 = 打开表
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // 对象面板双击 = 打开表 / 已保存查询
                         if this.is_double_click(act) {
-                            this.open_object(act, cx);
+                            if act.cat() == Some(4) {
+                                if let Some(sq) = this.saved_query_for(act) {
+                                    this.open_saved_query(sq, window, cx);
+                                }
+                            } else {
+                                this.open_object(act, cx);
+                            }
                         }
                         this.sel = act;
                         cx.notify();
@@ -38477,10 +38914,16 @@ impl DaroApp {
                     .cursor_pointer()
                     .when(selected, move |s| s.bg(sel))
                     .when(!selected, move |s| s.hover(move |s| s.bg(hover)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        // 对象面板双击 = 打开表
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // 对象面板双击 = 打开表 / 已保存查询
                         if this.is_double_click(act) {
-                            this.open_object(act, cx);
+                            if act.cat() == Some(4) {
+                                if let Some(sq) = this.saved_query_for(act) {
+                                    this.open_saved_query(sq, window, cx);
+                                }
+                            } else {
+                                this.open_object(act, cx);
+                            }
                         }
                         this.sel = act;
                         cx.notify();
@@ -39837,8 +40280,9 @@ impl DaroApp {
             .map(|t| self.table_page_status(&t))
             .unwrap_or_default();
         let has_sql = designer.is_none() && !sql.is_empty();
-        // 对象页复制 / 粘贴的临时说明优先于计数（切到别的页签就不显示）
-        let note = (self.active_tab == 0)
+        // 对象页复制 / 粘贴的临时说明优先于计数；查询页没有取数 SQL 那一格，
+        // 同一份说明也显示在最左（粘贴 SQL 文件时人在查询页也能看到回执）。
+        let note = (designer.is_none() && !has_sql)
             .then(|| self.pane_note.clone())
             .flatten();
 
@@ -40223,7 +40667,14 @@ fn tree_row(
                 }
                 Act::Obj(..) => {
                     if this.is_double_click(action) {
-                        this.open_object(action, cx);
+                        // 查询行双击 = 打开已保存查询（要窗口开页签）
+                        if action.cat() == Some(4) {
+                            if let Some(sq) = this.saved_query_for(action) {
+                                this.open_saved_query(sq, window, cx);
+                            }
+                        } else {
+                            this.open_object(action, cx);
+                        }
                     }
                     this.sel = action;
                 }
@@ -42390,21 +42841,31 @@ fn cat_menu(
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let kind = CATEGORIES[k].0;
+    // 只读引擎（MongoDB / Access）只给浏览入口：新建 / 导入一律置灰
+    let writable = me
+        .read(cx)
+        .conns
+        .get(c)
+        .is_some_and(|conn| !backend::is_read_only(conn.kind));
     let mut menu = menu;
     match k {
         0 => {
-            let me_new = me.clone();
-            menu = menu.submenu(format!("新建{kind}"), window, cx, move |sub, _, _| {
-                // 子项实测（对象级同款）：常规 / 外部 / 分区；只有常规接了设计器
-                let me2 = me_new.clone();
-                sub.item(mi("常规").on_click(move |_, window, cx| {
-                    me2.update(cx, |app, cx| {
-                        app.open_new_designer(Act::Obj(c, d, s, 0, 0), window, cx)
-                    });
-                }))
-                .item(todo_item("外部"))
-                .item(todo_item("分区"))
-            });
+            if writable {
+                let me_new = me.clone();
+                menu = menu.submenu(format!("新建{kind}"), window, cx, move |sub, _, _| {
+                    // 子项实测（对象级同款）：常规 / 外部 / 分区；只有常规接了设计器
+                    let me2 = me_new.clone();
+                    sub.item(mi("常规").on_click(move |_, window, cx| {
+                        me2.update(cx, |app, cx| {
+                            app.open_new_designer(Act::Obj(c, d, s, 0, 0), window, cx)
+                        });
+                    }))
+                    .item(todo_item("外部"))
+                    .item(todo_item("分区"))
+                });
+            } else {
+                menu = menu.item(todo_item(format!("新建{kind}")));
+            }
             // 和动作条同口径：没有库 / 模式上下文时置灰，不做假入口
             menu = menu.item(if me.read(cx).pane_cat().is_some() {
                 ent_item(&me, "通过 AI 新建表")
@@ -42415,7 +42876,7 @@ fn cat_menu(
             // 向导落点：数据页签或选中的一行；右键点在空白处时两者皆无 → 置灰
             let wizard_ok = me.read(cx).table_wizard_available();
             menu = menu
-                .item(wired_item(&me, "导入向导...", wizard_ok, |app, cx| {
+                .item(wired_item(&me, "导入向导...", wizard_ok && writable, |app, cx| {
                     app.open_data_import(cx);
                 }))
                 .item(wired_item(&me, "导出向导...", wizard_ok, |app, cx| {
@@ -42436,12 +42897,16 @@ fn cat_menu(
         }
         1 => {
             // 视图分类 / 面板空白：照实测的「新建视图 ▸ 导出向导 · 数据字典(企业版)」
-            let me_new = me.clone();
-            menu = menu.item(mi("新建视图").on_click(move |_, window, cx| {
-                me_new.update(cx, |app, cx| {
-                    app.open_new_designer(Act::Obj(c, d, s, 1, 0), window, cx)
-                });
-            }));
+            if writable {
+                let me_new = me.clone();
+                menu = menu.item(mi("新建视图").on_click(move |_, window, cx| {
+                    me_new.update(cx, |app, cx| {
+                        app.open_new_designer(Act::Obj(c, d, s, 1, 0), window, cx)
+                    });
+                }));
+            } else {
+                menu = menu.item(todo_item("新建视图"));
+            }
             menu = menu.separator();
             // 分类级没有点名对象，导出落点和表那层同一口径：数据页签或选中的一行
             let wizard_ok = me.read(cx).table_wizard_available();
@@ -42453,12 +42918,16 @@ fn cat_menu(
         }
         2 => {
             // 实体化视图：打开 / 设计 / 新建都走已有通路（设计器见 view_or_function_designer）
-            let me_new = me.clone();
-            menu = menu.item(mi("新建实体化视图").on_click(move |_, window, cx| {
-                me_new.update(cx, |app, cx| {
-                    app.open_new_designer(Act::Obj(c, d, s, 2, 0), window, cx)
-                });
-            }));
+            if writable {
+                let me_new = me.clone();
+                menu = menu.item(mi("新建实体化视图").on_click(move |_, window, cx| {
+                    me_new.update(cx, |app, cx| {
+                        app.open_new_designer(Act::Obj(c, d, s, 2, 0), window, cx)
+                    });
+                }));
+            } else {
+                menu = menu.item(todo_item("新建实体化视图"));
+            }
             menu = menu.separator();
             let wizard_ok = me.read(cx).table_wizard_available();
             menu = menu
@@ -42468,12 +42937,16 @@ fn cat_menu(
                 .item(ent_item(&me, "数据字典..."));
         }
         3 => {
-            let me_new = me.clone();
-            menu = menu.item(mi("新建函数").on_click(move |_, window, cx| {
-                me_new.update(cx, |app, cx| {
-                    app.open_new_designer(Act::Obj(c, d, s, 3, 0), window, cx)
-                });
-            }));
+            if writable {
+                let me_new = me.clone();
+                menu = menu.item(mi("新建函数").on_click(move |_, window, cx| {
+                    me_new.update(cx, |app, cx| {
+                        app.open_new_designer(Act::Obj(c, d, s, 3, 0), window, cx)
+                    });
+                }));
+            } else {
+                menu = menu.item(todo_item("新建函数"));
+            }
             menu = menu.item(ent_item(&me, "数据字典..."));
         }
         _ => {
@@ -42484,15 +42957,17 @@ fn cat_menu(
         }
     }
     menu = menu.separator();
-    // 分类级「新建组」管的是对象分组，本体没实现；表分类上的「粘贴」走
-    // 对象级剪贴板，落点就是这一栏的连接 / 库 / 模式。
+    // 分类级「新建组」管的是对象分组，本体没实现。表分类的「粘贴」走对象级
+    // 剪贴板；查询分类的「粘贴」收资源管理器里复制的 `.sql` 文件，落点就是
+    // 这一栏的连接 / 库 / 模式。
     menu = menu.item(todo_item("新建组"));
-    let paste_ok = k == 0 && {
+    let table_paste_ok = k == 0 && {
         let app = me.read(cx);
         match app.table_clip.as_ref() {
             Some(clip) => app.conns.get(c).is_some_and(|conn| {
                 conn.connected
                     && table_copy_ready(conn)
+                    && !backend::is_read_only(conn.kind)
                     && app
                         .conns
                         .iter()
@@ -42502,7 +42977,20 @@ fn cat_menu(
             None => false,
         }
     };
-    if paste_ok {
+    let sql_paste_ok = k == 4
+        && me.read(cx).conns.get(c).is_some_and(|conn| conn.connected)
+        && !sql_assoc::clipboard_sql_files().is_empty();
+    if sql_paste_ok {
+        let target = me.clone();
+        menu = menu.item(mi("粘贴").on_click(move |_, _, cx| {
+            target.update(cx, |app, cx| {
+                let files = sql_assoc::clipboard_sql_files();
+                if !files.is_empty() {
+                    app.import_sql_files_at(&files, c, d, s, cx);
+                }
+            });
+        }));
+    } else if table_paste_ok {
         let target = me.clone();
         menu = menu.item(mi("粘贴").on_click(move |_, _, cx| {
             target.update(cx, |app, cx| app.paste_tables_at(c, d, s, cx));
@@ -42698,14 +43186,39 @@ fn obj_menu(
             .item(todo_item("导出向导"))
             .item(ent_item(&me, "数据字典..."));
     } else {
-        // 实体化视图 / 查询：打开与设计行为没有实测样本，
-        // 删除 / 改名的 DDL 各家语法差异没验过，按视图骨架推断并全部置灰。
-        menu = menu.item(todo_item(format!("打开{kind}")));
-        menu = menu.item(todo_item(format!("设计{kind}")));
-        menu = menu
-            .item(todo_item(format!("新建{kind}")))
-            .item(todo_item(format!("删除{kind}")))
-            .item(todo_item("设置权限"));
+        // 查询：已保存查询有真通路（打开 / 删除）；实体化视图的打开与设计
+        // 行为没有实测样本，按视图骨架推断并全部置灰。
+        if k == 4 {
+            let me_open = me.clone();
+            menu = menu.item(mi("打开查询").on_click(move |_, window, cx| {
+                me_open.update(cx, |app, cx| {
+                    if let Some(sq) = app.saved_query_for(act) {
+                        app.open_saved_query(sq, window, cx);
+                    }
+                });
+            }));
+            let me_del = me.clone();
+            menu = menu.item(mi("删除查询").on_click(move |_, _, cx| {
+                me_del.update(cx, |app, cx| {
+                    if let Some(sq) = app.saved_query_for(act) {
+                        app.delete_saved_query(&sq.key());
+                        app.sel = Act::Cat(c, d, s, 4);
+                        app.pane_note = Some(format!("已删除查询「{}」", sq.name));
+                        cx.notify();
+                    }
+                });
+            }));
+            menu = menu
+                .item(todo_item(format!("新建{kind}")))
+                .item(todo_item("设置权限"));
+        } else {
+            menu = menu.item(todo_item(format!("打开{kind}")));
+            menu = menu.item(todo_item(format!("设计{kind}")));
+            menu = menu
+                .item(todo_item(format!("新建{kind}")))
+                .item(todo_item(format!("删除{kind}")))
+                .item(todo_item("设置权限"));
+        }
         menu = menu.separator();
         menu = menu
             .item(todo_item("导出向导"))
@@ -43668,6 +44181,18 @@ mod ui_test_support {
             ),
             path,
         )
+    }
+
+    /// 造一个 Access 夹具库：把仓库里的 `.accdb` 拷到临时路径（驱动只读，源文件别动）。
+    pub(crate) fn access_fixture(tag: &str) -> (PathBuf, String) {
+        let file = std::env::temp_dir().join(format!("daro_rs_{tag}_{}.accdb", std::process::id()));
+        std::fs::write(
+            &file,
+            include_bytes!("../assets/testdata/access_fixture.accdb"),
+        )
+        .unwrap();
+        let path = file.to_string_lossy().to_string();
+        (file, path)
     }
 
     /// 场景失败时把最后一帧登记过的元素写进 stderr，定位「哪一步没点到」。
@@ -51551,6 +52076,188 @@ mod designer_tests {
         assert_eq!(persisted[0].name, "b");
     }
 
+    /// 资源管理器复制 `.sql` → 窗口里 Ctrl+V：按当前选中的连接存成已保存查询。
+    /// 同一文件再贴一次不重复；同名不同内容让到「名称 (2)」。
+    #[gpui_kit::test]
+    fn pasting_sql_files_saves_queries_under_selected_connection(cx: &mut TestAppContext) {
+        isolate_store("sqlpaste");
+        let (mut conn, db_path) = sqlite_fixture(
+            "sqlpaste",
+            &["CREATE TABLE member (id INTEGER PRIMARY KEY)"],
+        );
+        conn.name = "粘贴SQL用例".into();
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![conn];
+                a.groups.clear();
+                a.sel = Act::Conn(0);
+                a.open_connection(0, cx);
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+
+        let dir = std::env::temp_dir().join(format!("daro_sql_paste_{}", std::process::id()));
+        let other = dir.join("v2");
+        std::fs::create_dir_all(&other).unwrap();
+        let first = dir.join("日报.sql");
+        std::fs::write(&first, "select 1;").unwrap();
+        let second = other.join("日报.sql");
+        std::fs::write(&second, "select 2;").unwrap();
+
+        app.update(cx, |a, cx| a.import_sql_files(&[first.clone()], cx));
+        app.update(cx, |a, _| {
+            assert_eq!(a.saved_queries.len(), 1, "第一个文件存成一条查询");
+            assert_eq!(a.saved_queries[0].name, "日报");
+            assert_eq!(a.saved_queries[0].sql, "select 1;");
+            assert_eq!(a.saved_queries[0].connection, "粘贴SQL用例");
+            assert!(
+                a.pane_note.as_deref().unwrap_or_default().contains("已保存"),
+                "状态栏给回执：{:?}",
+                a.pane_note
+            );
+            assert_eq!(a.sel.cat(), Some(4), "粘完落到目标的查询分类");
+            assert_eq!(a.pane_objects(), &["日报"], "查询分类里能看到新查询");
+            assert!(a.query_objects("别的连接", "main", "").is_empty(), "按归属过滤");
+        });
+
+        // 同一份文件再贴一次：内容一致，不重复保存
+        app.update(cx, |a, cx| a.import_sql_files(&[first.clone()], cx));
+        app.update(cx, |a, _| {
+            assert_eq!(a.saved_queries.len(), 1, "同名同内容不重复");            assert!(
+                a.pane_note.as_deref().unwrap_or_default().contains("未重复保存"),
+                "{:?}",
+                a.pane_note
+            );
+        });
+
+        // 同名但内容不同：保留原查询，新的一份让到「日报 (2)」
+        app.update(cx, |a, cx| a.import_sql_files(&[second.clone()], cx));
+        app.update(cx, |a, _| {
+            assert_eq!(a.saved_queries.len(), 2);
+            assert_eq!(a.saved_queries[0].name, "日报");
+            assert_eq!(a.saved_queries[0].sql, "select 1;", "原查询不被覆盖");
+            assert_eq!(a.saved_queries[1].name, "日报 (2)");
+            assert_eq!(a.saved_queries[1].sql, "select 2;");
+            assert_eq!(a.pane_objects(), &["日报", "日报 (2)"], "两条都列在查询分类");
+        });
+
+        // 分类菜单「粘贴」走显式落点（右键的那一栏连接 / 库 / 模式）
+        let third = other.join("月报.sql");
+        std::fs::write(&third, "select 3;").unwrap();
+        app.update(cx, |a, cx| a.import_sql_files_at(&[third], 0, 0, NO_SCHEMA, cx));
+        app.update(cx, |a, _| {
+            assert_eq!(a.saved_queries.len(), 3);
+            assert_eq!(
+                a.pane_objects(),
+                &["日报", "日报 (2)", "月报"],
+                "菜单粘贴的也落进查询分类"
+            );
+        });
+
+        let persisted = saved_queries::load();
+        assert_eq!(persisted.len(), 3, "三条都落盘");
+        saved_queries::save(&[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// 树 / 对象面板里选中已保存查询 → Delete 直接删掉并落盘。
+    #[gpui_kit::test]
+    fn delete_key_removes_the_selected_saved_query(cx: &mut TestAppContext) {
+        isolate_store("sqldelkey");
+        let (handle, app) = open_app(cx);
+        cx.update(|cx| wire_global_keys(app.clone(), handle, cx));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, _| {
+                let conn = a.conns[0].clone();
+                let db = catalog::databases(&conn)[0].to_string();
+                let schema = if catalog::has_schemas(conn.kind) {
+                    catalog::schemas(&conn, &db)[0].to_string()
+                } else {
+                    String::new()
+                };
+                a.save_named_query(saved_queries::SavedQuery {
+                    name: "删除我".into(),
+                    connection: conn.name.clone(),
+                    database: db,
+                    schema: schema.clone(),
+                    sql: "select 1;".into(),
+                });
+                a.sel = Act::Obj(
+                    0,
+                    0,
+                    if schema.is_empty() { NO_SCHEMA } else { 0 },
+                    4,
+                    0,
+                );
+            });
+            window.render_frame(cx);
+            window.press("delete", cx);
+        })
+        .unwrap();
+        app.update(cx, |a, _| {
+            assert!(a.saved_queries.is_empty(), "Delete 删掉选中的已保存查询");
+            assert!(matches!(a.sel, Act::Cat(.., 4)), "删完选回查询分类");
+            assert!(
+                a.pane_note.as_deref().unwrap_or_default().contains("已删除"),
+                "状态栏给回执：{:?}",
+                a.pane_note
+            );
+        });
+        assert!(saved_queries::load().is_empty(), "删除同步落盘");
+        saved_queries::save(&[]);
+    }
+
+    /// 外部拖入 `.sql`：Entered / Pending / Submit 走完，窗口要接住并打开文件。
+    #[gpui_kit::test]
+    fn dropping_a_sql_file_on_the_window_opens_it(cx: &mut TestAppContext) {
+        isolate_store("sqldrop");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, _| a.sel = Act::Conn(0));
+        })
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("daro_sql_drop_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("拖入.sql");
+        std::fs::write(&file, "select 9;").unwrap();
+        let at = point(px(600.), px(400.));
+        use gpui_kit::InputEvent as _;
+        cx.update_window(handle, |_, window, cx| {
+            let entered = FileDropEvent::Entered {
+                position: at,
+                paths: ExternalPaths([file.clone()].into_iter().collect()),
+            };
+            window.dispatch_event(entered.to_platform_input(), cx);
+            window.render_frame(cx);
+            window.dispatch_event(
+                FileDropEvent::Pending { position: at }.to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            window.dispatch_event(
+                FileDropEvent::Submit { position: at }.to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, cx| {
+            let hit = a.opened.iter().any(|t| {
+                t.qstate
+                    .as_ref()
+                    .is_some_and(|q| q.editor.read(cx).value().contains("select 9;"))
+            });
+            assert!(hit, "拖进来的 .sql 要打开成查询页签");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 收藏夹：查询页签 → 添加 → 顶栏菜单列出 9 个槽位 → Ctrl+1 重开同一份 SQL。
     #[gpui_kit::test]
     fn favorites_reopen_the_collected_tab(cx: &mut TestAppContext) {
@@ -52432,6 +53139,125 @@ mod tree_menu_tests {
         );
 
         crate::sqlite_driver::close("粘贴表测试");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 搜索框留着焦点时，点树 / 对象面板要把焦点让出来：否则 Ctrl+C / Ctrl+V
+    /// 被搜索 Input 截获，「复制表 → 换库粘贴」的快捷键根本走不到。
+    #[gpui_kit::test]
+    fn clicking_trees_releases_search_focus_for_table_paste(cx: &mut TestAppContext) {
+        isolate_store("pastefocus");
+        let (mut conn, path) = sqlite_fixture(
+            "pastefocus",
+            &["CREATE TABLE member (id INTEGER PRIMARY KEY, name TEXT)"],
+        );
+        conn.name = "粘贴焦点用例".into();
+        let (handle, app) = open_app(cx);
+        cx.update(|cx| wire_global_keys(app.clone(), handle, cx));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![conn];
+                a.groups.clear();
+                a.sel = Act::Conn(0);
+                a.open_connection(0, cx);
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            assert!(a.conns[0].connected, "测试库连接成功");
+            let _ = catalog::objects(&a.conns[0], "main", "", 0);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            assert_eq!(catalog::objects(&a.conns[0], "main", "", 0), &["member"]);
+        });
+        settle(cx, handle);
+
+        // 场景：为了找表刚在树顶搜索框里打过字，焦点还在那里
+        cx.update_window(handle, |_, window, cx| {
+            let input = app.read(cx).search_input.clone().unwrap();
+            input.update(cx, |s, cx| s.focus(window, cx));
+            window.render_frame(cx);
+            assert!(
+                input.read(cx).focus_handle(cx).is_focused(window),
+                "搜索框先拿到焦点"
+            );
+        })
+        .unwrap();
+
+        // 复制表后点目标库：焦点必须还给窗口
+        app.update(cx, |a, cx| {
+            a.active_tab = 0;
+            a.sel = Act::Obj(0, 0, NO_SCHEMA, 0, 0);
+            a.obj_multi = None;
+            a.edit_copy(cx);
+        });
+        assert!(
+            app.read_with(cx, |a, _| a.table_clip.is_some()),
+            "表已进对象级剪贴板"
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.click("db/0/0", cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            let input = app.read(cx).search_input.clone().unwrap();
+            assert!(
+                !input.read(cx).focus_handle(cx).is_focused(window),
+                "点树后搜索框要让出焦点"
+            );
+        })
+        .unwrap();
+
+        // 对象面板的搜索框同理：点面板行之后也不能再吃快捷键
+        app.update(cx, |a, _| a.obj_search_open = true);
+        settle(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            let input = app.read(cx).obj_search_input.clone().unwrap();
+            input.update(cx, |s, cx| s.focus(window, cx));
+            window.render_frame(cx);
+            assert!(
+                input.read(cx).focus_handle(cx).is_focused(window),
+                "面板搜索框先拿到焦点"
+            );
+            window.click(("obj", 0usize), cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            let input = app.read(cx).obj_search_input.clone().unwrap();
+            assert!(
+                !input.read(cx).focus_handle(cx).is_focused(window),
+                "点面板后搜索框要让出焦点"
+            );
+        })
+        .unwrap();
+
+        // Ctrl+V 走对象页的「粘贴表」，不再落进搜索框
+        cx.update_window(handle, |_, window, cx| {
+            window.press("ctrl-v", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        assert_eq!(cx.windows().len(), 2, "Ctrl+V 要打开「粘贴表」对话框");
+        cx.update_window(handle, |_, _, cx| {
+            let value = app
+                .read(cx)
+                .search_input
+                .clone()
+                .unwrap()
+                .read(cx)
+                .value()
+                .to_string();
+            assert!(value.is_empty(), "粘贴不该落进搜索框：{value:?}");
+        })
+        .unwrap();
+
+        crate::sqlite_driver::close("粘贴焦点用例");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -57449,3 +58275,125 @@ mod click_misroute_tests {
     }
 }
 
+
+/// Access 只读驱动接入：拖入库文件建连、目录清单、整表物化页签与只读门禁。
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    use crate::ui_test_support::{access_fixture, isolate_store, open_app, settle};
+    use gpui_kit::TestAppContext;
+
+    // `use super::*` 会带进 gpui 的同名 test 宏，显式引回标准宏。
+    use core::prelude::v1::test;
+
+    #[gpui_kit::test]
+    fn dropping_access_file_creates_readonly_connection(cx: &mut TestAppContext) {
+        use gpui_kit::InputEvent as _;
+        use gpui_kit::test::TestWindowExt as _;
+
+        isolate_store("accessdrop");
+        let (handle, app) = open_app(cx);
+        let (file, path) = access_fixture("accessdrop");
+        let stem = std::path::Path::new(&path)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        // 走真实拖放事件（Entered / Pending / Submit），不只调 import_db_files
+        let drop_file = |cx: &mut TestAppContext, path: &str| {
+            let at = point(px(600.), px(400.));
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.dispatch_event(
+                    FileDropEvent::Entered {
+                        position: at,
+                        paths: ExternalPaths([PathBuf::from(path)].into_iter().collect()),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+                window.dispatch_event(
+                    FileDropEvent::Pending { position: at }.to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+                window.dispatch_event(
+                    FileDropEvent::Submit { position: at }.to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+            })
+            .unwrap();
+        };
+
+        drop_file(cx, &path);
+        settle(cx, handle);
+
+        let ix = app.update(cx, |a, _| {
+            assert_eq!(a.conns.len(), 5, "演示夹具 4 条 + 拖入 1 条");
+            let conn = a.conns.last().unwrap();
+            assert!(matches!(conn.kind, DbKind::Access), "拖入 accdb 应建 Access 连接");
+            assert_eq!(conn.name, stem, "连接名取文件名");
+            assert_eq!(conn.database, path);
+            assert!(conn.connected, "拖入即连上");
+            a.conns.len() - 1
+        });
+
+        // 同一文件再拖一次：只定位，不重复建连接
+        drop_file(cx, &path);
+        settle(cx, handle);
+        app.update(cx, |a, _| assert_eq!(a.conns.len(), 5, "同路径去重"));
+
+        // 目录缓存按需装载：树没展开时自己发一次请求，等后台填完再断言
+        app.update(cx, |a, _| {
+            let conn = &a.conns[ix];
+            assert_eq!(catalog::databases(conn), [stem.as_str()], "库节点 = 文件名");
+            assert!(catalog::has_category(conn.kind, 0));
+            assert!(
+                !catalog::has_category(conn.kind, 1),
+                "Access 目录里没有视图分类"
+            );
+            let _ = catalog::objects(conn, &stem, "", 0);
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let conn = &a.conns[ix];
+            assert_eq!(
+                catalog::objects(conn, &stem, "", 0),
+                ["member", "no_key"],
+                "用户表清单"
+            );
+            let _ = catalog::table_columns(conn, &stem, "", "member");
+        });
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let cols = catalog::table_columns(&a.conns[ix], &stem, "", "member");
+            let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, ["id", "name", "score", "active", "born", "remark"]);
+            assert!(cols.iter().all(|c| !c.writable), "列不可编辑");
+        });
+
+        // 双击表：整表物化页签（没有服务端分页），数据页只读
+        app.update(cx, |a, cx| {
+            a.open_object(Act::Obj(ix, 0, NO_SCHEMA, 0, 0), cx);
+        });
+        app.update(cx, |a, _| {
+            let t = a.opened.last().expect("打开数据页签");
+            assert!(t.page.is_none(), "Access 走本地物化页签");
+            assert_eq!(t.data.len(), 3);
+            assert_eq!(t.data[0][1], "Alice");
+            assert!(a.tab_read_only(t), "Access 页签只读");
+        });
+        app.update(cx, |a, _| {
+            let act = Act::Obj(ix, 0, NO_SCHEMA, 0, 0);
+            assert!(
+                !a.table_op_available(act, table_ops::TableOp::Drop),
+                "只读连接不提供删表"
+            );
+        });
+
+        let _ = std::fs::remove_file(&file);
+    }
+}

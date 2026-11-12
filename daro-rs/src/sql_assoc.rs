@@ -27,8 +27,38 @@ pub fn sql_files(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
         .collect()
 }
 
+/// 剪贴板里由资源管理器「复制文件」带进来的 `.sql` 清单。
+/// 剪贴板只有文字（复制 SQL 正文）时返回空，调用方照旧走文本粘贴。
+pub fn clipboard_sql_files() -> Vec<PathBuf> {
+    sql_files(clipboard_paths())
+}
+
+/// 读 SQL 文件正文：UTF-8 优先，读不出来按 GB18030 解（中文 Windows 的
+/// ANSI 存盘很常见），开头的 BOM 去掉，免得贴在编辑器第一行里看不见。
+pub fn read_sql_text(path: &Path) -> Result<String, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("无法读取 {}：{e}", path.display()))?;
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => encoding_rs::GB18030.decode(&bytes).0.into_owned(),
+    };
+    Ok(text.trim_start_matches('\u{feff}').to_string())
+}
+
+#[cfg(windows)]
+fn clipboard_paths() -> Vec<PathBuf> {
+    win::clipboard_paths()
+}
+
+#[cfg(not(windows))]
+fn clipboard_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
 #[cfg(windows)]
 mod win {
+    use std::path::PathBuf;
+
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
         HKEY_CURRENT_USER, REG_NONE, REG_SZ, RegSetKeyValueW,
@@ -106,6 +136,46 @@ mod win {
         Ok(())
     }
 
+    /// 剪贴板里的文件清单（CF_HDROP）。资源管理器 Ctrl+C 复制文件时写的就是它；
+    /// 拿不到（没复制文件 / 剪贴板被别的程序占着）就返回空。
+    pub fn clipboard_paths() -> Vec<PathBuf> {
+        use windows_sys::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        };
+        use windows_sys::Win32::System::Ole::CF_HDROP;
+        use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+        let mut out = Vec::new();
+        unsafe {
+            if IsClipboardFormatAvailable(CF_HDROP as u32) == 0 {
+                return out;
+            }
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return out;
+            }
+            let handle = GetClipboardData(CF_HDROP as u32);
+            if !handle.is_null() {
+                let drop = handle as HDROP;
+                let count = DragQueryFileW(drop, u32::MAX, std::ptr::null_mut(), 0);
+                for i in 0..count {
+                    let len = DragQueryFileW(drop, i, std::ptr::null_mut(), 0);
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u16; len as usize + 1];
+                    let n = DragQueryFileW(drop, i, buf.as_mut_ptr(), buf.len() as u32);
+                    if n > 0 {
+                        out.push(PathBuf::from(String::from_utf16_lossy(
+                            &buf[..n as usize],
+                        )));
+                    }
+                }
+            }
+            CloseClipboard();
+        }
+        out
+    }
+
     /// 打开系统的「打开方式」对话框，并把 daro 放进候选。
     /// 用户勾「始终使用此应用」后，以后双击 .sql 就归系统记住了。
     pub fn ask_default_app() -> Result<(), String> {
@@ -158,6 +228,25 @@ mod tests {
 
         let got = sql_files(vec![sql.clone(), txt, missing, dir.clone()]);
         assert_eq!(got, vec![sql]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_sql_text_as_utf8_bom_or_gb18030() {
+        let dir = std::env::temp_dir().join(format!("daro_sql_read_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 带 BOM 的 UTF-8：BOM 不进正文
+        let utf8 = dir.join("utf8.sql");
+        std::fs::write(&utf8, b"\xEF\xBB\xBFselect 1;").unwrap();
+        assert_eq!(read_sql_text(&utf8).unwrap(), "select 1;");
+
+        // GB18030（「查询」= B2 E9 D1 AF）按 UTF-8 解不开，要回退
+        let gbk = dir.join("gbk.sql");
+        std::fs::write(&gbk, b"-- \xB2\xE9\xD1\xAF\nselect 1;").unwrap();
+        assert_eq!(read_sql_text(&gbk).unwrap(), "-- 查询\nselect 1;");
+
+        assert!(read_sql_text(&dir.join("missing.sql")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

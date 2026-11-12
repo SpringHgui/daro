@@ -53,9 +53,9 @@ cargo test --bin daro-rs -- --test-threads=1
 - Linux：`daro-rs-<version>-linux-x64.tar.gz`
 
 macOS / Linux 的包没有签名：macOS 解压后先 `xattr -dr com.apple.quarantine daro-rs.app`。
-macOS 包里自带 ODBC 运行库（`Contents/Frameworks` 下的 libodbc、libltdl），不需要装 Homebrew 的
-unixodbc；Linux 需要系统里有 x11/wayland、fontconfig 与 libodbc 运行库。ODBC 只给 SQL Server
-连接用，连 SQL Server 还要另外装微软的 ODBC Driver for SQL Server。
+SQL Server 连接走纯 Rust 的 TDS 驱动（tiberius），三个平台都不需要装 ODBC 驱动或额外运行库；
+Linux 只需要系统里有 x11/wayland 与 fontconfig。Access（.mdb/.accdb）只有 Windows 版驱动，
+后续按 Windows 专属能力接，macOS/Linux 不受影响。
 
 ```bash
 git tag daro-rs-v0.0.1

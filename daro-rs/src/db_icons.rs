@@ -135,6 +135,7 @@ pub fn asset_id(kind: DbKind) -> &'static str {
         DbKind::PostgreSql => "postgresql",
         DbKind::SqlServer => "sqlserver",
         DbKind::SQLite => "sqlite",
+        DbKind::Access => "access",
         DbKind::MongoDb => "mongodb",
         DbKind::Redis => "redis",
     }

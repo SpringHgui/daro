@@ -1,24 +1,36 @@
-//! SQL Server 驱动：走系统 ODBC（与 Flutter 版 `sqlserver_driver.dart` 同一条路）。
+//! SQL Server 驱动：纯 Rust 的 TDS（tiberius），不依赖系统 ODBC 驱动。
 //!
 //! 方言口径：
 //! - 标识符 `[name]`，内部 `]` 双写；字面量 `N'...'`，单引号双写
 //! - 表名三段 `[库].[模式].[表]`；模式缺省 `dbo`
 //! - 分页 `OFFSET n ROWS FETCH NEXT m ROWS ONLY`，没有 ORDER BY 时补
 //!   `ORDER BY (SELECT NULL)`，否则 SQL Server 直接报错
-//! - 认证：填了用户名走 SQL 认证，留空走 Windows 集成认证（Trusted_Connection）
+//! - 认证：填了用户名走 SQL 认证，留空在 Windows 上走集成认证；macOS/Linux
+//!   没有 Windows 身份，留空会直接报错，提示填账号
+//!
+//! 驱动对上层是同步接口：内部统一在这个模块的运行时上跑 tiberius 的 async
+//! 调用。调用点不能位于 tokio 运行时线程里（MCP 后台已用 spawn_blocking 隔开）。
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use odbc_api::{Connection, ConnectionOptions, Cursor, Environment, ResultSetMetadata};
+use chrono::{Duration as ChronoDuration, NaiveDate};
+use futures_util::TryStreamExt;
+use tiberius::time::{
+    Date as TibDate, DateTime as TibDateTime, DateTime2 as TibDateTime2,
+    DateTimeOffset as TibDateTimeOffset, SmallDateTime, Time as TibTime,
+};
+use tiberius::{AuthMethod, Client, Column, ColumnData, ColumnType, Config, EncryptionLevel, QueryItem, Row};
+use tokio::net::TcpStream;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::db_types::{ColMeta, ExecOutcome, GridChanges, ScriptRun, SelectPage, StmtRun};
 
 /// 查询页一次取回的最大行数。
 pub const QUERY_ROW_LIMIT: usize = 5000;
 const NULL_TEXT: &str = "NULL";
-const QUERY_TIMEOUT_SECS: usize = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Params {
@@ -29,75 +41,71 @@ pub struct Params {
     pub dbname: String,
 }
 
-static ENV: LazyLock<Result<&'static Environment, String>> = LazyLock::new(|| {
-    Environment::new()
-        .map(|env| &*Box::leak(Box::new(env)))
-        .map_err(|e| format!("初始化 ODBC 失败：{e}"))
+type Conn = Client<Compat<TcpStream>>;
+
+/// 所有连接共用的小运行时：`block_on` 只阻塞调用线程，网络读写由工作线程驱动。
+static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .thread_name("daro-sqlserver")
+        .build()
+        .expect("初始化 SQL Server 运行时失败")
 });
 
-static CONNS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Connection<'static>>>>>> =
+fn block_on<F: Future>(f: F) -> F::Output {
+    RT.block_on(f)
+}
+
+static CONNS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Conn>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 与 Flutter 版一致的驱动查找顺序：先新的 Microsoft 驱动，最后是系统自带的
-/// 旧 `SQL Server` 驱动。
-const DRIVERS: [&str; 5] = [
-    "ODBC Driver 18 for SQL Server",
-    "ODBC Driver 17 for SQL Server",
-    "ODBC Driver 13 for SQL Server",
-    "SQL Server Native Client 11.0",
-    "SQL Server",
-];
+fn auth_method(p: &Params) -> Result<AuthMethod, String> {
+    let user = p.user.trim();
+    if !user.is_empty() {
+        return Ok(AuthMethod::sql_server(user, &p.password));
+    }
+    #[cfg(windows)]
+    {
+        Ok(AuthMethod::Integrated)
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Windows 集成认证只在 Windows 上可用；请填写 SQL Server 用户名和密码".to_string())
+    }
+}
 
-fn connection_string(p: &Params, driver: &str) -> String {
+fn connect(p: &Params) -> Result<Conn, String> {
     let host = p.host.trim();
+    if host.is_empty() {
+        return Err("SQL Server 主机不能为空".to_string());
+    }
     let port = if p.port == 0 { 1433 } else { p.port };
-    let db = if p.dbname.trim().is_empty() {
+    let database = if p.dbname.trim().is_empty() {
         "master"
     } else {
         p.dbname.trim()
     };
-    let auth = if p.user.trim().is_empty() {
-        "Trusted_Connection=yes;".to_string()
-    } else {
-        format!(
-            "UID={};PWD={};",
-            esc_conn(p.user.trim()),
-            esc_conn(&p.password)
-        )
-    };
-    format!(
-        "DRIVER={{{driver}}};SERVER={host},{port};DATABASE={db};\
-         Encrypt=No;TrustServerCertificate=Yes;APP=daro;{auth}"
-    )
-}
-
-/// 连接串里的分号 / 花括号要转义，否则密码里有 `;` 会截断参数。
-fn esc_conn(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            ';' => out.push_str("{;}"),
-            '{' => out.push_str("{{"),
-            '}' => out.push_str("}}"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn connect(p: &Params) -> Result<Connection<'static>, String> {
-    let env = *ENV.as_ref().as_ref().map_err(|e| e.clone())?;
-    let mut last = String::new();
-    for driver in DRIVERS {
-        let cs = connection_string(p, driver);
-        match env.connect_with_connection_string(&cs, ConnectionOptions::default()) {
-            Ok(conn) => return Ok(conn),
-            Err(e) => last = format!("{driver}: {e}"),
-        }
-    }
-    Err(format!(
-        "SQL Server 连接失败（{last}）。请确认已安装 64 位 Microsoft ODBC Driver for SQL Server"
-    ))
+    let auth = auth_method(p)?;
+    block_on(async move {
+        let mut cfg = Config::new();
+        cfg.host(host);
+        cfg.port(port);
+        cfg.database(database);
+        cfg.application_name("daro");
+        // 与原先连接串的 Encrypt=No;TrustServerCertificate=Yes 一致：
+        // 只在登录阶段加密，证书不校验（内网实例多是自签名）。
+        cfg.encryption(EncryptionLevel::Off);
+        cfg.trust_cert();
+        cfg.authentication(auth);
+        let tcp = TcpStream::connect((host, port))
+            .await
+            .map_err(|e| format!("连不上 {host}:{port}：{e}"))?;
+        let _ = tcp.set_nodelay(true);
+        Client::connect(cfg, tcp.compat_write())
+            .await
+            .map_err(|e| format!("SQL Server 登录失败：{e}"))
+    })
 }
 
 pub fn open(key: &str, p: &Params) -> Result<(), String> {
@@ -135,13 +143,13 @@ pub fn probe(p: &Params) -> Result<(), String> {
     Ok(())
 }
 
-fn with_conn<T>(key: &str, p: &Params, f: impl FnOnce(&mut Connection<'static>) -> Result<T, String>) -> Result<T, String> {
+fn with_conn<T>(key: &str, p: &Params, f: impl FnOnce(&mut Conn) -> Result<T, String>) -> Result<T, String> {
     ensure(key, p)?;
     with_open_conn(key, f)
 }
 
 /// 只按缓存键执行：连接必须先 open / ensure 过（与其它驱动的 `execute_stmt` 同口径）。
-fn with_open_conn<T>(key: &str, f: impl FnOnce(&mut Connection<'static>) -> Result<T, String>) -> Result<T, String> {
+fn with_open_conn<T>(key: &str, f: impl FnOnce(&mut Conn) -> Result<T, String>) -> Result<T, String> {
     let c = CONNS.lock().unwrap().get(key).cloned();
     let Some(c) = c else {
         return Err("SQL Server 连接已关闭".to_string());
@@ -150,12 +158,7 @@ fn with_open_conn<T>(key: &str, f: impl FnOnce(&mut Connection<'static>) -> Resu
     match f(&mut guard) {
         Ok(v) => Ok(v),
         Err(e) => {
-            let lower = e.to_ascii_lowercase();
-            if lower.contains("communication")
-                || lower.contains("connection is broken")
-                || lower.contains("08s01")
-                || lower.contains("not connected")
-            {
+            if is_conn_broken(&e) {
                 CONNS.lock().unwrap().remove(key);
             }
             Err(e)
@@ -163,8 +166,26 @@ fn with_open_conn<T>(key: &str, f: impl FnOnce(&mut Connection<'static>) -> Resu
     }
 }
 
-fn odbc_err(e: odbc_api::Error) -> String {
-    e.to_string()
+/// 连接已被服务端/网络打断：下次 ensure 会重连，别继续用坏连接。
+fn is_conn_broken(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("communication")
+        || lower.contains("connection is broken")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
+        || lower.contains("08s01")
+        || lower.contains("not connected")
+}
+
+/// 服务端报错只把消息给用户看；`Token error: '...' on server ...` 那层包装
+/// 对用户没意义。
+fn db_err(e: tiberius::error::Error) -> String {
+    match e {
+        tiberius::error::Error::Server(err) => err.message().to_string(),
+        other => other.to_string(),
+    }
 }
 
 pub fn quote_ident(name: &str) -> String {
@@ -210,45 +231,12 @@ fn num_is_numeric(ty: &str) -> bool {
 
 /// 跑一条查询：返回列元数据（来自结果集）与文本行；最多 `max_rows` 行。
 fn query_rows(
-    conn: &mut Connection<'static>,
+    conn: &mut Conn,
     sql: &str,
     max_rows: usize,
 ) -> Result<(Vec<ColMeta>, Vec<Vec<String>>), String> {
-    let mut stmt = conn.preallocate().map_err(odbc_err)?;
-    let Some(mut cursor) = stmt.execute(sql, ()).map_err(odbc_err)? else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    let ncols = cursor.num_result_cols().map_err(odbc_err)?;
-    let mut columns = Vec::new();
-    for i in 1..=ncols {
-        let name = cursor.col_name(i as u16).unwrap_or_else(|_| format!("col{i}"));
-        let ty = cursor
-            .col_data_type(i as u16)
-            .map(type_label)
-            .unwrap_or_default();
-        let mut meta = ColMeta::new(name, ty.clone(), num_is_numeric(&ty));
-        meta.writable = false;
-        columns.push(meta);
-    }
-    let columns = dedup_names(columns);
-    let mut rows = Vec::new();
-    while let Some(mut row) = cursor.next_row().map_err(odbc_err)? {
-        if rows.len() >= max_rows {
-            break;
-        }
-        let mut vals = Vec::with_capacity(columns.len());
-        for i in 1..=ncols {
-            let mut buf = Vec::new();
-            let present = row.get_text(i as u16, &mut buf).map_err(odbc_err)?;
-            if present {
-                vals.push(String::from_utf8_lossy(&buf).into_owned());
-            } else {
-                vals.push(NULL_TEXT.to_string());
-            }
-        }
-        rows.push(vals);
-    }
-    Ok((columns, rows))
+    let page = take_page(conn, sql, Vec::new(), &[], max_rows)?;
+    Ok((page.columns, page.rows))
 }
 
 /// 列名去重（查询页同名列不能把网格搞乱）。
@@ -264,30 +252,158 @@ fn dedup_names(mut cols: Vec<ColMeta>) -> Vec<ColMeta> {
     cols
 }
 
-fn type_label(t: odbc_api::handles::DataType) -> String {
-    use odbc_api::handles::DataType as D;
+fn describe_columns(cols: &[Column]) -> Vec<ColMeta> {
+    let mut out = Vec::with_capacity(cols.len());
+    for c in cols {
+        let ty = type_label(c.column_type());
+        let mut m = ColMeta::new(c.name().to_string(), ty.clone(), num_is_numeric(&ty));
+        m.writable = false;
+        out.push(m);
+    }
+    dedup_names(out)
+}
+
+fn type_label(t: ColumnType) -> String {
     match t {
-        D::Char { .. } => "CHAR",
-        D::WChar { .. } => "NCHAR",
-        D::Varchar { .. } => "VARCHAR",
-        D::WVarchar { .. } => "NVARCHAR",
-        D::LongVarchar { .. } | D::WLongVarchar { .. } => "TEXT",
-        D::Numeric { .. } | D::Decimal { .. } => "DECIMAL",
-        D::Integer => "INT",
-        D::SmallInt => "SMALLINT",
-        D::BigInt => "BIGINT",
-        D::TinyInt => "TINYINT",
-        D::Bit => "BIT",
-        D::Float { .. } => "FLOAT",
-        D::Real => "REAL",
-        D::Double => "DOUBLE",
-        D::Date => "DATE",
-        D::Time { .. } => "TIME",
-        D::Timestamp { .. } => "DATETIME",
-        D::Varbinary { .. } | D::Binary { .. } | D::LongVarbinary { .. } => "VARBINARY",
-        _ => "SQL_VARIANT",
+        ColumnType::Bit | ColumnType::Bitn => "BIT",
+        ColumnType::Int1 => "TINYINT",
+        ColumnType::Int2 => "SMALLINT",
+        ColumnType::Int4 | ColumnType::Intn => "INT",
+        ColumnType::Int8 => "BIGINT",
+        ColumnType::Money | ColumnType::Money4 => "MONEY",
+        ColumnType::Float4 => "REAL",
+        ColumnType::Float8 | ColumnType::Floatn => "FLOAT",
+        ColumnType::Decimaln | ColumnType::Numericn => "DECIMAL",
+        ColumnType::Datetime | ColumnType::Datetime4 | ColumnType::Datetimen => "DATETIME",
+        ColumnType::Datetime2 => "DATETIME2",
+        ColumnType::Daten => "DATE",
+        ColumnType::Timen => "TIME",
+        ColumnType::DatetimeOffsetn => "DATETIMEOFFSET",
+        ColumnType::BigVarBin | ColumnType::BigBinary | ColumnType::Image => "VARBINARY",
+        ColumnType::BigVarChar | ColumnType::BigChar => "VARCHAR",
+        ColumnType::NVarchar | ColumnType::NChar => "NVARCHAR",
+        ColumnType::Text => "TEXT",
+        ColumnType::NText => "NTEXT",
+        ColumnType::Xml => "XML",
+        ColumnType::Guid => "UNIQUEIDENTIFIER",
+        ColumnType::Null | ColumnType::Udt | ColumnType::SSVariant => "SQL_VARIANT",
     }
     .to_string()
+}
+
+/// 一格 → 与原来 ODBC 文本结果一致的字符串。
+fn cell_text(cell: ColumnData<'_>) -> String {
+    match cell {
+        ColumnData::U8(v) => null_text(v),
+        ColumnData::I16(v) => null_text(v),
+        ColumnData::I32(v) => null_text(v),
+        ColumnData::I64(v) => null_text(v),
+        ColumnData::F32(v) => null_text(v),
+        ColumnData::F64(v) => null_text(v),
+        ColumnData::Bit(Some(true)) => "1".to_string(),
+        ColumnData::Bit(Some(false)) => "0".to_string(),
+        ColumnData::Bit(None) => null_s(),
+        ColumnData::String(v) => match v {
+            Some(s) => s.into_owned(),
+            None => null_s(),
+        },
+        ColumnData::Guid(v) => match v {
+            Some(g) => g.to_string().to_ascii_uppercase(),
+            None => null_s(),
+        },
+        ColumnData::Binary(v) => match v {
+            Some(b) => hex_text(&b),
+            None => null_s(),
+        },
+        ColumnData::Numeric(v) => null_text(v),
+        ColumnData::Xml(v) => match v {
+            Some(x) => x.as_ref().to_string(),
+            None => null_s(),
+        },
+        ColumnData::DateTime(v) => v.map(fmt_datetime).unwrap_or_else(null_s),
+        ColumnData::SmallDateTime(v) => v.map(fmt_smalldatetime).unwrap_or_else(null_s),
+        ColumnData::Time(v) => v.map(fmt_time).unwrap_or_else(null_s),
+        ColumnData::Date(v) => v.map(fmt_date).unwrap_or_else(null_s),
+        ColumnData::DateTime2(v) => v.map(fmt_datetime2).unwrap_or_else(null_s),
+        ColumnData::DateTimeOffset(v) => v.map(fmt_datetimeoffset).unwrap_or_else(null_s),
+    }
+}
+
+fn null_s() -> String {
+    NULL_TEXT.to_string()
+}
+
+fn null_text<T: ToString>(v: Option<T>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_else(null_s)
+}
+
+fn hex_text(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(2 + bytes.len() * 2);
+    s.push_str("0x");
+    for b in bytes {
+        let _ = write!(s, "{b:02X}");
+    }
+    s
+}
+
+/// SQL Server 的日期起点：date 从 0001-01-01 起，datetime/smalldatetime 从
+/// 1900-01-01 起（按天计）。
+fn civil_date(epoch_year: i32, days: i64) -> String {
+    let base = NaiveDate::from_ymd_opt(epoch_year, 1, 1).unwrap_or_default();
+    base.checked_add_signed(ChronoDuration::days(days))
+        .unwrap_or_default()
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+fn fmt_hms(nanos: u64, scale: usize) -> String {
+    let secs = nanos / 1_000_000_000;
+    let h = secs / 3600;
+    let m = secs % 3600 / 60;
+    let s = secs % 60;
+    if scale == 0 {
+        return format!("{h:02}:{m:02}:{s:02}");
+    }
+    let frac = (nanos % 1_000_000_000) / 10u64.pow(9 - scale as u32);
+    format!("{h:02}:{m:02}:{s:02}.{frac:0w$}", w = scale)
+}
+
+fn fmt_datetime(v: TibDateTime) -> String {
+    let days = v.days() as i64;
+    // 1/300 秒一格，SQL Server 展示到毫秒。
+    let nanos = v.seconds_fragments() as u64 * 1_000_000_000 / 300;
+    format!("{} {}", civil_date(1900, days), fmt_hms(nanos, 3))
+}
+
+fn fmt_smalldatetime(v: SmallDateTime) -> String {
+    let days = v.days() as i64;
+    let nanos = v.seconds_fragments() as u64 * 60 * 1_000_000_000;
+    format!("{} {}", civil_date(1900, days), fmt_hms(nanos, 0))
+}
+
+fn fmt_date(v: TibDate) -> String {
+    civil_date(1, v.days() as i64)
+}
+
+fn fmt_time(v: TibTime) -> String {
+    let scale = (v.scale() as usize).min(7);
+    let nanos = v.increments() * 10u64.pow(9 - scale as u32);
+    fmt_hms(nanos, scale)
+}
+
+fn fmt_datetime2(v: TibDateTime2) -> String {
+    format!("{} {}", fmt_date(v.date()), fmt_time(v.time()))
+}
+
+fn fmt_datetimeoffset(v: TibDateTimeOffset) -> String {
+    let (sign, mins) = if v.offset() < 0 {
+        ('-', v.offset().unsigned_abs())
+    } else {
+        ('+', v.offset() as u16)
+    };
+    let dt2 = fmt_datetime2(v.datetime2());
+    format!("{dt2}{sign}{:02}:{:02}", mins / 60, mins % 60)
 }
 
 pub fn try_list_databases(key: &str, p: &Params) -> Result<Vec<String>, String> {
@@ -500,68 +616,48 @@ pub fn select_table(
 }
 
 fn take_page(
-    conn: &mut Connection<'static>,
+    conn: &mut Conn,
     sql: &str,
     columns: Vec<ColMeta>,
     pk: &[usize],
     max_rows: usize,
 ) -> Result<SelectPage, String> {
-    let mut stmt = conn.preallocate().map_err(odbc_err)?;
-    let Some(mut cursor) = stmt.execute(sql, ()).map_err(odbc_err)? else {
-        return Ok(SelectPage {
-            columns,
-            rows: Vec::new(),
-            keys: Vec::new(),
-            truncated: false,
-        });
-    };
-    let ncols = cursor.num_result_cols().map_err(odbc_err)?;
-    let columns = if columns.is_empty() {
-        let mut described = Vec::new();
-        for i in 1..=ncols {
-            let name = cursor.col_name(i as u16).unwrap_or_else(|_| format!("col{i}"));
-            let ty = cursor
-                .col_data_type(i as u16)
-                .map(type_label)
-                .unwrap_or_default();
-            let mut m = ColMeta::new(name, ty.clone(), num_is_numeric(&ty));
-            m.writable = false;
-            described.push(m);
-        }
-        dedup_names(described)
-    } else {
-        columns
-    };
-    let mut rows = Vec::new();
-    let mut keys = Vec::new();
-    let mut truncated = false;
-    while let Some(mut row) = cursor.next_row().map_err(odbc_err)? {
-        if rows.len() >= max_rows {
-            truncated = true;
-            break;
-        }
-        let mut vals = Vec::with_capacity(columns.len());
-        for i in 1..=ncols {
-            let mut buf = Vec::new();
-            let present = row.get_text(i as u16, &mut buf).map_err(odbc_err)?;
-            if present {
-                vals.push(String::from_utf8_lossy(&buf).into_owned());
-            } else {
-                vals.push(NULL_TEXT.to_string());
+    block_on(async {
+        let mut stream = conn.simple_query(sql).await.map_err(db_err)?;
+        let columns = if columns.is_empty() {
+            let described = stream.columns().await.map_err(db_err)?;
+            describe_columns(described.unwrap_or(&[]))
+        } else {
+            columns
+        };
+        let mut rows = Vec::new();
+        let mut keys = Vec::new();
+        let mut truncated = false;
+        while let Some(item) = stream.try_next().await.map_err(db_err)? {
+            let QueryItem::Row(row) = item else {
+                continue;
+            };
+            if row.result_index() != 0 {
+                continue;
             }
+            if rows.len() >= max_rows {
+                truncated = true;
+                break;
+            }
+            let vals = row_text(row);
+            keys.push(
+                pk.iter()
+                    .filter_map(|i| vals.get(*i).cloned())
+                    .collect::<Vec<_>>(),
+            );
+            rows.push(vals);
         }
-        keys.push(
-            pk.iter()
-                .filter_map(|i| vals.get(*i).cloned())
-                .collect::<Vec<_>>(),
-        );
-        rows.push(vals);
-    }
-    Ok(SelectPage {
-        columns,
-        rows,
-        keys,
-        truncated,
+        Ok(SelectPage {
+            columns,
+            rows,
+            keys,
+            truncated,
+        })
     })
 }
 
@@ -598,52 +694,69 @@ pub fn execute_stmt(key: &str, stmt: &str, max_rows: usize) -> Result<ExecOutcom
     with_open_conn(key, |c| execute_on(c, stmt, max_rows))
 }
 
-fn execute_on(
-    conn: &mut Connection<'static>,
-    stmt: &str,
-    max_rows: usize,
-) -> Result<ExecOutcome, String> {
-    let mut st = conn.preallocate().map_err(odbc_err)?;
-    let cursor = st.execute(stmt, ()).map_err(odbc_err)?;
-    if let Some(mut cursor) = cursor {
-        let ncols = cursor.num_result_cols().map_err(odbc_err)?;
-        let mut columns = Vec::new();
-        for i in 1..=ncols {
-            let name = cursor.col_name(i as u16).unwrap_or_else(|_| format!("col{i}"));
-            let ty = cursor
-                .col_data_type(i as u16)
-                .map(type_label)
-                .unwrap_or_default();
-            let mut m = ColMeta::new(name, ty.clone(), num_is_numeric(&ty));
-            m.writable = false;
-            columns.push(m);
-        }
-        let columns = dedup_names(columns);
+fn row_text(row: Row) -> Vec<String> {
+    row.into_iter().map(cell_text).collect()
+}
+
+/// tiberius 的结果流只暴露列与行，不带 Done 里的影响行数，所以批处理里没有
+/// 结果集时再问一次 `@@ROWCOUNT`。
+async fn affected_rows(conn: &mut Conn) -> Result<usize, String> {
+    let stream = conn
+        .simple_query("SELECT @@ROWCOUNT")
+        .await
+        .map_err(db_err)?;
+    let row = stream.into_row().await.map_err(db_err)?;
+    let n = row
+        .and_then(|r| r.into_iter().next())
+        .map(cell_text)
+        .unwrap_or_default();
+    Ok(n.trim().parse().unwrap_or(0))
+}
+
+/// 只取影响行数（写回/事务控制用）。`execute` 直接读 Done 里的行数，不占
+/// 结果流，也不用额外往返。
+fn run_affected(conn: &mut Conn, sql: &str) -> Result<usize, String> {
+    block_on(async {
+        let res = conn.execute(sql, &[]).await.map_err(db_err)?;
+        Ok(res.rows_affected().iter().sum::<u64>() as usize)
+    })
+}
+
+fn execute_on(conn: &mut Conn, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
+    block_on(async {
+        let mut stream = conn.simple_query(stmt).await.map_err(db_err)?;
+        let described = stream.columns().await.map_err(db_err)?;
+        let grid = described.map(describe_columns);
+        let Some(columns) = grid else {
+            drop(stream);
+            let affected = affected_rows(conn).await?;
+            return Ok(ExecOutcome {
+                select: None,
+                affected,
+                message: format!("{affected} rows affected"),
+            });
+        };
         let mut rows = Vec::new();
         let mut truncated = false;
-        while let Some(mut row) = cursor.next_row().map_err(odbc_err)? {
+        while let Some(item) = stream.try_next().await.map_err(db_err)? {
+            let QueryItem::Row(row) = item else {
+                continue;
+            };
+            if row.result_index() != 0 {
+                continue;
+            }
             if rows.len() >= max_rows {
                 truncated = true;
                 break;
             }
-            let mut vals = Vec::with_capacity(columns.len());
-            for i in 1..=ncols {
-                let mut buf = Vec::new();
-                let present = row.get_text(i as u16, &mut buf).map_err(odbc_err)?;
-                if present {
-                    vals.push(String::from_utf8_lossy(&buf).into_owned());
-                } else {
-                    vals.push(NULL_TEXT.to_string());
-                }
-            }
-            rows.push(vals);
+            rows.push(row_text(row));
         }
         let msg = if truncated {
             format!("结果超过 {max_rows} 行，已截断")
         } else {
             format!("{} 行", rows.len())
         };
-        return Ok(ExecOutcome {
+        Ok(ExecOutcome {
             select: Some(SelectPage {
                 columns,
                 rows,
@@ -652,14 +765,7 @@ fn execute_on(
             }),
             affected: 0,
             message: msg,
-        });
-    }
-    drop(cursor);
-    let affected = st.row_count().map_err(odbc_err)?.unwrap_or(0);
-    Ok(ExecOutcome {
-        select: None,
-        affected,
-        message: format!("{affected} rows affected"),
+        })
     })
 }
 
@@ -689,12 +795,7 @@ fn literal(meta: &ColMeta, v: &str) -> String {
 }
 
 /// 视图不能直接编辑。
-fn is_view(
-    conn: &mut Connection<'static>,
-    db: &str,
-    schema: &str,
-    table: &str,
-) -> Result<bool, String> {
+fn is_view(conn: &mut Conn, db: &str, schema: &str, table: &str) -> Result<bool, String> {
     let schema = if schema.trim().is_empty() { "dbo" } else { schema };
     let sql = format!(
         "SELECT TABLE_TYPE FROM {}INFORMATION_SCHEMA.TABLES \
@@ -745,13 +846,7 @@ pub fn apply_changes(
         };
         let table = qualify(db, schema, ch.table);
         let mut touched = 0usize;
-        execute_on(c, "BEGIN TRANSACTION", 1)?;
-        let run = |c: &mut Connection<'static>, sql: &str| -> Result<usize, String> {
-            let mut st = c.preallocate().map_err(odbc_err)?;
-            let cursor = st.execute(sql, ()).map_err(odbc_err)?;
-            drop(cursor);
-            Ok(st.row_count().map_err(odbc_err)?.unwrap_or(0))
-        };
+        run_affected(c, "BEGIN TRANSACTION")?;
         let result = (|| -> Result<(), String> {
             for (key_vals, col, val) in ch.updates {
                 let Some(meta) = ch.columns.get(*col) else {
@@ -766,7 +861,7 @@ pub fn apply_changes(
                     literal(meta, val),
                     where_part(key_vals)?
                 );
-                let n = run(c, &sql)?;
+                let n = run_affected(c, &sql)?;
                 if n == 0 {
                     return Err(
                         "按主键没找到该行（可能已被其它客户端改动或删除），请刷新".to_string()
@@ -776,7 +871,7 @@ pub fn apply_changes(
             }
             for key_vals in ch.deletes {
                 let sql = format!("DELETE FROM {table} WHERE {}", where_part(key_vals)?);
-                let n = run(c, &sql)?;
+                let n = run_affected(c, &sql)?;
                 if n == 0 {
                     return Err("按主键没找到该行（可能已被其它客户端删除），请刷新".to_string());
                 }
@@ -806,18 +901,18 @@ pub fn apply_changes(
                         .collect::<Vec<_>>()
                         .join(", ");
                     let sql = format!("INSERT INTO {table} ({names}) VALUES ({vals})");
-                    touched += run(c, &sql)?;
+                    touched += run_affected(c, &sql)?;
                 }
             }
             Ok(())
         })();
         match result {
             Ok(()) => {
-                execute_on(c, "COMMIT TRANSACTION", 1)?;
+                run_affected(c, "COMMIT TRANSACTION")?;
                 Ok(format!("{touched} rows affected"))
             }
             Err(e) => {
-                let _ = execute_on(c, "ROLLBACK TRANSACTION", 1);
+                let _ = run_affected(c, "ROLLBACK TRANSACTION");
                 Err(e)
             }
         }
@@ -856,7 +951,7 @@ pub fn create_job(p: &Params) -> Job {
 }
 
 /// 后台跑整段脚本：自己开一条连接，按 `continue_on_error` 决定是否在
-/// 第一条报错后收手。停止只在语句之间生效（ODBC 不发取消请求）。
+/// 第一条报错后收手。停止只在语句之间生效（驱动层不发取消请求）。
 pub fn run_script(
     job: &Job,
     stmts: &[String],
@@ -930,16 +1025,82 @@ mod tests {
     }
 
     #[test]
-    fn connection_string_escapes_password() {
-        let p = Params {
-            host: "h".into(),
-            port: 1433,
-            user: "sa".into(),
-            password: "a;b}c".into(),
-            dbname: String::new(),
-        };
-        let cs = connection_string(&p, "ODBC Driver 18 for SQL Server");
-        assert!(cs.contains("PWD=a{;}b}}c;"), "{cs}");
-        assert!(cs.contains("DATABASE=master;"), "{cs}");
+    fn datetime_text_matches_sql_server_display() {
+        assert_eq!(
+            fmt_datetime(TibDateTime::new(0, 0)),
+            "1900-01-01 00:00:00.000"
+        );
+        // 1/300 秒一格，展示截到毫秒
+        assert_eq!(
+            fmt_datetime(TibDateTime::new(0, 1)),
+            "1900-01-01 00:00:00.003"
+        );
+        assert_eq!(
+            fmt_datetime(TibDateTime::new(0, 300)),
+            "1900-01-01 00:00:01.000"
+        );
+        let base = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
+        let day = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let days = day.signed_duration_since(base).num_days() as i32;
+        assert_eq!(
+            fmt_datetime(TibDateTime::new(days, 0)),
+            "2024-01-02 00:00:00.000"
+        );
+    }
+
+    #[test]
+    fn smalldatetime_date_and_time_text() {
+        assert_eq!(
+            fmt_smalldatetime(SmallDateTime::new(0, 90)),
+            "1900-01-01 01:30:00"
+        );
+        assert_eq!(fmt_date(TibDate::new(0)), "0001-01-01");
+        let days = NaiveDate::from_ymd_opt(2024, 1, 2)
+            .unwrap()
+            .signed_duration_since(NaiveDate::from_ymd_opt(1, 1, 1).unwrap())
+            .num_days() as u32;
+        assert_eq!(fmt_date(TibDate::new(days)), "2024-01-02");
+        assert_eq!(
+            fmt_time(TibTime::new(45_296 * 10_000_000, 7)),
+            "12:34:56.0000000"
+        );
+        assert_eq!(
+            fmt_time(TibTime::new(45_296_1234567, 7)),
+            "12:34:56.1234567"
+        );
+        assert_eq!(
+            fmt_datetimeoffset(TibDateTimeOffset::new(
+                TibDateTime2::new(TibDate::new(0), TibTime::new(0, 7)),
+                -330
+            )),
+            "0001-01-01 00:00:00.0000000-05:30"
+        );
+    }
+
+    #[test]
+    fn cell_text_matches_driver_text() {
+        assert_eq!(cell_text(ColumnData::Bit(Some(true))), "1");
+        assert_eq!(cell_text(ColumnData::Bit(Some(false))), "0");
+        assert_eq!(cell_text(ColumnData::I32(None)), "NULL");
+        assert_eq!(
+            cell_text(ColumnData::String(Some("中文".into()))),
+            "中文"
+        );
+        let bytes = ColumnData::Binary(Some(std::borrow::Cow::Borrowed(&[0xDE, 0xAD])));
+        assert_eq!(cell_text(bytes), "0xDEAD");
+        let guid = tiberius::Uuid::from_u128(0x6f9619ff_8b86_d011_b42d_00c04fc964ff);
+        assert_eq!(
+            cell_text(ColumnData::Guid(Some(guid))),
+            "6F9619FF-8B86-D011-B42D-00C04FC964FF"
+        );
+    }
+
+    #[test]
+    fn type_labels_match_sql_server_names() {
+        assert_eq!(type_label(ColumnType::Datetime2), "DATETIME2");
+        assert_eq!(type_label(ColumnType::NVarchar), "NVARCHAR");
+        assert_eq!(type_label(ColumnType::Guid), "UNIQUEIDENTIFIER");
+        assert!(num_is_numeric(&type_label(ColumnType::Decimaln)));
+        assert!(!num_is_numeric(&type_label(ColumnType::NVarchar)));
     }
 }

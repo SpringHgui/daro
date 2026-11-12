@@ -25,6 +25,7 @@ const COLS: usize = 5;
 /// 表单页（参考界面「常规」页）的布局常量。数值来自参考截图（900×700 内容区）。
 const TABS: [&str; 7] = ["常规", "高级", "数据库", "SSL", "SSH", "HTTP", "备注"];
 const TABS_SQLITE: [&str; 5] = ["常规", "高级", "附加的数据库", "HTTP", "备注"];
+const TABS_ACCESS: [&str; 3] = ["常规", "高级", "备注"];
 const SQLITE_TYPES: [&str; 3] = ["现有的数据库文件", "新建 SQLite 3", "新建 SQLite 2"];
 const LABEL_COL_W: f32 = 172.;
 const FORM_W: f32 = 624.;
@@ -41,7 +42,7 @@ pub(crate) struct TypeTile {
 
 /// 只有接入了驱动的类型可选；其余照参考界面摆出来但置灰。
 /// 连接树底部的筛选弹层复用同一份清单（见 main.rs）。
-pub(crate) const TILES: [TypeTile; 9] = [
+pub(crate) const TILES: [TypeTile; 10] = [
     TypeTile { name: "MySQL", kind: Some(DbKind::MySql), icon: "mysql" },
     TypeTile { name: "PostgreSQL", kind: Some(DbKind::PostgreSql), icon: "postgresql" },
     TypeTile { name: "SQL Server", kind: Some(DbKind::SqlServer), icon: "sqlserver" },
@@ -51,6 +52,7 @@ pub(crate) const TILES: [TypeTile; 9] = [
     TypeTile { name: "MongoDB", kind: Some(DbKind::MongoDb), icon: "mongodb" },
     TypeTile { name: "Redis", kind: Some(DbKind::Redis), icon: "redis" },
     TypeTile { name: "Snowflake", kind: None, icon: "snowflake" },
+    TypeTile { name: "Access", kind: Some(DbKind::Access), icon: "access" },
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -347,6 +349,9 @@ impl NewConnectionDialog {
             // rusqlite 只支持 SQLite 3 文件格式，选 2 时不给保存
             return self.sqlite_new != 2 && !self.database.read(cx).value().trim().is_empty();
         }
+        if self.kind == DbKind::Access {
+            return !self.database.read(cx).value().trim().is_empty();
+        }
         !self.host.read(cx).value().trim().is_empty() && self.port.read(cx).value().parse::<u16>().is_ok()
     }
 
@@ -384,7 +389,7 @@ impl NewConnectionDialog {
             say(self, "尚未接入数据库驱动，无法测试连接".into(), cx);
             return;
         }
-        if kind == DbKind::SQLite && database.trim().is_empty() {
+        if matches!(kind, DbKind::SQLite | DbKind::Access) && database.trim().is_empty() {
             say(self, "请填写数据库文件路径".into(), cx);
             return;
         }
@@ -784,10 +789,13 @@ impl NewConnectionDialog {
     }
 
     fn tabs(&self) -> &'static [&'static str] {
-        if self.kind == DbKind::SQLite && !self.uri_mode {
-            &TABS_SQLITE
-        } else {
-            &TABS
+        if self.uri_mode {
+            return &TABS;
+        }
+        match self.kind {
+            DbKind::SQLite => &TABS_SQLITE,
+            DbKind::Access => &TABS_ACCESS,
+            _ => &TABS,
         }
     }
 
@@ -815,13 +823,20 @@ impl NewConnectionDialog {
             .px(px(0.))
             .text_size(px(12.))
             .on_click(cx.listener(|this, _, window, cx| {
-                let dialog = rfd::FileDialog::new()
-                    .set_title("选择 SQLite 数据库文件")
-                    .add_filter("SQLite 数据库", &["db", "sqlite", "sqlite3"]);
-                let picked = if this.sqlite_new == 0 {
-                    dialog.pick_file()
+                // Access 只读、不能新建库文件，永远只挑现有文件
+                let dialog = if this.kind == DbKind::Access {
+                    rfd::FileDialog::new()
+                        .set_title("选择 Access 数据库文件")
+                        .add_filter("Access 数据库", &["accdb", "mdb"])
                 } else {
+                    rfd::FileDialog::new()
+                        .set_title("选择 SQLite 数据库文件")
+                        .add_filter("SQLite 数据库", &["db", "sqlite", "sqlite3"])
+                };
+                let picked = if this.kind != DbKind::Access && this.sqlite_new != 0 {
                     dialog.set_file_name("新建数据库.db").save_file()
+                } else {
+                    dialog.pick_file()
                 };
                 if let Some(path) = picked {
                     let text = path.display().to_string();
@@ -912,6 +927,48 @@ impl NewConnectionDialog {
                             .child(ui::field_input(&self.user, self.dark, window, cx)),
                     )
                     .mt(px(8.)),
+                )
+                .child(
+                    self.form_line(
+                        "密码",
+                        div()
+                            .w(px(MID_W))
+                            .child(ui::field_input(&self.password, self.dark, window, cx)),
+                    )
+                    .mt(px(8.)),
+                )
+                .child(
+                    self.indent(ui::checkbox(
+                        "save-password",
+                        "保存密码",
+                        self.save_password,
+                        true,
+                        self.dark,
+                        cx.listener(|this, _, _, cx| {
+                            this.save_password = !this.save_password;
+                            cx.notify();
+                        }),
+                    ))
+                    .mt(px(10.)),
+                );
+        } else if self.kind == DbKind::Access {
+            // Access 只读：只挑现有的库文件；密码只给加密库用
+            body = body
+                .child(
+                    self.form_line(
+                        "数据库文件",
+                        h_flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .w(px(WIDE_W + 4. + BROWSE_W))
+                            .child(
+                                div()
+                                    .w(px(WIDE_W))
+                                    .child(ui::field_input(&self.database, self.dark, window, cx)),
+                            )
+                            .child(self.browse_button(cx)),
+                    )
+                    .mt(px(38.5)),
                 )
                 .child(
                     self.form_line(

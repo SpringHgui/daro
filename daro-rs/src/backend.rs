@@ -15,7 +15,8 @@ use crate::catalog;
 use crate::db_types::{ColMeta, ExecOutcome, GridChanges, ScriptRun, SelectPage};
 use crate::mock::{Connection, DbKind};
 use crate::{
-    mongo_driver, mysql_driver, pg_driver, redis_driver, sqlite_driver, sqlserver_driver,
+    access_driver, mongo_driver, mysql_driver, pg_driver, redis_driver, sqlite_driver,
+    sqlserver_driver,
 };
 
 /// 是否已有真驱动（决定树上要不要建连、页签要不要真取数）。
@@ -23,6 +24,7 @@ pub fn is_real(kind: DbKind) -> bool {
     matches!(
         kind,
         DbKind::SQLite
+            | DbKind::Access
             | DbKind::PostgreSql
             | DbKind::MySql
             | DbKind::SqlServer
@@ -31,12 +33,23 @@ pub fn is_real(kind: DbKind) -> bool {
     )
 }
 
+/// 引擎层是否只读（MongoDB 走游标写回，Access 是纯 Rust 解析文件页）。
+/// 网格编辑、建表 / 改表、导入、复制粘贴全部按这道门收放。
+pub fn is_read_only(kind: DbKind) -> bool {
+    matches!(kind, DbKind::MongoDb | DbKind::Access)
+}
+
 /// 这条连接走不走真库。
 ///
 /// 引擎有真驱动 ≠ 这条连接连真库：标了 `demo` 的演示条目只提供假数据，
 /// 树照样能展开看结构，但不会去连那台演示主机。
 pub fn is_real_conn(conn: &Connection) -> bool {
     is_real(conn.kind) && !conn.demo
+}
+
+/// 连接表单里的密码（空串即无密码）。Access 的加密库走这个字段。
+pub fn conn_password(conn: &Connection) -> Option<String> {
+    (!conn.password.is_empty()).then(|| conn.password.clone())
 }
 
 /// 连接表单 → PG 档位。`db` 为空时兜到维护库 `postgres`（列库清单用的就是它）。
@@ -111,6 +124,13 @@ pub enum Target {
         db: String,
         path: String,
     },
+    /// Access 档只有一个库文件：`db` 坐标（文件名的库节点）不参与寻址，
+    /// 取数直接按连接锁住的 `PageReader` 走。
+    Access {
+        conn: String,
+        path: String,
+        password: Option<String>,
+    },
     Pg {
         conn: String,
         db: String,
@@ -148,6 +168,11 @@ impl Target {
                 conn: conn.name.clone(),
                 db: db.to_string(),
                 path: catalog::sqlite_path(conn),
+            }),
+            DbKind::Access => Some(Target::Access {
+                conn: conn.name.clone(),
+                path: catalog::access_path(conn),
+                password: conn_password(conn),
             }),
             DbKind::PostgreSql => {
                 let schema = schema.trim();
@@ -200,6 +225,7 @@ impl Target {
     pub fn kind(&self) -> DbKind {
         match self {
             Target::Sqlite { .. } => DbKind::SQLite,
+            Target::Access { .. } => DbKind::Access,
             Target::Pg { .. } => DbKind::PostgreSql,
             Target::MySql { .. } => DbKind::MySql,
             Target::SqlServer { .. } => DbKind::SqlServer,
@@ -211,7 +237,7 @@ impl Target {
     /// MySQL 一条连接看全部库，键就是连接名）。
     fn keyed(&self) -> String {
         match self {
-            Target::Sqlite { conn, .. } => conn.clone(),
+            Target::Sqlite { conn, .. } | Target::Access { conn, .. } => conn.clone(),
             Target::Pg { conn, db, .. } => pg_driver::key(conn, db),
             Target::MySql { conn, .. } | Target::SqlServer { conn, .. } | Target::Mongo { conn, .. } => {
                 conn.clone()
@@ -224,6 +250,8 @@ impl Target {
     pub(crate) fn space(&self) -> &str {
         match self {
             Target::Sqlite { db, .. } => db,
+            // Access 没有库 / 模式限定：表名就是表名
+            Target::Access { .. } => "",
             Target::Pg { schema, .. } => schema,
             Target::MySql { db, .. } => db,
             Target::SqlServer { schema, .. } => schema,
@@ -237,6 +265,8 @@ impl Target {
         match self {
             Target::MySql { .. } => format!("`{}`", ident.replace('`', "``")),
             Target::SqlServer { .. } => sqlserver_driver::quote_ident(ident),
+            // Access 的标识符用方括号，内部 `]` 双写；只用于状态栏展示的 SQL
+            Target::Access { .. } => format!("[{}]", ident.replace(']', "]]")),
             _ => format!("\"{}\"", ident.replace('"', "\"\"")),
         }
     }
@@ -265,6 +295,9 @@ impl Target {
     fn ensure(&self) -> Result<(), String> {
         match self {
             Target::Sqlite { conn, path, .. } => sqlite_driver::ensure(conn, path),
+            Target::Access {
+                conn, path, password, ..
+            } => access_driver::ensure(conn, path, password.as_deref()),
             Target::Pg { params, .. } => pg_driver::ensure(&self.keyed(), params),
             Target::MySql { params, .. } => mysql_driver::ensure(&self.keyed(), params),
             Target::SqlServer { params, .. } => sqlserver_driver::ensure(&self.keyed(), params),
@@ -276,6 +309,7 @@ impl Target {
     pub fn row_limit(&self) -> usize {
         match self {
             Target::Sqlite { .. } => sqlite_driver::QUERY_ROW_LIMIT,
+            Target::Access { .. } => access_driver::QUERY_ROW_LIMIT,
             Target::Pg { .. } => pg_driver::QUERY_ROW_LIMIT,
             Target::MySql { .. } => mysql_driver::QUERY_ROW_LIMIT,
             Target::SqlServer { .. } => sqlserver_driver::QUERY_ROW_LIMIT,
@@ -345,6 +379,9 @@ impl Target {
                 offset,
                 limit,
             ),
+            // Access 没有可下推的 WHERE / ORDER BY：页签走整表物化 + 本地筛选
+            // 排序（见界面 `load_table_page`），这里只按偏移交付数据。
+            Target::Access { conn, .. } => access_driver::select_page(conn, table, offset, limit),
         }
     }
 
@@ -372,6 +409,8 @@ impl Target {
             Target::Mongo { db, params, .. } => {
                 mongo_driver::count_docs(&self.keyed(), params, db, table)
             }
+            // 行数取表头缓存；本地筛选下的计数由界面按物化行算
+            Target::Access { conn, .. } => access_driver::count_rows(conn, table),
         }
     }
 
@@ -415,6 +454,8 @@ impl Target {
             Target::Mongo { db, .. } => {
                 mongo_driver::page_sql(db, table, orders, limit, offset)
             }
+            // Access 不跑 SQL：状态栏只展示等价的「整表读取」
+            Target::Access { .. } => format!("SELECT * FROM {}", self.qualified_table(table)),
         }
     }
 
@@ -435,6 +476,7 @@ impl Target {
             Target::SqlServer {
                 schema, params, ..
             } => sqlserver_driver::all_columns_by_table(&self.keyed(), params, schema),
+            Target::Access { conn, .. } => access_driver::all_columns_by_table(conn),
             // MongoDB 没有固定列：补全只能按集合名做，列名留给网格按文档现算
             Target::Mongo { .. } => Vec::new(),
         }
@@ -454,7 +496,8 @@ impl Target {
         match self {
             Target::Sqlite { .. } => format!("EXPLAIN QUERY PLAN {stmt}"),
             Target::SqlServer { .. } => format!("SET SHOWPLAN_ALL ON; {stmt}"),
-            Target::Mongo { .. } => stmt.to_string(),
+            // Access 不执行 SQL，没有可解释的执行计划
+            Target::Access { .. } | Target::Mongo { .. } => stmt.to_string(),
             Target::Pg { .. } | Target::MySql { .. } => format!("EXPLAIN {stmt}"),
         }
     }
@@ -470,10 +513,13 @@ impl Target {
             }
             Target::SqlServer { .. } => sqlserver_driver::execute_stmt(&self.keyed(), stmt, max_rows),
             Target::Mongo { .. } => Err("MongoDB 不支持 SQL 语句执行，请使用集合浏览".to_string()),
+            Target::Access { .. } => {
+                Err("Access 连接为只读，不支持执行 SQL 语句".to_string())
+            }
         }
     }
 
-    /// 网格工作集写回。MongoDB 只读。
+    /// 网格工作集写回。MongoDB / Access 只读。
     pub fn apply(&self, ch: &GridChanges<'_>) -> Result<String, String> {
         self.ensure()?;
         match self {
@@ -484,6 +530,7 @@ impl Target {
                 db, schema, params, ..
             } => sqlserver_driver::apply_changes(&self.keyed(), params, db, schema, ch),
             Target::Mongo { .. } => Err("MongoDB 连接为只读，暂不支持写回".to_string()),
+            Target::Access { .. } => Err("Access 连接为只读，暂不支持写回".to_string()),
         }
     }
 
@@ -492,7 +539,7 @@ impl Target {
     pub fn background_ok(&self) -> bool {
         match self {
             Target::Sqlite { path, .. } => !sqlite_driver::is_memory_path(path),
-            Target::Mongo { .. } => false,
+            Target::Access { .. } | Target::Mongo { .. } => false,
             _ => true,
         }
     }
@@ -505,7 +552,7 @@ impl Target {
             Target::SqlServer { params, .. } => {
                 Job::SqlServer(sqlserver_driver::create_job(params))
             }
-            Target::Mongo { .. } => Job::Unsupported,
+            Target::Access { .. } | Target::Mongo { .. } => Job::Unsupported,
         }
     }
 
@@ -548,6 +595,15 @@ impl Target {
                     continue_on_error,
                 )
             }
+            // Access 只读：脚本入口在功能区就被置灰，这里兜住直接调用
+            (Target::Access { .. }, _) => ScriptRun {
+                runs: Vec::new(),
+                open_error: Some("Access 连接为只读，不支持运行 SQL 脚本".to_string()),
+                cancelled: false,
+                rolled_back: false,
+                aborted_tx: false,
+                total_ms: 0,
+            },
             // 页签挂的任务和后端不配套（改过连接类型没重开）：当作没跑成
             _ => ScriptRun {
                 runs: Vec::new(),
@@ -568,7 +624,11 @@ impl Target {
             Target::Sqlite { conn, .. } => {
                 sqlite_driver::in_transaction(conn) && sqlite_driver::rollback_if_open(conn)
             }
-            Target::Pg { .. } | Target::MySql { .. } | Target::SqlServer { .. } | Target::Mongo { .. } => false,
+            Target::Pg { .. }
+            | Target::MySql { .. }
+            | Target::SqlServer { .. }
+            | Target::Mongo { .. }
+            | Target::Access { .. } => false,
         }
     }
 }
@@ -629,6 +689,7 @@ pub fn close_connection(conn: &Connection) {
 pub fn close_named(conn: &str, kind: DbKind) {
     match kind {
         DbKind::SQLite => sqlite_driver::close(conn),
+        DbKind::Access => access_driver::close(conn),
         DbKind::PostgreSql => pg_driver::close_prefix(conn),
         DbKind::MySql => mysql_driver::close(conn),
         DbKind::SqlServer => sqlserver_driver::close_prefix(conn),
@@ -647,6 +708,8 @@ pub fn rename_connection(old_name: &str, new_name: &str, kind: DbKind, path: &st
                 let _ = sqlite_driver::open(new_name, path);
             }
         }
+        // Access 句柄不带参数：关掉即可，下次取数按新名字惰性重开
+        DbKind::Access => access_driver::close(old_name),
         DbKind::PostgreSql => pg_driver::close_prefix(old_name),
         DbKind::MySql => mysql_driver::close(old_name),
         DbKind::SqlServer => sqlserver_driver::close_prefix(old_name),
@@ -670,6 +733,13 @@ pub fn open_connection(conn: &Connection) -> Result<(), String> {
             }
             sqlite_driver::open(&conn.name, &path)
         }
+        DbKind::Access => {
+            let path = catalog::access_path(conn);
+            if path.is_empty() {
+                return Err("连接没有数据库文件路径".to_string());
+            }
+            access_driver::open(&conn.name, &path, conn_password(conn).as_deref())
+        }
         DbKind::PostgreSql => {
             let params = pg_params(conn, &conn.database);
             let key = pg_driver::key(&conn.name, &params.dbname);
@@ -691,6 +761,9 @@ pub fn probe(conn: &Connection) -> Result<(), String> {
     }
     match conn.kind {
         DbKind::SQLite => sqlite_driver::probe(&catalog::sqlite_path(conn)),
+        DbKind::Access => {
+            access_driver::probe(&catalog::access_path(conn), conn_password(conn).as_deref())
+        }
         DbKind::PostgreSql => pg_driver::probe(&pg_params(conn, &conn.database)),
         DbKind::MySql => mysql_driver::probe(&mysql_params(conn)),
         DbKind::SqlServer => sqlserver_driver::probe(&sqlserver_params(conn, &conn.database)),
