@@ -7491,6 +7491,10 @@ struct DaroApp {
     /// 对象页 Ctrl+C 复制的非表对象（视图 / 实体化视图 / 函数 / 查询）：源上下文
     /// + 分类 + 名字。None = 剪贴板里没有这类对象。表走 [Self::table_clip]。
     object_clip: Option<object_copy::ObjectClip>,
+    /// 帧尾待执行的「对象粘贴」批次（视图 / 实体化视图 / 函数）。由
+    /// [Self::paste_objects_at] 在确认落点时挂入，[Self::pump_object_copies]
+    /// 在帧尾统一投到后台（内存库同步）。与 [Self::table_copies] 平行。
+    object_copies: Vec<object_copy::CopyJob>,
     /// 状态栏左侧的一次性反馈（已复制 / 已粘贴 N 张表）；None = 显示默认统计。
     pane_note: Option<String>,
     list_view: bool,
@@ -7883,6 +7887,7 @@ impl DaroApp {
             table_clip: None,
             table_copies: Vec::new(),
             object_clip: None,
+            object_copies: Vec::new(),
             pane_note: None,
             list_view,
             show_info,
@@ -9560,12 +9565,12 @@ impl DaroApp {
         let Some(src) = backend::Target::of(src_conn, &clip.db, &clip.schema) else {
             return;
         };
-        let Some(dst) = backend::Target::of(conn, db, schema) else {
+        let Some(dst) = backend::Target::of(conn, db, &schema) else {
             return;
         };
         // 同库粘贴时源对象本身就在目标清单里，先塞进去让规划器直接挑 `_copy`。
         let same_ctx = clip.conn == conn.name && clip.db == db && clip.schema == schema;
-        let mut existing: Vec<String> = catalog::objects(conn, db, schema, clip.cat)
+        let mut existing: Vec<String> = catalog::objects(conn, db, &schema, clip.cat)
             .iter()
             .map(|n| n.to_string())
             .collect();
@@ -9577,42 +9582,65 @@ impl DaroApp {
             &clip.names,
             table_copy::name_limit(conn.kind),
         );
-        // 远端库丢到后台跑整段（读定义 + 建副本），内存库同步跑。
-        if dst.background_ok() && src.background_ok() {
-            let work_src = src.clone();
-            let work_dst = dst.clone();
-            let items = planned.clone();
-            let cat = clip.cat;
-            let conn_name = conn.name.clone();
-            let db_s = db.to_string();
-            let schema_s = schema.clone();
-            let win = cx.window_handle();
-            let entity = cx.entity().downgrade();
+        // 真正执行延到帧尾 pump_object_copies：远端库在后台线程跑整段
+        // （读定义 + 建副本），内存库在 pump 里同步跑。这里只把任务挂起，
+        // 不占用 UI 线程，也不需 window 句柄（沿用泵模式，与表复制一致）。
+        self.object_copies.push(object_copy::CopyJob {
+            src,
+            dst,
+            items: planned,
+            cat: clip.cat,
+            conn_name: conn.name.clone(),
+            db: db.to_string(),
+            schema: schema.clone(),
+        });
+    }
+
+    /// 帧尾把对象粘贴任务投到后台：整批串行跑，回执一次落地（成功只改状态栏，
+    /// 失败列成一张清单，不按对象弹一串窗口）。与 [Self::pump_table_copies] 同构。
+    fn pump_object_copies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let jobs = std::mem::take(&mut self.object_copies);
+        if jobs.is_empty() {
+            return;
+        }
+        let win = window.window_handle();
+        let entity = cx.entity().downgrade();
+        for job in jobs {
+            // 内存库只活在 UI 线程那条连接上，换线程打开是空库，只能同步跑。
+            if !job.dst.background_ok() {
+                let results =
+                    object_copy::run_copies(&job.src, &job.dst, &job.items, job.cat);
+                self.object_paste_done(
+                    &job.conn_name,
+                    &job.db,
+                    &job.schema,
+                    job.cat,
+                    results,
+                    cx,
+                );
+                continue;
+            }
+            let work = job.clone();
+            let ent = entity.clone();
+            let conn_name = job.conn_name.clone();
+            let db = job.db.clone();
+            let schema = job.schema.clone();
+            let cat = job.cat;
             cx.spawn(async move |_, cx| {
                 let results = cx
                     .background_executor()
                     .spawn(async move {
-                        object_copy::run_copies(&work_src, &work_dst, &items, cat)
+                        object_copy::run_copies(&work.src, &work.dst, &work.items, work.cat)
                     })
                     .await;
                 let _ = win.update(cx, |_, _, app| {
-                    let Some(ent) = entity.upgrade() else { return };
+                    let Some(ent) = ent.upgrade() else { return };
                     ent.update(app, |a, cx| {
-                        a.object_paste_done(&conn_name, &db_s, &schema_s, cat, results, cx)
+                        a.object_paste_done(&conn_name, &db, &schema, cat, results, cx)
                     });
                 });
             })
             .detach();
-        } else {
-            let results = object_copy::run_copies(&src, &dst, &planned, clip.cat);
-            self.object_paste_done(
-                &conn.name,
-                db,
-                &schema,
-                clip.cat,
-                results,
-                cx,
-            );
         }
     }
 
@@ -9700,7 +9728,7 @@ impl DaroApp {
             let s = if schema.is_empty() {
                 NO_SCHEMA
             } else {
-                catalog::schemas(&self.conns[c], db)
+                catalog::schemas(&self.conns[c], &db)
                     .iter()
                     .position(|x| *x == schema)
                     .unwrap_or(NO_SCHEMA)
@@ -9725,7 +9753,6 @@ impl DaroApp {
         if !object_copy::object_copy_ready(conn, cat) {
             return;
         }
-        let noun = CATEGORIES[cat].0;
         if cat == 4 {
             // 查询是本地 SQL 片段，直接复制条目，不需要真库连接。
             let existing: Vec<String> = self
@@ -9780,11 +9807,17 @@ impl DaroApp {
         .unwrap_or_else(|| format!("{name}_copy"));
         let dark = self.dark;
         let (c, d, s) = (conn_name.clone(), db.clone(), schema.clone());
+        let (title, label) = match cat {
+            1 => ("复制视图", "新视图名"),
+            2 => ("复制实体化视图", "新实体化视图名"),
+            3 => ("复制函数", "新函数名"),
+            _ => ("复制对象", "新对象名"),
+        };
         open_text_prompt(
             cx.entity(),
             dark,
-            format!("复制{noun}"),
-            format!("新{noun}名"),
+            title,
+            label,
             planned,
             move |app, new_name| {
                 let new_name = new_name.trim().to_string();
@@ -30212,6 +30245,10 @@ impl Render for DaroApp {
         cx.defer_in(window, |this, window, cx| {
             this.pump_table_copies(window, cx)
         });
+        // 对象（视图 / 实体化视图 / 函数）粘贴批次同样在帧尾起后台任务
+        cx.defer_in(window, |this, window, cx| {
+            this.pump_object_copies(window, cx)
+        });
         let (bg, fg) = {
             let t = cx.theme();
             (t.background, t.foreground)
@@ -42278,11 +42315,12 @@ fn copy_object_menu_item(
     me: &Entity<DaroApp>,
     act: Act,
     label: &'static str,
+    cx: &mut Context<PopupMenu>,
 ) -> PopupMenuItem {
     let ready = {
         let app = me.read(cx);
         let Some((conn, _, _, cat, _)) = app.object_ref(act) else {
-            false
+            return todo_item(label);
         };
         app.conns
             .iter()
@@ -44614,7 +44652,7 @@ fn obj_menu(
         }));
         menu = menu
             .item(table_ddl_item(&me, act, table_ops::TableOp::Drop, cx))
-            .item(copy_object_menu_item(&me, act, "复制视图"))
+            .item(copy_object_menu_item(&me, act, "复制视图", cx))
             .item(todo_item("设置权限"));
         menu = menu.separator();
         menu = menu
@@ -44639,7 +44677,7 @@ fn obj_menu(
             me_new.update(cx, |app, cx| app.open_new_designer(act, window, cx));
         }));
         menu = menu
-            .item(copy_object_menu_item(&me, act, "复制实体化视图"))
+            .item(copy_object_menu_item(&me, act, "复制实体化视图", cx))
             .item(todo_item("删除实体化视图"))
             .item(todo_item("设置权限"));
         menu = menu.separator();
@@ -44658,7 +44696,7 @@ fn obj_menu(
             me_new.update(cx, |app, cx| app.open_new_designer(act, window, cx));
         }));
         menu = menu
-            .item(copy_object_menu_item(&me, act, "复制函数"))
+            .item(copy_object_menu_item(&me, act, "复制函数", cx))
             .item(todo_item("删除函数"))
             .item(todo_item("运行函数"))
             .item(todo_item("设置权限"));
@@ -44690,7 +44728,7 @@ fn obj_menu(
                 });
             }));
             menu = menu
-                .item(copy_object_menu_item(&me, act, "复制查询"))
+                .item(copy_object_menu_item(&me, act, "复制查询", cx))
                 .item(todo_item(format!("新建{kind}")))
                 .item(todo_item("设置权限"));
         } else {
@@ -48395,14 +48433,12 @@ mod designer_tests {
         })
         .unwrap();
 
-        // 候选列下标：勾掉首列、给 name 列填前缀长度
+        // 候选列下标：勾上首列（id 原本不在索引里）、给 name 列填前缀长度
         let (ix_first, ix_name) = app.update(cx, |a, _| {
             let d = a.opened[0].dstate.as_ref().unwrap();
             let p = d.popup.as_ref().unwrap();
-            (
-                0usize,
-                p.items.iter().position(|(n, _)| n == "name").unwrap(),
-            )
+            let pos = |want: &str| p.items.iter().position(|(n, _)| n == want).unwrap();
+            (pos("id"), pos("name"))
         });
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
@@ -48414,11 +48450,12 @@ mod designer_tests {
         })
         .unwrap();
 
-        // 草稿不该提前改模型：勾掉的首列仍在、前缀长度还没落进字段
+        // 草稿不该提前改模型：勾上的首列没进索引、前缀长度还没落进字段
         app.update(cx, |a, _| {
             let d = a.opened[0].dstate.as_ref().unwrap();
             let p = d.popup.as_ref().unwrap();
-            assert!(!p.items[ix_first].1, "列表里已取消勾选");
+            assert!(p.items[ix_first].1, "列表里已勾上");
+            assert!(p.items[ix_name].1, "name 列保持勾选");
             assert_eq!(
                 d.indexes[0].fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
                 vec!["org_id", "name"],
@@ -48441,15 +48478,15 @@ mod designer_tests {
                 .collect();
             assert_eq!(
                 fields,
-                vec![("org_id", ""), ("name", "8")],
-                "按列表顺序写回，取消勾选的那列掉出去"
+                vec![("id", ""), ("org_id", ""), ("name", "8")],
+                "按列表顺序写回，新勾的列补在位"
             );
             assert!(d.popup.is_none(), "确定后对话框收掉");
             // 格子里的摘要带上前缀长度，DDL 也一样
-            assert_eq!(d.indexes[0].fields[1].summary_mysql(), "`name`(8)");
+            assert_eq!(d.indexes[0].fields[2].summary_mysql(), "`name`(8)");
             let sql = design_index_sql_at(true, "", "users", &d.indexes[0], &d.cols)
                 .unwrap_or_default();
-            assert!(sql.contains("(`org_id`, `name`(8))"), "{sql}");
+            assert!(sql.contains("(`id`, `org_id`, `name`(8))"), "{sql}");
         });
 
         // 索引类型换成 FULLTEXT：关键字顶上，USING 不再跟，唯一位跟着清掉
@@ -48464,10 +48501,23 @@ mod designer_tests {
             assert!(!sql.contains("USING"), "{sql}");
         });
 
-        // 再开一次：子部分回填进输入框；这一轮点取消，草稿丢掉、模型保持原样
+        // 再开一次：已存的前缀长度回填进输入框
         cx.update_window(handle, |_, window, cx| {
             window.click("idx-cell/0/1", cx);
             window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, cx| {
+            let d = a.opened[0].dstate.as_ref().unwrap();
+            let p = d.popup.as_ref().unwrap();
+            let draft = p.subs[ix_name]
+                .as_ref()
+                .map(|s| s.read(cx).value().to_string())
+                .unwrap_or_default();
+            assert_eq!(draft, "8", "重开对话框时前缀长度回填进输入框");
+        });
+        // 这一轮改完点取消：草稿丢掉、模型保持原样
+        cx.update_window(handle, |_, window, cx| {
             window.click(rid(&format!("idx-sub/{ix_name}")), cx);
             window.press("ctrl-a", cx);
             window.input("32", cx);
@@ -48478,7 +48528,7 @@ mod designer_tests {
         app.update(cx, |a, _| {
             let d = a.opened[0].dstate.as_ref().unwrap();
             assert!(d.popup.is_none(), "取消关掉对话框");
-            assert_eq!(d.indexes[0].fields[1].sub_part, "8", "取消不吃草稿");
+            assert_eq!(d.indexes[0].fields[2].sub_part, "8", "取消不吃草稿");
         });
     }
 

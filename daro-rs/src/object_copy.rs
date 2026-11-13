@@ -36,6 +36,21 @@ impl ObjectClip {
     }
 }
 
+/// 一次对象粘贴的任务描述：源 / 目标库定位 + 命名好的（源名 → 目标名）清单。
+///
+/// 真正执行延到帧尾的 `pump_object_copies`（在后台线程跑「读定义 + 建副本」），
+/// 内存库则在 pump 里同步跑。这里只把任务挂起，避免占用 UI 线程。
+#[derive(Clone)]
+pub struct CopyJob {
+    pub src: Target,
+    pub dst: Target,
+    pub items: Vec<(String, String)>,
+    pub cat: usize,
+    pub conn_name: String,
+    pub db: String,
+    pub schema: String,
+}
+
 /// 读取一个对象的完整 CREATE 语句（方言系统表）。取不到返回 None。
 ///
 /// `cat` 含义同上；`name` 是对象的（不带模式前缀的）短名。返回的文本已经是
@@ -43,7 +58,7 @@ impl ObjectClip {
 pub fn fetch_ddl(tg: &Target, cat: usize, name: &str) -> Option<String> {
     match (tg, cat) {
         // SQLite 的视图与实体化视图都落在 sqlite_master 的 type='view' 里。
-        (Target::Sqlite { conn, .. }, 1) | (Target::Sqlite { conn, .. }, 2) => {
+        (Target::Sqlite { .. }, 1) | (Target::Sqlite { .. }, 2) => {
             let sql = format!(
                 "SELECT COALESCE(sql, '') FROM sqlite_master \
                  WHERE type = 'view' AND name = {}",
@@ -160,7 +175,10 @@ pub fn rename_ddl(ddl: &str, newname: &str, tg_dst: &Target) -> Result<String, S
             end = e2;
         }
     }
-    let replacement = tg_dst.qualified_table(newname);
+    // 用「命名空间.新名」重建：MySQL 是 库.表、PG / SQL Server 是 模式.对象，
+    // 统一不带「库」前缀（SQL Server 的 DDL 里对象名只到 模式.对象 两级，
+    // 多出的库前缀反而会让 CREATE 指向错库甚至语法报警）。
+    let replacement = format!("{}{}", tg_dst.qualified_prefix(), tg_dst.quote(newname));
     Ok(format!("{}{}{}", &ddl[..start], replacement, &ddl[end..]))
 }
 
@@ -310,8 +328,8 @@ pub fn object_copy_ready(conn: &crate::mock::Connection, cat: usize) -> bool {
         4 => true,
         // 视图 / 实体化视图 / 函数：要读定义再重建，需要真库连接且引擎有这条路。
         1 | 2 | 3 => {
-            backend::is_real_conn(conn)
-                && !backend::is_read_only(conn.kind)
+            crate::backend::is_real_conn(conn)
+                && !crate::backend::is_read_only(conn.kind)
                 && matches!(
                     conn.kind,
                     DbKind::SQLite | DbKind::PostgreSql | DbKind::MySql | DbKind::SqlServer
