@@ -39,6 +39,7 @@ mod sql_format;
 mod sql_highlight;
 mod sql_preview;
 mod table_copy;
+mod object_copy;
 mod table_ops;
 mod table_paste_dialog;
 mod ui;
@@ -264,6 +265,15 @@ const D_PARAM_WIDTHS: [f32; 5] = [150., 130., 96., 160., 30.];
 /// 索引子页主表格列宽：名称 / 字段 / 索引方法 / 唯一键 / 并发 / 注释
 /// （照参考界面 1:1 量：273/589/185/112/148/314 物理像素 ÷ 1.75 后按窗口宽度压一档）
 const D_INDEX_WIDTHS: [f32; 6] = [148., 300., 96., 58., 80., 168.];
+/// MySQL 索引子页主表格列宽：名称 / 字段 / 索引类型 / 索引方法 / 注释
+/// （参考界面 1:1 量：格线在 68/370/972/1174/1311 物理像素，÷2 后取整）
+const D_MY_INDEX_WIDTHS: [f32; 5] = [151., 301., 101., 68., 168.];
+/// MySQL 索引「字段」对话框：行首槽 / 勾选列 / 名称 / 子部分
+/// （参考界面格线 353/407/449/1181/1311 物理像素 ÷2 = 27/21/366/65，整宽 479）
+const D_MY_IDX_POPUP_W: f32 = 479.;
+const D_MY_IDX_POPUP_COLS: [f32; 4] = [27., 21., 366., 65.];
+/// MySQL 字段格右缘的「…」按钮宽（参考界面 36 物理像素 ÷2）
+const D_MY_IDX_MORE_W: f32 = 18.;
 /// 索引「字段」浮层（参考界面点「字段」格弹出的小表格）整体宽
 /// （七列 700 + 每列 1px 网格线，留 10px 余量免得最后一列被裁）
 const D_IDX_POPUP_W: f32 = 710.;
@@ -2034,6 +2044,8 @@ struct IndexField {
     sort: String,
     /// Nulls 排序（NULLS FIRST / NULLS LAST）
     nulls: String,
+    /// 子部分（MySQL 的前缀长度，DDL 里的 `` `col`(n) ``）；PG 不用
+    sub_part: String,
 }
 
 /// 类型的默认运算符类别：参考界面里 int8 行是 int8_ops、varchar 行是 text_ops。
@@ -2079,6 +2091,7 @@ impl IndexField {
             opclass: index_default_opclass(ty).into(),
             sort: "ASC".into(),
             nulls: "NULLS LAST".into(),
+            sub_part: String::new(),
         }
     }
 
@@ -2122,6 +2135,23 @@ impl IndexField {
         }
         s
     }
+
+    /// 「子部分」只在填了正整数时才作数（格子摘要与 DDL 同一口径）。
+    fn sub_part_len(&self) -> Option<u32> {
+        self.sub_part.trim().parse::<u32>().ok().filter(|n| *n > 0)
+    }
+
+    /// MySQL 版摘要：参考界面「字段」格只列反引号列名，带前缀长度时跟 `(n)`。
+    fn summary_mysql(&self) -> String {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return String::new();
+        }
+        match self.sub_part_len() {
+            Some(n) => format!("`{name}`({n})"),
+            None => format!("`{name}`"),
+        }
+    }
 }
 
 /// 一条索引里的一列在 DDL 里的写法（不含表名）。
@@ -2134,6 +2164,12 @@ fn index_field_sql(is_mysql: bool, f: &IndexField, ty: &str) -> String {
     } else {
         format!("\"{name}\"")
     };
+    if is_mysql {
+        // 「子部分」= 前缀长度，只在填了正整数时写成 `col`(n)
+        if let Some(n) = f.sub_part_len() {
+            s.push_str(&format!("({n})"));
+        }
+    }
     if !is_mysql {
         let coll = f.collation.trim();
         if !coll.is_empty() && coll != "default" {
@@ -2199,6 +2235,9 @@ struct DesignIndex {
     /// 索引方法（B-Tree / Hash / GiST / GIN / BRIN / SP-GiST），空 = 默认
     method: String,
     unique: bool,
+    /// MySQL 参考界面的「索引类型」：NORMAL / UNIQUE / FULLTEXT / SPATIAL。
+    /// 空 = 按 `unique` 推断（旧存档与只填过方法的索引仍走原口径）。
+    kind: String,
     /// 并发建索引（PG 的 CREATE INDEX CONCURRENTLY）
     concurrent: bool,
     comment: String,
@@ -2220,6 +2259,7 @@ impl Default for DesignIndex {
             fields: Vec::new(),
             method: String::new(),
             unique: false,
+            kind: String::new(),
             concurrent: false,
             comment: String::new(),
             tablespace: String::new(),
@@ -2230,6 +2270,37 @@ impl Default for DesignIndex {
             pages_per_range: String::new(),
             constraint: String::new(),
         }
+    }
+}
+
+/// MySQL「索引类型」的取值：NORMAL / UNIQUE / FULLTEXT / SPATIAL。
+/// 没填时按老口径推断（勾选唯一 → UNIQUE，方法写成 FULLTEXT / SPATIAL → 跟着走），
+/// 免得旧存档与只填过方法的索引生成出错 DDL。
+fn mysql_index_kind(idx: &DesignIndex) -> String {
+    let k = idx.kind.trim().to_ascii_uppercase();
+    if matches!(k.as_str(), "NORMAL" | "UNIQUE" | "FULLTEXT" | "SPATIAL") {
+        return k;
+    }
+    let m = idx.method.trim().to_ascii_uppercase();
+    if m == "FULLTEXT" || m == "SPATIAL" {
+        m
+    } else if idx.unique {
+        "UNIQUE".into()
+    } else {
+        "NORMAL".into()
+    }
+}
+
+/// MySQL「索引方法」列显示值：没填时普通/唯一索引按默认 BTREE，
+/// 全文与空间索引没有方法可选，留空（参考界面也是空的）。
+fn mysql_index_method_label(idx: &DesignIndex) -> String {
+    let m = idx.method.trim().to_ascii_uppercase();
+    if !m.is_empty() {
+        return m;
+    }
+    match mysql_index_kind(idx).as_str() {
+        "FULLTEXT" | "SPATIAL" => String::new(),
+        _ => "BTREE".to_string(),
     }
 }
 
@@ -2273,18 +2344,34 @@ fn design_index_sql_at(
         .iter()
         .map(|f| index_field_sql(is_mysql, f, ty_of(f.name.trim())))
         .collect();
-    let unique = if idx.unique { "UNIQUE " } else { "" };
     let concurrently = if !is_mysql && idx.concurrent {
         "CONCURRENTLY "
     } else {
         ""
     };
-    // MySQL 的 FULLTEXT / SPATIAL 是 INDEX 前面的关键字，不跟 USING
-    let method = idx.method.trim().to_ascii_uppercase();
-    let (prefix, using) = if is_mysql && (method == "FULLTEXT" || method == "SPATIAL") {
-        (format!("{method} "), String::new())
+    // MySQL 按参考界面的「索引类型」出 DDL：UNIQUE / FULLTEXT / SPATIAL 都是
+    // INDEX 前面的关键字，且 FULLTEXT / SPATIAL 不跟 USING。
+    let (unique, prefix, using) = if is_mysql {
+        let kind = mysql_index_kind(idx);
+        let special = if kind == "FULLTEXT" || kind == "SPATIAL" {
+            format!("{kind} ")
+        } else {
+            String::new()
+        };
+        (
+            if kind == "UNIQUE" { "UNIQUE " } else { "" },
+            special.clone(),
+            if special.is_empty() {
+                index_method_sql(&idx.method)
+                    .map(|m| format!(" USING {m}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
+        )
     } else {
         (
+            if idx.unique { "UNIQUE " } else { "" },
             String::new(),
             index_method_sql(&idx.method)
                 .map(|m| format!(" USING {m}"))
@@ -3011,7 +3098,7 @@ fn read_mysql_design(
         tg,
         &format!(
             "SELECT INDEX_NAME, COALESCE(COLUMN_NAME, ''), NON_UNIQUE, INDEX_TYPE, \
-             COALESCE(COLLATION, '') \
+             COALESCE(COLLATION, ''), COALESCE(SUB_PART, '') \
              FROM information_schema.STATISTICS \
              WHERE TABLE_SCHEMA = '{dbl}' AND TABLE_NAME = '{tbl}' \
                AND INDEX_NAME <> 'PRIMARY' \
@@ -3044,9 +3131,14 @@ fn read_mysql_design(
         }
         let entry = idx_map.entry(name.clone()).or_insert_with(|| {
             idx_order.push(name.clone());
+            // INDEX_TYPE 一列同时承载「索引方法」和「索引类型」：
+            // BTREE / HASH 是方法，FULLTEXT / SPATIAL 是类型（此时没有方法）。
+            let t = r[3].trim().to_ascii_uppercase();
+            let special = t == "FULLTEXT" || t == "SPATIAL";
             DesignIndex {
                 name,
-                method: r[3].clone(),
+                method: if special { String::new() } else { t.clone() },
+                kind: if special { t } else { String::new() },
                 ..Default::default()
             }
         });
@@ -3055,6 +3147,9 @@ fn read_mysql_design(
         f.collation.clear();
         f.opclass_schema.clear();
         f.opclass.clear();
+        if r.len() >= 6 {
+            f.sub_part = r[5].trim().to_string();
+        }
         if r[4].eq_ignore_ascii_case("D") {
             f.sort = "DESC".into();
         }
@@ -4825,6 +4920,8 @@ pub(crate) struct DesignPopup {
     pub(crate) sel: usize,
     /// 检查约束的「表达式」面板：多行输入框（参考界面是一个空文本域 + 确定/取消）
     pub(crate) expr: Option<Entity<TextareaState>>,
+    /// MySQL 索引「字段」面板的「子部分」草稿（与 items 一一对应，确定才写回模型）
+    pub(crate) subs: Vec<Option<Entity<InputState>>>,
 }
 
 /// 最小校验：列名 / 索引 / 外键 / 唯一键 / 检查的必填与查重。返回 None 表示完整。
@@ -5590,7 +5687,7 @@ fn dollar_quote_tag(s: &str) -> Option<String> {
 }
 
 /// mock 档判断语句是否会「出结果网格」：SELECT / WITH / SHOW 开头。
-/// 其余语句 mock 不执行写操作，结果页签留白、消息页说明。
+/// 其余语句 mock 不执行写操作，没有结果页签，只在消息 / 摘要页回报。
 fn query_is_select(stmt: &str) -> bool {
     let head: String = stmt
         .trim_start()
@@ -6908,8 +7005,8 @@ fn new_filter_editor(
     state
 }
 
-/// 一条语句的 mock 执行结果。结果面板每条语句一个页签（同 pgAdmin /
-/// Flutter 版）：SELECT 出网格，写操作留白、消息页说明。
+/// 一条语句的执行结果（本轮进 `outcomes` 供消息 / 摘要统计）。只有带结果网格
+/// 的语句才在结果面板占一个页签；SELECT 出网格，写操作 / 出错只进消息与摘要。
 #[derive(Clone)]
 struct QueryOutcome {
     /// 语句原文（消息页回显用）
@@ -7391,6 +7488,9 @@ struct DaroApp {
     table_clip: Option<table_copy::TableClip>,
     /// 已确认的粘贴批次（可能多张表）：帧尾和表操作一起投到后台。
     table_copies: Vec<table_copy::CopyBatch>,
+    /// 对象页 Ctrl+C 复制的非表对象（视图 / 实体化视图 / 函数 / 查询）：源上下文
+    /// + 分类 + 名字。None = 剪贴板里没有这类对象。表走 [Self::table_clip]。
+    object_clip: Option<object_copy::ObjectClip>,
     /// 状态栏左侧的一次性反馈（已复制 / 已粘贴 N 张表）；None = 显示默认统计。
     pane_note: Option<String>,
     list_view: bool,
@@ -7782,6 +7882,7 @@ impl DaroApp {
             table_ops: Vec::new(),
             table_clip: None,
             table_copies: Vec::new(),
+            object_clip: None,
             pane_note: None,
             list_view,
             show_info,
@@ -9299,6 +9400,473 @@ impl DaroApp {
             );
         }
         cx.notify();
+    }
+
+    /// 对象页 Ctrl+C / 右键「复制」：把视图 / 实体化视图 / 函数 / 查询记进
+    /// 对象级剪贴板。要求这些对象同属一个（连接 / 库 / 模式）且分类一致，
+    /// 真库连接且引擎支持对象级复制；查询走本地保存，不需要真库连接。
+    /// 不满足（或混了表 / 多分类）返回 false，调用方退回原来的「复制对象名」。
+    fn copy_generic_objects(&mut self, acts: &[Act], cx: &mut Context<Self>) -> bool {
+        let mut ctx: Option<(usize, String, String, usize)> = None;
+        let mut names = Vec::new();
+        for &act in acts {
+            let Some((conn_name, db, schema, cat, name)) = self.object_ref(act) else {
+                return false;
+            };
+            if !(1..=4).contains(&cat) {
+                return false;
+            }
+            let Some(cix) = self.conns.iter().position(|c| c.name == conn_name) else {
+                return false;
+            };
+            let conn = &self.conns[cix];
+            if !object_copy::object_copy_ready(conn, cat) {
+                return false;
+            }
+            match &ctx {
+                None => ctx = Some((cix, db, schema, cat)),
+                Some((_, d, s, k)) if *d == db && *s == schema && *k == cat => {}
+                Some(_) => return false,
+            }
+            names.push(name);
+        }
+        let Some((cix, db, schema, cat)) = ctx else {
+            return false;
+        };
+        let conn = self.conns[cix].name.clone();
+        let count = names.len();
+        self.object_clip = Some(object_copy::ObjectClip {
+            conn: conn.clone(),
+            db: db.clone(),
+            schema: schema.clone(),
+            cat,
+            names: names.clone(),
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(names.join("\n")));
+        let noun = CATEGORIES[cat].0;
+        self.pane_note = Some(format!("已复制 {count} 个{noun}，Ctrl+V 粘贴为副本"));
+        cx.notify();
+        true
+    }
+
+    /// 右键「复制」的统一落点：表进表剪贴板，视图 / 实体化视图 / 函数 / 查询进
+    /// 对象剪贴板，其余（角色等）退化成复制名字。
+    fn copy_object(&mut self, act: Act, cx: &mut Context<Self>) {
+        let Some((_, _, _, cat, _)) = self.object_ref(act) else {
+            return;
+        };
+        match cat {
+            0 => {
+                self.copy_tables(&[act], cx);
+            }
+            1..=4 => {
+                self.copy_generic_objects(&[act], cx);
+            }
+            _ => self.copy_object_name(act, cx),
+        }
+    }
+
+    /// 「粘贴」的总入口：表剪贴板优先，否则对象剪贴板；都没有就什么都不做。
+    fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if self.table_clip.is_some() {
+            self.paste_tables(cx);
+        } else if self.object_clip.is_some() {
+            self.paste_objects(cx);
+        }
+    }
+
+    /// Ctrl+V（对象页）：把对象剪贴板里的非表对象粘到当前分类对应的库 / 模式。
+    fn paste_objects(&mut self, cx: &mut Context<Self>) {
+        if self.sel.db().is_none() {
+            open_notice(
+                self.dark,
+                "粘贴对象",
+                "请先在左侧选中目标数据库或对象，再粘贴。".to_string(),
+                cx,
+            );
+            return;
+        }
+        let (c, d, s, k) = self.pane_path();
+        // 剪贴板分类必须和当前分类一致，否则「视图」粘到「函数」分类没有意义。
+        if self.object_clip.as_ref().is_some_and(|clip| clip.cat != k) {
+            open_notice(
+                self.dark,
+                "粘贴对象",
+                format!(
+                    "复制的是「{}」，请到「{}」分类下粘贴。",
+                    CATEGORIES[self.object_clip.as_ref().unwrap().cat].0,
+                    CATEGORIES[k].0
+                ),
+                cx,
+            );
+            return;
+        }
+        self.paste_objects_at(c, d, s, cx);
+    }
+
+    /// 指定落点的对象粘贴：分类 / 空白菜单右键时也走这一份。
+    fn paste_objects_at(&mut self, c: usize, d: usize, s: usize, cx: &mut Context<Self>) {
+        let Some(clip) = self.object_clip.clone() else {
+            return;
+        };
+        let Some(conn) = self.conns.get(c) else {
+            return;
+        };
+        if !conn.connected {
+            open_notice(
+                self.dark,
+                "粘贴对象",
+                format!("请先打开目标连接「{}」再粘贴。", conn.name),
+                cx,
+            );
+            return;
+        }
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
+            open_notice(
+                self.dark,
+                "粘贴对象",
+                "请先在左侧选中目标数据库或对象，再粘贴。".to_string(),
+                cx,
+            );
+            return;
+        };
+        let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("").to_string();
+        if clip.cat == 4 {
+            self.paste_saved_queries(&clip, conn.name.clone(), db.to_string(), schema, cx);
+            return;
+        }
+        let Some(src_conn) = self.conns.iter().find(|x| x.name == clip.conn) else {
+            open_notice(
+                self.dark,
+                "粘贴对象",
+                format!("复制对象所在的连接「{}」已不存在。", clip.conn),
+                cx,
+            );
+            return;
+        };
+        if src_conn.kind != conn.kind {
+            open_notice(
+                self.dark,
+                "粘贴对象",
+                format!(
+                    "暂不支持跨数据库类型粘贴对象（{} → {}）。",
+                    src_conn.kind.label(),
+                    conn.kind.label()
+                ),
+                cx,
+            );
+            return;
+        }
+        let Some(src) = backend::Target::of(src_conn, &clip.db, &clip.schema) else {
+            return;
+        };
+        let Some(dst) = backend::Target::of(conn, db, schema) else {
+            return;
+        };
+        // 同库粘贴时源对象本身就在目标清单里，先塞进去让规划器直接挑 `_copy`。
+        let same_ctx = clip.conn == conn.name && clip.db == db && clip.schema == schema;
+        let mut existing: Vec<String> = catalog::objects(conn, db, schema, clip.cat)
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        if same_ctx {
+            existing.extend(clip.names.iter().cloned());
+        }
+        let planned = table_copy::plan_names(
+            &existing,
+            &clip.names,
+            table_copy::name_limit(conn.kind),
+        );
+        // 远端库丢到后台跑整段（读定义 + 建副本），内存库同步跑。
+        if dst.background_ok() && src.background_ok() {
+            let work_src = src.clone();
+            let work_dst = dst.clone();
+            let items = planned.clone();
+            let cat = clip.cat;
+            let conn_name = conn.name.clone();
+            let db_s = db.to_string();
+            let schema_s = schema.clone();
+            let win = cx.window_handle();
+            let entity = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                let results = cx
+                    .background_executor()
+                    .spawn(async move {
+                        object_copy::run_copies(&work_src, &work_dst, &items, cat)
+                    })
+                    .await;
+                let _ = win.update(cx, |_, _, app| {
+                    let Some(ent) = entity.upgrade() else { return };
+                    ent.update(app, |a, cx| {
+                        a.object_paste_done(&conn_name, &db_s, &schema_s, cat, results, cx)
+                    });
+                });
+            })
+            .detach();
+        } else {
+            let results = object_copy::run_copies(&src, &dst, &planned, clip.cat);
+            self.object_paste_done(
+                &conn.name,
+                db,
+                &schema,
+                clip.cat,
+                results,
+                cx,
+            );
+        }
+    }
+
+    /// 粘贴回执：成功失效目标分类目录，失败把逐对象原因合成一个说明框。
+    fn object_paste_done(
+        &mut self,
+        conn_name: &str,
+        db: &str,
+        schema: &str,
+        cat: usize,
+        results: Vec<(String, Result<(), String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+        let failed: Vec<(String, String)> = results
+            .into_iter()
+            .filter_map(|(name, r)| r.err().map(|e| (name, e)))
+            .collect();
+        if ok > 0 {
+            catalog::invalidate_objects(conn_name, db, schema, cat);
+            if let Some(conn) = self.conns.iter().find(|c| c.name == conn_name) {
+                let _ = catalog::objects(conn, db, schema, cat);
+            }
+        }
+        let noun = CATEGORIES[cat].0;
+        self.pane_note = Some(format!("已粘贴创建 {ok} 个{noun}"));
+        if !failed.is_empty() {
+            let mut lines = vec![format!("已粘贴创建 {ok} 个{noun}，{} 个失败：", failed.len())];
+            for (name, err) in failed {
+                lines.push(format!("{name}：{err}"));
+            }
+            open_confirm(
+                cx.entity(),
+                self.dark,
+                "粘贴对象",
+                lines.join("\n"),
+                |_| {},
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// 把复制的查询（cat=4）存成目标归属下的新条目；同名同归属内容一致跳过。
+    fn paste_saved_queries(
+        &mut self,
+        clip: &object_copy::ObjectClip,
+        conn: String,
+        db: String,
+        schema: String,
+        cx: &mut Context<Self>,
+    ) {
+        let mut made: Vec<String> = Vec::new();
+        for name in &clip.names {
+            let Some(src) = self.saved_queries.iter().find(|q| {
+                q.name == *name
+                    && q.connection == clip.conn
+                    && q.database == clip.db
+                    && q.schema == clip.schema
+            }) else {
+                continue;
+            };
+            let copy_name = self.unique_query_name(&conn, &db, &schema, format!("{name}_copy"), &src.sql);
+            let Some(copy_name) = copy_name else {
+                continue;
+            };
+            self.save_named_query(saved_queries::SavedQuery {
+                name: copy_name.clone(),
+                connection: conn.clone(),
+                database: db.clone(),
+                schema: schema.clone(),
+                sql: src.sql.clone(),
+            });
+            made.push(copy_name);
+        }
+        if made.is_empty() {
+            self.pane_note = Some("没有可复制的查询（源查询已不存在）".to_string());
+        } else {
+            self.pane_note = Some(format!("已复制 {} 个查询", made.len()));
+        }
+        // 粘完落到目标「查询」分类，新查询马上出现。
+        if let Some(c) = self.conns.iter().position(|x| x.name == conn)
+            && let Some(d) = catalog::databases(&self.conns[c]).iter().position(|x| *x == db)
+        {
+            let s = if schema.is_empty() {
+                NO_SCHEMA
+            } else {
+                catalog::schemas(&self.conns[c], db)
+                    .iter()
+                    .position(|x| *x == schema)
+                    .unwrap_or(NO_SCHEMA)
+            };
+            self.sel = Act::Cat(c, d, s, 4);
+        }
+        cx.notify();
+    }
+
+    /// 右键「复制视图 / 实体化视图 / 函数 / 查询」：在当前库里另起一份，先问新名
+    /// （预填 `_copy` 规划出来的落点）。
+    fn ask_capture_object(&mut self, act: Act, cx: &mut Context<Self>) {
+        let Some((conn_name, db, schema, cat, name)) = self.object_ref(act) else {
+            return;
+        };
+        if !(1..=4).contains(&cat) {
+            return;
+        }
+        let Some(conn) = self.conns.iter().find(|c| c.name == conn_name) else {
+            return;
+        };
+        if !object_copy::object_copy_ready(conn, cat) {
+            return;
+        }
+        let noun = CATEGORIES[cat].0;
+        if cat == 4 {
+            // 查询是本地 SQL 片段，直接复制条目，不需要真库连接。
+            let existing: Vec<String> = self
+                .saved_queries
+                .iter()
+                .filter(|q| {
+                    q.connection == conn_name && q.database == db && q.schema == schema
+                })
+                .map(|q| q.name.clone())
+                .collect();
+            let planned = table_copy::plan_names(
+                &existing,
+                std::slice::from_ref(&name),
+                table_copy::name_limit(conn.kind),
+            )
+            .into_iter()
+            .next()
+            .map(|(_, t)| t)
+            .unwrap_or_else(|| format!("{name}_copy"));
+            let dark = self.dark;
+            let (c, d, s) = (conn_name.clone(), db.clone(), schema.clone());
+            open_text_prompt(
+                cx.entity(),
+                dark,
+                "复制查询",
+                "新查询名",
+                planned,
+                move |app, new_name| {
+                    let new_name = new_name.trim().to_string();
+                    if new_name.is_empty() || new_name == name {
+                        return;
+                    }
+                    app.duplicate_saved_query(&c, &d, &s, &name, &new_name);
+                },
+                cx,
+            );
+            return;
+        }
+        // 视图 / 实体化视图 / 函数：先按现有对象规划落点名，再弹输入框。
+        let existing: Vec<String> = catalog::objects(conn, &db, &schema, cat)
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let planned = table_copy::plan_names(
+            &existing,
+            std::slice::from_ref(&name),
+            table_copy::name_limit(conn.kind),
+        )
+        .into_iter()
+        .next()
+        .map(|(_, t)| t)
+        .unwrap_or_else(|| format!("{name}_copy"));
+        let dark = self.dark;
+        let (c, d, s) = (conn_name.clone(), db.clone(), schema.clone());
+        open_text_prompt(
+            cx.entity(),
+            dark,
+            format!("复制{noun}"),
+            format!("新{noun}名"),
+            planned,
+            move |app, new_name| {
+                let new_name = new_name.trim().to_string();
+                if new_name.is_empty() || new_name == name {
+                    return;
+                }
+                app.capture_object_at(&c, &d, &s, cat, &name, &new_name);
+            },
+            cx,
+        );
+    }
+
+    /// 在当前上下文把单个对象（视图 / 实体化视图 / 函数）复制成 `new_name`：
+    /// 读源定义、换名、原库执行 CREATE。错误落到状态栏（由调用方弹窗的
+    /// `cx.notify()` 触发重绘），不单独弹确认框。
+    fn capture_object_at(
+        &mut self,
+        conn_name: &str,
+        db: &str,
+        schema: &str,
+        cat: usize,
+        name: &str,
+        new_name: &str,
+    ) {
+        let Some(conn) = self.conns.iter().find(|c| c.name == conn_name) else {
+            return;
+        };
+        let Some(tg) = backend::Target::of(conn, db, schema) else {
+            return;
+        };
+        let ddl = match object_copy::fetch_ddl(&tg, cat, name) {
+            Some(d) => d,
+            None => {
+                self.pane_note = Some(format!(
+                    "读不到「{name}」的定义，该引擎 / 分类暂不支持复制。"
+                ));
+                return;
+            }
+        };
+        let stmt = match object_copy::rename_ddl(&ddl, new_name, &tg) {
+            Ok(s) => s,
+            Err(e) => {
+                self.pane_note = Some(e);
+                return;
+            }
+        };
+        if let Err(e) = tg.execute(&stmt, 1) {
+            self.pane_note = Some(format!("创建「{new_name}」失败：{e}"));
+            return;
+        }
+        catalog::invalidate_objects(conn_name, db, schema, cat);
+        let _ = catalog::objects(conn, db, schema, cat);
+        let noun = CATEGORIES[cat].0;
+        self.pane_note = Some(format!("已复制{noun}「{new_name}」"));
+    }
+
+    /// 按新名字复制一条已保存查询到同一归属下（cat=4）。
+    fn duplicate_saved_query(
+        &mut self,
+        conn: &str,
+        db: &str,
+        schema: &str,
+        name: &str,
+        new_name: &str,
+    ) {
+        let Some(src) = self.saved_queries.iter().find(|q| {
+            q.name == name && q.connection == conn && q.database == db && q.schema == schema
+        }) else {
+            return;
+        };
+        let copy_name = self.unique_query_name(conn, db, schema, new_name.to_string(), &src.sql);
+        let Some(copy_name) = copy_name else {
+            return;
+        };
+        self.save_named_query(saved_queries::SavedQuery {
+            name: copy_name.clone(),
+            connection: conn.to_string(),
+            database: db.to_string(),
+            schema: schema.to_string(),
+            sql: src.sql.clone(),
+        });
+        self.pane_note = Some(format!("已复制查询「{copy_name}」"));
     }
 
     /// 顶栏「编辑 ▸ 全选」：对象面板当前分类的可见对象（含搜索过滤）全部进
@@ -13426,7 +13994,8 @@ impl DaroApp {
         let src = q.editor.read(cx).value().to_string();
         let out = sql_format::pretty(&src);
         if out != src {
-            q.editor.update(cx, |s, cx| s.set_value(out, window, cx));
+            // replace_all 而不是 set_value：set_value 会清空撤销栈，美化后 ctrl-z 就没了
+            q.editor.update(cx, |s, cx| s.replace_all(out, window, cx));
             q.dirty = true;
         }
         cx.notify();
@@ -14677,13 +15246,16 @@ impl DaroApp {
         kept.sort_by_key(|o| o.pin_seq);
         let kept_len = kept.len();
         // 执行完落哪一页签按「查看 ▸ 结果 ▸ 执行后默认显示 X 选项卡」的选择：
-        // 结果 = 本轮最新的「有网格」结果页签（全是写操作就回消息页），消息 / 摘要 = 停在那一页。
+        // 结果 = 本轮最新的「有网格」结果页签；整轮都是非查询语句（或全出错）时
+        // 没有结果页签可落，按参考界面直接展示「摘要」（处理数 / 成功 / 错误 /
+        // 起止与运行时间），不回消息页也不留一个空白结果页。显式选了消息 / 摘要
+        // 的仍按设置走。
         q.pane = match run_pane {
             0 => 0,
             1 => 1,
             _ => match outcomes.iter().rposition(|o| o.result.is_some()) {
                 Some(i) => kept_len + i + 2,
-                None => 0,
+                None => 1,
             },
         };
         // 消息日志整份重写（可拖选复制的只读文本）。口径对齐参考界面：
@@ -15328,6 +15900,25 @@ impl DaroApp {
         }
     }
 
+    /// MySQL「索引类型」列：NORMAL / UNIQUE / FULLTEXT / SPATIAL。
+    /// 顺带把 `unique` 位同步好——建表 SQL 与后续只认这一个开关的地方都靠它。
+    fn design_set_index_kind(&mut self, did: u64, row: usize, kind: String, cx: &mut Context<Self>) {
+        if let Some(ds) = self
+            .opened
+            .iter_mut()
+            .find(|t| t.did == did)
+            .and_then(|t| t.dstate.as_mut())
+        {
+            ds.index_sel = row;
+            if let Some(idx) = ds.indexes.get_mut(row) {
+                idx.kind = kind.clone();
+                idx.unique = kind.trim().eq_ignore_ascii_case("UNIQUE");
+            }
+            ds.note = None;
+            cx.notify();
+        }
+    }
+
     /// 唯一键 / 并发两列的勾选。
     fn design_toggle_index_flag(&mut self, did: u64, row: usize, unique: bool, cx: &mut Context<Self>) {
         if let Some(ds) = self
@@ -15379,6 +15970,15 @@ impl DaroApp {
         }
     }
 
+    /// 该设计器标签挂的连接是不是 MySQL：索引页的列与「字段」对话框按方言分岔。
+    fn designer_is_mysql(&self, did: u64) -> bool {
+        self.opened
+            .iter()
+            .find(|t| t.did == did)
+            .and_then(|t| self.conns.iter().find(|c| c.name == t.conn_name))
+            .is_some_and(|c| matches!(c.kind, mock::DbKind::MySql))
+    }
+
     /// 索引子页：一行一个索引（名称 / 字段 / 方法 / 唯一 / 删除），底部「添加索引」。
     /// 打开「…」列选择面板：候选 = 表里的列 + 已经写在字段串里但不在列里的项
     fn design_open_picker(
@@ -15386,6 +15986,7 @@ impl DaroApp {
         did: u64,
         target: PickTarget,
         row: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // 普通下拉（参考图：被引用的模式 / 被引用的表 / 删除时 / 更新时）：
@@ -15446,6 +16047,7 @@ impl DaroApp {
                     items: payload.0,
                     sel: payload.1,
                     expr: None,
+                    subs: Vec::new(),
                 });
                 d.note = None;
             }
@@ -15512,6 +16114,34 @@ impl DaroApp {
             items.sort_by_key(|(_, on)| !*on);
         }
         let sel = items.iter().position(|(_, on)| *on).unwrap_or(0);
+        // MySQL 的「子部分」草稿：一行一个输入框，初值取该索引已存的前缀长度。
+        // 面板里改完要按确定才写回模型，跟勾选一个口径。
+        let mut subs: Vec<Option<Entity<InputState>>> = Vec::new();
+        if target == PickTarget::IndexCols && self.designer_is_mysql(did) {
+            let olds: Vec<(String, String)> = self
+                .opened
+                .iter()
+                .find(|t| t.did == did)
+                .and_then(|t| t.dstate.as_ref())
+                .and_then(|d| d.indexes.get(row))
+                .map(|i| {
+                    i.fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.sub_part.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (name, _) in &items {
+                let v = olds
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_default();
+                subs.push(Some(cx.new(|cx| {
+                    InputState::new(window, cx).default_value(v)
+                })));
+            }
+        }
         if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
             && let Some(d) = t.dstate.as_mut()
         {
@@ -15521,6 +16151,7 @@ impl DaroApp {
                 items,
                 sel,
                 expr: None,
+                subs,
             });
             d.note = None;
         }
@@ -16403,8 +17034,23 @@ impl DaroApp {
             let to = (from as isize + delta).clamp(0, p.items.len() as isize - 1) as usize;
             if from != to {
                 p.items.swap(from, to);
+                if p.subs.len() == p.items.len() {
+                    p.subs.swap(from, to);
+                }
                 p.sel = to;
             }
+            cx.notify();
+        }
+    }
+
+    /// +：把选中的列加进索引 / 唯一键（勾选）
+    fn design_popup_add(&mut self, did: u64, cx: &mut Context<Self>) {
+        if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
+            && let Some(d) = t.dstate.as_mut()
+            && let Some(p) = d.popup.as_mut()
+            && let Some((_, on)) = p.items.get_mut(p.sel)
+        {
+            *on = true;
             cx.notify();
         }
     }
@@ -16473,30 +17119,33 @@ impl DaroApp {
             PickTarget::IndexCols => {
                 // 勾上的列按列表顺序组成索引字段；已有字段的六项参数保留，
                 // 新勾的按列类型推默认值（int8 → int8_ops、varchar → text_ops …）。
-                let names: Vec<String> = p
-                    .items
-                    .iter()
-                    .filter(|(_, on)| *on)
-                    .map(|(n, _)| n.clone())
-                    .collect();
+                // MySQL 面板的「子部分」草稿按行读回，写进 sub_part。
                 let old: Vec<IndexField> = d
                     .indexes
                     .get(p.row)
                     .map(|i| i.fields.clone())
                     .unwrap_or_default();
                 let mut fields: Vec<IndexField> = Vec::new();
-                for name in &names {
-                    if let Some(keep) = old.iter().find(|f| f.name == *name) {
-                        fields.push(keep.clone());
-                    } else {
-                        let ty = d
-                            .cols
-                            .iter()
-                            .find(|c| c.name == *name)
-                            .map(|c| c.ty.clone())
-                            .unwrap_or_default();
-                        fields.push(IndexField::make(name, &ty));
+                for (ix, (name, on)) in p.items.iter().enumerate() {
+                    if !on {
+                        continue;
                     }
+                    let mut f = match old.iter().find(|f| f.name == *name) {
+                        Some(keep) => keep.clone(),
+                        None => {
+                            let ty = d
+                                .cols
+                                .iter()
+                                .find(|c| c.name == *name)
+                                .map(|c| c.ty.clone())
+                                .unwrap_or_default();
+                            IndexField::make(name, &ty)
+                        }
+                    };
+                    if let Some(sub) = p.subs.get(ix).and_then(|slot| slot.as_ref()) {
+                        f.sub_part = sub.read(cx).value().trim().to_string();
+                    }
+                    fields.push(f);
                 }
                 if let Some(idx) = d.indexes.get_mut(p.row) {
                     idx.fields = fields;
@@ -16544,6 +17193,300 @@ impl DaroApp {
     }
 
     /// 浮层子编辑器（「…」面板）：白底 + 1px 边框，表头 / 勾选列表 / 上移下移删除 + 确定取消
+    /// MySQL 索引「字段」对话框（参考界面 1:1）：行首槽 + 勾选 + 名称 + 子部分，
+    /// 底栏 ↑ ↓ + − 与 确定 / 取消。勾选决定字段、列表顺序决定列序、子部分进 DDL。
+    fn my_index_fields_panel(
+        &self,
+        did: u64,
+        ds: &DesignerState,
+        popup: &DesignPopup,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.pal();
+        let (fg, muted, border, bg) = (
+            to_hsla(p.foreground),
+            to_hsla(p.muted_foreground),
+            to_hsla(p.border),
+            to_hsla(p.background),
+        );
+        let (hover, accent, selection, line) = (
+            to_hsla(p.hover),
+            to_hsla(p.accent),
+            to_hsla(p.selection),
+            to_hsla(p.border_soft),
+        );
+        // 表头行首那一格淡蓝（参考界面把「当前列」的表头整块染色）
+        let head_cur = to_hsla(blend(p.accent, p.background, 0.74));
+        let cw = D_MY_IDX_POPUP_COLS;
+
+        let head = h_flex()
+            .h(px(30.))
+            .flex_none()
+            .bg(bg)
+            .child(
+                div()
+                    .w(px(cw[0]))
+                    .h_full()
+                    .flex_none()
+                    .bg(head_cur)
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(line),
+            )
+            .child(
+                div()
+                    .w(px(cw[1]))
+                    .h_full()
+                    .flex_none()
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(line),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .px(px(6.))
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(line)
+                    .child(div().text_size(px(12.)).text_color(fg).child("名称")),
+            )
+            .child(
+                div()
+                    .w(px(cw[3]))
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px(px(6.))
+                    .border_b_1()
+                    .border_color(line)
+                    .child(div().text_size(px(12.)).text_color(fg).child("子部分")),
+            );
+
+        let body = v_flex()
+            .id("dpopup-list")
+            .flex_1()
+            .min_h_0()
+            .max_h(px(225.))
+            .overflow_y_scrollbar()
+            .children(popup.items.iter().enumerate().map(|(ix, (name, on))| {
+                let selected = popup.sel == ix;
+                let sub = popup.subs.get(ix).cloned().flatten();
+                let check = div()
+                    .size(px(16.))
+                    .rounded(px(2.))
+                    .border_1()
+                    .border_color(if *on { accent } else { to_hsla(p.subtle_foreground) })
+                    .bg(if *on { accent } else { bg })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(*on, |s| {
+                        s.child(
+                            Icon::new(ZedIcon::Check)
+                                .with_size(px(11.))
+                                .text_color(to_hsla(0xffffff)),
+                        )
+                    });
+                h_flex()
+                    .id(rid(&format!("dpopup/{ix}")))
+                    .h(px(20.))
+                    .flex_none()
+                    .border_b_1()
+                    .border_color(line)
+                    .cursor_pointer()
+                    .when(selected, |s| s.bg(bg))
+                    .when(!selected, move |s| s.hover(move |s| s.bg(hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.design_popup_toggle(did, ix, cx)
+                    }))
+                    .test_support()
+                    .child(
+                        // 行首槽：选中行铺浅蓝 + 左端强调条（参考界面在槽的左边）
+                        div()
+                            .w(px(cw[0]))
+                            .h_full()
+                            .flex_none()
+                            .relative()
+                            .border_r_1()
+                            .border_color(line)
+                            .when(selected, |s| {
+                                s.bg(selection).child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(3.))
+                                        .bg(accent),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w(px(cw[1]))
+                            .h_full()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .border_r_1()
+                            .border_color(line)
+                            .child(check),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .px(px(6.))
+                            .border_r_1()
+                            .border_color(line)
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(fg)
+                                    .child(name.clone()),
+                            ),
+                    )
+                    .child(
+                        // 子部分：每行一个输入框，确定才写回模型
+                        match sub {
+                            Some(state) => div()
+                                .w(px(cw[3]))
+                                .h_full()
+                                .flex_none()
+                                .relative()
+                                // 点「子部分」只是进输入框，别把这一行的勾选给点了
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(3.))
+                                        .right(px(2.))
+                                        .top_0()
+                                        .bottom_0()
+                                        .flex()
+                                        .items_center()
+                                        .child(
+                                            div().flex_1().min_w_0().child(
+                                                Input::new(&state)
+                                                    .id(rid(&format!("idx-sub/{ix}")))
+                                                    .h(px(17.))
+                                                    .appearance(false)
+                                                    .bordered(false)
+                                                    .text_size(px(12.)),
+                                            ),
+                                        ),
+                                )
+                                .into_any_element(),
+                            None => div().w(px(cw[3])).h_full().flex_none().into_any_element(),
+                        },
+                    )
+                    .into_any_element()
+            }));
+
+        let icon_btn = |id: &'static str, glyph: art::Glyph, color: Hsla| {
+            h_flex()
+                .id(rid(id))
+                .size(px(22.))
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded(px(2.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .child(art::icon(glyph, 13., color))
+        };
+        let footer = h_flex()
+            .h(px(32.))
+            .flex_none()
+            .items_center()
+            .px(px(6.))
+            .gap(px(2.))
+            .child(
+                icon_btn("dpopup-up", art::Glyph::Asset("FILTER_MOVE_UP"), muted)
+                    .test_support()
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.design_popup_move(did, -1, cx)),
+                    ),
+            )
+            .child(
+                icon_btn("dpopup-down", art::Glyph::Asset("FILTER_MOVE_DOWN"), muted)
+                    .test_support()
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.design_popup_move(did, 1, cx)),
+                    ),
+            )
+            .child(
+                icon_btn("dpopup-add", art::Glyph::Asset("TB_New"), to_hsla(D_ICON_ADD))
+                    .test_support()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.design_popup_add(did, cx)
+                    })),
+            )
+            .child(
+                icon_btn(
+                    "dpopup-del",
+                    art::Glyph::Asset("TB_Delete"),
+                    to_hsla(0xd9534f),
+                )
+                .test_support()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.design_popup_remove(did, cx)
+                })),
+            )
+            .child(div().flex_1())
+            .child(
+                crate::ui::primary_button("dpopup-ok", "确定", self.dark, cx).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.design_popup_commit(did, window, cx)
+                    }),
+                ),
+            )
+            .child(div().w(px(6.)))
+            .child(
+                crate::ui::secondary_button("dpopup-cancel", "取消").on_click(
+                    cx.listener(move |this, _, _, cx| this.design_popup_cancel(did, cx)),
+                ),
+            );
+
+        // 锚点：贴在「字段」格下缘，参考界面里对话框往左探出格边约 8 逻辑像素
+        let name_w = ds
+            .widths
+            .get(&(1usize, 0))
+            .copied()
+            .unwrap_or(D_MY_INDEX_WIDTHS[0]);
+        let left = D_GUTTER_W + name_w - 8.;
+        let top = D_TOOLBAR_H + D_TABBAR_H + D_HEADER_H + (popup.row + 1) as f32 * D_ROW_EXTENT + 1.;
+        div()
+            .id("dpopup")
+            .test_support()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(D_MY_IDX_POPUP_W))
+            .flex()
+            .flex_col()
+            .bg(bg)
+            .border_1()
+            .border_color(border)
+            .shadow_lg()
+            .child(head)
+            .child(body)
+            .child(footer)
+            .into_any_element()
+    }
+
     fn design_popup_panel(
         &self,
         did: u64,
@@ -16562,6 +17505,10 @@ impl DaroApp {
         );
         let hover = to_hsla(p.hover);
         let accent = to_hsla(p.accent);
+        // MySQL 的索引「字段」面板是独立形态（勾选 + 子部分 + ↑↓+−），单独一条路
+        if popup.target == PickTarget::IndexCols && self.designer_is_mysql(did) {
+            return self.my_index_fields_panel(did, ds, popup, cx);
+        }
         if let Some(state) = popup.expr.clone() {
             let footer = h_flex()
                 .h(px(40.))
@@ -17269,12 +18216,28 @@ impl DaroApp {
         // 表头「当前列」底色：和数据页同一口径（亮色往白里调，暗色往底色调）
         let head_cur = to_hsla(blend(p.accent, p.background, 0.74));
         let sel = Self::design_index_sel(ds);
-        let cur = ds.index_cur.min(5);
+        // MySQL 按参考界面出五列（名称 / 字段 / 索引类型 / 索引方法 / 注释），
+        // 其余方言保持 PG 口径的六列（唯一键 / 并发是 PG 的列）。
+        let ncols = if is_mysql { 5 } else { 6 };
+        let cur = ds.index_cur.min(ncols - 1);
         let me = cx.entity().clone();
         // 列宽：默认宽 + 用户拖过表头分割线后的宽（按子页 1 + 列序号存）
-        let iw = |ix: usize| ds.widths.get(&(1usize, ix)).copied().unwrap_or(D_INDEX_WIDTHS[ix]);
-        let total_w: f32 = D_GUTTER_W + (0..6).map(iw).sum::<f32>();
-        let headers = ["名称", "字段", "索引方法", "唯一键", "并发", "注释"];
+        let iw = |ix: usize| {
+            ds.widths
+                .get(&(1usize, ix))
+                .copied()
+                .unwrap_or(if is_mysql {
+                    D_MY_INDEX_WIDTHS[ix]
+                } else {
+                    D_INDEX_WIDTHS[ix]
+                })
+        };
+        let total_w: f32 = D_GUTTER_W + (0..ncols).map(iw).sum::<f32>();
+        let headers: &[&str] = if is_mysql {
+            &["名称", "字段", "索引类型", "索引方法", "注释"]
+        } else {
+            &["名称", "字段", "索引方法", "唯一键", "并发", "注释"]
+        };
 
         let head = h_flex()
             .h(px(D_HEADER_H))
@@ -17494,7 +18457,7 @@ impl DaroApp {
                 .fields
                 .iter()
                 .filter(|f| !f.name.trim().is_empty())
-                .map(|f| f.summary())
+                .map(|f| if is_mysql { f.summary_mysql() } else { f.summary() })
                 .collect();
             let fields_cell = div()
                 .id(rid(&format!("idx-cell/{r}/1")))
@@ -17507,9 +18470,9 @@ impl DaroApp {
                 .border_r_1()
                 .border_b_1()
                 .border_color(soft)
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     this.design_pick_index_cell(did, r, 1, cx);
-                    this.design_open_picker(did, PickTarget::IndexCols, r, cx);
+                    this.design_open_picker(did, PickTarget::IndexCols, r, window, cx);
                 }))
                 .child(
                     div()
@@ -17541,33 +18504,62 @@ impl DaroApp {
                                     summary.join(", ")
                                 }),
                         )
-                        // 参考界面那一格右缘的「…」：点它/点格都开字段选择浮层
-                        .child(
+                        // 参考界面那一格右缘的「…」：点它/点格都开字段选择浮层。
+                        // MySQL 是一枚贴边的小按钮（参考界面 36×40 物理像素 ÷2）。
+                        .child(if is_mysql {
+                            div()
+                                .flex_none()
+                                .w(px(D_MY_IDX_MORE_W))
+                                .h(px(18.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(2.))
+                                .border_1()
+                                .border_color(if anchor && cur == 1 { paper } else { border })
+                                .bg(if anchor && cur == 1 {
+                                    accent
+                                } else {
+                                    paper
+                                })
+                                .text_size(px(11.))
+                                .text_color(if anchor && cur == 1 { paper } else { fg })
+                                .child("…")
+                                .into_any_element()
+                        } else {
                             div()
                                 .flex_none()
                                 .text_size(px(11.))
-                                .text_color(if anchor && cur == 1 {
-                                    paper
-                                } else {
-                                    muted
-                                })
-                                .child("…"),
-                        ),
+                                .text_color(if anchor && cur == 1 { paper } else { muted })
+                                .child("…")
+                                .into_any_element()
+                        }),
                 )
                 .test_support()
                 .into_any_element();
-            // 索引方法：下拉（参考界面显示 B-Tree / Hash / GiST / GIN / BRIN / SP-GiST）
+            // 索引方法：MySQL 只有 BTREE / HASH（参考界面格子里就是大写），
+            // 其余方言按 PG 口径显示 B-Tree / Hash / GiST / GIN / BRIN / SP-GiST
             let me_m = me.clone();
+            let me_col = if is_mysql { 3 } else { 2 };
+            let methods: &[&str] = if is_mysql {
+                &["BTREE", "HASH"]
+            } else {
+                &["B-Tree", "Hash", "GiST", "GIN", "BRIN", "SP-GiST"]
+            };
             let method_cell = self.drop_cell(
                 format!("idx-method/{r}"),
-                index_method_label(&idx.method),
-                iw(2),
+                if is_mysql {
+                    mysql_index_method_label(idx)
+                } else {
+                    index_method_label(&idx.method)
+                },
+                iw(me_col),
                 D_ROW_EXTENT,
                 dark,
                 true,
                 true,
                 pick_menu(
-                    ["B-Tree", "Hash", "GiST", "GIN", "BRIN", "SP-GiST"]
+                    methods
                         .iter()
                         .map(|m| (m.to_string(), m.to_string()))
                         .collect(),
@@ -17579,53 +18571,93 @@ impl DaroApp {
                     }),
                 ),
             );
-            rows.push(
-                h_flex()
-                    .h(px(D_ROW_EXTENT))
-                    .flex_none()
-                    .child(
-                        // 行首空白槽：点它选中整行（当前行槽里有一条强调条）
+            // MySQL 的「索引类型」：NORMAL / UNIQUE / FULLTEXT / SPATIAL（参考界面这一列）
+            let kind_cell = if is_mysql {
+                let me_k = me.clone();
+                self.drop_cell(
+                    format!("idx-kind/{r}"),
+                    mysql_index_kind(idx),
+                    iw(2),
+                    D_ROW_EXTENT,
+                    dark,
+                    true,
+                    true,
+                    pick_menu(
+                        ["NORMAL", "UNIQUE", "FULLTEXT", "SPATIAL"]
+                            .iter()
+                            .map(|k| (k.to_string(), k.to_string()))
+                            .collect(),
+                        Rc::new(move |value: String, app: &mut App| {
+                            let me = me_k.clone();
+                            me.update(app, move |this, cx| {
+                                this.design_set_index_kind(did, r, value.clone(), cx)
+                            });
+                        }),
+                    ),
+                )
+            } else {
+                div().w(px(0.)).into_any_element()
+            };
+            let gutter = div()
+                .id(rid(&format!("idx-gutter/{r}")))
+                .w(px(D_GUTTER_W))
+                .h(px(D_ROW_EXTENT))
+                .flex_none()
+                .relative()
+                .border_r_1()
+                .border_b_1()
+                .border_color(border)
+                .when(anchor, |s| {
+                    s.bg(selection).child(
                         div()
-                            .id(rid(&format!("idx-gutter/{r}")))
-                            .w(px(D_GUTTER_W))
-                            .h(px(D_ROW_EXTENT))
-                            .flex_none()
-                            .relative()
-                            .border_r_1()
-                            .border_b_1()
-                            .border_color(border)
-                            .when(anchor, |s| {
-                                s.bg(selection).child(
-                                    div()
-                                        .absolute()
-                                        .right_0()
-                                        .top_0()
-                                        .bottom_0()
-                                        .w(px(D_ACCENT_BAR_W))
-                                        .bg(accent),
-                                )
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(ds) = this
-                                    .opened
-                                    .iter_mut()
-                                    .find(|t| t.did == did)
-                                    .and_then(|t| t.dstate.as_mut())
-                                {
-                                    ds.index_sel = r;
-                                    cx.notify();
-                                }
-                            }))
-                            .test_support(),
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(D_ACCENT_BAR_W))
+                            .bg(accent),
                     )
-                    .child(input_cell(cx, r, anchor, 0, edits[0].clone(), 0, "索引名", &idx.name))
-                    .child(fields_cell)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(ds) = this
+                        .opened
+                        .iter_mut()
+                        .find(|t| t.did == did)
+                        .and_then(|t| t.dstate.as_mut())
+                    {
+                        ds.index_sel = r;
+                        cx.notify();
+                    }
+                }))
+                .test_support()
+                .into_any_element();
+            // 列序按方言分岔：MySQL 是 名称/字段/索引类型/索引方法/注释，
+            // PG 是 名称/字段/索引方法/唯一/并发/注释。
+            let mut row = h_flex()
+                .h(px(D_ROW_EXTENT))
+                .flex_none()
+                .child(gutter)
+                .child(input_cell(cx, r, anchor, 0, edits[0].clone(), 0, "索引名", &idx.name))
+                .child(fields_cell);
+            if is_mysql {
+                row = row.child(kind_cell).child(method_cell);
+            } else {
+                row = row
                     .child(method_cell)
                     .child(flag_cell(cx, r, anchor, 3, idx.unique, true))
-                    .child(flag_cell(cx, r, anchor, 4, idx.concurrent, false))
-                    .child(input_cell(cx, r, anchor, 5, edits[1].clone(), 1, "", &idx.comment))
-                    .into_any_element(),
-            );
+                    .child(flag_cell(cx, r, anchor, 4, idx.concurrent, false));
+            }
+            row = row.child(input_cell(
+                cx,
+                r,
+                anchor,
+                if is_mysql { 4 } else { 5 },
+                edits[1].clone(),
+                1,
+                "",
+                &idx.comment,
+            ));
+            rows.push(row.into_any_element());
         }
 
         let grid = v_flex().child(head).children(rows);
@@ -18391,7 +19423,7 @@ impl DaroApp {
                     .on_click(move |_, window, cx| {
                         me_a.update(cx, move |this, cx| match a {
                             FkAfford::More(t) | FkAfford::Drop(t) => {
-                                this.design_open_picker(did, t, r, cx)
+                                this.design_open_picker(did, t, r, window, cx)
                             }
                             FkAfford::Note => this.design_open_fk_comment(did, r, window, cx),
                         })
@@ -18772,9 +19804,9 @@ impl DaroApp {
                     .bg(bg)
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         me_a.update(cx, move |this, cx| {
-                            this.design_open_picker(did, PickTarget::UniqueCols, r, cx)
+                            this.design_open_picker(did, PickTarget::UniqueCols, r, window, cx)
                         })
                     })
                     .test_support()
@@ -20537,6 +21569,7 @@ impl DaroApp {
                 items,
                 sel,
                 expr: None,
+                subs: Vec::new(),
             });
             d.note = None;
         }
@@ -21266,6 +22299,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 items,
                 sel,
                 expr: None,
+                subs: Vec::new(),
             });
             d.note = None;
         }
@@ -25004,7 +26038,9 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         if self.active_tab == 0 {
             let acts = self.selected_object_acts();
             if !self.copy_tables(&acts, cx) {
-                self.copy_selected_objects(cx);
+                if !self.copy_generic_objects(&acts, cx) {
+                    self.copy_selected_objects(cx);
+                }
             }
         } else if self.query_grid_ready().is_some() {
             self.query_copy(cx);
@@ -25020,7 +26056,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             return;
         }
         if self.active_tab == 0 {
-            self.paste_tables(cx);
+            self.paste_from_clipboard(cx);
         } else {
             self.grid_paste(cx);
         }
@@ -26128,8 +27164,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// 「查看 ▸ 结果」子菜单的数据：当前查询页的结果页签（顺序与标题同页签条，
-    /// 消息/摘要不在这里列，参考界面这栏只列结果）+ 正在显示的页签号。
-    /// 没有查询页签、或还没执行出结果时返回 None，菜单只剩置灰的说明行。
+    /// 消息/摘要不在这里列，参考界面这栏只列结果；非查询语句没有结果页签）
+    /// + 正在显示的页签号。没有查询页签时返回 None，菜单只剩置灰的说明行。
     fn active_result_panes(&self) -> Option<(Vec<(usize, String, bool)>, usize)> {
         let qid = self.active_query_id()?;
         let q = self
@@ -35684,7 +36720,8 @@ impl DaroApp {
         let src = editor.read(cx).value().to_string();
         let out = sql_format::pretty(&src);
         if out != src {
-            editor.update(cx, |s, cx| s.set_value(out, window, cx));
+            // replace_all 而不是 set_value：set_value 会清空撤销栈，美化后 ctrl-z 就没了
+            editor.update(cx, |s, cx| s.replace_all(out, window, cx));
         }
         cx.notify();
     }
@@ -41225,12 +42262,39 @@ fn obj_export_item(me: &Entity<DaroApp>, act: Act, label: &'static str) -> Popup
     })
 }
 
-/// 「复制」：把对象名写进剪贴板（对象级的粘贴还没做，见
-/// [DaroApp::copy_object_name]）。
+/// 「复制」：把对象记进对象级剪贴板（表进 [DaroApp::table_clip]，其余进
+/// [DaroApp::object_clip]），随后别处「粘贴」即可粘出副本。没有可复制的
+/// 对象级通路时退化成复制名字。
 fn object_copy_item(me: &Entity<DaroApp>, act: Act) -> PopupMenuItem {
     let target = me.clone();
     mi("复制").on_click(move |_, _, cx| {
-        target.update(cx, |app, cx| app.copy_object_name(act, cx));
+        target.update(cx, |app, cx| app.copy_object(act, cx));
+    })
+}
+
+/// 「复制X」：在当前库里另起一份同名 `_copy`（视图 / 实体化视图 / 函数 / 查询）。
+/// 先规划好落点名再弹输入框；引擎 / 分类没有对象级复制通路时置灰，不留假入口。
+fn copy_object_menu_item(
+    me: &Entity<DaroApp>,
+    act: Act,
+    label: &'static str,
+) -> PopupMenuItem {
+    let ready = {
+        let app = me.read(cx);
+        let Some((conn, _, _, cat, _)) = app.object_ref(act) else {
+            false
+        };
+        app.conns
+            .iter()
+            .find(|c| c.name == conn)
+            .is_some_and(|c| object_copy::object_copy_ready(c, cat))
+    };
+    if !ready {
+        return todo_item(label);
+    }
+    let target = me.clone();
+    mi(label).on_click(move |_, _, cx| {
+        target.update(cx, |app, cx| app.ask_capture_object(act, cx));
     })
 }
 
@@ -41308,15 +42372,15 @@ fn tree_blank_menu(
             cx.notify();
         });
     }));
-    // 粘贴要的是「剪贴板里有一个已复制的表」+ 当前有一个可落的目标库
+    // 粘贴要的是「剪贴板里有一个已复制的对象（表或非表）」+ 当前有一个可落的目标库
     let paste_ok = {
         let app = me.read(cx);
-        app.table_clip.is_some() && app.sel.db().is_some()
+        (app.table_clip.is_some() || app.object_clip.is_some()) && app.sel.db().is_some()
     };
     if paste_ok {
         let target = me.clone();
         menu = menu.item(mi("粘贴").on_click(move |_, _, cx| {
-            target.update(cx, |app, cx| app.paste_tables(cx));
+            target.update(cx, |app, cx| app.paste_from_clipboard(cx));
         }));
     } else {
         menu = menu.item(mi("粘贴").disabled(true));
@@ -41565,15 +42629,23 @@ const RUN_PANE_LABELS: [&str; 3] = [
 /// （按 `pin_seq` 升序）→ 消息 → 摘要 → 其余结果。返回
 /// `(pane 下标, 标题, 是否固定页签)`，pane 下标与 `QueryState::pane` 同口径
 /// （0=消息、1=摘要、i>=2 = outcomes[i-2]）。
+///
+/// 只有真的带结果网格的语句（`result.is_some()`）才配一个结果页签：DDL / DML /
+/// 出错的语句没有网格，按参考界面只在「消息」「摘要」里回报，不占一个空白
+/// 「结果 N」。这些语句仍留在 `outcomes` 里供摘要统计，所以 pane 下标直接用
+/// `oi + 2`、可能跳号，不能拿页签编号反推语句下标。
 fn pane_tabs(outcomes: &[QueryOutcome]) -> Vec<(usize, String, bool)> {
+    let has_grid = |o: &QueryOutcome| o.result.is_some();
     let mut pinned: Vec<usize> = outcomes
         .iter()
         .enumerate()
-        .filter(|(_, o)| o.pinned)
+        .filter(|(_, o)| o.pinned && has_grid(o))
         .map(|(oi, _)| oi)
         .collect();
     pinned.sort_by_key(|&oi| outcomes[oi].pin_seq);
-    let unpinned: Vec<usize> = (0..outcomes.len()).filter(|oi| !outcomes[*oi].pinned).collect();
+    let unpinned: Vec<usize> = (0..outcomes.len())
+        .filter(|oi| !outcomes[*oi].pinned && has_grid(&outcomes[*oi]))
+        .collect();
 
     let mut tabs: Vec<(usize, String, bool)> = pinned
         .iter()
@@ -41744,7 +42816,7 @@ fn edit_bar_menu(
 /// 三项都挂全局动作，行尾的 Ctrl+C / Ctrl+V / Ctrl+A 由菜单按绑定渲染；点击
 /// 走各自的 handler，不经动作派发（派发会先把焦点交回菜单，这里用不上）。
 /// 灰态按真状态定：面板空清单时全选不可点，没有选中对象时复制不可点，
-/// 对象级粘贴未实现，恒灰。
+/// 剪贴板里没有可粘贴的对象（表或非表）时粘贴不可点。
 fn objects_edit_bar_menu(
     me: Entity<DaroApp>,
     menu: PopupMenu,
@@ -41757,7 +42829,7 @@ fn objects_edit_bar_menu(
                 .iter()
                 .any(|&act| app.object_ref(act).is_some()),
             !app.pane_objects_visible().is_empty(),
-            app.table_clip.is_some(),
+            app.table_clip.is_some() || app.object_clip.is_some(),
         )
     };
     // 自绘行 + 固定 id：headless 用例能精确点到某一项，不用数分隔线下标。
@@ -41959,7 +43031,7 @@ fn view_bar_menu(
             .map_or((Vec::new(), usize::MAX), |x| x);
         let run_pane = me_result.read(cx).run_pane;
         if tabs.is_empty() {
-            sub = sub.item(PopupMenuItem::new("（当前页还没有结果）").disabled(true));
+            sub = sub.item(PopupMenuItem::new("（本轮没有查询结果集）").disabled(true));
         } else {
             for (i, label, _) in tabs {
                 let active = pane == i;
@@ -43355,6 +44427,29 @@ fn cat_menu(
             None => false,
         }
     };
+    // 非表对象（视图 / 实体化视图 / 函数 / 查询）的粘贴：剪贴板里要有同分类的
+    // 对象；视图 / 实体化视图 / 函数要求目标连接与源同引擎，查询（本地 SQL 片段）
+    // 任意已连接的连接都能落。
+    let object_paste_ok = (1..=4).contains(&k) && {
+        let app = me.read(cx);
+        match app.object_clip.as_ref() {
+            Some(clip) if clip.cat == k => app.conns.get(c).is_some_and(|conn| {
+                conn.connected
+                    && match clip.cat {
+                        4 => true,
+                        _ => {
+                            let same_kind = app
+                                .conns
+                                .iter()
+                                .find(|x| x.name == clip.conn)
+                                .is_some_and(|src| src.kind == conn.kind);
+                            same_kind && !backend::is_read_only(conn.kind)
+                        }
+                    }
+            }),
+            _ => false,
+        }
+    };
     let sql_paste_ok = k == 4
         && me.read(cx).conns.get(c).is_some_and(|conn| conn.connected)
         && !sql_assoc::clipboard_sql_files().is_empty();
@@ -43372,6 +44467,11 @@ fn cat_menu(
         let target = me.clone();
         menu = menu.item(mi("粘贴").on_click(move |_, _, cx| {
             target.update(cx, |app, cx| app.paste_tables_at(c, d, s, cx));
+        }));
+    } else if object_paste_ok {
+        let target = me.clone();
+        menu = menu.item(mi("粘贴").on_click(move |_, _, cx| {
+            target.update(cx, |app, cx| app.paste_objects_at(c, d, s, cx));
         }));
     } else {
         menu = menu.item(mi("粘贴").disabled(true));
@@ -43514,6 +44614,7 @@ fn obj_menu(
         }));
         menu = menu
             .item(table_ddl_item(&me, act, table_ops::TableOp::Drop, cx))
+            .item(copy_object_menu_item(&me, act, "复制视图"))
             .item(todo_item("设置权限"));
         menu = menu.separator();
         menu = menu
@@ -43538,6 +44639,7 @@ fn obj_menu(
             me_new.update(cx, |app, cx| app.open_new_designer(act, window, cx));
         }));
         menu = menu
+            .item(copy_object_menu_item(&me, act, "复制实体化视图"))
             .item(todo_item("删除实体化视图"))
             .item(todo_item("设置权限"));
         menu = menu.separator();
@@ -43556,6 +44658,7 @@ fn obj_menu(
             me_new.update(cx, |app, cx| app.open_new_designer(act, window, cx));
         }));
         menu = menu
+            .item(copy_object_menu_item(&me, act, "复制函数"))
             .item(todo_item("删除函数"))
             .item(todo_item("运行函数"))
             .item(todo_item("设置权限"));
@@ -43587,6 +44690,7 @@ fn obj_menu(
                 });
             }));
             menu = menu
+                .item(copy_object_menu_item(&me, act, "复制查询"))
                 .item(todo_item(format!("新建{kind}")))
                 .item(todo_item("设置权限"));
         } else {
@@ -45920,6 +47024,97 @@ mod designer_tests {
         );
     }
 
+    /// MySQL 索引页那两列要落到 DDL：索引类型（FULLTEXT / SPATIAL 不跟 USING）
+    /// 与字段「子部分」（前缀长度写成 `` `col`(n) ``）。
+    #[test]
+    fn mysql_index_kind_and_sub_part_reach_ddl() {
+        let cols = vec![
+            DesignCol { name: "id".into(), ty: "int8".into(), pk: true, ..Default::default() },
+            DesignCol {
+                name: "name".into(),
+                ty: "varchar(255)".into(),
+                ..Default::default()
+            },
+        ];
+        let sql_of = |idx: &DesignIndex| {
+            design_index_sql_at(true, "", "users", idx, &cols).unwrap_or_default()
+        };
+        let field = |sub: &str| IndexField {
+            sub_part: sub.into(),
+            ..IndexField::make("name", "varchar(255)")
+        };
+        // 子部分：填了正整数才写；0 和乱码当作没填
+        let prefix = DesignIndex {
+            name: "idx_name".into(),
+            fields: vec![field("10")],
+            method: "BTREE".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            sql_of(&prefix),
+            "CREATE INDEX `idx_name` ON `users` USING BTREE (`name`(10));"
+        );
+        assert_eq!(prefix.fields[0].summary_mysql(), "`name`(10)");
+        for junk in ["0", "", "abc"] {
+            let idx = DesignIndex { fields: vec![field(junk)], ..prefix.clone() };
+            assert!(sql_of(&idx).contains("(`name`);"), "{junk:?} → {}", sql_of(&idx));
+            assert_eq!(idx.fields[0].summary_mysql(), "`name`");
+        }
+        // 索引类型：FULLTEXT / SPATIAL 顶在 INDEX 前，且不带 USING
+        let ft = DesignIndex {
+            kind: "FULLTEXT".into(),
+            unique: true,
+            ..prefix.clone()
+        };
+        assert_eq!(
+            sql_of(&ft),
+            "CREATE FULLTEXT INDEX `idx_name` ON `users` (`name`(10));"
+        );
+        let sp = DesignIndex { kind: "SPATIAL".into(), unique: false, ..ft.clone() };
+        assert_eq!(
+            sql_of(&sp),
+            "CREATE SPATIAL INDEX `idx_name` ON `users` (`name`(10));"
+        );
+        // UNIQUE 照常跟 USING；NORMAL 不带前缀
+        let uq = DesignIndex { kind: "UNIQUE".into(), unique: true, ..prefix.clone() };
+        assert_eq!(
+            sql_of(&uq),
+            "CREATE UNIQUE INDEX `idx_name` ON `users` USING BTREE (`name`(10));"
+        );
+        let ha = DesignIndex {
+            kind: "NORMAL".into(),
+            unique: false,
+            method: "HASH".into(),
+            ..prefix.clone()
+        };
+        assert_eq!(sql_of(&ha), "CREATE INDEX `idx_name` ON `users` USING HASH (`name`(10));");
+        // 老存档没填 kind：仍按勾选唯一 / 方法里的 FULLTEXT 推断
+        let legacy = DesignIndex { kind: String::new(), method: "FULLTEXT".into(), ..prefix };
+        assert!(sql_of(&legacy).starts_with("CREATE FULLTEXT INDEX `idx_name`"));
+        let legacy_uq = DesignIndex {
+            kind: String::new(),
+            method: String::new(),
+            unique: true,
+            ..legacy.clone()
+        };
+        assert_eq!(mysql_index_kind(&legacy_uq), "UNIQUE");
+        // PG 口径不受影响：kind 是 MySQL 专属列，方法空着也不该冒出 FULLTEXT
+        let pg = design_index_sql_at(
+            false,
+            "",
+            "users",
+            &DesignIndex {
+                kind: "FULLTEXT".into(),
+                method: String::new(),
+                ..legacy
+            },
+            &cols,
+        )
+        .unwrap_or_default();
+        assert!(pg.starts_with("CREATE INDEX \"idx_name\" ON \"users\" ("), "{pg}");
+        assert!(!pg.contains("FULLTEXT"), "{pg}");
+    }
+
     #[test]
     fn design_indexes_generate_create_index_and_validate() {
         let cols = vec![
@@ -47046,7 +48241,7 @@ mod designer_tests {
                     assert_eq!(ds.indexes[0].fields.len(), 2);
                     assert!(ds.indexes[0].unique);
                 }
-                a.design_open_picker(did, PickTarget::IndexCols, 0, cx);
+                a.design_open_picker(did, PickTarget::IndexCols, 0, window, cx);
                 {
                     let ds = a.opened[0].dstate.as_ref().unwrap();
                     let popup = ds.popup.as_ref().expect("浮层已打开");
@@ -47081,7 +48276,7 @@ mod designer_tests {
                 }
 
                 // 取消勾选 org_id + 取消 → 模型不动
-                a.design_open_picker(did, PickTarget::IndexCols, 0, cx);
+                a.design_open_picker(did, PickTarget::IndexCols, 0, window, cx);
                 a.design_popup_toggle(did, 1, cx);
                 a.design_popup_cancel(did, cx);
                 {
@@ -47090,7 +48285,7 @@ mod designer_tests {
                     assert_eq!(ds.indexes[0].fields.len(), 3, "取消不改模型");
                 }
                 // 再取消勾选后确定 → org_id 从索引里摘掉
-                a.design_open_picker(did, PickTarget::IndexCols, 0, cx);
+                a.design_open_picker(did, PickTarget::IndexCols, 0, window, cx);
                 a.design_popup_toggle(did, 1, cx);
                 a.design_popup_commit(did, window, cx);
                 {
@@ -47143,13 +48338,23 @@ mod designer_tests {
                 assert_eq!(a.opened[0].dstate.as_ref().unwrap().index_sel, 0)
             });
 
-            // 点「字段」格 → 勾选浮层；表头首格空着，行里是勾选框
+            // 点「字段」格 → MySQL 的字段对话框：勾选 + 名称 + 子部分，底栏 ↑ ↓ + − 与确定取消
             window.click("idx-cell/0/1", cx);
             window.render_frame(cx);
-            assert!(window.try_find("dpopup").is_some(), "字段浮层");
-            assert!(window.try_find("idx-grid-scroll").is_some(), "表格滚动容器");
-            assert!(window.try_find("dpopup/0").is_some());
-            assert!(window.try_find("dpopup-ok").is_some(), "确定按钮");
+            for id in [
+                "dpopup",
+                "idx-grid-scroll",
+                "dpopup/0",
+                "dpopup-up",
+                "dpopup-down",
+                "dpopup-add",
+                "dpopup-del",
+                "dpopup-ok",
+                "dpopup-cancel",
+                "idx-sub/0",
+            ] {
+                assert!(window.try_find(id).is_some(), "{id}");
+            }
             window.click("dpopup-cancel", cx);
             window.render_frame(cx);
             assert!(window.try_find("dpopup").is_none(), "取消关掉浮层");
@@ -47168,6 +48373,113 @@ mod designer_tests {
             });
         })
         .unwrap();
+    }
+
+    /// MySQL 索引页的「字段」对话框：勾 / 去勾改字段、子部分填前缀长度，
+    /// 按确定才写回模型；取消要连草稿一起丢。索引类型选 FULLTEXT 后 DDL 换关键字。
+    #[gpui_kit::test]
+    fn mysql_index_dialog_edits_fields_and_sub_part(cx: &mut TestAppContext) {
+        isolate_store("myidxdlg");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.open_designer(Act::Obj(0, 0, NO_SCHEMA, 0, 0), window, cx)
+            });
+            window.render_frame(cx);
+            window.click("dsub/1", cx);
+            window.render_frame(cx);
+            window.click("idx-cell/0/1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dpopup").is_some(), "字段对话框");
+        })
+        .unwrap();
+
+        // 候选列下标：勾掉首列、给 name 列填前缀长度
+        let (ix_first, ix_name) = app.update(cx, |a, _| {
+            let d = a.opened[0].dstate.as_ref().unwrap();
+            let p = d.popup.as_ref().unwrap();
+            (
+                0usize,
+                p.items.iter().position(|(n, _)| n == "name").unwrap(),
+            )
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(rid(&format!("dpopup/{ix_first}")), cx);
+            window.render_frame(cx);
+            window.click(rid(&format!("idx-sub/{ix_name}")), cx);
+            window.press("ctrl-a", cx);
+            window.input("8", cx);
+        })
+        .unwrap();
+
+        // 草稿不该提前改模型：勾掉的首列仍在、前缀长度还没落进字段
+        app.update(cx, |a, _| {
+            let d = a.opened[0].dstate.as_ref().unwrap();
+            let p = d.popup.as_ref().unwrap();
+            assert!(!p.items[ix_first].1, "列表里已取消勾选");
+            assert_eq!(
+                d.indexes[0].fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                vec!["org_id", "name"],
+                "没点确定前模型不动"
+            );
+            assert!(d.indexes[0].fields.iter().all(|f| f.sub_part.is_empty()));
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            window.click("dpopup-ok", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, _| {
+            let d = a.opened[0].dstate.as_ref().unwrap();
+            let fields: Vec<(&str, &str)> = d.indexes[0]
+                .fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.sub_part.as_str()))
+                .collect();
+            assert_eq!(
+                fields,
+                vec![("org_id", ""), ("name", "8")],
+                "按列表顺序写回，取消勾选的那列掉出去"
+            );
+            assert!(d.popup.is_none(), "确定后对话框收掉");
+            // 格子里的摘要带上前缀长度，DDL 也一样
+            assert_eq!(d.indexes[0].fields[1].summary_mysql(), "`name`(8)");
+            let sql = design_index_sql_at(true, "", "users", &d.indexes[0], &d.cols)
+                .unwrap_or_default();
+            assert!(sql.contains("(`org_id`, `name`(8))"), "{sql}");
+        });
+
+        // 索引类型换成 FULLTEXT：关键字顶上，USING 不再跟，唯一位跟着清掉
+        app.update(cx, |a, cx| {
+            let did = a.opened[0].did;
+            a.design_set_index_kind(did, 0, "FULLTEXT".into(), cx);
+            let d = a.opened[0].dstate.as_ref().unwrap();
+            assert!(!d.indexes[0].unique, "选 FULLTEXT 后唯一位跟着清掉");
+            let sql = design_index_sql_at(true, "", "users", &d.indexes[0], &d.cols)
+                .unwrap_or_default();
+            assert!(sql.starts_with("CREATE FULLTEXT INDEX"), "{sql}");
+            assert!(!sql.contains("USING"), "{sql}");
+        });
+
+        // 再开一次：子部分回填进输入框；这一轮点取消，草稿丢掉、模型保持原样
+        cx.update_window(handle, |_, window, cx| {
+            window.click("idx-cell/0/1", cx);
+            window.render_frame(cx);
+            window.click(rid(&format!("idx-sub/{ix_name}")), cx);
+            window.press("ctrl-a", cx);
+            window.input("32", cx);
+            window.click("dpopup-cancel", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, _| {
+            let d = a.opened[0].dstate.as_ref().unwrap();
+            assert!(d.popup.is_none(), "取消关掉对话框");
+            assert_eq!(d.indexes[0].fields[1].sub_part, "8", "取消不吃草稿");
+        });
     }
 
     /// 一条索引都没有时表格常驻一行空白种子行：直接输入即可、不用先点「添加索引」；
@@ -47942,7 +49254,7 @@ mod designer_tests {
             window.render_frame(cx);
             assert!(window.try_find("qcell/0/0/0").is_some(), "切回数据页");
 
-            // 写操作：不出网格、停在消息页、状态文案换成演示口径
+            // 写操作：不出网格、不建结果页签，执行完直接展示摘要页（参考界面口径）
             app.update(cx, |a, cx| {
                 let editor = a.opened[0].qstate.as_ref().unwrap().editor.clone();
                 editor.update(cx, |s, cx| s.set_value("UPDATE t SET x = 1", window, cx));
@@ -47953,14 +49265,36 @@ mod designer_tests {
                 let q = a.opened[0].qstate.as_ref().unwrap();
                 assert_eq!(q.outcomes.len(), 1);
                 assert!(q.outcomes[0].result.is_none(), "mock 不执行写操作");
-                assert_eq!(q.pane, 0, "全是写操作停在消息页");
+                assert_eq!(q.pane, 1, "全是写操作执行完落摘要页");
                 let status = DaroApp::query_status_text(q);
                 assert!(status.starts_with("演示数据 · 写操作未执行 · "), "{status}");
             });
-            assert!(window.try_find("qtab/0").is_some());
-            assert!(window.try_find("qtab/2").is_some(), "写操作也有结果页签（内容留白）");
-            assert!(window.try_find("qmsg").is_some());
+            assert!(window.try_find("qtab/0").is_some(), "消息页签");
+            assert!(window.try_find("qtab/1").is_some(), "摘要页签");
+            assert!(window.try_find("qtab/2").is_none(), "写操作不建结果页签");
+            assert!(window.try_find("qsummary").is_some(), "摘要页回报这条写操作");
             assert!(window.try_find("qcell/0/0/0").is_none());
+
+            // 混合脚本：非查询语句不占结果页签，页签号按 outcomes 下标跳号；
+            // 默认仍落最后一条有网格的结果。
+            app.update(cx, |a, cx| {
+                let editor = a.opened[0].qstate.as_ref().unwrap().editor.clone();
+                editor.update(cx, |s, cx| {
+                    s.set_value("SELECT 1;\nUPDATE t SET x = 1;\nSELECT 2;", window, cx)
+                });
+            });
+            window.click_at("qrun-wrap", point(px(10.), px(11.)), cx);
+            window.render_frame(cx);
+            app.update(cx, |a, _| {
+                let q = a.opened[0].qstate.as_ref().unwrap();
+                assert_eq!(q.outcomes.len(), 3);
+                assert!(q.outcomes[1].result.is_none(), "中间的写操作没有结果网格");
+                assert_eq!(q.pane, 4, "落最后一条结果：outcomes[2] → pane 4");
+            });
+            assert_eq!(window.try_find("qtab/2").unwrap().label(), Some("结果 1"));
+            assert!(window.try_find("qtab/3").is_none(), "写操作不建结果页签");
+            assert_eq!(window.try_find("qtab/4").unwrap().label(), Some("结果 2"));
+            assert!(window.try_find("qcell/2/0/0").is_some(), "结果页照常出网格");
 
             // 空脚本：出提示、清结果、撤页签条
             app.update(cx, |a, cx| {
@@ -47979,6 +49313,55 @@ mod designer_tests {
             assert!(window.try_find("qmsg").is_none());
         })
         .unwrap();
+    }
+
+    /// 非查询 / 失败的语句没有结果网格：页签条只列有网格的语句，页签号仍按
+    /// outcomes 下标（会跳号）；固定了无网格的旧结果也不白占一个页签。
+    #[test]
+    fn pane_tabs_skip_statements_without_result_grid() {
+        let make = |sql: &str, result: Option<Vec<Vec<String>>>, pinned: bool, pin_seq: u64| {
+            QueryOutcome {
+                sql: sql.into(),
+                result,
+                columns: Vec::new(),
+                message: None,
+                elapsed_ms: 0,
+                cell: (0, 0),
+                sel: None,
+                explain: false,
+                pinned,
+                pin_seq,
+            }
+        };
+        let grid = || Some(vec![vec!["1".to_string()]]);
+        let outcomes = vec![
+            make("SELECT 1", grid(), false, 0),
+            make("ALTER TABLE t ADD INDEX ix(a)", None, false, 0),
+            make("SELECT 2", grid(), false, 0),
+            make("UPDATE t SET x = 1", None, true, 1),
+        ];
+        let tabs = pane_tabs(&outcomes);
+        assert_eq!(
+            tabs.iter()
+                .map(|(i, l, p)| (*i, l.as_str(), *p))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "消息", false),
+                (1, "摘要", false),
+                (2, "结果 1", false),
+                (4, "结果 2", false),
+            ],
+            "写操作不建页签，固定的无网格结果也不占位"
+        );
+        let only_ddl = pane_tabs(&[make("ALTER TABLE t ADD INDEX ix(a)", None, false, 0)]);
+        assert_eq!(
+            only_ddl
+                .iter()
+                .map(|(i, l, _)| (*i, l.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "消息"), (1, "摘要")],
+            "整轮都是写操作时只剩消息 / 摘要两枚页签"
+        );
     }
 
     /// 结果面板拖高：按下分隔条下拖，面板长高、编辑器压矮；上下都有夹紧。
@@ -50582,6 +51965,43 @@ mod designer_tests {
                 "SELECT a,\n  b\nFROM t\nWHERE a > 1\n  AND b < 2"
             );
             assert!(q.dirty, "美化算一次编辑");
+        });
+    }
+
+    /// 美化 SQL 后 Ctrl+Z 退回美化前的正文：写回用 replace_all 而不是
+    /// set_value（后者清空撤销栈，美化就变成撤不掉的操作）。
+    #[gpui_kit::test]
+    fn query_prettify_is_undoable(cx: &mut TestAppContext) {
+        isolate_store("qprettyundo");
+        const SQL: &str = "select a,b from t where a>1 and b<2";
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| a.open_query_tab(None, window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            let ed = app.update(cx, |a, _| a.opened[0].qstate.as_ref().unwrap().editor.clone());
+            ed.update(cx, |s, cx| s.set_value(SQL, window, cx));
+            window.render_frame(cx);
+            window.click("qp/pretty", cx);
+            window.render_frame(cx);
+            let formatted = ed.read(cx).value().to_string();
+            assert_ne!(formatted, SQL, "先确认美化真的改写了正文");
+            // 撤掉美化要焦点在编辑器里，否则 ctrl-z 落到别的上下文
+            ed.update(cx, |s, cx| s.focus(window, cx));
+            window.render_frame(cx);
+            window.press("ctrl-z", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, cx| {
+            assert_eq!(
+                a.opened[0].qstate.as_ref().unwrap().editor.read(cx).value().to_string(),
+                SQL,
+                "Ctrl+Z 撤掉美化，正文回到美化前"
+            );
         });
     }
 

@@ -9,6 +9,7 @@ use gpui_kit::{
 use crate::menu::PopupMenu;
 use gpui_kit::component::{Selectable, button::Button, popover::Popover};
 
+
 /// A dropdown menu trait for buttons and other interactive elements
 pub trait DropdownMenu: Styled + Selectable + InteractiveElement + IntoElement + 'static {
     /// Create a dropdown menu with the given items, anchored to the TopLeft corner

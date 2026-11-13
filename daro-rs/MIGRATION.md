@@ -1725,3 +1725,25 @@ SQL 预览只能出占位注释。上一轮实机图里那句 `OWNER TO "postgre
   时重建外键。索引之外的约束随引擎而异：MySQL `LIKE` 不带外键，SQL Server
   `SELECT INTO` 只带列和数据。
 
+## 本轮完成：非查询 SQL 不建结果页签（2026-11-13）
+
+- 用户口径：执行 `ALTER TABLE ... ADD INDEX ...` 这类非查询 SQL 后，不该再摆
+  一个空白「结果 N」页签；参考界面只留「消息 / 摘要」，执行完直接展示摘要
+  （已处理的查询 / 成功 / 错误 / 起止与运行时间 + 每句一览）。
+- 改动：
+  - `pane_tabs` 只给 `result.is_some()` 的语句建结果页签；DDL / DML / 出错的
+    语句仍留在 `outcomes` 里供消息日志与摘要统计，页签号沿用 `oi + 2` 因而
+    可能跳号（复制 / 固定 / 导出都按 `pane - 2` 取 outcome，不受影响）；固定
+    了无网格的旧结果也不再占位。
+  - `query_finish` 默认第三档（结果/解释）在整轮无结果集时落「摘要」而非
+    「消息」；显式选了「消息 / 摘要」的仍按 `Store.run_pane` 走。
+  - 「查看 ▸ 结果」子菜单与页签条共用 `pane_tabs`，无结果集时置灰提示改成
+    「（本轮没有查询结果集）」。
+- 验证：纯函数 `pane_tabs_skip_statements_without_result_grid`（混合脚本跳号、
+  固定无网格结果、整轮写操作只剩消息 / 摘要）+ headless
+  `query_run_select_write_empty`（单条写操作落摘要且无结果页签；`SELECT /
+  UPDATE / SELECT` 混合脚本的两个结果页签跨过写操作、网格照常）；
+  `view_menu_result_submenu_switches_panes_and_run_pane` 保持通过。
+- 偏差：混合脚本里只要还有 SELECT，默认仍落最后一条结果页签；想固定看摘要
+  可在「查看 ▸ 结果」里选「执行后默认显示摘要选项卡」。
+

@@ -11,6 +11,8 @@
 enum Tok {
     Word(String),
     Sym(char),
+    /// 多字符运算符（`>=` / `<=>` / `->>` / `::` …），必须整块输出
+    Op(String),
     /// 原子：字符串 / 引号标识符 / 数字 / 美元引号 / 注释，原样输出
     Atom(String),
 }
@@ -115,10 +117,36 @@ fn lex(s: &str) -> Vec<Tok> {
             out.push(Tok::Atom(s[start..i].to_string()));
             continue;
         }
+        // 多字符运算符要在退化成单符号之前整块吃掉：`>=` 一旦被读成
+        // `>` + `=`，输出时中间会补空格变成 `> =`，MySQL 直接报 1064。
+        if let Some(op) = match_operator(&s[i..]) {
+            out.push(Tok::Op(op.to_string()));
+            i += op.len();
+            continue;
+        }
         out.push(Tok::Sym(c));
         i += c.len_utf8();
     }
     out
+}
+
+/// 多字符运算符表。匹配时取最长的那一个，保证 `->>` 不会被 `->` 抢先、
+/// `<=>` 不会被 `<=` 抢先。只收录确为「一个运算符」的组合，避免把
+/// `a - -1` 之类的表达式粘成一团。
+const MULTI_CHAR_OPS: &[&str] = &[
+    // 3 字符
+    "->>", "#>>", "<=>", "!~*", "||/",
+    // 2 字符
+    ">=", "<=", "<>", "!=", "!<", "!>", "||", "&&", "<<", ">>", "::", ":=", "->", "#>", "~=",
+    "!~", "~*", "@>", "<@", "@?", "^@", "?|", "?&", "#-", "|/", "=>", "!!",
+];
+
+fn match_operator(s: &str) -> Option<&'static str> {
+    MULTI_CHAR_OPS
+        .iter()
+        .copied()
+        .filter(|op| s.starts_with(op))
+        .max_by_key(|op| op.len())
 }
 
 /// `$$` / `$tag$` 定界符（含首尾 $）；不构成定界符（如 `$1`）返回 None。
@@ -230,6 +258,11 @@ fn sticky(prev: &str, cur: &str) -> bool {
             | ("DISTINCT", "ON")
             | ("ON", "CONFLICT")
             | ("INSTEAD", "OF")
+            // EXPLAIN 是语句前缀，后面的 SELECT 不该另起一行
+            | ("EXPLAIN", "SELECT")
+            | ("EXPLAIN", "ANALYZE")
+            | ("ANALYZE", "SELECT")
+            | ("PLAN", "SELECT")
     )
 }
 
@@ -254,6 +287,24 @@ fn push_text(cur: &mut String, text: &str) {
     cur.push_str(text);
 }
 
+/// 语法上紧贴左操作数的运算符（`a::int` / `j->'$.a'`）。中间插空格多半也
+/// 能跑，但各驱动口径不一，保持原文形态最稳。
+fn glues_left(op: &str) -> bool {
+    matches!(op, "::" | "->" | "->>" | "#>" | "#>>")
+}
+
+/// 按上下文输出一个 token；`tight` 表示紧跟在贴右运算符之后，此时不补空格。
+fn push_tok(cur: &mut String, text: &str, tight: bool) {
+    if tight {
+        while cur.ends_with(' ') {
+            cur.pop();
+        }
+        cur.push_str(text);
+    } else {
+        push_text(cur, text);
+    }
+}
+
 fn flush(lines: &mut Vec<String>, cur: &mut String) {
     let t = std::mem::take(cur);
     if !t.trim().is_empty() {
@@ -272,7 +323,10 @@ pub fn pretty_statement(stmt: &str) -> String {
     // 触发器体：BEGIN 之后整体缩进一级，END 收回
     let mut saw_trigger = false;
     let mut in_body = false;
+    // 上一个 token 是 `::` / `->` 之类贴右运算符：下一个 token 不许补空格
+    let mut tight_next = false;
     for tok in toks {
+        let tight = std::mem::take(&mut tight_next);
         match tok {
             Tok::Sym(';') => {
                 // 只有触发器体内才会走到这（外层已由 splitter 拆过）
@@ -314,11 +368,22 @@ pub fn pretty_statement(stmt: &str) -> String {
                 }
                 cur.push('.');
             }
-            Tok::Sym(c) => push_text(&mut cur, &c.to_string()),
+            Tok::Sym(c) => push_tok(&mut cur, &c.to_string(), tight),
+            Tok::Op(op) => {
+                if glues_left(&op) {
+                    while cur.ends_with(' ') {
+                        cur.pop();
+                    }
+                    cur.push_str(&op);
+                    tight_next = true;
+                } else {
+                    push_tok(&mut cur, &op, tight);
+                }
+            }
             Tok::Atom(a) => {
                 let line_comment = a.starts_with("--");
                 let lead = leading_spaces(&cur);
-                push_text(&mut cur, &a);
+                push_tok(&mut cur, &a, tight);
                 if line_comment {
                     // `--` 吃掉本行剩余内容：后面的 token 必须换到下一行，
                     // 并沿用注释所在行的缩进，否则会顶格或落进注释里
@@ -354,7 +419,7 @@ pub fn pretty_statement(stmt: &str) -> String {
                     if up == "TRIGGER" {
                         saw_trigger = true;
                     }
-                    push_text(&mut cur, &upper_keyword(&w));
+                    push_tok(&mut cur, &upper_keyword(&w), tight);
                 }
                 prev_word = up;
             }
@@ -502,6 +567,59 @@ mod tests {
         let src = "select a,b, count(*) c from t where a>1 and b<2 order by c desc limit 10";
         let once = pretty(src);
         assert_eq!(pretty(&once), once, "{once}");
+    }
+
+    #[test]
+    fn comparison_operators_are_never_split() {
+        // 回归：>= / <= 曾被拆成 > = / < =，美化后 MySQL 报 1064
+        let src = "select * from t where a>=1 and b<=2 and c<>3 and d!=4 and e<=>5";
+        let out = pretty(src);
+        assert!(out.contains("a >= 1"), "{out}");
+        assert!(out.contains("b <= 2"), "{out}");
+        assert!(out.contains("c <> 3"), "{out}");
+        assert!(out.contains("d != 4"), "{out}");
+        assert!(out.contains("e <=> 5"), "{out}");
+        assert!(!out.contains("> ="), "{out}");
+        assert!(!out.contains("< ="), "{out}");
+        assert_eq!(pretty(&out), out, "美化两次结果一致");
+    }
+
+    #[test]
+    fn explain_query_keeps_day_id_range() {
+        // 用户现场语句：EXPLAIN + 多表 LEFT JOIN + day_id 区间 + LIMIT offset,count
+        let src = "EXPLAIN SELECT a.*, b.standard_name, b.custom_barcode, b.reserve now_count, \
+                   c.dish_name, c.unit, d.type_name FROM bxreport.rpt_dish_day_sale a \
+                   LEFT JOIN bxsq.dc_dish_standard b ON b.dish_standardid = a.standard_id \
+                   LEFT JOIN bxsq.dc_dish c ON c.dishid = a.dish_id \
+                   LEFT JOIN bxsq.dc_dish_type d ON d.dish_typeid = a.dish_type_id \
+                   WHERE a.dealer_id = 522017 AND a.sale_status = 1 \
+                   AND a.dish_id IN (18952) AND a.day_id >= 20260101 \
+                   AND a.day_id <= 20260310 ORDER BY a.sale_count DESC, \
+                   a.sale_price_fen DESC LIMIT 0, 15";
+        let out = pretty(src);
+        assert!(out.starts_with("EXPLAIN SELECT"), "{out}");
+        assert!(out.contains("a.day_id >= 20260101"), "{out}");
+        assert!(out.contains("a.day_id <= 20260310"), "{out}");
+        assert!(out.contains("IN (18952)"), "{out}");
+        assert!(!out.contains("> ="), "{out}");
+        assert!(!out.contains("< ="), "{out}");
+        assert_eq!(pretty(&out), out, "美化两次结果一致");
+    }
+
+    #[test]
+    fn dialect_operators_stay_intact() {
+        // MySQL JSON / PG 类型转换 / 拼接 / 正则：都不能被拆成两个单符号
+        for (src, want) in [
+            ("select j->'$.a' from t", "j->'$.a'"),
+            ("select j->>'$.a' from t", "j->>'$.a'"),
+            ("select a::int from t", "a::int"),
+            ("select a || b from t", "a || b"),
+            ("select * from t where a ~* 'x'", "a ~* 'x'"),
+        ] {
+            let out = pretty(src);
+            assert!(out.contains(want), "{src} => {out}");
+            assert_eq!(pretty(&out), out, "{src} 美化两次结果一致");
+        }
     }
 }
 

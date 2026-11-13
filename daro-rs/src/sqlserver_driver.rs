@@ -7,6 +7,8 @@
 //!   `ORDER BY (SELECT NULL)`，否则 SQL Server 直接报错
 //! - 认证：填了用户名走 SQL 认证，留空在 Windows 上走集成认证；macOS/Linux
 //!   没有 Windows 身份，留空会直接报错，提示填账号
+//! - 主机：命名实例写 `主机\实例名`（如 `localhost\SQLEXPRESS`），实例端口不
+//!   固定，先问 SQL Browser（UDP 1434）；`主机,端口` 可以钉死端口跳过 Browser
 //!
 //! 驱动对上层是同步接口：内部统一在这个模块的运行时上跑 tiberius 的 async
 //! 调用。调用点不能位于 tokio 运行时线程里（MCP 后台已用 spawn_blocking 隔开）。
@@ -22,7 +24,7 @@ use tiberius::time::{
     Date as TibDate, DateTime as TibDateTime, DateTime2 as TibDateTime2,
     DateTimeOffset as TibDateTimeOffset, SmallDateTime, Time as TibTime,
 };
-use tiberius::{AuthMethod, Client, Column, ColumnData, ColumnType, Config, EncryptionLevel, QueryItem, Row};
+use tiberius::{AuthMethod, Client, Column, ColumnData, ColumnType, Config, EncryptionLevel, QueryItem, Row, SqlBrowser};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -39,6 +41,47 @@ pub struct Params {
     pub user: String,
     pub password: String,
     pub dbname: String,
+}
+
+/// 「主机」拆出来的连接目标。
+#[derive(Debug, PartialEq, Eq)]
+pub struct Target {
+    pub host: String,
+    /// 命名实例名（`localhost\SQLEXPRESS` 里的 `SQLEXPRESS`），端口不固定，
+    /// 要向 SQL Browser 问。
+    pub instance: Option<String>,
+    /// 写在主机里的端口（`host,1433` / `host:1433`），比表单端口优先。
+    pub port: Option<u16>,
+}
+
+/// SQL Server 的主机写法比其它引擎多：命名实例的端口是装实例时随机分的，
+/// 所以 `主机\实例` 才是日常写法，端口也可以直接钉在主机串里。
+///
+/// 认这几种：`host`、`host\实例`、`host,端口`、`host\实例,端口`、`host:端口`。
+/// 端口和实例同时出现时端口赢、实例名忽略，与 SqlClient 一致。
+pub fn split_host(raw: &str) -> Target {
+    let raw = raw.trim();
+    // IPv6 的字面量带冒号，只在「一个冒号且后面全是数字」时才当端口切
+    let sep = raw
+        .rsplit_once(',')
+        .filter(|(_, p)| p.trim().parse::<u16>().is_ok())
+        .or_else(|| {
+            raw.split_once(':')
+                .filter(|(h, p)| !h.is_empty() && !h.contains(':') && p.parse::<u16>().is_ok())
+        });
+    let (head, port) = match sep {
+        Some((head, p)) => (head, p.trim().parse::<u16>().ok()),
+        None => (raw, None),
+    };
+    let (host, instance) = match head.split_once('\\') {
+        Some((h, i)) if !i.trim().is_empty() => (h.trim(), Some(i.trim().to_string())),
+        _ => (head.trim(), None),
+    };
+    Target {
+        host: host.to_string(),
+        instance,
+        port,
+    }
 }
 
 type Conn = Client<Compat<TcpStream>>;
@@ -76,11 +119,15 @@ fn auth_method(p: &Params) -> Result<AuthMethod, String> {
 }
 
 fn connect(p: &Params) -> Result<Conn, String> {
-    let host = p.host.trim();
-    if host.is_empty() {
+    let target = split_host(&p.host);
+    if target.host.is_empty() {
         return Err("SQL Server 主机不能为空".to_string());
     }
-    let port = if p.port == 0 { 1433 } else { p.port };
+    // 端口优先级：写在主机里的端口 → 表单端口 → 1433。走 Browser 时端口由
+    // 实例自己报，这里的值用不上。
+    let port = target
+        .port
+        .unwrap_or(if p.port == 0 { 1433 } else { p.port });
     let database = if p.dbname.trim().is_empty() {
         "master"
     } else {
@@ -88,9 +135,17 @@ fn connect(p: &Params) -> Result<Conn, String> {
     };
     let auth = auth_method(p)?;
     block_on(async move {
+        // 实例名和端口都从主机串里来：给了端口就直连，没给才问 Browser
+        let instance = target.instance.filter(|_| target.port.is_none());
+        let browser = instance.is_some();
         let mut cfg = Config::new();
-        cfg.host(host);
-        cfg.port(port);
+        cfg.host(&target.host);
+        if let Some(inst) = &instance {
+            // 不设端口：tiberius 会拿 1434 去问 Browser，再用报回来的端口连
+            cfg.instance_name(inst);
+        } else {
+            cfg.port(port);
+        }
         cfg.database(database);
         cfg.application_name("daro");
         // 与原先连接串的 Encrypt=No;TrustServerCertificate=Yes 一致：
@@ -98,9 +153,19 @@ fn connect(p: &Params) -> Result<Conn, String> {
         cfg.encryption(EncryptionLevel::Off);
         cfg.trust_cert();
         cfg.authentication(auth);
-        let tcp = TcpStream::connect((host, port))
-            .await
-            .map_err(|e| format!("连不上 {host}:{port}：{e}"))?;
+        let tcp = if browser {
+            let inst = instance.clone().unwrap_or_default();
+            TcpStream::connect_named(&cfg).await.map_err(|e| {
+                format!(
+                    "找不到命名实例 {}\\{inst}：{e}（确认 SQL Server Browser 服务已启动）",
+                    target.host
+                )
+            })?
+        } else {
+            TcpStream::connect((target.host.as_str(), port))
+                .await
+                .map_err(|e| format!("连不上 {}:{port}：{e}", target.host))?
+        };
         let _ = tcp.set_nodelay(true);
         Client::connect(cfg, tcp.compat_write())
             .await
@@ -1102,5 +1167,103 @@ mod tests {
         assert_eq!(type_label(ColumnType::Guid), "UNIQUEIDENTIFIER");
         assert!(num_is_numeric(&type_label(ColumnType::Decimaln)));
         assert!(!num_is_numeric(&type_label(ColumnType::NVarchar)));
+    }
+
+    fn target(host: &str, instance: Option<&str>, port: Option<u16>) -> Target {
+        Target {
+            host: host.to_string(),
+            instance: instance.map(str::to_string),
+            port,
+        }
+    }
+
+    #[test]
+    fn host_splits_named_instance_and_port() {
+        assert_eq!(split_host(r"localhost\SQLEXPRESS"), target("localhost", Some("SQLEXPRESS"), None));
+        assert_eq!(split_host(r".\SQLEXPRESS"), target(".", Some("SQLEXPRESS"), None));
+        assert_eq!(split_host(r"10.0.0.5\MSSQL2019,14330"), target("10.0.0.5", Some("MSSQL2019"), Some(14330)));
+        assert_eq!(split_host("db.example.com"), target("db.example.com", None, None));
+        // 端口两种写法都认：`,` 是 SQL Server 的传统写法，`:` 照顾从连接串抄过来的习惯
+        assert_eq!(split_host("db.example.com,51433"), target("db.example.com", None, Some(51433)));
+        assert_eq!(split_host("db.example.com:51433"), target("db.example.com", None, Some(51433)));
+        assert_eq!(split_host("  localhost\\SQLEXPRESS  "), target("localhost", Some("SQLEXPRESS"), None));
+    }
+
+    #[test]
+    fn host_without_valid_port_keeps_whole_string() {
+        // 端口位不是数字就别切，整串当主机名
+        assert_eq!(split_host("db.example.com:abc"), target("db.example.com:abc", None, None));
+        // 端口超范围同样不切
+        assert_eq!(split_host("db.example.com:70000"), target("db.example.com:70000", None, None));
+        // IPv6 字面量里全是冒号，不能当成端口
+        assert_eq!(split_host("::1"), target("::1", None, None));
+        assert_eq!(split_host("[::1]"), target("[::1]", None, None));
+        // 实例名为空时不认成命名实例
+        assert_eq!(split_host("localhost\\"), target("localhost\\", None, None));
+        assert_eq!(split_host(""), target("", None, None));
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// 本机 docker 起的 SQL Server 2022（Linux 容器没有 SQL Browser 服务，
+    /// 命名实例那条要额外起一个假的 Browser 监听 UDP 1434）：
+    ///
+    /// ```text
+    /// docker run -d --name daro-mssql -e ACCEPT_EULA=Y `
+    ///   -e MSSQL_SA_PASSWORD='Daro!Test2026' -p 14330:1433 `
+    ///   mcr.microsoft.com/mssql/server:2022-latest
+    /// ```
+    fn env_params() -> Params {
+        let get = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        Params {
+            host: get("DARO_MSSQL_HOST", "127.0.0.1"),
+            port: get("DARO_MSSQL_PORT", "14330").parse().unwrap_or(14330),
+            user: get("DARO_MSSQL_USER", "sa"),
+            password: get("DARO_MSSQL_PASSWORD", "Daro!Test2026"),
+            dbname: String::new(),
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 docker 里跑着的 SQL Server"]
+    fn docker_login_and_list_databases() {
+        let p = env_params();
+        probe(&p).expect("直连端口登录 docker SQL Server 失败");
+        let mut c = connect(&p).unwrap();
+        let (_, rows) = query_rows(&mut c, "SELECT name FROM sys.databases ORDER BY name", 100).unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+        for db in ["master", "tempdb"] {
+            assert!(names.contains(&db), "系统库要在清单里：{names:?}");
+        }
+    }
+
+    /// 命名实例：端口不固定，必须靠 SQL Browser 报回来。夹具把实例名报成上面
+    /// 那个容器的映射端口，所以这里故意把表单端口填成错的 1433，验证走 Browser
+    /// 时表单端口不参与。
+    ///
+    /// 实例名默认 `MSSQLSERVER`：Linux 容器里只有这一个实例名能过服务器的
+    /// prelogin 校验；连真 Windows 命名实例时用 `DARO_MSSQL_INSTANCE=SQLEXPRESS`。
+    #[test]
+    #[ignore = "需要 docker SQL Server + 监听 UDP 1434 的假 Browser"]
+    fn named_instance_port_comes_from_browser() {
+        let mut p = env_params();
+        let instance = std::env::var("DARO_MSSQL_INSTANCE").unwrap_or_else(|_| "MSSQLSERVER".to_string());
+        p.host = format!("{}\\{}", p.host, instance);
+        p.port = 1433;
+        probe(&p).unwrap_or_else(|e| panic!("命名实例 {instance} 应通过 SQL Browser 解析出真实端口：{e}"));
+    }
+
+    /// 主机串里钉了端口就不问 Browser，直接连（与 SqlClient 同口径）。
+    #[test]
+    #[ignore = "需要 docker 里跑着的 SQL Server"]
+    fn port_in_host_skips_browser() {
+        let mut p = env_params();
+        let port = p.port;
+        p.host = format!("{}\\NOPE,{}", p.host, port);
+        p.port = 1433;
+        probe(&p).expect("主机里给了端口，实例名应被忽略并直连该端口");
     }
 }

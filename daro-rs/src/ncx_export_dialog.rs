@@ -12,6 +12,7 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::*;
 
+use crate::mock::DbKind;
 use crate::ncx::{
     build_ano, build_ncx_file, ncx_export_blocker, ExportConnection, ExportFormat,
 };
@@ -352,7 +353,7 @@ impl ExportDialog {
                                             .truncate()
                                             .text_xs()
                                             .text_color(muted)
-                                            .child(format!("{}:{}", conn.host, conn.port)),
+                                            .child(addr_text(conn)),
                                     )
                                     .child(
                                         div()
@@ -372,6 +373,15 @@ impl ExportDialog {
                     }),
             )
     }
+}
+
+/// 列表里的地址列。SQL Server 命名实例的端口由 SQL Browser 报，端口字段是
+/// 摆设，只显示主机串，免得写成 `localhost\SQLEXPRESS:1433` 误导人。
+fn addr_text(conn: &ExportConnection) -> String {
+    if conn.kind == DbKind::SqlServer && crate::sqlserver_driver::split_host(&conn.host).instance.is_some() {
+        return conn.host.clone();
+    }
+    format!("{}:{}", conn.host, conn.port)
 }
 
 impl Render for ExportDialog {

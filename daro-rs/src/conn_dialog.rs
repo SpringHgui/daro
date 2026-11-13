@@ -11,6 +11,7 @@ use gpui_kit::*;
 use crate::DaroApp;
 use crate::art;
 use crate::db_icons;
+use crate::menu::{DropdownMenu as _, PopupMenuItem};
 use crate::ui;
 use crate::mock::{Connection, DbKind};
 use crate::palette::Palette;
@@ -121,6 +122,9 @@ pub struct NewConnectionDialog {
     /// SQLite 页的「类型」单选：0 现有文件 / 1 新建 SQLite 3 / 2 新建 SQLite 2。
     /// rusqlite 只认 SQLite 3 格式，选 2 时明确告知并阻止保存。
     sqlite_new: u8,
+    /// SQL Server 的「验证」：true = Windows 验证（用当前 Windows 账号，不填
+    /// 用户名密码）；false = SQL Server 验证。其它引擎恒为 false。
+    windows_auth: bool,
     last_title: Option<String>,
     save_password: bool,
     status: Option<SharedString>,
@@ -225,6 +229,10 @@ impl NewConnectionDialog {
             });
         }
 
+        // 空用户名就是 Windows 验证：驱动按「用户名为空 ⇒ 集成认证」处理，
+        // 编辑已有连接时照这个口径还原下拉选项。
+        let windows_auth =
+            kind == DbKind::SqlServer && editing.as_ref().is_some_and(|c| c.user.trim().is_empty());
         let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
@@ -242,6 +250,7 @@ impl NewConnectionDialog {
             kind,
             uri_mode: false,
             sqlite_new: 0,
+            windows_auth,
             last_title: None,
             save_password,
             status: None,
@@ -304,6 +313,8 @@ impl NewConnectionDialog {
         };
         let old_kind = self.kind;
         self.kind = kind;
+        // 换引擎等于重开表单：验证方式回默认（SQL Server 验证）
+        self.windows_auth = false;
         // 参考界面的习惯：进表单时空字段补上该类型的默认值
         // （主机 localhost、端口按类型，MySQL 再补用户名 root）。
         let port_value = self.port.read(cx).value().to_string();
@@ -355,7 +366,23 @@ impl NewConnectionDialog {
         if self.kind == DbKind::Access {
             return !self.database.read(cx).value().trim().is_empty();
         }
-        !self.host.read(cx).value().trim().is_empty() && self.port.read(cx).value().parse::<u16>().is_ok()
+        if self.host.read(cx).value().trim().is_empty() {
+            return false;
+        }
+        if self.kind == DbKind::SqlServer {
+            // SQL Server 验证必须有用户名；Windows 验证用当前账号，不拦
+            if !self.windows_auth && self.user.read(cx).value().trim().is_empty() {
+                return false;
+            }
+            if self.port.read(cx).value().trim().parse::<u16>().is_ok() {
+                return true;
+            }
+            // 端口可以不填：主机写了 `\实例` 时端口由 SQL Browser 报，
+            // 写了 `,端口` 时端口已经在主机串里
+            let t = crate::sqlserver_driver::split_host(&self.host.read(cx).value());
+            return t.instance.is_some() || t.port.is_some();
+        }
+        self.port.read(cx).value().trim().parse::<u16>().is_ok()
     }
 
     /// 表单 → 连接参数：「确定」和「测试连接」共用一套取字段口径。
@@ -363,13 +390,22 @@ impl NewConnectionDialog {
         if self.uri_mode {
             return parse_uri(self.uri.read(cx).value().trim());
         }
+        // Windows 验证不给用户名/密码：驱动见到空用户名就走集成认证
+        let (user, password) = if self.windows_auth {
+            (String::new(), String::new())
+        } else {
+            (
+                self.user.read(cx).value().trim().to_string(),
+                self.password.read(cx).value().to_string(),
+            )
+        };
         Some((
             self.kind,
             self.host.read(cx).value().trim().to_string(),
             self.port.read(cx).value().parse::<u16>().unwrap_or(self.kind.default_port()),
             self.database.read(cx).value().trim().to_string(),
-            self.user.read(cx).value().trim().to_string(),
-            self.password.read(cx).value().to_string(),
+            user,
+            password,
         ))
     }
 
@@ -871,6 +907,64 @@ impl NewConnectionDialog {
         }))
     }
 
+    /// 「验证」下拉。参考界面这一栏还有一串 Entra 方式，这里只摆驱动真能做的
+    /// 两条：SQL Server 验证（用户名 + 密码）和 Windows 验证（当前 Windows 账号）。
+    fn auth_select(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.pal();
+        let me = cx.entity().clone();
+        let windows = self.windows_auth;
+        Button::new("conn-auth")
+            .h(px(ui::FIELD_H))
+            .w_full()
+            .px(px(6.))
+            .bg(to_hsla(p.background))
+            .border(px(ui::HAIRLINE))
+            .border_color(to_hsla(p.field_border))
+            .rounded(px(ui::RADIUS))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(to_hsla(p.foreground))
+                            .child(if windows { "Windows 验证" } else { "SQL Server 验证" }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(to_hsla(p.subtle_foreground))
+                            .child("▾"),
+                    ),
+            )
+            .dropdown_menu(move |menu, _, _| {
+                let me_sql = me.clone();
+                let me_win = me.clone();
+                menu.item(
+                    PopupMenuItem::new("SQL Server 验证")
+                        .checked(!windows)
+                        .on_click(move |_, _, cx| {
+                            me_sql.update(cx, |this, cx| {
+                                this.windows_auth = false;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Windows 验证")
+                        .checked(windows)
+                        .on_click(move |_, _, cx| {
+                            me_win.update(cx, |this, cx| {
+                                this.windows_auth = true;
+                                cx.notify();
+                            });
+                        }),
+                )
+            })
+    }
+
     /// 表单页：参考图的 900×700 内容区 —— 页签条、
     /// 标签列 + 428 宽输入列、底部动作栏。
     fn form(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1007,15 +1101,19 @@ impl NewConnectionDialog {
                     )
                     .mt(px(38.)),
                 )
-                .child(
-                    self.form_line(
-                        "端口",
-                        div()
-                            .w(px(MID_W))
-                            .child(ui::field_input(&self.port, self.dark, window, cx)),
+                // SQL Server 的常规页不摆端口框：命名实例的端口由 SQL Browser 报，
+                // 要钉死端口写在主机里（`主机,端口`），与参考界面一致。
+                .when(self.kind != DbKind::SqlServer, |s| {
+                    s.child(
+                        self.form_line(
+                            "端口",
+                            div()
+                                .w(px(MID_W))
+                                .child(ui::field_input(&self.port, self.dark, window, cx)),
+                        )
+                        .mt(px(8.)),
                     )
-                    .mt(px(8.)),
-                )
+                })
                 .child(
                     self.form_line(
                         "初始数据库",
@@ -1025,38 +1123,50 @@ impl NewConnectionDialog {
                     )
                     .mt(px(8.)),
                 )
-                .child(
-                    self.form_line(
-                        "用户名",
-                        div()
-                            .w(px(MID_W))
-                            .child(ui::field_input(&self.user, self.dark, window, cx)),
+                .when(self.kind == DbKind::SqlServer, |s| {
+                    s.child(
+                        self.form_line(
+                            "验证",
+                            div().w(px(WIDE_W)).child(self.auth_select(cx)),
+                        )
+                        .mt(px(8.)),
                     )
-                    .mt(px(8.)),
-                )
-                .child(
-                    self.form_line(
-                        "密码",
-                        div()
-                            .w(px(MID_W))
-                            .child(ui::field_input(&self.password, self.dark, window, cx)),
+                })
+                // Windows 验证用当前 Windows 账号，没有用户名/密码可填
+                .when(!self.windows_auth, |s| {
+                    s.child(
+                        self.form_line(
+                            "用户名",
+                            div()
+                                .w(px(MID_W))
+                                .child(ui::field_input(&self.user, self.dark, window, cx)),
+                        )
+                        .mt(px(8.)),
                     )
-                    .mt(px(8.)),
-                )
-                .child(
-                    self.indent(ui::checkbox(
-                        "save-password",
-                        "保存密码",
-                        self.save_password,
-                        true,
-                        self.dark,
-                        cx.listener(|this, _, _, cx| {
-                            this.save_password = !this.save_password;
-                            cx.notify();
-                        }),
-                    ))
-                    .mt(px(10.)),
-                );
+                    .child(
+                        self.form_line(
+                            "密码",
+                            div()
+                                .w(px(MID_W))
+                                .child(ui::field_input(&self.password, self.dark, window, cx)),
+                        )
+                        .mt(px(8.)),
+                    )
+                    .child(
+                        self.indent(ui::checkbox(
+                            "save-password",
+                            "保存密码",
+                            self.save_password,
+                            true,
+                            self.dark,
+                            cx.listener(|this, _, _, cx| {
+                                this.save_password = !this.save_password;
+                                cx.notify();
+                            }),
+                        ))
+                        .mt(px(10.)),
+                    )
+                });
         }
 
         body = body.child(

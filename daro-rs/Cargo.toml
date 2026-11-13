@@ -47,7 +47,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 getrandom = "0.3"
 
 [target.'cfg(windows)'.dependencies]
-tiberius = { version = "0.13", default-features = false, features = ["tds80", "native-tls", "winauth"] }
+# sql-browser-tokio：`主机\实例` 要先问 SQL Browser（UDP 1434）拿真实端口
+tiberius = { version = "0.13", default-features = false, features = ["tds80", "native-tls", "winauth", "sql-browser-tokio"] }
 raw-window-handle = "0.6"
 # 「Internet 选项」里配的系统代理，ureq 只在开了这个特性时读注册表
 ureq = { version = "3", features = ["socks-proxy", "win-system-proxy"] }
@@ -67,7 +68,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-tiberius = { version = "0.13", default-features = false, features = ["tds80", "rustls"] }
+tiberius = { version = "0.13", default-features = false, features = ["tds80", "rustls", "sql-browser-tokio"] }
 
 [build-dependencies]
 embed-resource = "3"
