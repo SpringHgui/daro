@@ -219,11 +219,10 @@ impl UpdateWindow {
         std::thread::spawn(move || {
             let _ = tx.send_blocking(update::check(env!("CARGO_PKG_VERSION")));
         });
-        // 无头用例里不打真网络：请求线程会活过 TestAppContext，把后续用例带崩。
+        // 无头用例里不打真网络：结果当场塞回通道，别让查更新线程的调度
+        // 耽误帧数——并行跑用例时它可能抢不到 CPU，settle 几帧就白等。
         #[cfg(test)]
-        std::thread::spawn(move || {
-            let _ = tx.send_blocking(Ok(Catalog::default()));
-        });
+        let _ = tx.try_send(Ok(Catalog::default()));
         self.check_task = Some(cx.spawn(async move |this, cx| {
             let Ok(result) = rx.recv().await else {
                 return;

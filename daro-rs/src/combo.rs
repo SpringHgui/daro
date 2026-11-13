@@ -236,19 +236,22 @@ pub enum PanelFit {
 }
 
 /// 下拉面板：0.5px 描边、上下留白 4、超出滚动。
+/// 描边画在滚动区外层：滚动组件会把内容自身的边框留在内容底部，候选多到
+/// 撑出视口时下边框就跟着被裁掉了，选中列表看上去没有下沿。
 pub fn panel(rows: Vec<AnyElement>, fit: PanelFit, colors: Colors) -> AnyElement {
-    let base = v_flex()
+    let scroll = v_flex().w_full().overflow_y_scrollbar().py(px(PAD_Y)).children(rows);
+    let frame = v_flex()
         .w_full()
-        .overflow_y_scrollbar()
         .bg(colors.menu_bg)
         .border(px(0.5))
-        .border_color(colors.edge)
-        .py(px(PAD_Y));
-    let sized = match fit {
-        PanelFit::Content { max_h } => base.max_h(px(max_h)),
-        PanelFit::Fill => base.size_full(),
-    };
-    sized.children(rows).into_any_element()
+        .border_color(colors.edge);
+    match fit {
+        PanelFit::Content { max_h } => frame
+            .max_h(px(max_h))
+            .child(scroll.max_h(px(max_h))),
+        PanelFit::Fill => frame.size_full().child(scroll.size_full()),
+    }
+    .into_any_element()
 }
 
 /// 命中段铺黄底的标签文本（参考界面搜索的浏览器式高亮）。

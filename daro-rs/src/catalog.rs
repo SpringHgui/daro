@@ -277,23 +277,26 @@ fn fill_databases(conn: &Connection) -> Result<(), String> {
 
 /// 取出待办并标记为「已在飞」；同一件事在跑完前不会重复入队。
 pub fn take_pending() -> Vec<Pending> {
-    let mut queue = PENDING.lock().unwrap();
-    let mut inflight = IN_FLIGHT.lock().unwrap();
-    let jobs: Vec<Pending> = queue.drain(..).collect();
-    for p in &jobs {
-        for m in p.marks() {
-            inflight.insert(m);
-        }
-    }
-    jobs
+    with_pending(|queue| {
+        let jobs: Vec<Pending> = queue.drain(..).collect();
+        with_inflight(|inflight| {
+            for p in &jobs {
+                for m in p.marks() {
+                    inflight.insert(m);
+                }
+            }
+        });
+        jobs
+    })
 }
 
 /// 一个加载跑完：放开在飞标记。界面层紧接着重绘，故不需要额外通知。
 pub fn finish(p: &Pending) {
-    let mut inflight = IN_FLIGHT.lock().unwrap();
-    for m in p.marks() {
-        inflight.remove(&m);
-    }
+    with_inflight(|inflight| {
+        for m in p.marks() {
+            inflight.remove(&m);
+        }
+    })
 }
 
 /// 缓存读不到就入队。已经在飞的同类活儿（含「建连顺带列库」）不重复排。
@@ -303,18 +306,21 @@ fn schedule(p: Pending) {
     if is_closed(&p.conn().name) {
         return;
     }
+    #[cfg(test)]
+    TEST_CONNS.with(|names| {
+        names.borrow_mut().insert(p.conn().name.clone());
+    });
     let key = p.key();
-    {
-        let inflight = IN_FLIGHT.lock().unwrap();
-        if inflight.iter().any(|m| *m == key) {
-            return;
-        }
-    }
-    let mut queue = PENDING.lock().unwrap();
-    if queue.iter().any(|q| q.marks().iter().any(|m| *m == key)) {
+    let busy = with_inflight(|inflight| inflight.contains(&key));
+    if busy {
         return;
     }
-    queue.push(p);
+    with_pending(|queue| {
+        if queue.iter().any(|q| q.marks().iter().any(|m| *m == key)) {
+            return;
+        }
+        queue.push(p);
+    });
 }
 
 /// 用户点「打开连接」：直接排一条建连任务（顺带列库），不等渲染碰到缓存才排。
@@ -336,7 +342,7 @@ pub fn request_open(conn: &Connection) -> String {
 pub fn request_close(conn: &str) {
     CLOSED.lock().unwrap().insert(conn.to_string());
     bump_epoch(conn);
-    PENDING.lock().unwrap().retain(|p| p.conn().name != conn);
+    with_pending(|queue| queue.retain(|p| p.conn().name != conn));
 }
 
 /// 这条连接是否已被关闭（界面据此作废建连回执）。
@@ -473,7 +479,7 @@ pub fn table_parts(conn: &Connection, db: &str, schema: &str, table: &str) -> Ta
 
 // ── 真查询（只在后台线程走） ─────────────────────────────────────
 
-fn query_databases(conn: &Connection) -> Result<Vec<String>, String> {
+pub(crate) fn query_databases(conn: &Connection) -> Result<Vec<String>, String> {
     match conn.kind {
         DbKind::SQLite => {
             let path = sqlite_path(conn);
@@ -515,7 +521,7 @@ fn query_databases(conn: &Connection) -> Result<Vec<String>, String> {
     }
 }
 
-fn query_schemas(conn: &Connection, db: &str) -> Result<Vec<String>, String> {
+pub(crate) fn query_schemas(conn: &Connection, db: &str) -> Result<Vec<String>, String> {
     match conn.kind {
         // MySQL / Access / MongoDB / Redis 没有模式层：库下面直接是对象
         DbKind::MySql | DbKind::Access | DbKind::MongoDb | DbKind::Redis => Ok(Vec::new()),
@@ -527,7 +533,7 @@ fn query_schemas(conn: &Connection, db: &str) -> Result<Vec<String>, String> {
     }
 }
 
-fn query_objects(conn: &Connection, db: &str, schema: &str, cat: usize) -> Result<Vec<String>, String> {
+pub(crate) fn query_objects(conn: &Connection, db: &str, schema: &str, cat: usize) -> Result<Vec<String>, String> {
     match conn.kind {
         DbKind::SQLite => {
             let path = sqlite_path(conn);
@@ -787,12 +793,29 @@ fn mock_columns() -> Vec<ColMeta> {
 
 /// 「刷新」失效目录缓存：只清索引，已驻留的名字由 INTERN 去重，不会
 /// 随刷新次数增长（唯一名字总量才是上界）。
+#[cfg(not(test))]
 pub fn invalidate() {
     DATABASES_CACHE.lock().unwrap().clear();
     SCHEMAS_CACHE.lock().unwrap().clear();
     OBJECTS_CACHE.lock().unwrap().clear();
     COLUMNS_CACHE.lock().unwrap().clear();
     PARTS_CACHE.lock().unwrap().clear();
+}
+
+/// 测试并行跑时只清本线程用过的连接：别的用例的缓存各有各的连接名，别抹掉。
+#[cfg(test)]
+pub fn invalidate() {
+    let own = |key: &str| {
+        TEST_CONNS.with(|names| {
+            let names = names.borrow();
+            key.split('|').nth(1).is_some_and(|conn| names.contains(conn))
+        })
+    };
+    DATABASES_CACHE.lock().unwrap().retain(|k, _| !own(k));
+    SCHEMAS_CACHE.lock().unwrap().retain(|k, _| !own(k));
+    OBJECTS_CACHE.lock().unwrap().retain(|k, _| !own(k));
+    COLUMNS_CACHE.lock().unwrap().retain(|k, _| !own(k));
+    PARTS_CACHE.lock().unwrap().retain(|k, _| !own(k));
 }
 
 /// 只失效某一段对象清单（某库某模式某分类）：表被删 / 改名后，那一层重查，
@@ -821,11 +844,11 @@ pub fn invalidate_columns(conn: &str, db: &str, schema: &str, table: &str) {
 
 /// 取走最近一次目录查询错误（连接 / 刷新后由上屏层消费）。
 pub fn take_error() -> Option<String> {
-    LAST_ERROR.lock().unwrap().take()
+    with_last_error(|slot| slot.take())
 }
 
 fn set_error(e: String) {
-    *LAST_ERROR.lock().unwrap() = Some(e);
+    with_last_error(|slot| *slot = Some(e));
 }
 
 /// PG：确保「这条连接的这个库」有句柄，返回驱动注册表的键。
@@ -886,10 +909,61 @@ static PARTS_CACHE: LazyLock<Mutex<HashMap<String, TableParts>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static INTERN: LazyLock<Mutex<HashSet<&'static str>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+#[cfg(not(test))]
 static LAST_ERROR: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 /// 待办队列 + 在飞集合（键相同即视为同一件事）
+#[cfg(not(test))]
 static PENDING: LazyLock<Mutex<Vec<Pending>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+#[cfg(not(test))]
 static IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 测试并行跑时每个用例各占一个线程：待办队列 / 在飞标记 / 最近错误放线程上，
+/// 免得一个用例的 render 把另一个用例排的活儿取走。
+#[cfg(test)]
+thread_local! {
+    static TEST_PENDING: std::cell::RefCell<Vec<Pending>> =
+        std::cell::RefCell::new(Vec::new());
+    static TEST_IN_FLIGHT: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    static TEST_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// 本线程碰过的连接名：测试里 `invalidate()` 只清自己这些，别把并行用例的缓存抹掉。
+    static TEST_CONNS: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+fn with_pending<R>(f: impl FnOnce(&mut Vec<Pending>) -> R) -> R {
+    #[cfg(test)]
+    {
+        TEST_PENDING.with(|q| f(&mut q.borrow_mut()))
+    }
+    #[cfg(not(test))]
+    {
+        f(&mut PENDING.lock().unwrap())
+    }
+}
+
+fn with_inflight<R>(f: impl FnOnce(&mut HashSet<String>) -> R) -> R {
+    #[cfg(test)]
+    {
+        TEST_IN_FLIGHT.with(|s| f(&mut s.borrow_mut()))
+    }
+    #[cfg(not(test))]
+    {
+        f(&mut IN_FLIGHT.lock().unwrap())
+    }
+}
+
+fn with_last_error<R>(f: impl FnOnce(&mut Option<String>) -> R) -> R {
+    #[cfg(test)]
+    {
+        TEST_LAST_ERROR.with(|slot| f(&mut slot.borrow_mut()))
+    }
+    #[cfg(not(test))]
+    {
+        f(&mut LAST_ERROR.lock().unwrap())
+    }
+}
 /// 已关闭（或改名作废）的连接名：在飞的目录任务回来后据此作废，见 [request_close]。
 static CLOSED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 /// 每条连接「第几轮」：打开 / 关闭各算一轮。后台任务据此认出手里是上一轮的句柄。

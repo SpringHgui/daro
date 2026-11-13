@@ -597,11 +597,24 @@ pub static THEMES: [ThemeDef; 13] = [
 /// 当前主题下标。默认 Light 2026，启动时按存档覆盖。
 static ACTIVE: AtomicUsize = AtomicUsize::new(11);
 
+/// 测试并行跑时每个用例各占一个线程，主题档也放线程上，免得一个用例的
+/// 悬浮预览把另一个用例正在断言的主题改掉。
+#[cfg(test)]
+thread_local! {
+    static ACTIVE_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(11) };
+}
+
 pub fn active_index() -> usize {
-    ACTIVE.load(Ordering::Relaxed).min(THEMES.len() - 1)
+    #[cfg(test)]
+    let ix = ACTIVE_TEST.with(|c| c.get());
+    #[cfg(not(test))]
+    let ix = ACTIVE.load(Ordering::Relaxed);
+    ix.min(THEMES.len() - 1)
 }
 
 pub fn set_active(ix: usize) {
+    #[cfg(test)]
+    ACTIVE_TEST.with(|c| c.set(ix.min(THEMES.len() - 1)));
     ACTIVE.store(ix.min(THEMES.len() - 1), Ordering::Relaxed);
 }
 

@@ -38,6 +38,7 @@ mod snippet;
 mod sql_format;
 mod sql_highlight;
 mod sql_preview;
+mod structure_compare;
 mod table_copy;
 mod object_copy;
 mod table_ops;
@@ -262,16 +263,18 @@ const D_PROP_FIELD_W: f32 = 300.;
 const D_FIELD_WIDTHS: [f32; 7] = [200., 120., 60., 60., 60., 60., 300.];
 /// 函数设计器「参数」子页列宽：名称 / 类型 / 模式 / 默认值 / 删除
 const D_PARAM_WIDTHS: [f32; 5] = [150., 130., 96., 160., 30.];
-/// 索引子页主表格列宽：名称 / 字段 / 索引方法 / 唯一键 / 并发 / 注释
-/// （照参考界面 1:1 量：273/589/185/112/148/314 物理像素 ÷ 1.75 后按窗口宽度压一档）
-const D_INDEX_WIDTHS: [f32; 6] = [148., 300., 96., 58., 80., 168.];
+/// 索引子页主表格列宽：名称 / 字段 / 索引类型 / 索引方法 / 唯一键 / 并发 / 注释
+/// （照参考界面 1:1 量：273/589/185/112/148/314 物理像素 ÷ 1.75 后按窗口宽度压一档，
+/// 索引类型照 MySQL 那版插一列）
+const D_INDEX_WIDTHS: [f32; 7] = [148., 300., 88., 96., 58., 80., 168.];
 /// MySQL 索引子页主表格列宽：名称 / 字段 / 索引类型 / 索引方法 / 注释
 /// （参考界面 1:1 量：格线在 68/370/972/1174/1311 物理像素，÷2 后取整）
 const D_MY_INDEX_WIDTHS: [f32; 5] = [151., 301., 101., 68., 168.];
-/// MySQL 索引「字段」对话框：行首槽 / 勾选列 / 名称 / 子部分
-/// （参考界面格线 353/407/449/1181/1311 物理像素 ÷2 = 27/21/366/65，整宽 479）
+/// MySQL 索引「字段」对话框：行首槽 / 名称 / 子部分（参考界面整宽 479）
 const D_MY_IDX_POPUP_W: f32 = 479.;
-const D_MY_IDX_POPUP_COLS: [f32; 4] = [27., 21., 366., 65.];
+/// 行首槽 / 名称 / 子部分（剩余 ~15 留给滚动条）
+const D_MY_IDX_POPUP_COLS: [f32; 3] = [12., 388., 64.];
+const D_MY_IDX_ROW_H: f32 = 20.;
 /// MySQL 字段格右缘的「…」按钮宽（参考界面 36 物理像素 ÷2）
 const D_MY_IDX_MORE_W: f32 = 18.;
 /// 索引「字段」浮层（参考界面点「字段」格弹出的小表格）整体宽
@@ -1245,7 +1248,17 @@ fn wire_global_keys(root: Entity<DaroApp>, win: AnyWindowHandle, cx: &mut App) {
     cx.on_action::<GridCopy>(move |_, cx| {
         let root = root_copy.clone();
         cx.defer(move |cx| {
-            let _ = win.update(cx, |_, _, cx| {
+            let _ = win.update(cx, |_, window, cx| {
+                // 窗口里有拖选的文字（SQL 预览这类只读区）时复制那份选区——
+                // 只读区拖选后会主动失焦，按键只剩这条全局绑定，由这里兜住；
+                // 没有窗口选区才落回编辑区 / 结果格。
+                let text = gpui_kit::base::TextSelection::selected_text(window, cx)
+                    .trim()
+                    .to_string();
+                if !text.is_empty() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    return;
+                }
                 root.update(cx, |this, cx| this.edit_copy(cx));
             });
         });
@@ -2111,29 +2124,14 @@ impl IndexField {
         }
     }
 
-    /// 主表格「字段」格的摘要：`"tenant_id" int8_ops ASC NULLS LAST`
+    /// 主表格「字段」格的摘要：只列双引号列名，排序 / 运算符类别不进格子
+    /// （参考界面 MySQL 行的写法，PG 也跟着简化成一串列名）。
     fn summary(&self) -> String {
         let name = self.name.trim();
         if name.is_empty() {
             return String::new();
         }
-        let mut s = format!("\"{name}\"");
-        let op = self.opclass.trim();
-        if !op.is_empty() {
-            s.push(' ');
-            s.push_str(op);
-        }
-        if self.sort.trim().eq_ignore_ascii_case("DESC") {
-            s.push_str(" DESC");
-        } else {
-            s.push_str(" ASC");
-        }
-        let nulls = self.nulls.trim().to_ascii_uppercase();
-        if !nulls.is_empty() {
-            s.push(' ');
-            s.push_str(&nulls);
-        }
-        s
+        format!("\"{name}\"")
     }
 
     /// 「子部分」只在填了正整数时才作数（格子摘要与 DDL 同一口径）。
@@ -2304,6 +2302,55 @@ fn mysql_index_method_label(idx: &DesignIndex) -> String {
     }
 }
 
+/// 「索引类型」列的可选值：MySQL 是参考界面那四种，其余方言只有
+/// NORMAL / UNIQUE（PG 没有全文 / 空间索引类型，唯一性就是 UNIQUE）。
+fn index_kind_options(is_mysql: bool) -> &'static [&'static str] {
+    if is_mysql {
+        &["NORMAL", "UNIQUE", "FULLTEXT", "SPATIAL"]
+    } else {
+        &["NORMAL", "UNIQUE"]
+    }
+}
+
+/// 「索引类型」格的显示值：MySQL 走老口径，其余方言按 `unique` 推 NORMAL / UNIQUE。
+fn index_kind_label(idx: &DesignIndex, is_mysql: bool) -> String {
+    if is_mysql {
+        return mysql_index_kind(idx);
+    }
+    if idx.kind.trim().eq_ignore_ascii_case("UNIQUE") || idx.unique {
+        "UNIQUE".into()
+    } else {
+        "NORMAL".into()
+    }
+}
+
+/// 索引名留空时按数据库默认口径补一个：PG 是 `表_列1_列2_idx`（服务端自己起名
+/// 也是这个规则），MySQL 用首列名（`ALTER TABLE ... ADD INDEX` 的默认名）。
+fn design_index_auto_name(is_mysql: bool, table: &str, fields: &[&IndexField]) -> String {
+    let cols: Vec<&str> = fields
+        .iter()
+        .filter_map(|f| {
+            let n = f.name.trim();
+            (!n.is_empty()).then_some(n)
+        })
+        .collect();
+    let Some(first) = cols.first() else {
+        return String::new();
+    };
+    if is_mysql {
+        return (*first).to_string();
+    }
+    let t = table.trim();
+    let mut s = String::new();
+    if !t.is_empty() {
+        s.push_str(t);
+        s.push('_');
+    }
+    s.push_str(&cols.join("_"));
+    s.push_str("_idx");
+    s
+}
+
 /// [`design_index_sql`] 的带模式版：`ON "public"."cameras"`（无模式退化为裸表名）。
 fn design_index_sql_at(
     is_mysql: bool,
@@ -2318,12 +2365,18 @@ fn design_index_sql_at(
         mock::DbKind::PostgreSql
     };
     let qual = sql_preview::qualify(kind, schema, table);
-    let name = idx.name.trim();
     let fields: Vec<&IndexField> = idx
         .fields
         .iter()
         .filter(|f| !f.name.trim().is_empty())
         .collect();
+    // 名称留空交给数据库起名：按方言的默认规则补一个（效果与不写名字一致）
+    let auto_name = design_index_auto_name(is_mysql, table, &fields);
+    let name = if idx.name.trim().is_empty() {
+        auto_name.as_str()
+    } else {
+        idx.name.trim()
+    };
     if name.is_empty() || fields.is_empty() {
         return None;
     }
@@ -4730,6 +4783,11 @@ pub(crate) struct DesignerState {
     /// 网格与属性面板之间那条缝拖出来的高：key = 缝位（D_SPLIT_*），
     /// 没拖过的子页保持该属性面板的固有高。
     pub(crate) props_h: HashMap<u32, f32>,
+    /// 各子页网格的滚动句柄（key = 子页）：滚轮当方向键挪锚点行，
+    /// 与数据页网格同款，只有锚点行要出视口时才跟滚。
+    pub(crate) grid_scrolls: HashMap<usize, ScrollHandle>,
+    /// MySQL 索引「字段」浮层拖右下角改出来的尺寸（None = 按行数算默认高）
+    pub(crate) popup_size: Option<(f32, f32)>,
     pub(crate) cols: Vec<DesignCol>,
     pub(crate) baseline: Vec<DesignCol>,
     /// 锚点行（属性面板显示它的属性）
@@ -4835,12 +4893,16 @@ pub(crate) struct DesignerState {
     /// 视图「注释」子页的多行正文（值仍写回 `options.comment`，与表 / 实体化视图同源）
     pub(crate) view_comment_edit: Option<Entity<TextareaState>>,
     /// 保存后的提示；一动模型就撤（与 Flutter 版 _note 同款）
-    pub(crate) note: Option<&'static str>,
+    pub(crate) note: Option<String>,
+    /// 正在后台跑保存脚本（连点两次会发两遍 DDL）
+    pub(crate) saving: bool,
     /// 正在从真库反查已有表结构（打开设计页签后异步回填）
     pub(crate) loading: bool,
     /// None = 编辑已有表（名字随目录项走）；Some(name) = 新建表，
     /// name 空 = 未命名（页面上没有表名框，点「保存」时弹独立窗口补）。
     pub(crate) new_name: Option<String>,
+    /// 新建对象已经落库：此后保存走增量脚本，不再 CREATE
+    pub(crate) created: bool,
 }
 
 /// 角色 / 用户设计器工作状态，随页签存亡（放 [OpenTab] 里，关页签即弃）。
@@ -4920,7 +4982,14 @@ pub(crate) struct DesignPopup {
     pub(crate) sel: usize,
     /// 检查约束的「表达式」面板：多行输入框（参考界面是一个空文本域 + 确定/取消）
     pub(crate) expr: Option<Entity<TextareaState>>,
-    /// MySQL 索引「字段」面板的「子部分」草稿（与 items 一一对应，确定才写回模型）
+    /// MySQL 索引「字段」对话框的行（Some = 这种形态，只列索引现有字段；
+    /// `+` 追加空行，名称格下拉选列）。None = 通用勾选面板。
+    pub(crate) rows: Option<Vec<String>>,
+    /// MySQL 名称下拉的候选列（本表全部列）
+    pub(crate) cands: Vec<String>,
+    /// 名称下拉展开的行（None = 收起）
+    pub(crate) open_row: Option<usize>,
+    /// MySQL 索引「字段」面板的「子部分」草稿（与 items / rows 一一对应，确定才写回模型）
     pub(crate) subs: Vec<Option<Entity<InputState>>>,
 }
 
@@ -4944,17 +5013,20 @@ fn design_validation(
             return Some(format!("列名「{}」重复", c.name));
         }
     }
-    // 索引子页：名称/字段不能为空，名称不能重复；索引属性里的数字要合法。
+    // 索引子页：字段不能为空，名称填了不能重复，索引属性里的数字要合法。
+    // 名称留空由数据库按默认规则起名（DDL 里补 `表_列_idx` / 首列名），不算错。
     // 空白种子行（一行都没填）直接跳过：它只是等着输入的占位行。
     for (i, idx) in indexes.iter().enumerate() {
         if design_index_blank(idx) {
             continue;
         }
-        if idx.name.trim().is_empty() {
-            return Some(format!("第 {} 个索引的名称不能为空", i + 1));
-        }
+        let who = if idx.name.trim().is_empty() {
+            format!("第 {} 个索引", i + 1)
+        } else {
+            format!("索引「{}」", idx.name.trim())
+        };
         if idx.fields.iter().all(|f| f.name.trim().is_empty()) {
-            return Some(format!("索引「{}」的字段不能为空", idx.name.trim()));
+            return Some(format!("{who}的字段不能为空"));
         }
         for (label, value) in [
             ("填充因子", &idx.fillfactor),
@@ -4968,18 +5040,20 @@ fn design_validation(
             };
             if !v.is_empty() && !valid {
                 let unit = if label == "填充因子" { "0..100 的整数" } else { "正整数" };
-                return Some(format!("索引「{}」的{label}必须是 {unit}", idx.name.trim()));
+                return Some(format!("{who}的{label}必须是 {unit}"));
             }
         }
     }
     for (i, idx) in indexes.iter().enumerate() {
-        if design_index_blank(idx) {
+        // 留空的名称由数据库起名，两行都空不算重名
+        let name = idx.name.trim();
+        if design_index_blank(idx) || name.is_empty() {
             continue;
         }
-        if let Some(j) = indexes.iter().position(|o| o.name.trim() == idx.name.trim())
+        if let Some(j) = indexes.iter().position(|o| o.name.trim() == name)
             && j != i
         {
-            return Some(format!("索引名「{}」重复", idx.name.trim()));
+            return Some(format!("索引名「{name}」重复"));
         }
     }
     // 外键子页：四个必填项 + 名称不能重复；整行空白的种子行跳过
@@ -5192,6 +5266,922 @@ pub(crate) fn design_dirty(ds: &DesignerState) -> bool {
         || ds.excludes != ds.baseline_excludes
         || ds.rules != ds.baseline_rules
         || ds.triggers != ds.baseline_triggers
+}
+
+/// 设计器下发脚本里的标识符引号：MySQL 反引号、SQL Server 方括号，其余双引号。
+fn design_quote(kind: mock::DbKind, n: &str) -> String {
+    match kind {
+        mock::DbKind::MySql => format!("`{n}`"),
+        mock::DbKind::SqlServer => format!("[{}]", n.replace(']', "]]")),
+        _ => format!("\"{n}\""),
+    }
+}
+
+/// 表限定名：没有模式层的引擎（MySQL / SQLite）或没带模式时只引表名。
+fn design_qualify(kind: mock::DbKind, schema: &str, table: &str) -> String {
+    let t = design_quote(kind, table);
+    if schema.trim().is_empty() || matches!(kind, mock::DbKind::MySql | mock::DbKind::SQLite) {
+        t
+    } else {
+        format!("{}.{}", design_quote(kind, schema), t)
+    }
+}
+
+/// 保存成功后把名称留空的索引落成 DDL 里实际用的那个名字
+/// （[`design_index_auto_name`]），否则表格里一直停在「留空自动命名」，
+/// 下次改字段时还会按新列序重算出另一个名字。
+fn design_fill_auto_index_names(is_mysql: bool, table: &str, ds: &mut DesignerState) {
+    for idx in &mut ds.indexes {
+        if !idx.name.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&IndexField> = idx
+            .fields
+            .iter()
+            .filter(|f| !f.name.trim().is_empty())
+            .collect();
+        let name = design_index_auto_name(is_mysql, table, &fields);
+        if !name.is_empty() {
+            idx.name = name;
+        }
+    }
+}
+
+/// 保存成功后基线对齐工作集（演示档与真库回执共用这一份）。
+pub(crate) fn design_align_baselines(ds: &mut DesignerState) {
+    ds.baseline = ds.cols.clone();
+    ds.baseline_indexes = ds.indexes.clone();
+    ds.baseline_fks = ds.fks.clone();
+    ds.baseline_uniques = ds.uniques.clone();
+    ds.baseline_checks = ds.checks.clone();
+    ds.baseline_options = ds.options.clone();
+    ds.baseline_excludes = ds.excludes.clone();
+    ds.baseline_rules = ds.rules.clone();
+    ds.baseline_triggers = ds.triggers.clone();
+    ds.baseline_params = ds.params.clone();
+    ds.baseline_ret_ty = ds.ret_ty.clone();
+    ds.baseline_view_body = ds.view_body.clone();
+    ds.baseline_matview_concurrent = ds.matview_concurrent;
+    ds.baseline_matview_with_data = ds.matview_with_data;
+    ds.baseline_view_check_option = ds.view_check_option.clone();
+    ds.baseline_view_security_barrier = ds.view_security_barrier;
+}
+
+/// [DesignerState] 按 did 认领：页签可能在后台回执之前就被关掉。
+fn design_state_mut(opened: &mut [OpenTab], did: u64) -> Option<&mut DesignerState> {
+    opened.iter_mut().find(|t| t.did == did)?.dstate.as_mut()
+}
+
+/// 同名索引 / 约束改动的比较口径：注释单独走 COMMENT ON，不算「要重建」。
+fn design_pair_same_shape(a: &DesignPair, b: &DesignPair) -> bool {
+    let mut x = a.clone();
+    x.comment.clear();
+    let mut y = b.clone();
+    y.comment.clear();
+    x == y
+}
+
+fn design_fk_same_shape(a: &DesignForeignKey, b: &DesignForeignKey) -> bool {
+    let mut x = a.clone();
+    x.comment.clear();
+    let mut y = b.clone();
+    y.comment.clear();
+    x == y
+}
+
+/// 「更新指定列定义」的增量语句。方言表达不了的改动直接报错——保存按钮
+/// 把原因留在工具条，基线不动，不假装保存成功。
+fn design_col_alter(
+    kind: mock::DbKind,
+    qual: &str,
+    c: &DesignCol,
+    b: &DesignCol,
+) -> Result<Vec<String>, String> {
+    let q = |n: &str| design_quote(kind, n);
+    let name = c.name.trim();
+    let alter = |frag: &str| format!("ALTER TABLE {qual}\n  {frag};");
+    // 只动了主键勾：表级主键段负责，这里不出 MODIFY（MySQL 的 MODIFY 会重建表）
+    let mut no_pk = c.clone();
+    no_pk.pk = b.pk;
+    if no_pk == *b {
+        return Ok(Vec::new());
+    }
+    match kind {
+        mock::DbKind::MySql => {
+            if c.collation != b.collation {
+                return Err(format!("列「{name}」的排序规则改动还没接（MySQL）"));
+            }
+            Ok(vec![alter(&format!(
+                "MODIFY COLUMN {}",
+                design_col_sql(true, c)
+            ))])
+        }
+        mock::DbKind::PostgreSql => {
+            let col = q(name);
+            let mut out = Vec::new();
+            let type_changed = design_full_type(c) != design_full_type(b);
+            let ty = design_full_type(c);
+            // 改类型时 PG 不会自动套赋值转换（text→integer 之类直接报错），
+            // 必须显式给 USING；旧默认值先摘掉，改完再按源的默认值补回。
+            if type_changed && !b.default.trim().is_empty() {
+                out.push(alter(&format!("ALTER COLUMN {col} DROP DEFAULT")));
+            }
+            if type_changed || c.collation != b.collation {
+                let collate = if c.collation.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" COLLATE {}", q(c.collation.trim()))
+                };
+                let using = if type_changed {
+                    format!(" USING CAST({col} AS {ty})")
+                } else {
+                    String::new()
+                };
+                out.push(alter(&format!(
+                    "ALTER COLUMN {col} TYPE {ty}{collate}{using}"
+                )));
+            }
+            if c.not_null != b.not_null {
+                out.push(alter(&format!(
+                    "ALTER COLUMN {col} {}",
+                    if c.not_null { "SET NOT NULL" } else { "DROP NOT NULL" }
+                )));
+            }
+            let dropped_early = type_changed && !b.default.trim().is_empty();
+            if !c.default.trim().is_empty() && (c.default != b.default || dropped_early) {
+                out.push(alter(&format!(
+                    "ALTER COLUMN {col} SET DEFAULT {}",
+                    c.default.trim()
+                )));
+            } else if c.default.trim().is_empty() && c.default != b.default && !dropped_early {
+                out.push(alter(&format!("ALTER COLUMN {col} DROP DEFAULT")));
+            }
+            if c.identity != b.identity {
+                out.push(alter(&format!(
+                    "ALTER COLUMN {col} {}",
+                    if c.identity.trim().is_empty() {
+                        "DROP IDENTITY".to_string()
+                    } else {
+                        format!("SET GENERATED {}", c.identity.trim())
+                    }
+                )));
+            }
+            if c.comment != b.comment {
+                let lit = if c.comment.trim().is_empty() {
+                    "NULL".to_string()
+                } else {
+                    format!("'{}'", sql_literal(c.comment.trim()))
+                };
+                out.push(format!(
+                    "COMMENT ON COLUMN {qual}.{col} IS {lit};"
+                ));
+            }
+            if out.is_empty() {
+                return Err(format!("列「{name}」的改动没有可执行的语句"));
+            }
+            Ok(out)
+        }
+        mock::DbKind::SqlServer => {
+            if !c.identity.is_empty() || !b.identity.is_empty() {
+                return Err(format!("列「{name}」的标识列改动还没接（SQL Server）"));
+            }
+            if c.default != b.default || c.comment != b.comment {
+                return Err(format!("列「{name}」的默认值 / 注释改动还没接（SQL Server）"));
+            }
+            let mut ty = design_full_type(c);
+            if !c.collation.trim().is_empty() {
+                ty.push_str(&format!(" COLLATE {}", c.collation.trim()));
+            }
+            let null = if c.not_null { " NOT NULL" } else { " NULL" };
+            Ok(vec![alter(&format!(
+                "ALTER COLUMN {} {ty}{null}",
+                q(name)
+            ))])
+        }
+        mock::DbKind::SQLite => Err(format!(
+            "SQLite 不能直接改列定义（列「{name}」），要重建表"
+        )),
+        _ => Err("这种连接不支持改表结构".to_string()),
+    }
+}
+
+/// 真库「保存」实际下发的脚本：把工作集与保存基线的差异翻成可执行 DDL。
+/// 与 SQL 预览的「更改」不同：不出触发器 / 规则的空模板，同名约束改了先删
+/// 后建；方言表达不了的差异返回错误（调用方原样上屏，基线不动）。
+pub(crate) fn design_apply_statements(
+    kind: mock::DbKind,
+    schema: &str,
+    table: &str,
+    ds: &DesignerState,
+) -> Result<Vec<String>, String> {
+    let is_mysql = matches!(kind, mock::DbKind::MySql);
+    let is_pg = matches!(kind, mock::DbKind::PostgreSql);
+    let is_sqlserver = matches!(kind, mock::DbKind::SqlServer);
+    let q = |n: &str| design_quote(kind, n);
+    let qual = design_qualify(kind, schema, table);
+    let alter = |frag: &str| format!("ALTER TABLE {qual}\n  {frag};");
+    let mut first: Vec<String> = Vec::new(); // 先删（索引 / 约束 / 主键）
+    let mut middle: Vec<String> = Vec::new(); // 列
+    let mut last: Vec<String> = Vec::new(); // 后建（主键 / 约束 / 索引 / 表属性）
+
+    // ── 字段：同名比定义，改名的「删一列 + 加一列」按 RENAME 处理，别把数据删掉 ──
+    let col_name = |c: &DesignCol| c.name.trim().to_string();
+    let mut added: Vec<&DesignCol> = Vec::new();
+    let mut removed: Vec<&DesignCol> = Vec::new();
+    for c in &ds.cols {
+        let name = col_name(c);
+        if name.is_empty() {
+            continue;
+        }
+        match ds.baseline.iter().find(|b| col_name(b) == name) {
+            None => added.push(c),
+            Some(b) if b == c => {}
+            Some(b) => middle.extend(design_col_alter(kind, &qual, c, b)?),
+        }
+    }
+    for b in &ds.baseline {
+        let name = col_name(b);
+        if name.is_empty() {
+            continue;
+        }
+        if !ds.cols.iter().any(|c| col_name(c) == name) {
+            removed.push(b);
+        }
+    }
+    // 改名：只剩一加一删、除名字外定义一致 → RENAME COLUMN（保留数据）
+    let mut rename_done = false;
+    if added.len() == 1 && removed.len() == 1 {
+        let mut a = added[0].clone();
+        let mut r = removed[0].clone();
+        a.name = String::new();
+        r.name = String::new();
+        if a == r {
+            let (old, new) = (removed[0].name.trim(), added[0].name.trim());
+            if is_sqlserver {
+                last.push(format!(
+                    "EXEC sp_rename '{}.{}', '{}', 'COLUMN';",
+                    table, old, new
+                ));
+            } else {
+                middle.push(alter(&format!(
+                    "RENAME COLUMN {} TO {}",
+                    q(old),
+                    q(new)
+                )));
+            }
+            rename_done = true;
+        }
+    }
+    if !rename_done {
+        for c in &added {
+            middle.push(alter(&format!(
+                "{} {}",
+                if is_sqlserver { "ADD" } else { "ADD COLUMN" },
+                design_col_sql(is_mysql, c)
+            )));
+        }
+        for b in &removed {
+            middle.push(alter(&format!("DROP COLUMN {}", q(b.name.trim()))));
+        }
+    }
+
+    // ── 主键：加 / 换列可以，去掉要约束名（PG / SQL Server 的名字不可推断） ──
+    let pk_of = |cols: &[DesignCol]| -> Vec<String> {
+        cols.iter()
+            .filter(|c| c.pk && !c.name.trim().is_empty())
+            .map(|c| c.name.trim().to_string())
+            .collect()
+    };
+    let (pk_now, pk_base) = (pk_of(&ds.cols), pk_of(&ds.baseline));
+    if pk_now != pk_base {
+        if pk_base.is_empty() {
+            last.push(alter(&format!(
+                "ADD PRIMARY KEY ({})",
+                pk_now.iter().map(|n| q(n)).collect::<Vec<_>>().join(", ")
+            )));
+        } else if is_mysql {
+            first.push(alter("DROP PRIMARY KEY"));
+            if !pk_now.is_empty() {
+                last.push(alter(&format!(
+                    "ADD PRIMARY KEY ({})",
+                    pk_now.iter().map(|n| q(n)).collect::<Vec<_>>().join(", ")
+                )));
+            }
+        } else {
+            return Err("改主键要先知道库里的约束名，这里还没接；先保留原来的主键列".into());
+        }
+    }
+
+    // ── 外键 ──
+    let fk_name = |f: &DesignForeignKey| f.name.trim().to_string();
+    for fk in &ds.fks {
+        let name = fk_name(fk);
+        if name.is_empty() {
+            if design_fk_blank(fk) {
+                continue;
+            }
+            return Err("外键行没填完（名称 / 字段 / 引用表 / 引用字段）".into());
+        }
+        let Some(b) = ds.baseline_fks.iter().find(|b| fk_name(b) == name) else {
+            let clause = design_fk_sql(is_mysql, fk)
+                .ok_or_else(|| format!("外键「{name}」没填完（字段 / 引用表 / 引用字段）"))?;
+            last.push(alter(&format!("ADD {clause}")));
+            continue;
+        };
+        if b == fk {
+            continue;
+        }
+        if !design_fk_same_shape(b, fk) {
+            first.push(alter(&format!(
+                "DROP {}",
+                if is_mysql {
+                    format!("FOREIGN KEY {}", q(&name))
+                } else {
+                    format!("CONSTRAINT {}", q(&name))
+                }
+            )));
+            let clause = design_fk_sql(is_mysql, fk)
+                .ok_or_else(|| format!("外键「{name}」没填完（字段 / 引用表 / 引用字段）"))?;
+            last.push(alter(&format!("ADD {clause}")));
+        } else if is_pg && b.comment != fk.comment {
+            let lit = if fk.comment.trim().is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("'{}'", sql_literal(fk.comment.trim()))
+            };
+            last.push(format!(
+                "COMMENT ON CONSTRAINT {} ON {qual} IS {lit};",
+                q(&name)
+            ));
+        }
+    }
+    for b in &ds.baseline_fks {
+        let name = fk_name(b);
+        if name.is_empty() || ds.fks.iter().any(|f| fk_name(f) == name) {
+            continue;
+        }
+        first.push(alter(&format!(
+            "DROP {}",
+            if is_mysql {
+                format!("FOREIGN KEY {}", q(&name))
+            } else {
+                format!("CONSTRAINT {}", q(&name))
+            }
+        )));
+    }
+
+    // ── 唯一键 / 检查：同名比形状，改了先删后建；只改注释走 COMMENT ON ──
+    let pair_name = |p: &DesignPair| p.name.trim().to_string();
+    for uk in &ds.uniques {
+        let name = pair_name(uk);
+        if name.is_empty() {
+            if design_pair_blank(uk) {
+                continue;
+            }
+            return Err("唯一键行没填完（名称 / 字段）".into());
+        }
+        let Some(b) = ds.baseline_uniques.iter().find(|b| pair_name(b) == name) else {
+            let clause = design_unique_sql(is_mysql, uk)
+                .ok_or_else(|| format!("唯一键「{name}」没填字段"))?;
+            last.push(alter(&format!("ADD {clause}")));
+            continue;
+        };
+        if b == uk {
+            continue;
+        }
+        if !design_pair_same_shape(b, uk) {
+            first.push(alter(&format!(
+                "DROP {}",
+                if is_mysql {
+                    format!("INDEX {}", q(&name))
+                } else {
+                    format!("CONSTRAINT {}", q(&name))
+                }
+            )));
+            let clause = design_unique_sql(is_mysql, uk)
+                .ok_or_else(|| format!("唯一键「{name}」没填字段"))?;
+            last.push(alter(&format!("ADD {clause}")));
+        } else if is_pg && b.comment != uk.comment {
+            let lit = if uk.comment.trim().is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("'{}'", sql_literal(uk.comment.trim()))
+            };
+            last.push(format!(
+                "COMMENT ON CONSTRAINT {} ON {qual} IS {lit};",
+                q(&name)
+            ));
+        }
+    }
+    for b in &ds.baseline_uniques {
+        let name = pair_name(b);
+        if name.is_empty() || ds.uniques.iter().any(|f| pair_name(f) == name) {
+            continue;
+        }
+        first.push(alter(&format!(
+            "DROP {}",
+            if is_mysql {
+                format!("INDEX {}", q(&name))
+            } else {
+                format!("CONSTRAINT {}", q(&name))
+            }
+        )));
+    }
+    for ck in &ds.checks {
+        let name = pair_name(ck);
+        if name.is_empty() {
+            if design_pair_blank(ck) {
+                continue;
+            }
+            return Err("检查约束行没填完（名称 / 表达式）".into());
+        }
+        let Some(b) = ds.baseline_checks.iter().find(|b| pair_name(b) == name) else {
+            let clause = design_check_sql(is_pg, ck)
+                .ok_or_else(|| format!("检查约束「{name}」没填表达式"))?;
+            last.push(alter(&format!("ADD {clause}")));
+            continue;
+        };
+        if b == ck {
+            continue;
+        }
+        if !design_pair_same_shape(b, ck) {
+            first.push(alter(&format!("DROP CONSTRAINT {}", q(&name))));
+            let clause = design_check_sql(is_pg, ck)
+                .ok_or_else(|| format!("检查约束「{name}」没填表达式"))?;
+            last.push(alter(&format!("ADD {clause}")));
+        } else if is_pg && b.comment != ck.comment {
+            let lit = if ck.comment.trim().is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("'{}'", sql_literal(ck.comment.trim()))
+            };
+            last.push(format!(
+                "COMMENT ON CONSTRAINT {} ON {qual} IS {lit};",
+                q(&name)
+            ));
+        }
+    }
+    for b in &ds.baseline_checks {
+        let name = pair_name(b);
+        if name.is_empty() || ds.checks.iter().any(|f| pair_name(f) == name) {
+            continue;
+        }
+        first.push(alter(&format!("DROP CONSTRAINT {}", q(&name))));
+    }
+
+    // ── 排除约束（PG 专属） ──
+    if is_pg {
+        let ex_name = |e: &DesignExclude| e.name.trim().to_string();
+        for ex in &ds.excludes {
+            let name = ex_name(ex);
+            if name.is_empty() {
+                if design_exclude_blank(ex) {
+                    continue;
+                }
+                return Err("排除约束行没填完（名称 / 元素）".into());
+            }
+            let Some(b) = ds.baseline_excludes.iter().find(|b| ex_name(b) == name) else {
+                let clause = design_exclude_sql(ex)
+                    .ok_or_else(|| format!("排除约束「{name}」没填元素"))?;
+                last.push(alter(&format!("ADD {clause}")));
+                continue;
+            };
+            if b == ex {
+                continue;
+            }
+            if b.elements != ex.elements
+                || b.method != ex.method
+                || b.predicate != ex.predicate
+            {
+                first.push(alter(&format!("DROP CONSTRAINT {}", q(&name))));
+                let clause = design_exclude_sql(ex)
+                    .ok_or_else(|| format!("排除约束「{name}」没填元素"))?;
+                last.push(alter(&format!("ADD {clause}")));
+            } else if b.comment != ex.comment {
+                let lit = if ex.comment.trim().is_empty() {
+                    "NULL".to_string()
+                } else {
+                    format!("'{}'", sql_literal(ex.comment.trim()))
+                };
+                last.push(format!(
+                    "COMMENT ON CONSTRAINT {} ON {qual} IS {lit};",
+                    q(&name)
+                ));
+            }
+        }
+        for b in &ds.baseline_excludes {
+            let name = ex_name(b);
+            if name.is_empty() || ds.excludes.iter().any(|f| ex_name(f) == name) {
+                continue;
+            }
+            first.push(alter(&format!("DROP CONSTRAINT {}", q(&name))));
+        }
+    }
+
+    // ── 索引：改了先删后建（名字没填时按方言默认口径补一个） ──
+    let idx_name = |idx: &DesignIndex| -> String {
+        let n = idx.name.trim();
+        if !n.is_empty() {
+            return n.to_string();
+        }
+        let fields: Vec<&IndexField> = idx
+            .fields
+            .iter()
+            .filter(|f| !f.name.trim().is_empty())
+            .collect();
+        design_index_auto_name(is_mysql, table, &fields)
+    };
+    let drop_index = |name: &str| -> String {
+        match kind {
+            mock::DbKind::MySql => alter(&format!("DROP INDEX {}", q(name))),
+            mock::DbKind::SqlServer => format!("DROP INDEX {} ON {qual};", q(name)),
+            mock::DbKind::PostgreSql if !schema.trim().is_empty() => format!(
+                "DROP INDEX {}.{};",
+                q(schema.trim()),
+                q(name)
+            ),
+            _ => format!("DROP INDEX {};", q(name)),
+        }
+    };
+    for idx in &ds.indexes {
+        if design_index_blank(idx) {
+            continue;
+        }
+        let name = idx_name(idx);
+        if name.is_empty() {
+            return Err("索引行没填字段".into());
+        }
+        let Some(b) = ds.baseline_indexes.iter().find(|b| idx_name(b) == name) else {
+            let stmt = design_index_sql_at(is_mysql, schema, table, idx, &ds.cols)
+                .ok_or_else(|| format!("索引「{name}」没填字段"))?;
+            last.extend(split_sql_statements(&stmt));
+            continue;
+        };
+        if b == idx {
+            continue;
+        }
+        // 只改注释：PG 走 COMMENT ON INDEX；MySQL 8 无此语法（走重建），
+        // SQLite / SQL Server 也没有，跟着重建
+        if is_pg && b.comment != idx.comment && {
+            let mut x = b.clone();
+            x.comment.clear();
+            let mut y = idx.clone();
+            y.comment.clear();
+            x == y
+        } {
+            let lit = if idx.comment.trim().is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("'{}'", sql_literal(idx.comment.trim()))
+            };
+            last.push(format!("COMMENT ON INDEX {} IS {lit};", q(&name)));
+            continue;
+        }
+        first.push(drop_index(&name));
+        let stmt = design_index_sql_at(is_mysql, schema, table, idx, &ds.cols)
+            .ok_or_else(|| format!("索引「{name}」没填字段"))?;
+        last.extend(split_sql_statements(&stmt));
+    }
+    for b in &ds.baseline_indexes {
+        if design_index_blank(b) {
+            continue;
+        }
+        let name = idx_name(b);
+        if name.is_empty() || ds.indexes.iter().any(|f| idx_name(f) == name) {
+            continue;
+        }
+        first.push(drop_index(&name));
+    }
+
+    // ── 触发器 / 规则：新增走生成器，删除 / 改动先删后建；空模板不下发 ──
+    let trig_name = |t: &DesignTrigger| t.name.trim().to_string();
+    for t in &ds.triggers {
+        if design_trigger_blank(t) || trig_name(t).is_empty() {
+            continue;
+        }
+        let name = trig_name(t);
+        let Some(b) = ds.baseline_triggers.iter().find(|b| trig_name(b) == name) else {
+            let sql = design_triggers_sql_at(kind, schema, table, std::slice::from_ref(t));
+            if sql.is_empty() {
+                return Err(format!("触发器「{name}」没填事件"));
+            }
+            last.extend(sql);
+            continue;
+        };
+        if b == t {
+            continue;
+        }
+        let sql = design_triggers_sql_at(kind, schema, table, std::slice::from_ref(t));
+        if sql.is_empty() {
+            return Err(format!("触发器「{name}」没填事件"));
+        }
+        first.push(match kind {
+            mock::DbKind::PostgreSql => format!("DROP TRIGGER {} ON {qual};", q(&name)),
+            _ => format!("DROP TRIGGER {};", q(&name)),
+        });
+        last.extend(sql);
+    }
+    for b in &ds.baseline_triggers {
+        let name = trig_name(b);
+        if name.is_empty() || ds.triggers.iter().any(|f| trig_name(f) == name) {
+            continue;
+        }
+        first.push(match kind {
+            mock::DbKind::PostgreSql => format!("DROP TRIGGER {} ON {qual};", q(&name)),
+            _ => format!("DROP TRIGGER {};", q(&name)),
+        });
+    }
+    if is_pg {
+        let rule_name = |r: &DesignRule| r.name.trim().to_string();
+        for r in &ds.rules {
+            if design_rule_blank(r) || rule_name(r).is_empty() {
+                continue;
+            }
+            let name = rule_name(r);
+            let Some(b) = ds.baseline_rules.iter().find(|b| rule_name(b) == name) else {
+                let stmt = design_rule_sql(r, &qual)
+                    .ok_or_else(|| format!("规则「{name}」没填事件"))?;
+                last.push(stmt);
+                continue;
+            };
+            if b == r {
+                continue;
+            }
+            let stmt = design_rule_sql(r, &qual)
+                .ok_or_else(|| format!("规则「{name}」没填事件"))?;
+            first.push(format!("DROP RULE {} ON {qual};", q(&name)));
+            last.push(stmt);
+        }
+        for b in &ds.baseline_rules {
+            let name = rule_name(b);
+            if name.is_empty() || ds.rules.iter().any(|f| rule_name(f) == name) {
+                continue;
+            }
+            first.push(format!("DROP RULE {} ON {qual};", q(&name)));
+        }
+    }
+
+    // ── 表属性：PG 逐项 ALTER，MySQL 只支持注释，其余方言报错 ──
+    let (o, ob) = (&ds.options, &ds.baseline_options);
+    if o != ob {
+        if is_pg {
+            if o.comment != ob.comment {
+                let lit = if o.comment.trim().is_empty() {
+                    "NULL".to_string()
+                } else {
+                    format!("'{}'", sql_literal(o.comment.trim()))
+                };
+                last.push(format!("COMMENT ON TABLE {qual} IS {lit};"));
+            }
+            if o.fillfactor != ob.fillfactor {
+                if o.fillfactor.trim().is_empty() {
+                    last.push(alter("RESET (fillfactor)"));
+                } else {
+                    last.push(alter(&format!(
+                        "SET (fillfactor = {})",
+                        o.fillfactor.trim()
+                    )));
+                }
+            }
+            if o.tablespace != ob.tablespace && !o.tablespace.trim().is_empty() {
+                last.push(alter(&format!(
+                    "SET TABLESPACE {}",
+                    q(o.tablespace.trim())
+                )));
+            }
+            if o.owner != ob.owner && !o.owner.trim().is_empty() {
+                last.push(alter(&format!("OWNER TO {}", q(o.owner.trim()))));
+            }
+            if o.unlogged != ob.unlogged {
+                last.push(alter(if o.unlogged {
+                    "SET UNLOGGED"
+                } else {
+                    "SET LOGGED"
+                }));
+            }
+            if o.cluster != ob.cluster {
+                if o.cluster.trim().is_empty() {
+                    last.push(alter("SET WITHOUT CLUSTER"));
+                } else {
+                    last.push(format!(
+                        "CLUSTER {qual} USING {};",
+                        q(o.cluster.trim())
+                    ));
+                }
+            }
+            if o.inherit != ob.inherit {
+                let split = |s: &str| -> Vec<String> {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                };
+                let now = split(&o.inherit);
+                let base = split(&ob.inherit);
+                let parent_sql = |p: &str| -> String {
+                    match p.split_once('.') {
+                        Some((sch, t)) => format!(
+                            "{}.{}",
+                            design_quote(mock::DbKind::PostgreSql, sch),
+                            design_quote(mock::DbKind::PostgreSql, t)
+                        ),
+                        None => design_quote(mock::DbKind::PostgreSql, p),
+                    }
+                };
+                for p in now.iter().filter(|p| !base.contains(p)) {
+                    last.push(alter(&format!("INHERIT {}", parent_sql(p))));
+                }
+                for p in base.iter().filter(|p| !now.contains(p)) {
+                    last.push(alter(&format!("NO INHERIT {}", parent_sql(p))));
+                }
+            }
+        } else if is_mysql {
+            if o.comment != ob.comment {
+                last.push(format!(
+                    "ALTER TABLE {qual} COMMENT = '{}';",
+                    sql_literal(o.comment.trim())
+                ));
+            }
+            let unsupported = [
+                ("填充因子", &o.fillfactor, &ob.fillfactor),
+                ("表空间", &o.tablespace, &ob.tablespace),
+                ("所有者", &o.owner, &ob.owner),
+                ("继承自", &o.inherit, &ob.inherit),
+                ("集群", &o.cluster, &ob.cluster),
+            ]
+            .into_iter()
+            .find(|(_, a, b)| a != b);
+            if o.unlogged != ob.unlogged {
+                return Err("MySQL 没有「不记录」选项".into());
+            }
+            if let Some((label, _, _)) = unsupported {
+                return Err(format!("MySQL 的表「{label}」改动还没接"));
+            }
+        } else if is_sqlserver {
+            return Err("SQL Server 的表属性改动还没接".into());
+        } else {
+            return Err("这个引擎不支持改表属性".into());
+        }
+    }
+
+    let mut out = first;
+    out.extend(middle);
+    out.extend(last);
+    Ok(out)
+}
+
+/// 新建表 / 视图 / 函数保存时的一次性脚本，按顶层分号拆成逐条执行。
+fn design_create_script(
+    conn: &mock::Connection,
+    schema: &str,
+    table: &str,
+    ds: &DesignerState,
+    cat: usize,
+) -> Result<Vec<String>, String> {
+    if cat != 0 {
+        return match cat {
+            1 => design_view_statements(conn.kind, schema, table, ds, false),
+            2 => Err("实体化视图的建库还没接（要先建实体化视图、再建索引）".into()),
+            _ => Err("函数 / 存储过程还没从真库读回正文，新建先不落库".into()),
+        };
+    }
+    let mut script = design_create_sql_at(
+        conn.kind,
+        schema,
+        table,
+        // 真库保存不替用户改属主：建表人本来就是当前连接用户
+        "",
+        &ds.cols,
+        &ds.indexes,
+        &ds.fks,
+        &ds.uniques,
+        &ds.checks,
+        &ds.options,
+        &ds.excludes,
+        &ds.rules,
+    );
+    for stmt in design_triggers_sql_at(conn.kind, schema, table, &ds.triggers) {
+        script.push('\n');
+        script.push_str(&stmt);
+    }
+    let stmts = split_sql_statements(&script);
+    if stmts.is_empty() {
+        return Err("没有可执行的建表语句".into());
+    }
+    Ok(stmts)
+}
+
+/// 视图定义语句（新建与改定义共用）：`replace` = 对象已存在，能就地换定义。
+/// PG 顺带把注释 / 属主 / 规则一起下；其它方言视图没有这些从属对象。
+fn design_view_statements(
+    kind: mock::DbKind,
+    schema: &str,
+    table: &str,
+    ds: &DesignerState,
+    replace: bool,
+) -> Result<Vec<String>, String> {
+    let body = ds.view_body.trim();
+    if body.is_empty() {
+        return Err("「定义」页还没写 SELECT 语句".into());
+    }
+    let qual = design_qualify(kind, schema, table);
+    let check = match ds.view_check_option.trim().to_uppercase().as_str() {
+        "LOCAL" => " WITH LOCAL CHECK OPTION",
+        "CASCADED" => " WITH CASCADED CHECK OPTION",
+        _ => "",
+    };
+    let mut out = Vec::new();
+    match kind {
+        mock::DbKind::PostgreSql => {
+            let with = if ds.view_security_barrier {
+                " WITH (security_barrier=true)"
+            } else {
+                ""
+            };
+            let head = if replace {
+                "CREATE OR REPLACE VIEW"
+            } else {
+                "CREATE VIEW"
+            };
+            out.push(format!("{head} {qual}{with} AS\n{body}{check};"));
+            let tail =
+                design_view_pg_tail(&qual, &ds.options.owner, &ds.options.comment, &ds.rules);
+            out.extend(split_sql_statements(&tail));
+        }
+        mock::DbKind::MySql => {
+            if ds.view_security_barrier {
+                return Err("MySQL 视图没有「安全屏障」".into());
+            }
+            let head = if replace {
+                "CREATE OR REPLACE VIEW"
+            } else {
+                "CREATE VIEW"
+            };
+            out.push(format!("{head} {qual} AS\n{body}{check};"));
+        }
+        mock::DbKind::SqlServer => {
+            if ds.view_security_barrier {
+                return Err("SQL Server 视图没有「安全屏障」".into());
+            }
+            let head = if replace {
+                "CREATE OR ALTER VIEW"
+            } else {
+                "CREATE VIEW"
+            };
+            out.push(format!("{head} {qual} AS\n{body}{check};"));
+        }
+        mock::DbKind::SQLite => {
+            if ds.view_security_barrier || !check.is_empty() {
+                return Err("SQLite 视图没有检查选项 / 安全屏障".into());
+            }
+            if replace {
+                out.push(format!("DROP VIEW IF EXISTS {qual};"));
+            }
+            out.push(format!("CREATE VIEW {qual} AS\n{body};"));
+        }
+        _ => return Err(format!("{} 的视图保存还没接", kind.label())),
+    }
+    Ok(out)
+}
+
+/// 已有视图改定义：先删掉不再保留 / 内容改过的 PG 规则，再换定义。
+fn design_view_apply_statements(
+    kind: mock::DbKind,
+    schema: &str,
+    table: &str,
+    ds: &DesignerState,
+) -> Result<Vec<String>, String> {
+    let mut drops: Vec<String> = Vec::new();
+    if matches!(kind, mock::DbKind::PostgreSql) {
+        let qual = design_qualify(kind, schema, table);
+        for b in &ds.baseline_rules {
+            let name = b.name.trim();
+            if name.is_empty() || design_rule_blank(b) {
+                continue;
+            }
+            let same = ds
+                .rules
+                .iter()
+                .any(|r| r.name.trim() == name && r == b);
+            if !same {
+                drops.push(format!(
+                    "DROP RULE {} ON {qual};",
+                    design_quote(kind, name)
+                ));
+            }
+        }
+    }
+    let mut out = design_view_statements(kind, schema, table, ds, true)?;
+    if matches!(kind, mock::DbKind::PostgreSql) {
+        let qual = design_qualify(kind, schema, table);
+        if ds.options.comment.trim().is_empty()
+            && ds.baseline_options.comment.trim() != ds.options.comment.trim()
+        {
+            out.push(format!("COMMENT ON VIEW {qual} IS NULL;"));
+        }
+    }
+    drops.extend(out);
+    Ok(drops)
 }
 
 const DESIGN_PAGE_X: f32 = 257.;
@@ -7610,6 +8600,8 @@ struct DaroApp {
     q_panel_drag: Option<(u64, f32, f32)>,
     /// 网格与属性面板那条缝拖高的瞬态：(设计器 did, 缝位, 起始指针 y, 起始面板高)
     d_prop_drag: Option<(u64, u32, f32, f32)>,
+    /// 索引「字段」浮层右下角缩放：(did, 起始指针 x, y, 起始宽, 起始高)
+    popup_drag: Option<(u64, f32, f32, f32, f32)>,
     /// 本帧窗口高度（逻辑像素）：虚拟化算可见行数用，比网格实际高度略大，
     /// 多画的几行正好当上下的缓冲。
     viewport_h: f32,
@@ -7946,6 +8938,7 @@ impl DaroApp {
             pane_drag: None,
             q_panel_drag: None,
             d_prop_drag: None,
+            popup_drag: None,
             viewport_h: 900.,
             viewport_w: 1440.,
             table_layouts,
@@ -8975,7 +9968,7 @@ impl DaroApp {
             "复制表",
             "新表名",
             planned,
-            move |app, name| {
+            move |app, _cx, name| {
                 let name = name.trim().to_string();
                 if name.is_empty() || name == table {
                     return;
@@ -9780,7 +10773,7 @@ impl DaroApp {
                 "复制查询",
                 "新查询名",
                 planned,
-                move |app, new_name| {
+                move |app, _cx, new_name| {
                     let new_name = new_name.trim().to_string();
                     if new_name.is_empty() || new_name == name {
                         return;
@@ -9819,7 +10812,7 @@ impl DaroApp {
             title,
             label,
             planned,
-            move |app, new_name| {
+            move |app, _cx, new_name| {
                 let new_name = new_name.trim().to_string();
                 if new_name.is_empty() || new_name == name {
                     return;
@@ -9989,7 +10982,7 @@ impl DaroApp {
                 title,
                 field,
                 current,
-                move |app, name| {
+                move |app, _cx, name| {
                     if let Some(job) = app.table_op_job(act, op, &name) {
                         app.queue_table_op(job);
                     }
@@ -10584,6 +11577,8 @@ impl DaroApp {
             widths: Default::default(),
             resize: None,
             props_h: Default::default(),
+            grid_scrolls: (0..11).map(|i| (i, ScrollHandle::new())).collect(),
+            popup_size: None,
             cols: mock_design_cols(obj),
             baseline: mock_design_cols(obj),
             sel: 0,
@@ -10665,8 +11660,10 @@ impl DaroApp {
             baseline_view_security_barrier: false,
             view_comment_edit: None,
             note: None,
+            saving: false,
             loading: false,
             new_name: None,
+            created: false,
         };
         if load_real {
             dstate.cols.clear();
@@ -10959,6 +11956,8 @@ impl DaroApp {
                 widths: Default::default(),
                 resize: None,
                 props_h: Default::default(),
+                grid_scrolls: (0..11).map(|i| (i, ScrollHandle::new())).collect(),
+                popup_size: None,
                 cols: empty.clone(),
                 baseline: empty,
                 sel: 0,
@@ -11040,8 +12039,10 @@ impl DaroApp {
                 baseline_view_security_barrier: false,
                 view_comment_edit: None,
                 note: None,
+                saving: false,
                 loading: false,
                 new_name: Some(String::new()),
+                created: false,
             }),
             role: false,
             rid: 0,
@@ -11528,7 +12529,7 @@ impl DaroApp {
             "过期日期",
             "过期日期（YYYY-MM-DD HH:MM:SS）",
             initial,
-            move |app, value| app.role_set_until(role_id, value),
+            move |app, _cx, value| app.role_set_until(role_id, value),
             cx,
         );
     }
@@ -12239,20 +13240,30 @@ impl DaroApp {
             let w_after = sql_preview::code_lines_w(&after, gutter_w);
             // id 挂外层（滚动条包一层内层 div，否则 overflow_scrollbar 会拆掉
             // test_support 的观察包装，元素就从测试注册表里消失）
-            let pane = |id: &'static str, rows: &[&str], chg: &[bool], w: f32| {
-                div()
-                    .id(rid(id))
-                    .test_support()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div().size_full().overflow_scrollbar().child(
-                            v_flex().w(px(w)).children(rows.iter().enumerate().map(|(i, l)| {
-                                sql_preview::diff_row(i + 1, l, chg[i], w, gutter_w, self.dark, fg)
-                            })),
-                        ),
-                    )
-            };
+            let pane =
+                |id: &'static str, rows: &[&str], chg: &[bool], w: f32, order: u64| {
+                    div()
+                        .id(rid(id))
+                        .test_support()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            // 双轴 Scrollable 的内容在交叉轴上会被拉伸到视口高，
+                            // 纵向就滚不动；self_start 让内容按自身高度撑开。
+                            div().size_full().self_start().overflow_scrollbar().child(
+                                v_flex().w(px(w)).child(sql_preview::code_block(
+                                    rid(&format!("{id}-sql")),
+                                    rows,
+                                    chg,
+                                    gutter_w,
+                                    w,
+                                    order,
+                                    self.dark,
+                                    fg,
+                                )),
+                            ),
+                        )
+                };
             v_flex()
                 .id(rid("rsql-ddl"))
                 .test_support()
@@ -12286,8 +13297,8 @@ impl DaroApp {
                         .px(px(10.))
                         .pb(px(6.))
                         .gap(px(10.))
-                        .child(pane("rsql-before", &before, &chg_b, w_before))
-                        .child(pane("rsql-after", &after, &chg_a, w_after)),
+                        .child(pane("rsql-before", &before, &chg_b, w_before, 0))
+                        .child(pane("rsql-after", &after, &chg_a, w_after, 1)),
                 )
                 .into_any_element()
         } else {
@@ -12324,13 +13335,17 @@ impl DaroApp {
                         .test_support()
                         .size_full()
                         .child(
-                            div().size_full().overflow_scrollbar().child(
-                                v_flex()
-                                    .w(px(w))
-                                    .pt(px(6.))
-                                    .children(refs.iter().map(|l| {
-                                        sql_preview::plain_row(l, w, self.dark, fg)
-                                    })),
+                            div().size_full().self_start().overflow_scrollbar().child(
+                                v_flex().w(px(w)).pt(px(6.)).child(sql_preview::code_block(
+                                    rid("rsql-changes-sql"),
+                                    &refs,
+                                    &[],
+                                    0.,
+                                    w,
+                                    0,
+                                    self.dark,
+                                    fg,
+                                )),
                             ),
                         ),
                 )
@@ -12532,8 +13547,8 @@ impl DaroApp {
     }
 
     /// 新建表点「保存」后的承接（「表名」输入框独立窗口的回调）：
-    /// 记下名字、基线对齐当前模型、给一句如实说明（mock 档不落库）。
-    fn finish_new_design_save(&mut self, did: u64, name: String) {
+    /// 记下名字后立刻走正常保存（真库下发 CREATE，演示档只对齐基线）。
+    fn finish_new_design_save(&mut self, did: u64, name: String, cx: &mut Context<Self>) {
         let Some(tab) = self.opened.iter_mut().find(|t| t.did == did) else {
             return;
         };
@@ -12541,14 +13556,8 @@ impl DaroApp {
         if ds.new_name.as_ref().is_some_and(|n| !n.is_empty()) {
             return;
         }
-        ds.new_name = Some(name);
-        ds.baseline = ds.cols.clone();
-        ds.baseline_options = ds.options.clone();
-        ds.baseline_view_body = ds.view_body.clone();
-        ds.baseline_matview_with_data = ds.matview_with_data;
-        ds.baseline_view_check_option = ds.view_check_option.clone();
-        ds.baseline_view_security_barrier = ds.view_security_barrier;
-        ds.note = Some("已创建（演示数据，不落库）");
+        ds.new_name = Some(name.trim().to_string());
+        self.design_save(did, cx);
     }
 
     /// 打开「新建查询」页签（Ribbon / 文件菜单 / 连接右键菜单共用入口）。
@@ -14731,7 +15740,7 @@ impl DaroApp {
             "添加到收藏夹",
             "收藏夹名称：",
             initial,
-            move |app, name| app.add_favorite(name, target.clone()),
+            move |app, _cx, name| app.add_favorite(name, target.clone()),
             cx,
         );
     }
@@ -15759,7 +16768,7 @@ impl DaroApp {
             .enumerate()
             .flat_map(|(r, idx)| {
                 [
-                    (0usize, idx.name.clone(), "索引名"),
+                    (0usize, idx.name.clone(), "留空自动命名"),
                     (1, idx.comment.clone(), ""),
                     (2, idx.fillfactor.clone(), ""),
                     (3, idx.pending_list_limit.clone(), ""),
@@ -15814,6 +16823,30 @@ impl DaroApp {
                 .and_then(|t| t.dstate.as_mut())
                 .expect("设计页签必有状态");
             ds.index_edits[r][f] = Some(state);
+        }
+    }
+
+    /// 渲染时把索引「名称」输入框的文本跟模型对齐：保存后模型里补上了自动名，
+    /// 常驻编辑器还是旧文本。只在两者不一致且输入框没聚焦时写回，
+    /// 打字 / 输入法组字途中不会互相抢内容。
+    fn sync_design_index_name_edits(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut stale: Vec<(Entity<InputState>, String)> = Vec::new();
+        for tab in &self.opened {
+            let Some(ds) = tab.dstate.as_ref() else { continue };
+            for (r, idx) in ds.indexes.iter().enumerate() {
+                let Some(Some(edit)) = ds.index_edits.get(r).map(|edits| edits[0].clone()) else {
+                    continue;
+                };
+                let input = edit.read(cx);
+                if input.value().to_string() != idx.name
+                    && !input.focus_handle(cx).is_focused(window)
+                {
+                    stale.push((edit.clone(), idx.name.clone()));
+                }
+            }
+        }
+        for (edit, name) in stale {
+            edit.update(cx, |s, cx| s.set_value(name, window, cx));
         }
     }
 
@@ -15933,8 +16966,9 @@ impl DaroApp {
         }
     }
 
-    /// MySQL「索引类型」列：NORMAL / UNIQUE / FULLTEXT / SPATIAL。
-    /// 顺带把 `unique` 位同步好——建表 SQL 与后续只认这一个开关的地方都靠它。
+    /// 「索引类型」列：MySQL 是 NORMAL / UNIQUE / FULLTEXT / SPATIAL，
+    /// 其余方言只有 NORMAL / UNIQUE。顺带把 `unique` 位同步好——
+    /// 建表 SQL 与后续只认这一个开关的地方都靠它。
     fn design_set_index_kind(&mut self, did: u64, row: usize, kind: String, cx: &mut Context<Self>) {
         if let Some(ds) = self
             .opened
@@ -15961,10 +16995,16 @@ impl DaroApp {
             .and_then(|t| t.dstate.as_mut())
         {
             ds.index_sel = row;
-            ds.index_cur = if unique { 3 } else { 4 };
+            ds.index_cur = if unique { 4 } else { 5 };
             if let Some(idx) = ds.indexes.get_mut(row) {
                 if unique {
                     idx.unique = !idx.unique;
+                    // 唯一键与索引类型是同一个开关的两处，勾完类型格跟着走；
+                    // MySQL 的 FULLTEXT / SPATIAL 不掺和。
+                    let k = idx.kind.trim().to_ascii_uppercase();
+                    if !matches!(k.as_str(), "FULLTEXT" | "SPATIAL") {
+                        idx.kind = if idx.unique { "UNIQUE".into() } else { "NORMAL".into() };
+                    }
                 } else {
                     idx.concurrent = !idx.concurrent;
                 }
@@ -16080,6 +17120,9 @@ impl DaroApp {
                     items: payload.0,
                     sel: payload.1,
                     expr: None,
+                    rows: None,
+                    cands: Vec::new(),
+                    open_row: None,
                     subs: Vec::new(),
                 });
                 d.note = None;
@@ -16109,6 +17152,58 @@ impl DaroApp {
         }
         .unwrap_or_default();
         let chosen = split_cols(&current);
+        // MySQL 的「字段」对话框：只列索引现有字段（名称 + 子部分），加字段走底栏 +。
+        if target == PickTarget::IndexCols && self.designer_is_mysql(did) {
+            let (rows, subs) = {
+                let idx = d.indexes.get(row);
+                let rows: Vec<String> = idx
+                    .map(|i| {
+                        i.fields
+                            .iter()
+                            .map(|f| f.name.trim().to_string())
+                            .filter(|n| !n.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let subs = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, _)| {
+                        let v = idx
+                            .and_then(|i| i.fields.get(ix))
+                            .map(|f| f.sub_part.clone())
+                            .unwrap_or_default();
+                        cx.new(|cx| InputState::new(window, cx).default_value(v))
+                    })
+                    .map(Some)
+                    .collect();
+                (rows, subs)
+            };
+            let cands: Vec<String> = d
+                .cols
+                .iter()
+                .map(|c| c.name.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect();
+            if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
+                && let Some(d) = t.dstate.as_mut()
+            {
+                d.popup = Some(DesignPopup {
+                    target,
+                    row,
+                    items: Vec::new(),
+                    sel: 0,
+                    expr: None,
+                    rows: Some(rows),
+                    cands,
+                    open_row: None,
+                    subs,
+                });
+                d.note = None;
+            }
+            cx.notify();
+            return;
+        }
         // 候选列：本表列（FkCols）或被引用表的列（FkRefCols，参考图列出引用表的 id/name/value）
         let mut items: Vec<(String, bool)> = match target {
             PickTarget::FkRefCols => d
@@ -16147,34 +17242,6 @@ impl DaroApp {
             items.sort_by_key(|(_, on)| !*on);
         }
         let sel = items.iter().position(|(_, on)| *on).unwrap_or(0);
-        // MySQL 的「子部分」草稿：一行一个输入框，初值取该索引已存的前缀长度。
-        // 面板里改完要按确定才写回模型，跟勾选一个口径。
-        let mut subs: Vec<Option<Entity<InputState>>> = Vec::new();
-        if target == PickTarget::IndexCols && self.designer_is_mysql(did) {
-            let olds: Vec<(String, String)> = self
-                .opened
-                .iter()
-                .find(|t| t.did == did)
-                .and_then(|t| t.dstate.as_ref())
-                .and_then(|d| d.indexes.get(row))
-                .map(|i| {
-                    i.fields
-                        .iter()
-                        .map(|f| (f.name.clone(), f.sub_part.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for (name, _) in &items {
-                let v = olds
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, s)| s.clone())
-                    .unwrap_or_default();
-                subs.push(Some(cx.new(|cx| {
-                    InputState::new(window, cx).default_value(v)
-                })));
-            }
-        }
         if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
             && let Some(d) = t.dstate.as_mut()
         {
@@ -16184,7 +17251,10 @@ impl DaroApp {
                 items,
                 sel,
                 expr: None,
-                subs,
+                rows: None,
+                cands: Vec::new(),
+                open_row: None,
+                subs: Vec::new(),
             });
             d.note = None;
         }
@@ -17100,11 +18170,117 @@ impl DaroApp {
         }
     }
 
+    /// MySQL 字段对话框：点行只是选中（字段不靠勾选开关）
+    fn design_index_row_select(&mut self, did: u64, ix: usize, cx: &mut Context<Self>) {
+        if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
+            && let Some(d) = t.dstate.as_mut()
+            && let Some(p) = d.popup.as_mut()
+        {
+            p.sel = ix;
+            p.open_row = None;
+            cx.notify();
+        }
+    }
+
+    /// 名称格：展开 / 收起候选列下拉
+    fn design_index_row_open(&mut self, did: u64, ix: usize, cx: &mut Context<Self>) {
+        if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
+            && let Some(d) = t.dstate.as_mut()
+            && let Some(p) = d.popup.as_mut()
+        {
+            p.sel = ix;
+            p.open_row = if p.open_row == Some(ix) { None } else { Some(ix) };
+            cx.notify();
+        }
+    }
+
+    /// 下拉里点一列：填进该行的名称格
+    fn design_index_row_pick(&mut self, did: u64, ix: usize, name: String, cx: &mut Context<Self>) {
+        if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
+            && let Some(d) = t.dstate.as_mut()
+            && let Some(p) = d.popup.as_mut()
+        {
+            if let Some(row) = p.rows.as_mut().and_then(|r| r.get_mut(ix)) {
+                *row = name;
+            }
+            p.sel = ix;
+            p.open_row = None;
+            cx.notify();
+        }
+    }
+
+    /// MySQL 字段对话框的 +：末尾追加一行空字段并直接展开候选列
+    fn design_index_rows_add(
+        &mut self,
+        did: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
+            && let Some(d) = t.dstate.as_mut()
+            && let Some(p) = d.popup.as_mut()
+            && let Some(rows) = p.rows.as_mut()
+        {
+            rows.push(String::new());
+            let ix = rows.len() - 1;
+            p.subs.push(Some(cx.new(|cx| InputState::new(window, cx))));
+            p.sel = ix;
+            p.open_row = Some(ix);
+            cx.notify();
+        }
+    }
+
+    /// MySQL 字段对话框的 −：删掉选中行（连同子部分草稿）
+    fn design_index_rows_remove(&mut self, did: u64, cx: &mut Context<Self>) {
+        if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
+            && let Some(d) = t.dstate.as_mut()
+            && let Some(p) = d.popup.as_mut()
+        {
+            let Some(rows) = p.rows.as_mut() else { return };
+            if rows.is_empty() {
+                return;
+            }
+            let at = p.sel.min(rows.len() - 1);
+            rows.remove(at);
+            if p.subs.len() > at {
+                p.subs.remove(at);
+            }
+            p.sel = at.min(rows.len().saturating_sub(1));
+            p.open_row = None;
+            cx.notify();
+        }
+    }
+
+    /// MySQL 字段对话框的 ↑ / ↓：挪动选中行（字段顺序即列序）
+    fn design_index_rows_move(&mut self, did: u64, delta: isize, cx: &mut Context<Self>) {
+        if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
+            && let Some(d) = t.dstate.as_mut()
+            && let Some(p) = d.popup.as_mut()
+        {
+            let Some(rows) = p.rows.as_mut() else { return };
+            if rows.is_empty() {
+                return;
+            }
+            let from = p.sel.min(rows.len() - 1);
+            let to = (from as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+            if from != to {
+                rows.swap(from, to);
+                if p.subs.len() == rows.len() {
+                    p.subs.swap(from, to);
+                }
+                p.sel = to;
+            }
+            p.open_row = None;
+            cx.notify();
+        }
+    }
+
     fn design_popup_cancel(&mut self, did: u64, cx: &mut Context<Self>) {
         if let Some(t) = self.opened.iter_mut().find(|t| t.did == did)
             && let Some(d) = t.dstate.as_mut()
         {
             d.popup = None;
+            self.popup_drag = None;
             cx.notify();
         }
     }
@@ -17116,6 +18292,7 @@ impl DaroApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.popup_drag = None;
         let Some(t) = self.opened.iter_mut().find(|t| t.did == did) else {
             return;
         };
@@ -17138,6 +18315,45 @@ impl DaroApp {
             if fk_comment {
                 self.design_sync_fk_editor(did, p.row, 4, &text, window, cx);
             }
+            return;
+        }
+        // MySQL 的「字段」对话框：行顺序即列序，空行（没选列）跳过
+        if p.target == PickTarget::IndexCols
+            && p.rows.is_some()
+        {
+            let old: Vec<IndexField> = d
+                .indexes
+                .get(p.row)
+                .map(|i| i.fields.clone())
+                .unwrap_or_default();
+            let mut fields: Vec<IndexField> = Vec::new();
+            for (ix, name) in p.rows.as_ref().into_iter().flatten().enumerate() {
+                let name = name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let mut f = match old.iter().find(|f| f.name == name) {
+                    Some(keep) => keep.clone(),
+                    None => {
+                        let ty = d
+                            .cols
+                            .iter()
+                            .find(|c| c.name == name)
+                            .map(|c| c.ty.clone())
+                            .unwrap_or_default();
+                        IndexField::make(name, &ty)
+                    }
+                };
+                if let Some(sub) = p.subs.get(ix).and_then(|slot| slot.as_ref()) {
+                    f.sub_part = sub.read(cx).value().trim().to_string();
+                }
+                fields.push(f);
+            }
+            if let Some(idx) = d.indexes.get_mut(p.row) {
+                idx.fields = fields;
+            }
+            d.note = None;
+            cx.notify();
             return;
         }
         let joined = p
@@ -17226,8 +18442,8 @@ impl DaroApp {
     }
 
     /// 浮层子编辑器（「…」面板）：白底 + 1px 边框，表头 / 勾选列表 / 上移下移删除 + 确定取消
-    /// MySQL 索引「字段」对话框（参考界面 1:1）：行首槽 + 勾选 + 名称 + 子部分，
-    /// 底栏 ↑ ↓ + − 与 确定 / 取消。勾选决定字段、列表顺序决定列序、子部分进 DDL。
+    /// MySQL 索引「字段」对话框（参考界面 1:1）：行首槽 + 名称 + 子部分，只列索引现有字段；
+    /// 底栏 ↑ ↓ + − 与 确定 / 取消。+ 追加空行并展开候选列下拉，行顺序决定列序。
     fn my_index_fields_panel(
         &self,
         did: u64,
@@ -17251,6 +18467,32 @@ impl DaroApp {
         // 表头行首那一格淡蓝（参考界面把「当前列」的表头整块染色）
         let head_cur = to_hsla(blend(p.accent, p.background, 0.74));
         let cw = D_MY_IDX_POPUP_COLS;
+        let rh = D_MY_IDX_ROW_H;
+        let rows = popup.rows.clone().unwrap_or_default();
+
+        // 浮层尺寸：没拖过按行数算默认高；名称下拉展开时临时撑到能装下它，
+        // 收起来回到原高。上限给窗口底栏留出余量，免得浮层跑到屏幕外。
+        let (bw, bh) = ds.popup_size.unwrap_or((
+            D_MY_IDX_POPUP_W,
+            30. + (rows.len() as f32 * rh).min(225.) + 32.,
+        ));
+        let name_w_grid = ds
+            .widths
+            .get(&(1usize, 0))
+            .copied()
+            .unwrap_or(D_MY_INDEX_WIDTHS[0]);
+        let left = D_GUTTER_W + name_w_grid - 8.;
+        let top = D_TOOLBAR_H + D_TABBAR_H + D_HEADER_H + (popup.row + 1) as f32 * D_ROW_EXTENT + 1.;
+        let open_row = popup.open_row.filter(|r| *r < rows.len());
+        let drop_want = 168.;
+        let need_h = open_row
+            .map(|r| 30. + (r as f32 + 1.) * rh + drop_want + 32.)
+            .unwrap_or(0.);
+        let max_h = (self.viewport_h - TITLE_H - RIBBON_H - top - STATUS_BAR_H - 8.).max(160.);
+        let w = bw;
+        let h = bh.max(need_h).min(max_h).max(140.);
+        // 名称列吃掉浮层多出来的宽（子部分固定，右侧仍留 ~15 给滚动条）
+        let name_w = (w - cw[0] - cw[2] - 15.).max(120.);
 
         let head = h_flex()
             .h(px(30.))
@@ -17268,18 +18510,9 @@ impl DaroApp {
             )
             .child(
                 div()
-                    .w(px(cw[1]))
+                    .w(px(name_w))
                     .h_full()
                     .flex_none()
-                    .border_r_1()
-                    .border_b_1()
-                    .border_color(line),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
                     .flex()
                     .items_center()
                     .px(px(6.))
@@ -17290,7 +18523,7 @@ impl DaroApp {
             )
             .child(
                 div()
-                    .w(px(cw[3]))
+                    .w(px(cw[2]))
                     .h_full()
                     .flex_none()
                     .flex()
@@ -17299,36 +18532,20 @@ impl DaroApp {
                     .border_b_1()
                     .border_color(line)
                     .child(div().text_size(px(12.)).text_color(fg).child("子部分")),
-            );
+            )
+            .child(div().flex_1().h_full().border_b_1().border_color(line));
 
         let body = v_flex()
             .id("dpopup-list")
             .flex_1()
             .min_h_0()
-            .max_h(px(225.))
             .overflow_y_scrollbar()
-            .children(popup.items.iter().enumerate().map(|(ix, (name, on))| {
+            .children(rows.iter().enumerate().map(|(ix, name)| {
                 let selected = popup.sel == ix;
                 let sub = popup.subs.get(ix).cloned().flatten();
-                let check = div()
-                    .size(px(16.))
-                    .rounded(px(2.))
-                    .border_1()
-                    .border_color(if *on { accent } else { to_hsla(p.subtle_foreground) })
-                    .bg(if *on { accent } else { bg })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(*on, |s| {
-                        s.child(
-                            Icon::new(ZedIcon::Check)
-                                .with_size(px(11.))
-                                .text_color(to_hsla(0xffffff)),
-                        )
-                    });
                 h_flex()
                     .id(rid(&format!("dpopup/{ix}")))
-                    .h(px(20.))
+                    .h(px(rh))
                     .flex_none()
                     .border_b_1()
                     .border_color(line)
@@ -17336,7 +18553,7 @@ impl DaroApp {
                     .when(selected, |s| s.bg(bg))
                     .when(!selected, move |s| s.hover(move |s| s.bg(hover)))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.design_popup_toggle(did, ix, cx)
+                        this.design_index_row_select(did, ix, cx)
                     }))
                     .test_support()
                     .child(
@@ -17361,45 +18578,49 @@ impl DaroApp {
                             }),
                     )
                     .child(
+                        // 名称格：点开展开候选列下拉（参考图的组合框）
                         div()
-                            .w(px(cw[1]))
+                            .id(rid(&format!("idx-name/{ix}")))
+                            .w(px(name_w))
                             .h_full()
                             .flex_none()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .border_r_1()
-                            .border_color(line)
-                            .child(check),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .flex()
-                            .items_center()
+                            .gap(px(2.))
                             .px(px(6.))
                             .border_r_1()
                             .border_color(line)
+                            .cursor_pointer()
+                            // 点名称格只是开下拉，别传给行点击（那会把下拉又收起）
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.design_index_row_open(did, ix, cx)
+                            }))
+                            .test_support()
                             .child(
                                 div()
+                                    .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_size(px(12.))
                                     .text_color(fg)
                                     .child(name.clone()),
+                            )
+                            .child(
+                                Icon::new(ZedIcon::ChevronDown)
+                                    .with_size(px(9.))
+                                    .text_color(muted),
                             ),
                     )
                     .child(
                         // 子部分：每行一个输入框，确定才写回模型
                         match sub {
                             Some(state) => div()
-                                .w(px(cw[3]))
+                                .w(px(cw[2]))
                                 .h_full()
                                 .flex_none()
                                 .relative()
-                                // 点「子部分」只是进输入框，别把这一行的勾选给点了
+                                // 点「子部分」只是进输入框，别把这一行给选了
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
                                     div()
@@ -17422,11 +18643,63 @@ impl DaroApp {
                                         ),
                                 )
                                 .into_any_element(),
-                            None => div().w(px(cw[3])).h_full().flex_none().into_any_element(),
+                            None => div().w(px(cw[2])).h_full().flex_none().into_any_element(),
                         },
                     )
                     .into_any_element()
             }));
+
+        // 名称下拉：贴在当前行名称格下缘，候选 = 本表全部列。整体收在浮层里
+        // （下方放不下就翻到当前行上方），别压住底边和底栏。
+        let dropdown = open_row.map(|r| {
+                let cur = rows.get(r).cloned().unwrap_or_default();
+                let top_below = 30. + (r as f32 + 1.) * rh;
+                let below = (h - 32. - top_below).max(0.);
+                let above = r as f32 * rh;
+                let (drop_top, drop_h) = if below >= drop_want || below >= above {
+                    (top_below, below.min(drop_want).max(40.))
+                } else {
+                    let dh = above.min(drop_want).max(40.);
+                    (30. + r as f32 * rh - dh, dh)
+                };
+                div()
+                    .id("idx-drop")
+                    .test_support()
+                    .absolute()
+                    .left(px(cw[0]))
+                    .top(px(drop_top))
+                    .w(px(name_w))
+                    .h(px(drop_h))
+                    .bg(bg)
+                    .border_1()
+                    .border_color(border)
+                    .shadow_lg()
+                    // 滚动条包一层：外层留 id / test-support，内层管滚动
+                    .child(
+                        v_flex()
+                            .h_full()
+                            .overflow_y_scrollbar()
+                            .children(popup.cands.iter().map(|name| {
+                                let is_cur = *name == cur;
+                                let name = name.clone();
+                                let label = name.clone();
+                                h_flex()
+                                    .id(rid(&format!("idx-pick/{name}")))
+                                    .h(px(22.))
+                                    .flex_none()
+                                    .items_center()
+                                    .px(px(8.))
+                                    .cursor_pointer()
+                                    .when(is_cur, |s| s.bg(selection))
+                                    .hover(move |s| s.bg(hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.design_index_row_pick(did, r, name.clone(), cx)
+                                    }))
+                                    .test_support()
+                                    .child(div().text_size(px(12.)).text_color(fg).child(label))
+                            })),
+                    )
+            });
 
         let icon_btn = |id: &'static str, glyph: art::Glyph, color: Hsla| {
             h_flex()
@@ -17450,21 +18723,21 @@ impl DaroApp {
                 icon_btn("dpopup-up", art::Glyph::Asset("FILTER_MOVE_UP"), muted)
                     .test_support()
                     .on_click(
-                        cx.listener(move |this, _, _, cx| this.design_popup_move(did, -1, cx)),
+                        cx.listener(move |this, _, _, cx| this.design_index_rows_move(did, -1, cx)),
                     ),
             )
             .child(
                 icon_btn("dpopup-down", art::Glyph::Asset("FILTER_MOVE_DOWN"), muted)
                     .test_support()
                     .on_click(
-                        cx.listener(move |this, _, _, cx| this.design_popup_move(did, 1, cx)),
+                        cx.listener(move |this, _, _, cx| this.design_index_rows_move(did, 1, cx)),
                     ),
             )
             .child(
                 icon_btn("dpopup-add", art::Glyph::Asset("TB_New"), to_hsla(D_ICON_ADD))
                     .test_support()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.design_popup_add(did, cx)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.design_index_rows_add(did, window, cx)
                     })),
             )
             .child(
@@ -17475,7 +18748,7 @@ impl DaroApp {
                 )
                 .test_support()
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.design_popup_remove(did, cx)
+                    this.design_index_rows_remove(did, cx)
                 })),
             )
             .child(div().flex_1())
@@ -17493,21 +18766,45 @@ impl DaroApp {
                 ),
             );
 
-        // 锚点：贴在「字段」格下缘，参考界面里对话框往左探出格边约 8 逻辑像素
-        let name_w = ds
-            .widths
-            .get(&(1usize, 0))
-            .copied()
-            .unwrap_or(D_MY_INDEX_WIDTHS[0]);
-        let left = D_GUTTER_W + name_w - 8.;
-        let top = D_TOOLBAR_H + D_TABBAR_H + D_HEADER_H + (popup.row + 1) as f32 * D_ROW_EXTENT + 1.;
+        // 右下角抓手：斜向缩放，三个小点当视觉提示（拖动期间靠整页捕获层跟手）
+        let grip = div()
+            .id("dpopup-grip")
+            .test_support()
+            .absolute()
+            .right(px(0.))
+            .bottom(px(0.))
+            .size(px(12.))
+            .cursor_nwse_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    this.popup_resize_begin(
+                        did,
+                        ev.position.x.as_f32(),
+                        ev.position.y.as_f32(),
+                        w,
+                        h,
+                        cx,
+                    )
+                }),
+            )
+            .children([(7., 7.), (4., 7.), (7., 4.)].map(|(x, y)| {
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .size(px(1.5))
+                    .bg(muted)
+            }));
+
         div()
             .id("dpopup")
             .test_support()
             .absolute()
             .left(px(left))
             .top(px(top))
-            .w(px(D_MY_IDX_POPUP_W))
+            .w(px(w))
+            .h(px(h))
             .flex()
             .flex_col()
             .bg(bg)
@@ -17517,6 +18814,8 @@ impl DaroApp {
             .child(head)
             .child(body)
             .child(footer)
+            .children(dropdown)
+            .child(grip)
             .into_any_element()
     }
 
@@ -17538,7 +18837,7 @@ impl DaroApp {
         );
         let hover = to_hsla(p.hover);
         let accent = to_hsla(p.accent);
-        // MySQL 的索引「字段」面板是独立形态（勾选 + 子部分 + ↑↓+−），单独一条路
+        // MySQL 的索引「字段」面板是独立形态（行 + 名称下拉 + 子部分 + ↑↓+−），单独一条路
         if popup.target == PickTarget::IndexCols && self.designer_is_mysql(did) {
             return self.my_index_fields_panel(did, ds, popup, cx);
         }
@@ -18250,10 +19549,12 @@ impl DaroApp {
         let head_cur = to_hsla(blend(p.accent, p.background, 0.74));
         let sel = Self::design_index_sel(ds);
         // MySQL 按参考界面出五列（名称 / 字段 / 索引类型 / 索引方法 / 注释），
-        // 其余方言保持 PG 口径的六列（唯一键 / 并发是 PG 的列）。
-        let ncols = if is_mysql { 5 } else { 6 };
+        // 其余方言跟参考界面同样带索引类型，再补 PG 特有的唯一键 / 并发。
+        let ncols = if is_mysql { 5 } else { 7 };
         let cur = ds.index_cur.min(ncols - 1);
         let me = cx.entity().clone();
+        let gscroll = ds.grid_scrolls.get(&1).cloned().unwrap_or_default();
+        let row_total = ds.indexes.len();
         // 列宽：默认宽 + 用户拖过表头分割线后的宽（按子页 1 + 列序号存）
         let iw = |ix: usize| {
             ds.widths
@@ -18269,7 +19570,7 @@ impl DaroApp {
         let headers: &[&str] = if is_mysql {
             &["名称", "字段", "索引类型", "索引方法", "注释"]
         } else {
-            &["名称", "字段", "索引方法", "唯一键", "并发", "注释"]
+            &["名称", "字段", "索引类型", "索引方法", "唯一键", "并发", "注释"]
         };
 
         let head = h_flex()
@@ -18573,7 +19874,8 @@ impl DaroApp {
             // 索引方法：MySQL 只有 BTREE / HASH（参考界面格子里就是大写），
             // 其余方言按 PG 口径显示 B-Tree / Hash / GiST / GIN / BRIN / SP-GiST
             let me_m = me.clone();
-            let me_col = if is_mysql { 3 } else { 2 };
+            // 两种方言里索引方法都在索引类型右边那一格
+            let me_col = 3;
             let methods: &[&str] = if is_mysql {
                 &["BTREE", "HASH"]
             } else {
@@ -18604,33 +19906,30 @@ impl DaroApp {
                     }),
                 ),
             );
-            // MySQL 的「索引类型」：NORMAL / UNIQUE / FULLTEXT / SPATIAL（参考界面这一列）
-            let kind_cell = if is_mysql {
-                let me_k = me.clone();
-                self.drop_cell(
-                    format!("idx-kind/{r}"),
-                    mysql_index_kind(idx),
-                    iw(2),
-                    D_ROW_EXTENT,
-                    dark,
-                    true,
-                    true,
-                    pick_menu(
-                        ["NORMAL", "UNIQUE", "FULLTEXT", "SPATIAL"]
-                            .iter()
-                            .map(|k| (k.to_string(), k.to_string()))
-                            .collect(),
-                        Rc::new(move |value: String, app: &mut App| {
-                            let me = me_k.clone();
-                            me.update(app, move |this, cx| {
-                                this.design_set_index_kind(did, r, value.clone(), cx)
-                            });
-                        }),
-                    ),
-                )
-            } else {
-                div().w(px(0.)).into_any_element()
-            };
+            // 「索引类型」：MySQL 是 NORMAL / UNIQUE / FULLTEXT / SPATIAL，
+            // 其余方言只有 NORMAL / UNIQUE。
+            let me_k = me.clone();
+            let kind_cell = self.drop_cell(
+                format!("idx-kind/{r}"),
+                index_kind_label(idx, is_mysql),
+                iw(2),
+                D_ROW_EXTENT,
+                dark,
+                true,
+                true,
+                pick_menu(
+                    index_kind_options(is_mysql)
+                        .iter()
+                        .map(|k| (k.to_string(), k.to_string()))
+                        .collect(),
+                    Rc::new(move |value: String, app: &mut App| {
+                        let me = me_k.clone();
+                        me.update(app, move |this, cx| {
+                            this.design_set_index_kind(did, r, value.clone(), cx)
+                        });
+                    }),
+                ),
+            );
             let gutter = div()
                 .id(rid(&format!("idx-gutter/{r}")))
                 .w(px(D_GUTTER_W))
@@ -18665,26 +19964,25 @@ impl DaroApp {
                 .test_support()
                 .into_any_element();
             // 列序按方言分岔：MySQL 是 名称/字段/索引类型/索引方法/注释，
-            // PG 是 名称/字段/索引方法/唯一/并发/注释。
+            // PG 是 名称/字段/索引类型/索引方法/唯一/并发/注释。
             let mut row = h_flex()
                 .h(px(D_ROW_EXTENT))
                 .flex_none()
                 .child(gutter)
-                .child(input_cell(cx, r, anchor, 0, edits[0].clone(), 0, "索引名", &idx.name))
-                .child(fields_cell);
-            if is_mysql {
-                row = row.child(kind_cell).child(method_cell);
-            } else {
+                .child(input_cell(cx, r, anchor, 0, edits[0].clone(), 0, "留空自动命名", &idx.name))
+                .child(fields_cell)
+                .child(kind_cell)
+                .child(method_cell);
+            if !is_mysql {
                 row = row
-                    .child(method_cell)
-                    .child(flag_cell(cx, r, anchor, 3, idx.unique, true))
-                    .child(flag_cell(cx, r, anchor, 4, idx.concurrent, false));
+                    .child(flag_cell(cx, r, anchor, 4, idx.unique, true))
+                    .child(flag_cell(cx, r, anchor, 5, idx.concurrent, false));
             }
             row = row.child(input_cell(
                 cx,
                 r,
                 anchor,
-                if is_mysql { 4 } else { 5 },
+                if is_mysql { 4 } else { 6 },
                 edits[1].clone(),
                 1,
                 "",
@@ -18701,15 +19999,27 @@ impl DaroApp {
                 div()
                     .id("idx-grid-scroll")
                     .test_support()
+                    .relative()
                     .flex_1()
                     .min_h_0()
+                    .vertical_scrollbar(&gscroll)
+                    .horizontal_scrollbar(&gscroll)
                     // 滚动条包一层：外层留 id / test-support，内层管滚动
                     .child(
                         div()
                             .id("idx-grid-inner")
                             .size_full()
-                            .overflow_scrollbar()
-                            
+                            .overflow_scroll()
+                            .track_scroll(&gscroll)
+                            .on_scroll(Self::design_grid_wheel_listener(
+                                me.clone(),
+                                did,
+                                1,
+                                gscroll.clone(),
+                                row_total,
+                                D_HEADER_H,
+                            ))
+                            .test_support()
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
@@ -19291,6 +20601,8 @@ impl DaroApp {
         let sel = Self::design_fk_sel(ds);
         let cur = ds.fk_cur.min(7);
         let me = cx.entity().clone();
+        let gscroll = ds.grid_scrolls.get(&2).cloned().unwrap_or_default();
+        let row_total = ds.fks.len();
         // 列宽：默认宽 + 用户拖过表头分割线后的宽（按子页 2 + 列序号存）
         let cw = |ix: usize| ds.widths.get(&(2usize, ix)).copied().unwrap_or(D_FK_WIDTHS[ix]);
         let total_w = D_GUTTER_W + (0..8).map(cw).sum::<f32>();
@@ -19577,6 +20889,53 @@ impl DaroApp {
                 }
                 cell.test_support().into_any_element()
             };
+            // 候选格（字段 / 被引用的表 / 被引用的字段）：整格单击就弹浮层，
+            // 右缘的 …/▼ 只是提示，不再是唯一入口（和数据网格一样点哪选哪）。
+            let pick_cell = |col: usize, value: &str, target: PickTarget, a: FkAfford| -> AnyElement {
+                let current = anchor && col == cur;
+                let mut cell = div()
+                    .id(rid(&format!("fk-cell/{r}/{col}")))
+                    .w(px(cw(col)))
+                    .h(px(D_ROW_EXTENT))
+                    .flex_none()
+                    .relative()
+                    .when(current, |s| s.bg(accent))
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(soft)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.design_pick_fk_cell(did, r, col, cx);
+                        this.design_open_picker(did, target, r, window, cx);
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(6.))
+                            .right(px(if current { 26. } else { 4. }))
+                            .top_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(if current {
+                                        paper
+                                    } else if value.trim().is_empty() {
+                                        subtle
+                                    } else {
+                                        muted
+                                    })
+                                    .child(value.to_string()),
+                            ),
+                    );
+                if current {
+                    cell = cell.child(afford_btn(col, a));
+                }
+                cell.test_support().into_any_element()
+            };
 
             rows.push(
                 h_flex()
@@ -19593,27 +20952,24 @@ impl DaroApp {
                             .test_support()
                     })
                     .child(input_cell(0, 0, edits[0].clone(), &fk.name, None))
-                    .child(input_cell(
+                    .child(pick_cell(
                         1,
-                        1,
-                        edits[1].clone(),
                         &fk.columns,
-                        Some(FkAfford::More(PickTarget::FkCols)),
+                        PickTarget::FkCols,
+                        FkAfford::More(PickTarget::FkCols),
                     ))
                     .child(text_cell(2, &fk.ref_schema, FkAfford::Drop(PickTarget::FkSchema)))
-                    .child(input_cell(
+                    .child(pick_cell(
                         3,
-                        2,
-                        edits[2].clone(),
                         &fk.ref_table,
-                        Some(FkAfford::Drop(PickTarget::FkRefTable)),
+                        PickTarget::FkRefTable,
+                        FkAfford::Drop(PickTarget::FkRefTable),
                     ))
-                    .child(input_cell(
+                    .child(pick_cell(
                         4,
-                        3,
-                        edits[3].clone(),
                         &fk.ref_columns,
-                        Some(FkAfford::More(PickTarget::FkRefCols)),
+                        PickTarget::FkRefCols,
+                        FkAfford::More(PickTarget::FkRefCols),
                     ))
                     .child(text_cell(5, &fk.on_delete, FkAfford::Drop(PickTarget::FkOnDelete)))
                     .child(text_cell(6, &fk.on_update, FkAfford::Drop(PickTarget::FkOnUpdate)))
@@ -19648,14 +21004,27 @@ impl DaroApp {
                 div()
                     .id("fk-scroll")
                     .test_support()
+                    .relative()
                     .flex_1()
                     .min_h_0()
+                    .vertical_scrollbar(&gscroll)
+                    .horizontal_scrollbar(&gscroll)
                     // 滚动条包一层：外层留 id / test-support，内层管滚动
                     .child(
                         div()
+                            .id("fk-grid-inner")
                             .size_full()
-                            .overflow_scrollbar()
-                            
+                            .overflow_scroll()
+                            .track_scroll(&gscroll)
+                            .on_scroll(Self::design_grid_wheel_listener(
+                                me.clone(),
+                                did,
+                                2,
+                                gscroll.clone(),
+                                row_total,
+                                6. + D_HEADER_H,
+                            ))
+                            .test_support()
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
@@ -19694,6 +21063,8 @@ impl DaroApp {
         let sel = Self::design_unique_sel(ds);
         let cur = ds.unique_cur.min(2);
         let me = cx.entity().clone();
+        let gscroll = ds.grid_scrolls.get(&3).cloned().unwrap_or_default();
+        let row_total = ds.uniques.len();
         // 列宽：默认宽 + 用户拖过表头分割线后的宽（按子页 3 + 列序号存）
         let uw = |ix: usize| ds.widths.get(&(3usize, ix)).copied().unwrap_or(D_UNIQUE_WIDTHS[ix]);
         let total_w = D_GUTTER_W + (0..3).map(uw).sum::<f32>();
@@ -19914,6 +21285,50 @@ impl DaroApp {
                 }
                 cell.test_support().into_any_element()
             };
+            // 字段格：整格单击就弹勾选浮层（与索引页同款），「…」只是视觉提示
+            let pick_cell = |col: usize| -> AnyElement {
+                let current = anchor && col == cur;
+                let mut cell = div()
+                    .id(rid(&format!("un-cell/{r}/{col}")))
+                    .w(px(uw(col)))
+                    .h(px(D_ROW_EXTENT))
+                    .flex_none()
+                    .relative()
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(soft)
+                    .when(current, |s| s.border_2().border_color(accent))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.design_pick_unique_cell(did, r, col, cx);
+                        this.design_open_picker(did, PickTarget::UniqueCols, r, window, cx);
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(6.))
+                            .right(px(if current { 26. } else { 4. }))
+                            .top_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(if uk.value.trim().is_empty() { subtle } else { fg })
+                                    .child(if uk.value.trim().is_empty() {
+                                        "（无字段）".to_string()
+                                    } else {
+                                        uk.value.clone()
+                                    }),
+                            ),
+                    );
+                if current {
+                    cell = cell.child(afford_btn(col));
+                }
+                cell.test_support().into_any_element()
+            };
 
             rows.push(
                 h_flex()
@@ -19930,7 +21345,7 @@ impl DaroApp {
                             .test_support()
                     })
                     .child(input_cell(0, 0, edits[0].clone(), &uk.name, false))
-                    .child(input_cell(1, 1, edits[1].clone(), &uk.value, true))
+                    .child(pick_cell(1))
                     .child(input_cell(2, 2, edits[2].clone(), &uk.comment, false))
                     .child(
                         div()
@@ -19955,13 +21370,27 @@ impl DaroApp {
                 div()
                     .id("un-scroll")
                     .test_support()
+                    .relative()
                     .flex_1()
                     .min_h_0()
+                    .vertical_scrollbar(&gscroll)
+                    .horizontal_scrollbar(&gscroll)
                     // 滚动条包一层：外层留 id / test-support，内层管滚动
                     .child(
                         div()
+                            .id("un-grid-inner")
                             .size_full()
-                            .overflow_scrollbar()
+                            .overflow_scroll()
+                            .track_scroll(&gscroll)
+                            .on_scroll(Self::design_grid_wheel_listener(
+                                me.clone(),
+                                did,
+                                3,
+                                gscroll.clone(),
+                                row_total,
+                                6. + D_HEADER_H,
+                            ))
+                            .test_support()
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
@@ -20071,6 +21500,8 @@ impl DaroApp {
         let sel = Self::design_check_sel(ds);
         let cur = ds.check_cur.min(3);
         let me = cx.entity().clone();
+        let gscroll = ds.grid_scrolls.get(&4).cloned().unwrap_or_default();
+        let row_total = ds.checks.len();
         let cw = |ix: usize| ds.widths.get(&(4usize, ix)).copied().unwrap_or(D_CHECK_WIDTHS[ix]);
         let total_w = D_GUTTER_W + (0..4).map(cw).sum::<f32>();
         let headers = ["名称", "表达式", "无继承", "注释"];
@@ -20289,6 +21720,50 @@ impl DaroApp {
                 }
                 cell.test_support().into_any_element()
             };
+            // 表达式格：整格单击弹表达式小窗（「…」只是视觉提示）
+            let pick_cell = |col: usize| -> AnyElement {
+                let current = anchor && col == cur;
+                let mut cell = div()
+                    .id(rid(&format!("dck-cell/{r}/{col}")))
+                    .w(px(cw(col)))
+                    .h(px(D_ROW_EXTENT))
+                    .flex_none()
+                    .relative()
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(soft)
+                    .when(current, |s| s.border_2().border_color(accent))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.design_pick_check_cell(did, r, col, cx);
+                        this.design_open_check(did, r, window, cx);
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(6.))
+                            .right(px(if current { 26. } else { 4. }))
+                            .top_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(if ck.value.trim().is_empty() { subtle } else { fg })
+                                    .child(if ck.value.trim().is_empty() {
+                                        "（无表达式）".to_string()
+                                    } else {
+                                        ck.value.clone()
+                                    }),
+                            ),
+                    );
+                if current {
+                    cell = cell.child(afford_btn(col));
+                }
+                cell.test_support().into_any_element()
+            };
             // 无继承：勾选格（点击即切换，勾选框恒 13）
             let flag_cell = div()
                 .id(rid(&format!("dck-cell/{r}/2")))
@@ -20351,7 +21826,7 @@ impl DaroApp {
                             .test_support()
                     })
                     .child(input_cell(0, 0, edits[0].clone(), &ck.name, false))
-                    .child(input_cell(1, 1, edits[1].clone(), &ck.value, true))
+                    .child(pick_cell(1))
                     .child(flag_cell)
                     .child(input_cell(3, 2, edits[2].clone(), &ck.comment, false))
                     .child(
@@ -20377,13 +21852,27 @@ impl DaroApp {
                 div()
                     .id("dck-scroll")
                     .test_support()
+                    .relative()
                     .flex_1()
                     .min_h_0()
+                    .vertical_scrollbar(&gscroll)
+                    .horizontal_scrollbar(&gscroll)
                     // 滚动条包一层：外层留 id / test-support，内层管滚动
                     .child(
                         div()
+                            .id("dck-grid-inner")
                             .size_full()
-                            .overflow_scrollbar()
+                            .overflow_scroll()
+                            .track_scroll(&gscroll)
+                            .on_scroll(Self::design_grid_wheel_listener(
+                                me.clone(),
+                                did,
+                                4,
+                                gscroll.clone(),
+                                row_total,
+                                6. + D_HEADER_H,
+                            ))
+                            .test_support()
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
@@ -20466,6 +21955,8 @@ impl DaroApp {
         let sel = Self::design_exclude_sel(ds);
         let cur = ds.exclude_cur.min(3);
         let me = cx.entity().clone();
+        let gscroll = ds.grid_scrolls.get(&5).cloned().unwrap_or_default();
+        let row_total = ds.excludes.len();
         let cw = |ix: usize| ds.widths.get(&(5usize, ix)).copied().unwrap_or(D_EXCLUDE_WIDTHS[ix]);
         let total_w = D_GUTTER_W + (0..4).map(cw).sum::<f32>();
         let headers = ["名称", "索引方法", "元素", "注释"];
@@ -20684,6 +22175,50 @@ impl DaroApp {
                 }
                 cell.test_support().into_any_element()
             };
+            // 元素格：整格单击弹元素浮层（「…」只是视觉提示）
+            let pick_cell = |col: usize| -> AnyElement {
+                let current = anchor && col == cur;
+                let mut cell = div()
+                    .id(rid(&format!("dex-cell/{r}/{col}")))
+                    .w(px(cw(col)))
+                    .h(px(D_ROW_EXTENT))
+                    .flex_none()
+                    .relative()
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(soft)
+                    .when(current, |s| s.border_2().border_color(accent))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.design_pick_exclude_cell(did, r, col, cx);
+                        this.design_open_exclude_elements(did, r, window, cx);
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(6.))
+                            .right(px(if current { 26. } else { 4. }))
+                            .top_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(if ex.elements.trim().is_empty() { subtle } else { fg })
+                                    .child(if ex.elements.trim().is_empty() {
+                                        "（无元素）".to_string()
+                                    } else {
+                                        ex.elements.clone()
+                                    }),
+                            ),
+                    );
+                if current {
+                    cell = cell.child(afford_btn(col));
+                }
+                cell.test_support().into_any_element()
+            };
             // 索引方法：整格下拉（展示名 B-Tree / GiST / …，DDL 存 SQL 名）
             let me_m = me.clone();
             let method_label = EXCLUDE_METHODS
@@ -20729,7 +22264,7 @@ impl DaroApp {
                     })
                     .child(input_cell(0, 0, edits[0].clone(), &ex.name, false))
                     .child(method_cell)
-                    .child(input_cell(2, 1, edits[1].clone(), &ex.elements, true))
+                    .child(pick_cell(2))
                     .child(input_cell(3, 2, edits[2].clone(), &ex.comment, false))
                     .child(
                         div()
@@ -20754,13 +22289,27 @@ impl DaroApp {
                 div()
                     .id("dex-scroll")
                     .test_support()
+                    .relative()
                     .flex_1()
                     .min_h_0()
+                    .vertical_scrollbar(&gscroll)
+                    .horizontal_scrollbar(&gscroll)
                     // 滚动条包一层：外层留 id / test-support，内层管滚动
                     .child(
                         div()
+                            .id("dex-grid-inner")
                             .size_full()
-                            .overflow_scrollbar()
+                            .overflow_scroll()
+                            .track_scroll(&gscroll)
+                            .on_scroll(Self::design_grid_wheel_listener(
+                                me.clone(),
+                                did,
+                                5,
+                                gscroll.clone(),
+                                row_total,
+                                6. + D_HEADER_H,
+                            ))
+                            .test_support()
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
@@ -21602,6 +23151,9 @@ impl DaroApp {
                 items,
                 sel,
                 expr: None,
+                rows: None,
+                cands: Vec::new(),
+                open_row: None,
                 subs: Vec::new(),
             });
             d.note = None;
@@ -22332,6 +23884,9 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 items,
                 sel,
                 expr: None,
+                rows: None,
+                cands: Vec::new(),
+                open_row: None,
                 subs: Vec::new(),
             });
             d.note = None;
@@ -22503,6 +24058,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let sel = Self::design_rule_sel(ds);
         let cur = ds.rule_cur.min(4);
         let me = cx.entity().clone();
+        let gscroll = ds.grid_scrolls.get(&6).cloned().unwrap_or_default();
+        let row_total = ds.rules.len();
         let cw = |ix: usize| ds.widths.get(&(6usize, ix)).copied().unwrap_or(D_RULE_WIDTHS[ix]);
         let total_w = D_GUTTER_W + (0..5).map(cw).sum::<f32>();
         let headers = ["名称", "事件", "代替运行", "启用", "注释"];
@@ -22827,13 +24384,27 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 div()
                     .id("drule-scroll")
                     .test_support()
+                    .relative()
                     .flex_1()
                     .min_h_0()
+                    .vertical_scrollbar(&gscroll)
+                    .horizontal_scrollbar(&gscroll)
                     // 滚动条包一层：外层留 id / test-support，内层管滚动
                     .child(
                         div()
+                            .id("drule-grid-inner")
                             .size_full()
-                            .overflow_scrollbar()
+                            .overflow_scroll()
+                            .track_scroll(&gscroll)
+                            .on_scroll(Self::design_grid_wheel_listener(
+                                me.clone(),
+                                did,
+                                6,
+                                gscroll.clone(),
+                                row_total,
+                                6. + D_HEADER_H,
+                            ))
+                            .test_support()
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
@@ -23756,6 +25327,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let sel = Self::design_trig_sel(ds);
         let cur = ds.trig_cur.min(9);
         let me = cx.entity().clone();
+        let gscroll = ds.grid_scrolls.get(&7).cloned().unwrap_or_default();
+        let row_total = ds.triggers.len();
         let cw = |ix: usize| ds.widths.get(&(7usize, ix)).copied().unwrap_or(D_TRIGGER_WIDTHS[ix]);
         let total_w = D_GUTTER_W + (0..10).map(cw).sum::<f32>();
         let headers = [
@@ -23985,7 +25558,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                     .border_b_1()
                     .border_color(soft)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.design_pick_trig_cell(did, r, 7, cx)
+                        this.design_pick_trig_cell(did, r, 7, cx);
+                        this.design_open_trig_fields(did, r, cx);
                     }))
                     .child(editor);
                 if current {
@@ -24182,13 +25756,27 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 div()
                     .id("dtrg-scroll")
                     .test_support()
+                    .relative()
                     .flex_1()
                     .min_h_0()
+                    .vertical_scrollbar(&gscroll)
+                    .horizontal_scrollbar(&gscroll)
                     // 滚动条包一层：外层留 id / test-support，内层管滚动
                     .child(
                         div()
+                            .id("dtrg-grid-inner")
                             .size_full()
-                            .overflow_scrollbar()
+                            .overflow_scroll()
+                            .track_scroll(&gscroll)
+                            .on_scroll(Self::design_grid_wheel_listener(
+                                me.clone(),
+                                did,
+                                7,
+                                gscroll.clone(),
+                                row_total,
+                                6. + D_HEADER_H,
+                            ))
+                            .test_support()
                             .child(div().w(px(total_w)).child(grid)),
                     ),
             )
@@ -24490,32 +26078,239 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 title,
                 label,
                 String::new(),
-                move |app, value| app.finish_new_design_save(did, value),
+                move |app, cx, value| app.finish_new_design_save(did, value, cx),
                 cx,
             );
             return;
         }
-        let Some(tab) = self.opened.iter_mut().find(|t| t.did == did) else {
+        let Some(tab) = self.opened.iter().find(|t| t.did == did) else {
             return;
         };
-        let Some(ds) = tab.dstate.as_mut() else { return };
-        ds.baseline = ds.cols.clone();
-        ds.baseline_indexes = ds.indexes.clone();
-        ds.baseline_fks = ds.fks.clone();
-        ds.baseline_uniques = ds.uniques.clone();
-        ds.baseline_checks = ds.checks.clone();
-        ds.baseline_options = ds.options.clone();
-        ds.baseline_excludes = ds.excludes.clone();
-        ds.baseline_rules = ds.rules.clone();
-        ds.baseline_triggers = ds.triggers.clone();
-        ds.baseline_params = ds.params.clone();
-        ds.baseline_ret_ty = ds.ret_ty.clone();
-        ds.baseline_view_body = ds.view_body.clone();
-        ds.baseline_matview_concurrent = ds.matview_concurrent;
-        ds.baseline_matview_with_data = ds.matview_with_data;
-        ds.baseline_view_check_option = ds.view_check_option.clone();
-        ds.baseline_view_security_barrier = ds.view_security_barrier;
-        ds.note = Some("已保存（演示数据，不落库）");
+        let (conn_name, db, schema_ix, cat, obj) =
+            (tab.conn_name.clone(), tab.db, tab.schema, tab.cat, tab.obj);
+        let Some(ds) = tab.dstate.as_ref() else { return };
+        if ds.loading || ds.saving {
+            return;
+        }
+        let is_new = ds.new_name.is_some() && !ds.created;
+        let dirty = match cat {
+            0 => design_dirty(ds),
+            1 => {
+                ds.view_body.trim() != ds.baseline_view_body.trim()
+                    || ds.rules != ds.baseline_rules
+                    || ds.options.comment != ds.baseline_options.comment
+                    || ds.options.owner != ds.baseline_options.owner
+                    || ds.view_check_option != ds.baseline_view_check_option
+                    || ds.view_security_barrier != ds.baseline_view_security_barrier
+            }
+            2 => {
+                ds.view_body.trim() != ds.baseline_view_body.trim()
+                    || ds.matview_concurrent != ds.baseline_matview_concurrent
+                    || ds.matview_with_data != ds.baseline_matview_with_data
+                    || ds.options != ds.baseline_options
+            }
+            _ => {
+                ds.params != ds.baseline_params
+                    || ds.ret_ty != ds.baseline_ret_ty
+                    || ds.view_body.trim() != ds.baseline_view_body.trim()
+            }
+        };
+        let Some(conn) = self.conns.iter().find(|c| c.name == conn_name).cloned() else {
+            return;
+        };
+        if !backend::is_real_conn(&conn) {
+            // 演示档不落库：原样对齐基线，只给一句如实说明。留空的索引名
+            // 也按会下发的 DDL 补上，界面与真库保持一致。
+            let table = ds
+                .new_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    let schema = catalog::schemas(&conn, db)
+                        .get(schema_ix)
+                        .copied()
+                        .unwrap_or("");
+                    catalog::objects(&conn, db, schema, cat)
+                        .get(obj)
+                        .copied()
+                        .unwrap_or("")
+                        .to_string()
+                });
+            if let Some(ds) = design_state_mut(&mut self.opened, did) {
+                let note = if is_new {
+                    "已创建（演示数据，不落库）"
+                } else {
+                    "已保存（演示数据，不落库）"
+                };
+                if cat == 0 {
+                    design_fill_auto_index_names(conn.kind == mock::DbKind::MySql, &table, ds);
+                }
+                design_align_baselines(ds);
+                ds.created = true;
+                ds.note = Some(note.to_string());
+            }
+            cx.notify();
+            return;
+        }
+        if !dirty && !is_new {
+            // 没有改动也要给回执：否则 Ctrl+S 看着像没反应
+            if let Some(ds) = design_state_mut(&mut self.opened, did) {
+                ds.note = Some("没有需要保存的改动".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        let schema = catalog::schemas(&conn, db)
+            .get(schema_ix)
+            .copied()
+            .unwrap_or("")
+            .to_string();
+        let table = match ds.new_name.as_deref().map(str::trim) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            Some(_) => return,
+            None => catalog::objects(&conn, db, &schema, cat)
+                .get(obj)
+                .copied()
+                .unwrap_or("")
+                .to_string(),
+        };
+        if table.is_empty() {
+            if let Some(ds) = design_state_mut(&mut self.opened, did) {
+                ds.note = Some("先给对象起个名字".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        let script = match cat {
+            0 if is_new => design_create_script(&conn, &schema, &table, ds, cat),
+            0 => design_apply_statements(conn.kind, &schema, &table, ds),
+            1 if is_new => design_create_script(&conn, &schema, &table, ds, cat),
+            // 视图才有可靠的「改定义」下发；实体化视图要删后重建、函数正文还
+            // 没从真库读回，这两类先不动库，把话留在工具条
+            1 => design_view_apply_statements(conn.kind, &schema, &table, ds),
+            2 => Err("实体化视图在真库上改定义要先删后建，这里先不下发".to_string()),
+            _ => Err("函数设计器还没从真库读回正文，先不覆盖已有函数".to_string()),
+        };
+        let stmts = match script {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(ds) = design_state_mut(&mut self.opened, did) {
+                    ds.note = Some(e);
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if stmts.is_empty() {
+            if let Some(ds) = design_state_mut(&mut self.opened, did) {
+                ds.note = Some("没有需要下发的改动".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        let Some(tg) = backend::Target::of(&conn, db, &schema) else {
+            if let Some(ds) = design_state_mut(&mut self.opened, did) {
+                ds.note = Some("这条连接还连不上，脚本没发出去".to_string());
+            }
+            cx.notify();
+            return;
+        };
+        if let Some(ds) = design_state_mut(&mut self.opened, did) {
+            ds.saving = true;
+            ds.note = None;
+        }
+        cx.notify();
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let job = tg.create_job();
+            let worker = job.clone();
+            let run = cx
+                .background_executor()
+                .spawn(async move { tg.run_script(&worker, &stmts, false) })
+                .await;
+            let Some(ent) = entity.upgrade() else { return };
+            let _ = cx.update_entity(&ent, |a, cx| a.design_saved(did, run, cx));
+        })
+        .detach();
+    }
+
+    /// 保存脚本的后台上屏：成功对齐基线（新建对象同时把页签挂回目录）、
+    /// 刷新列缓存；失败把原因留在工具条，基线不动。
+    fn design_saved(&mut self, did: u64, run: db_types::ScriptRun, cx: &mut Context<Self>) {
+        let n = run.runs.len();
+        let ms = run.total_ms;
+        let all_ok = run.runs.iter().all(|r| r.result.is_ok()) && run.open_error.is_none();
+        let stmt_err = run.runs.iter().find_map(|r| match &r.result {
+            Err(e) => Some(e.clone()),
+            Ok(_) => None,
+        });
+        let err = stmt_err
+            .or(run.open_error)
+            .or_else(|| run.cancelled.then(|| "已停止，脚本没跑完".to_string()));
+        let Some(tab) = self.opened.iter().find(|t| t.did == did) else {
+            return;
+        };
+        let (conn_name, db, schema_ix, cat, obj, table_name, was_new) = (
+            tab.conn_name.clone(),
+            tab.db,
+            tab.schema,
+            tab.cat,
+            tab.obj,
+            tab.dstate.as_ref().and_then(|d| {
+                d.new_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+            }),
+            tab.dstate.as_ref().is_some_and(|d| d.new_name.is_some() && !d.created),
+        );
+        let Some(conn) = self.conns.iter().find(|c| c.name == conn_name).cloned() else {
+            return;
+        };
+        let schema = catalog::schemas(&conn, db)
+            .get(schema_ix)
+            .copied()
+            .unwrap_or("")
+            .to_string();
+        let table = table_name.unwrap_or_else(|| {
+            catalog::objects(&conn, db, &schema, cat)
+                .get(obj)
+                .copied()
+                .unwrap_or("")
+                .to_string()
+        });
+        if let Some(ds) = design_state_mut(&mut self.opened, did) {
+            ds.saving = false;
+            match err {
+                Some(e) => ds.note = Some(format!("保存失败：{e}")),
+                None => {
+                    if cat == 0 {
+                        design_fill_auto_index_names(
+                            conn.kind == mock::DbKind::MySql,
+                            &table,
+                            ds,
+                        );
+                    }
+                    design_align_baselines(ds);
+                    ds.created = true;
+                    ds.note = Some(if was_new {
+                        format!("已创建（{n} 条语句，{ms} 毫秒）")
+                    } else {
+                        format!("已保存（{n} 条语句，{ms} 毫秒）")
+                    });
+                }
+            }
+        }
+        if all_ok {
+            if !table.is_empty() {
+                catalog::invalidate_columns(&conn.name, db, &schema, &table);
+            }
+            // 新建对象：对象清单重查一次，树里随即多出这一项
+            catalog::invalidate_objects(&conn.name, db, &schema, cat);
+        }
         cx.notify();
     }
 
@@ -26350,6 +28145,82 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             return (false, false);
         }
         (!t.undo.is_empty(), !t.redo.is_empty())
+    }
+
+    /// 设计器各子页网格的滚轮：和数据页网格同一套口径——滚轮当方向键，
+    /// 一次挪一行锚点（当前列不动），视图只在锚点要出视口时才跟滚。
+    /// `sub` 是子页下标，用来挑锚点字段与配对的滚动句柄。
+    fn design_grid_wheel_step(
+        &mut self,
+        did: u64,
+        sub: usize,
+        scroll: &ScrollHandle,
+        dy: f32,
+        dir: i32,
+        total: usize,
+        head_h: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if total == 0 {
+            return;
+        }
+        let viewport_h = self.viewport_h;
+        let Some(ds) = self
+            .opened
+            .iter_mut()
+            .find(|t| t.did == did)
+            .and_then(|t| t.dstate.as_mut())
+        else {
+            return;
+        };
+        let sel = match sub {
+            0 => &mut ds.sel,
+            1 => &mut ds.index_sel,
+            2 => &mut ds.fk_sel,
+            3 => &mut ds.unique_sel,
+            4 => &mut ds.check_sel,
+            5 => &mut ds.exclude_sel,
+            6 => &mut ds.rule_sel,
+            7 => &mut ds.trig_sel,
+            _ => return,
+        };
+        let cur = (*sel).min(total - 1);
+        let (next, _) = wheel_apply(
+            scroll,
+            dy,
+            cur,
+            total,
+            dir,
+            head_h,
+            D_ROW_EXTENT,
+            viewport_h,
+        );
+        *sel = next;
+        cx.notify();
+    }
+
+    /// 设计器网格挂滚轮监听：Shift / 横向滚轮留给默认滚动，
+    /// 其余情况把垂直分量交给 [Self::design_grid_wheel_step]。
+    fn design_grid_wheel_listener(
+        app: Entity<Self>,
+        did: u64,
+        sub: usize,
+        scroll: ScrollHandle,
+        total: usize,
+        head_h: f32,
+    ) -> impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static {
+        move |ev, window, cx| {
+            let d = ev.delta.pixel_delta(window.line_height());
+            let dy = d.y.as_f32();
+            let dx = d.x.as_f32();
+            if ev.modifiers.shift || dy.abs() < f32::EPSILON || dx.abs() > dy.abs() {
+                return;
+            }
+            let dir = if dy < 0. { 1 } else { -1 };
+            app.update(cx, |this, cx| {
+                this.design_grid_wheel_step(did, sub, &scroll, dy, dir, total, head_h, cx)
+            });
+        }
     }
 
     /// 滚轮驱动表数据网格的激活格：一次一格，当前格要出视口时视图才跟着走。
@@ -30207,6 +32078,7 @@ impl Render for DaroApp {
         let t0 = if perf_log() { Some(Instant::now()) } else { None };
         // 后台回执靠这个句柄落地（测试 / 失焦时 active_window 可能为空）
         self.win = Some(window.window_handle());
+        self.sync_design_index_name_edits(window, cx);
         self.viewport_h = window.viewport_size().height.as_f32();
         self.viewport_w = window.viewport_size().width.as_f32();
         self.sync_block_regions(window);
@@ -35011,6 +36883,28 @@ impl DaroApp {
                             .child("载入表结构…"),
                     )
                 })
+                .when(ds.saving, |s| {
+                    s.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(muted)
+                            .child("保存中…"),
+                    )
+                })
+                .when_some(ds.note.clone(), |s, note| {
+                    let color = if note.starts_with("保存失败") {
+                        to_hsla(0xDC2626)
+                    } else {
+                        muted
+                    };
+                    s.child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(color)
+                            .child(note),
+                    )
+                })
                 .when_some(invalid.as_ref(), |s, err| {
                     s.child(
                         div()
@@ -35153,7 +37047,7 @@ impl DaroApp {
                     })
                     .test_support(),
                 )
-                .child(div().flex_1())
+                .child(toolbar_tail())
         } else if ds.sub == 4 {
             h_flex()
                 .h(px(D_TOOLBAR_H))
@@ -35200,7 +37094,7 @@ impl DaroApp {
                     })
                     .test_support(),
                 )
-                .child(div().flex_1())
+                .child(toolbar_tail())
         } else if ds.sub == 5 {
             h_flex()
                 .h(px(D_TOOLBAR_H))
@@ -35247,7 +37141,7 @@ impl DaroApp {
                     })
                     .test_support(),
                 )
-                .child(div().flex_1())
+                .child(toolbar_tail())
         } else if ds.sub == 6 {
             h_flex()
                 .h(px(D_TOOLBAR_H))
@@ -35294,7 +37188,7 @@ impl DaroApp {
                     })
                     .test_support(),
                 )
-                .child(div().flex_1())
+                .child(toolbar_tail())
         } else if ds.sub == 8 {
             h_flex()
                 .h(px(D_TOOLBAR_H))
@@ -35311,7 +37205,7 @@ impl DaroApp {
                         })
                         .test_support(),
                 )
-                .child(div().flex_1())
+                .child(toolbar_tail())
         } else if ds.sub == 1 {
             h_flex()
                 .h(px(D_TOOLBAR_H))
@@ -35999,16 +37893,35 @@ impl DaroApp {
                 .into_any_element()
         };
 
+        let fscroll = ds.grid_scrolls.get(&0).cloned().unwrap_or_default();
+        let field_rows = ds.cols.len();
         let fields_tab = v_flex()
             .size_full()
             .child(
                 div()
                     .id("dgrid-scroll")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_scrollbar()
-                    
-                    .child(div().w(px(total_w)).child(grid)),
+                    .vertical_scrollbar(&fscroll)
+                    .horizontal_scrollbar(&fscroll)
+                    .child(
+                        div()
+                            .id("dgrid-inner")
+                            .size_full()
+                            .overflow_scroll()
+                            .track_scroll(&fscroll)
+                            .on_scroll(Self::design_grid_wheel_listener(
+                                cx.entity(),
+                                tab.did,
+                                0,
+                                fscroll.clone(),
+                                field_rows,
+                                D_HEADER_H,
+                            ))
+                            .test_support()
+                            .child(div().w(px(total_w)).child(grid)),
+                    ),
             )
             .children(self.d_split_pair(
                 tab.did,
@@ -36112,17 +38025,24 @@ impl DaroApp {
             let w_after = sql_preview::code_lines_w(&after_lines, gutter_w);
             // id 挂外层（滚动条包一层内层 div，否则 overflow_scrollbar 会拆掉
             // test_support 的观察包装，元素就从测试注册表里消失）
-            let pane = |id: &'static str, lines: &[&str], chg: &[bool], w: f32| {
+            let pane = |id: &'static str, lines: &[&str], chg: &[bool], w: f32, order: u64| {
                 div()
                     .id(rid(id))
                     .test_support()
                     .flex_1()
                     .min_w_0()
                     .child(
-                        div().size_full().overflow_scrollbar().child(
-                            v_flex().w(px(w)).children(lines.iter().enumerate().map(|(i, l)| {
-                                sql_preview::diff_row(i + 1, l, chg[i], w, gutter_w, dark, fg)
-                            })),
+                        div().size_full().self_start().overflow_scrollbar().child(
+                            v_flex().w(px(w)).child(sql_preview::code_block(
+                                rid(&format!("{id}-sql")),
+                                lines,
+                                chg,
+                                gutter_w,
+                                w,
+                                order,
+                                dark,
+                                fg,
+                            )),
                         ),
                     )
             };
@@ -36157,8 +38077,8 @@ impl DaroApp {
                         .px(px(10.))
                         .pb(px(6.))
                         .gap(px(10.))
-                        .child(pane("dsql-before", &before_lines, &chg_b, w_before))
-                        .child(pane("dsql-after", &after_lines, &chg_a, w_after)),
+                        .child(pane("dsql-before", &before_lines, &chg_b, w_before, 0))
+                        .child(pane("dsql-after", &after_lines, &chg_a, w_after, 1)),
                 )
                 .into_any_element()
         } else {
@@ -36196,9 +38116,19 @@ impl DaroApp {
                         .child(
                     div()
                         .size_full()
+                        .self_start()
                         .overflow_scrollbar()
-                        .child(v_flex().w(px(w_change)).pt(px(6.)).children(
-                            lines.iter().map(|l| sql_preview::plain_row(l, w_change, dark, fg)),
+                        .child(v_flex().w(px(w_change)).pt(px(6.)).child(
+                            sql_preview::code_block(
+                                "dsql-changes-sql",
+                                &lines,
+                                &[],
+                                0.,
+                                w_change,
+                                0,
+                                dark,
+                                fg,
+                            ),
                         )),
                 ),
                 )
@@ -36241,6 +38171,7 @@ impl DaroApp {
             .size_full()
             .child(page)
             .when(ds.popup.is_some(), |s| s.child(popup))
+            .when(self.popup_drag.is_some(), |s| s.child(self.popup_capture(cx)))
             .into_any_element()
     }
 
@@ -36502,6 +38433,28 @@ impl DaroApp {
                             .test_support(),
                         )
                 })
+            })
+            .when(ds.saving, |s| {
+                s.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child("保存中…"),
+                )
+            })
+            .when_some(ds.note.clone(), |s, note| {
+                let color = if note.starts_with("保存失败") {
+                    to_hsla(0xDC2626)
+                } else {
+                    muted
+                };
+                s.child(
+                    div()
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(color)
+                        .child(note),
+                )
             })
             .when_some(invalid.as_ref(), |s, err| {
                 s.child(
@@ -37768,25 +39721,29 @@ impl DaroApp {
         // 两子页各自有正文：「DDL」铺满高亮脚本，「更改」只放增量语句——
         // 截图里那页整片留白（无改动可列时参考界面也是空的）。
         let body: AnyElement = if ds.sql_sub == 1 {
+            // 整块一个可选中文字；定高 20px 一行（空行也有高度），长行横向滚
+            let lines: Vec<&str> = sql.lines().collect();
+            let w = sql_preview::code_lines_w(&lines, 0.);
             div()
                 .id(rid("dsql-ddl"))
                 .test_support()
                 .flex_1()
                 .min_h_0()
                 .child(
-                    div().size_full().overflow_y_scrollbar().bg(to_hsla(0xffffff)).pt(px(0.)).px(
+                    div().size_full().self_start().overflow_scrollbar().bg(to_hsla(0xffffff)).pt(px(0.)).px(
                         px(1.),
                     )
-                    .child(v_flex().children(sql.lines().enumerate().map(|(i, line)| {
-                        // 定高一行（与表页 SQL 预览同一口径 20px）：空行没有 span，
-                        // 不定高就塌成 0，句子之间的空行会消失。
-                        h_flex()
-                            .id(rid(&format!("dsql-row/{i}")))
-                            .test_support()
-                            .flex_none()
-                            .h(px(20.))
-                            .children(sql_preview::sql_code_spans(line, dark, fg))
-                    }))),
+                    .child(v_flex().id(rid("dsql-block")).test_support().w(px(w)).child(
+                        sql_preview::code_block(
+                        rid("dsql-block-sql"),
+                        &lines,
+                        &[],
+                        0.,
+                        w,
+                        0,
+                        dark,
+                        fg,
+                    ))),
                 )
                 .into_any_element()
         } else {
@@ -37904,6 +39861,73 @@ impl DaroApp {
         if self.d_prop_drag.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// 索引「字段」浮层右下角缩放：按下时记起始指针与当前尺寸。
+    fn popup_resize_begin(
+        &mut self,
+        did: u64,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.popup_drag = Some((did, x, y, w, h));
+        cx.notify();
+    }
+
+    /// 拖动中按指针增量改宽高，各自夹紧；尺寸记在设计器页签上，下次打开沿用。
+    fn popup_resize_move(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let Some((did, x0, y0, w0, h0)) = self.popup_drag else {
+            return;
+        };
+        let max_w = (self.viewport_w - 360.).max(520.);
+        let max_h = (self.viewport_h - 200.).max(240.);
+        let w = (w0 + (x - x0)).clamp(320., max_w);
+        let h = (h0 + (y - y0)).clamp(140., max_h);
+        let Some(ds) = self
+            .opened
+            .iter_mut()
+            .find(|t| t.did == did)
+            .and_then(|t| t.dstate.as_mut())
+        else {
+            self.popup_drag = None;
+            return;
+        };
+        if ds.popup_size == Some((w, h)) {
+            return;
+        }
+        ds.popup_size = Some((w, h));
+        cx.notify();
+    }
+
+    fn popup_resize_end(&mut self, cx: &mut Context<Self>) {
+        if self.popup_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 缩放期间的整页捕获层：右下角抓手只有 12px，指针一滑就丢。
+    fn popup_capture(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("dpopup-capture")
+            .test_support()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .w_full()
+            .h_full()
+            .occlude()
+            .cursor_nwse_resize()
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                this.popup_resize_move(ev.position.x.as_f32(), ev.position.y.as_f32(), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.popup_resize_end(cx)),
+            )
+            .into_any_element()
     }
 
     /// 「缝 + 属性面板」成对交付：缝按下可拖，属性面板外面套一层高度（拖过用
@@ -39139,13 +41163,8 @@ impl DaroApp {
             .or_else(|| q.started_at.clone())
             .unwrap_or_else(|| "—".to_string());
 
-        let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
-        for (range, kind) in sql_highlight::lex_sql(&out.sql) {
-            let mut style = HighlightStyle::default();
-            style.color = Some(sql_highlight::color_for(kind, self.dark));
-            highlights.push((range, style));
-        }
-        let sql = StyledText::new(out.sql.clone()).with_highlights(highlights);
+        let sql_lines: Vec<&str> = out.sql.lines().collect();
+        let sql_w = sql_preview::code_lines_w(&sql_lines, 0.);
 
         v_flex()
             .id("qinfo")
@@ -39184,11 +41203,20 @@ impl DaroApp {
                     .test_support()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .font_family("Consolas")
-                    .text_size(px(12.5))
-                    .text_color(fg)
-                    .child(sql),
+                    .child(
+                        div().size_full().self_start().overflow_scrollbar().child(
+                            v_flex().w(px(sql_w)).child(sql_preview::code_block(
+                                "qinfo/sql-block",
+                                &sql_lines,
+                                &[],
+                                0.,
+                                sql_w,
+                                0,
+                                self.dark,
+                                fg,
+                            )),
+                        ),
+                    ),
             )
             .into_any_element()
     }
@@ -41454,13 +43482,19 @@ impl DaroApp {
                 div().id("info-ddl").test_support().size_full().child(
                     div()
                         .size_full()
+                        .self_start()
                         .overflow_scrollbar()
                         .p(px(14.))
-                        .child(v_flex().w(px(w)).children(
-                            lines
-                                .iter()
-                                .map(|l| sql_preview::plain_row(l, w, self.dark, fg)),
-                        )),
+                        .child(v_flex().w(px(w)).child(sql_preview::code_block(
+                            "info-ddl-sql",
+                            &lines,
+                            &[],
+                            0.,
+                            w,
+                            0,
+                            self.dark,
+                            fg,
+                        ))),
                 ),
             )
             .child(
@@ -43360,17 +45394,23 @@ fn favorites_bar_menu(
 /// 数据生成 / 数据脱敏 / 数据字典在其余界面（功能区、右键菜单）是企业版占位项，
 /// 这张截图里没有这类标记，所以这里按截图走成不带标记的死标签。MCP 设置归在选项窗里。
 fn tools_bar_menu(
-    _me: Entity<DaroApp>,
+    me: Entity<DaroApp>,
     menu: PopupMenu,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
+    let me_struct = me.clone();
     menu.label("数据传输...")
         .label("数据生成...")
         .label("数据脱敏...")
         .label("数据字典...")
         .label("数据同步...")
-        .label("结构同步...")
+        .item(
+            PopupMenuItem::new("结构同步...").on_click(move |_, _, cx| {
+                let dark = me_struct.read(cx).dark;
+                let _ = structure_compare::open_structure_compare(me_struct.clone(), dark, cx);
+            }),
+        )
         .item(PopupMenuItem::new("命令列界面...").disabled(true))
         .submenu("服务器监控", window, cx, |sub, _, _| {
             sub.label("（子菜单内容待截图核对）")
@@ -44865,7 +46905,7 @@ fn conn_menu_body(
                 "复制连接",
                 "连接名",
                 default_name,
-                move |app, new_name| app.duplicate_connection_named(&src, new_name),
+                move |app, _cx, new_name| app.duplicate_connection_named(&src, new_name),
                 cx,
             );
         }));
@@ -44947,7 +46987,7 @@ fn conn_menu_body(
                     "新建组",
                     "组名",
                     String::new(),
-                    move |app, group| app.add_group_with(group, &conn_name),
+                    move |app, _cx, group| app.add_group_with(group, &conn_name),
                     cx,
                 );
             }));
@@ -45611,13 +47651,13 @@ mod ui_test_support {
     use gpui_kit::test::TestWindowExt;
 
     /// 每个用例独立数据目录：隔离 connections.json，也隔离用例间状态泄漏。
+    /// 目录挂在当前线程上，并行跑用例时互不干扰。
     pub(crate) fn isolate_store(tag: &str) {
         let dir =
             std::env::temp_dir().join(format!("daro_rs_test_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: 用例由 --test-threads=1 串行执行，且写 env 先于任何 DaroApp 构造
-        unsafe { std::env::set_var("DARO_DATA_DIR", &dir) };
+        daro_rs::set_thread_data_dir(Some(dir));
     }
 
     /// 按生产口径开窗：首次启动读不到存档时，连接 / 分组都是空的。
@@ -45677,7 +47717,9 @@ mod ui_test_support {
         crate::sqlite_driver::close(tag);
         (
             mock::Connection::new(
-                "本地 SQLite",
+                // 驱动注册表与目录缓存都按连接名记档：默认名带上夹具 tag，
+                // 并行跑用例时每个夹具独占一份，免得同名连接互相顶掉。
+                format!("SQLite {tag}"),
                 DbKind::SQLite,
                 "",
                 0,
@@ -47153,6 +49195,31 @@ mod designer_tests {
         assert!(!pg.contains("FULLTEXT"), "{pg}");
     }
 
+    /// 主表格「字段」格只列列名：排序 / Nulls / 运算符类别都不上格；
+    /// 「索引类型」按方言给候选，PG 只认 NORMAL / UNIQUE。
+    #[test]
+    fn index_summary_names_only_and_kind_per_dialect() {
+        let mut f = IndexField::make("dealer_id", "int8");
+        f.sort = "DESC".into();
+        f.nulls = "NULLS FIRST".into();
+        assert_eq!(f.summary(), "\"dealer_id\"");
+        assert_eq!(IndexField::default().summary(), "");
+        assert_eq!(
+            index_kind_options(true),
+            &["NORMAL", "UNIQUE", "FULLTEXT", "SPATIAL"]
+        );
+        assert_eq!(index_kind_options(false), &["NORMAL", "UNIQUE"]);
+        let idx = |unique: bool, kind: &str| DesignIndex {
+            unique,
+            kind: kind.into(),
+            ..Default::default()
+        };
+        assert_eq!(index_kind_label(&idx(true, ""), false), "UNIQUE");
+        assert_eq!(index_kind_label(&idx(false, ""), false), "NORMAL");
+        // MySQL 的全文 / 空间类型不被 PG 的勾选位覆盖
+        assert_eq!(index_kind_label(&idx(true, "FULLTEXT"), true), "FULLTEXT");
+    }
+
     #[test]
     fn design_indexes_generate_create_index_and_validate() {
         let cols = vec![
@@ -47212,17 +49279,13 @@ mod designer_tests {
         );
         assert!(sql.contains(" USING BTREE ("));
 
-        // 校验：名称/字段为空、名称重复都要拦住
-        // 名称空但有字段 → 不是空白行，照样拦住
+        // 校验：名称可以留空（数据库默认起名），字段为空、名称重复才拦
         let empty_name = vec![DesignIndex {
             name: " ".into(),
             fields: vec![IndexField::make("id", "int8")],
             ..Default::default()
         }];
-        assert_eq!(
-            design_validation(&cols, &empty_name, &[], &[], &[]).as_deref(),
-            Some("第 1 个索引的名称不能为空")
-        );
+        assert_eq!(design_validation(&cols, &empty_name, &[], &[], &[]), None);
         let empty_cols = vec![DesignIndex { name: "i1".into(), ..Default::default() }];
         assert_eq!(
             design_validation(&cols, &empty_cols, &[], &[], &[]).as_deref(),
@@ -47242,6 +49305,39 @@ mod designer_tests {
         ];
         assert_eq!(design_validation(&cols, &dup, &[], &[], &[]).as_deref(), Some("索引名「i1」重复"));
         assert_eq!(design_validation(&cols, &[idx.clone()], &[], &[], &[]), None);
+        assert_eq!(
+            design_validation(&cols, &[empty_name[0].clone(), empty_name[0].clone()], &[], &[], &[]),
+            None,
+            "两行都留空不算重名"
+        );
+
+        // 留空名称进 DDL 时按数据库默认规则补名：PG `表_列_idx`，MySQL 首列名
+        let auto = vec![DesignIndex {
+            name: String::new(),
+            fields: vec![IndexField::make("id", "int8"), IndexField::make("org_id", "int8")],
+            ..Default::default()
+        }];
+        for (kind, want) in [
+            (
+                mock::DbKind::PostgreSql,
+                "CREATE INDEX \"users_id_org_id_idx\" ON \"users\" (\"id\", \"org_id\");",
+            ),
+            (mock::DbKind::MySql, "CREATE INDEX `id` ON `users` (`id`, `org_id`);"),
+        ] {
+            let sql = design_create_sql(
+                kind,
+                "users",
+                &cols,
+                &auto,
+                &[],
+                &[],
+                &[],
+                &DesignOptions::default(),
+                &[],
+                &[],
+            );
+            assert!(sql.contains(want), "{sql}");
+        }
 
         // 索引属性：填充因子 / 待处理列表限制 / 每范围页数要能变成 DDL
         let opts = DesignIndex {
@@ -47843,7 +49939,7 @@ mod designer_tests {
             app.update(cx, |a, _| {
                 let ds = a.opened[0].dstate.as_ref().unwrap();
                 assert_eq!(ds.cols, ds.baseline);
-                assert_eq!(ds.note, Some("已保存（演示数据，不落库）"));
+                assert_eq!(ds.note.as_deref(), Some("已保存（演示数据，不落库）"));
             });
         })
         .unwrap();
@@ -48260,12 +50356,14 @@ mod designer_tests {
     }
 
     /// 索引「字段」浮层：勾选列 → 确定写回字段序；取消不动模型；勾掉的列从索引里摘掉。
+    /// （勾选面板是 PG 的形态；MySQL 走「行 + 名称下拉」那条路，见 mysql_index_dialog_*）
     #[gpui_kit::test]
     fn index_fields_picker_commits_in_order(cx: &mut TestAppContext) {
         isolate_store("idxfields");
         let (handle, app) = open_app(cx);
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
+            app.update(cx, |a, _| a.conns[0].kind = DbKind::PostgreSql);
             app.update(cx, |a, cx| {
                 a.open_designer(Act::Obj(0, 0, NO_SCHEMA, 0, 0), window, cx)
             });
@@ -48413,8 +50511,61 @@ mod designer_tests {
         .unwrap();
     }
 
-    /// MySQL 索引页的「字段」对话框：勾 / 去勾改字段、子部分填前缀长度，
-    /// 按确定才写回模型；取消要连草稿一起丢。索引类型选 FULLTEXT 后 DDL 换关键字。
+    /// 索引页的「索引类型」列两种方言都出：PG 的候选只有 NORMAL / UNIQUE，
+    /// 勾选唯一键与类型格同步；索引方法在类型右边，唯一 / 并发 / 注释顺延。
+    #[gpui_kit::test]
+    fn index_grid_kind_column_follows_dialect(cx: &mut TestAppContext) {
+        isolate_store("idxkind");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, _| a.conns[0].kind = DbKind::PostgreSql);
+            app.update(cx, |a, cx| {
+                a.open_designer(Act::Obj(0, 0, NO_SCHEMA, 0, 0), window, cx)
+            });
+            window.render_frame(cx);
+            window.click("dsub/1", cx);
+            window.render_frame(cx);
+            for id in [
+                "idx-kind/0",
+                "idx-method/0",
+                "idx-cell/0/4",
+                "idx-cell/0/5",
+                "idx-cell/0/6",
+            ] {
+                assert!(window.try_find(id).is_some(), "{id}");
+            }
+        })
+        .unwrap();
+
+        app.update(cx, |a, cx| {
+            let did = a.opened[0].did;
+            // 种子索引是唯一的：类型格显示 UNIQUE
+            {
+                let ds = a.opened[0].dstate.as_ref().unwrap();
+                assert!(ds.indexes[0].unique);
+                assert_eq!(index_kind_label(&ds.indexes[0], false), "UNIQUE");
+            }
+            // 取消唯一键 → 类型回 NORMAL，当前列跟到唯一键那格（第 5 列）
+            a.design_toggle_index_flag(did, 0, true, cx);
+            {
+                let ds = a.opened[0].dstate.as_ref().unwrap();
+                assert!(!ds.indexes[0].unique);
+                assert_eq!(ds.indexes[0].kind, "NORMAL");
+                assert_eq!(index_kind_label(&ds.indexes[0], false), "NORMAL");
+                assert_eq!(ds.index_cur, 4);
+            }
+            // 从类型格选回 UNIQUE → 唯一键同步勾上
+            a.design_set_index_kind(did, 0, "UNIQUE".into(), cx);
+            let ds = a.opened[0].dstate.as_ref().unwrap();
+            assert!(ds.indexes[0].unique);
+            assert_eq!(index_kind_label(&ds.indexes[0], false), "UNIQUE");
+        });
+    }
+
+    /// MySQL 索引页的「字段」对话框：只列索引现有字段，子部分填前缀长度；
+    /// + 追加空行后从名称下拉选列、− 删行，按确定才写回模型；取消连草稿一起丢。
+    /// 索引类型选 FULLTEXT 后 DDL 换关键字。
     #[gpui_kit::test]
     fn mysql_index_dialog_edits_fields_and_sub_part(cx: &mut TestAppContext) {
         isolate_store("myidxdlg");
@@ -48429,33 +50580,60 @@ mod designer_tests {
             window.render_frame(cx);
             window.click("idx-cell/0/1", cx);
             window.render_frame(cx);
-            assert!(window.try_find("dpopup").is_some(), "字段对话框");
+            for id in ["dpopup", "dpopup-add", "idx-name/0", "idx-sub/0"] {
+                assert!(window.try_find(id).is_some(), "{id}");
+            }
+            assert!(window.try_find("idx-drop").is_none(), "下拉默认收起");
         })
         .unwrap();
 
-        // 候选列下标：勾上首列（id 原本不在索引里）、给 name 列填前缀长度
-        let (ix_first, ix_name) = app.update(cx, |a, _| {
+        // 只列索引现有的两列（org_id / name），不是整表勾选
+        app.update(cx, |a, _| {
             let d = a.opened[0].dstate.as_ref().unwrap();
             let p = d.popup.as_ref().unwrap();
-            let pos = |want: &str| p.items.iter().position(|(n, _)| n == want).unwrap();
-            (pos("id"), pos("name"))
+            assert_eq!(
+                p.rows.as_deref(),
+                Some(&["org_id".to_string(), "name".to_string()][..])
+            );
+            assert_eq!(d.indexes[0].fields.len(), 2);
         });
+
+        // 给 name 行填前缀长度
         cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            window.click(rid(&format!("dpopup/{ix_first}")), cx);
-            window.render_frame(cx);
-            window.click(rid(&format!("idx-sub/{ix_name}")), cx);
+            window.click("idx-sub/1", cx);
             window.press("ctrl-a", cx);
             window.input("8", cx);
         })
         .unwrap();
 
-        // 草稿不该提前改模型：勾上的首列没进索引、前缀长度还没落进字段
-        app.update(cx, |a, _| {
+        // + 追加空行并直接展开下拉；点 id 填进名称格
+        cx.update_window(handle, |_, window, cx| {
+            window.click("dpopup-add", cx);
+            window.render_frame(cx);
+            app.update(cx, |a, _| {
+                let p = a.opened[0].dstate.as_ref().unwrap().popup.as_ref().unwrap();
+                assert_eq!(p.rows.as_ref().map(|r| r.len()), Some(3), "+ 追加一行");
+                assert_eq!(p.open_row, Some(2), "+ 之后展开该行的下拉");
+            });
+            assert!(window.try_find("idx-drop").is_some(), "+ 之后展开候选列");
+            assert!(window.try_find("idx-pick/id").is_some(), "下拉列出本表列");
+            window.click("idx-pick/id", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("idx-drop").is_none(), "选完收起");
+        })
+        .unwrap();
+
+        // 草稿不该提前改模型
+        app.update(cx, |a, cx| {
             let d = a.opened[0].dstate.as_ref().unwrap();
             let p = d.popup.as_ref().unwrap();
-            assert!(p.items[ix_first].1, "列表里已勾上");
-            assert!(p.items[ix_name].1, "name 列保持勾选");
+            let rows = p.rows.as_ref().unwrap();
+            assert_eq!(rows, &vec!["org_id".to_string(), "name".to_string(), "id".to_string()]);
+            let draft = p.subs[1]
+                .as_ref()
+                .map(|s| s.read(cx).value().to_string())
+                .unwrap_or_default();
+            assert_eq!(draft, "8");
             assert_eq!(
                 d.indexes[0].fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
                 vec!["org_id", "name"],
@@ -48478,15 +50656,15 @@ mod designer_tests {
                 .collect();
             assert_eq!(
                 fields,
-                vec![("id", ""), ("org_id", ""), ("name", "8")],
-                "按列表顺序写回，新勾的列补在位"
+                vec![("org_id", ""), ("name", "8"), ("id", "")],
+                "按行顺序写回，新加的列排在末尾"
             );
             assert!(d.popup.is_none(), "确定后对话框收掉");
             // 格子里的摘要带上前缀长度，DDL 也一样
-            assert_eq!(d.indexes[0].fields[2].summary_mysql(), "`name`(8)");
+            assert_eq!(d.indexes[0].fields[1].summary_mysql(), "`name`(8)");
             let sql = design_index_sql_at(true, "", "users", &d.indexes[0], &d.cols)
                 .unwrap_or_default();
-            assert!(sql.contains("(`id`, `org_id`, `name`(8))"), "{sql}");
+            assert!(sql.contains("(`org_id`, `name`(8), `id`)"), "{sql}");
         });
 
         // 索引类型换成 FULLTEXT：关键字顶上，USING 不再跟，唯一位跟着清掉
@@ -48510,7 +50688,7 @@ mod designer_tests {
         app.update(cx, |a, cx| {
             let d = a.opened[0].dstate.as_ref().unwrap();
             let p = d.popup.as_ref().unwrap();
-            let draft = p.subs[ix_name]
+            let draft = p.subs[1]
                 .as_ref()
                 .map(|s| s.read(cx).value().to_string())
                 .unwrap_or_default();
@@ -48518,7 +50696,7 @@ mod designer_tests {
         });
         // 这一轮改完点取消：草稿丢掉、模型保持原样
         cx.update_window(handle, |_, window, cx| {
-            window.click(rid(&format!("idx-sub/{ix_name}")), cx);
+            window.click("idx-sub/1", cx);
             window.press("ctrl-a", cx);
             window.input("32", cx);
             window.click("dpopup-cancel", cx);
@@ -48528,7 +50706,92 @@ mod designer_tests {
         app.update(cx, |a, _| {
             let d = a.opened[0].dstate.as_ref().unwrap();
             assert!(d.popup.is_none(), "取消关掉对话框");
-            assert_eq!(d.indexes[0].fields[2].sub_part, "8", "取消不吃草稿");
+            assert_eq!(d.indexes[0].fields[1].sub_part, "8", "取消不吃草稿");
+        });
+
+        // − 删掉选中行（org_id），确定后索引里只剩 name / id
+        cx.update_window(handle, |_, window, cx| {
+            window.click("idx-cell/0/1", cx);
+            window.render_frame(cx);
+            window.click("dpopup/0", cx);
+            window.render_frame(cx);
+            window.click("dpopup-del", cx);
+            window.render_frame(cx);
+            window.click("dpopup-ok", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, _| {
+            let d = a.opened[0].dstate.as_ref().unwrap();
+            assert_eq!(
+                d.indexes[0].fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                vec!["name", "id"]
+            );
+            assert_eq!(d.indexes[0].fields[0].sub_part, "8");
+        });
+    }
+
+    /// 索引「字段」浮层：名称下拉收在浮层里（不压底边 / 底栏），右下角能斜向拖拽缩放，
+    /// 尺寸记在设计器页签上。
+    #[gpui_kit::test]
+    fn mysql_index_dialog_dropdown_inside_and_resizable(cx: &mut TestAppContext) {
+        isolate_store("myidxdlgsize");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.open_designer(Act::Obj(0, 0, NO_SCHEMA, 0, 0), window, cx)
+            });
+            window.render_frame(cx);
+            window.click("dsub/1", cx);
+            window.render_frame(cx);
+            window.click("idx-cell/0/1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dpopup-grip").is_some(), "右下角有缩放抓手");
+
+            // 最后一行开下拉：下拉整体待在浮层里
+            window.click("idx-name/1", cx);
+            window.render_frame(cx);
+            let popup = window.find("dpopup").bounds();
+            let drop = window.find("idx-drop").bounds();
+            assert!(drop.origin.y >= popup.origin.y, "下拉在浮层内");
+            assert!(
+                drop.origin.y + drop.size.height <= popup.origin.y + popup.size.height + px(0.5),
+                "下拉没越过浮层底边：{drop:?} / {popup:?}"
+            );
+            window.click("idx-name/1", cx);
+            window.render_frame(cx);
+
+            // 右下角斜拖：宽高按增量长出来，松手撤捕获层
+            let b = window.find("dpopup-grip").bounds();
+            let from = point(
+                b.origin.x + b.size.width * 0.5,
+                b.origin.y + b.size.height * 0.5,
+            );
+            let w0 = window.find("dpopup").bounds().size.width;
+            let h0 = window.find("dpopup").bounds().size.height;
+            window.drag(from, point(from.x + px(60.), from.y + px(40.)), cx);
+            window.render_frame(cx);
+            let after = window.find("dpopup").bounds();
+            assert!(
+                (after.size.width - (w0 + px(60.))).abs() <= px(2.),
+                "宽按拖动增量长：{w0} → {}",
+                after.size.width
+            );
+            assert!(
+                (after.size.height - (h0 + px(40.))).abs() <= px(2.),
+                "高按拖动增量长：{h0} → {}",
+                after.size.height
+            );
+            assert!(
+                window.try_find("dpopup-capture").is_none(),
+                "松手撤掉捕获层"
+            );
+        })
+        .unwrap();
+        app.update(cx, |a, _| {
+            let ds = a.opened[0].dstate.as_ref().unwrap();
+            assert!(ds.popup_size.is_some(), "拖出来的尺寸记在设计器页签上");
         });
     }
 
@@ -48636,7 +50899,7 @@ mod designer_tests {
             app.update(cx, |a, _| {
                 let ds = a.opened[0].dstate.as_ref().unwrap();
                 assert!(!design_dirty(ds));
-                assert_eq!(ds.note, Some("已保存（演示数据，不落库）"));
+                assert_eq!(ds.note.as_deref(), Some("已保存（演示数据，不落库）"));
             });
         })
         .unwrap();
@@ -48946,6 +51209,82 @@ mod designer_tests {
             });
         })
         .unwrap();
+    }
+
+    /// 设计器子页网格与数据页网格同一套交互：候选格整格单击就弹浮层
+    /// （不必先点右缘 …），滚轮一次挪一行锚点（内容不够一屏也动），当前列不动。
+    #[gpui_kit::test]
+    fn designer_grid_click_and_wheel_match_data_grid(cx: &mut TestAppContext) {
+        isolate_store("dgridwheel");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.open_designer(Act::Obj(0, 0, NO_SCHEMA, 0, 0), window, cx)
+            });
+            window.render_frame(cx);
+
+            // 外键页：点「字段」格直接弹列选择浮层
+            window.click("dsub/2", cx);
+            window.render_frame(cx);
+            window.click("fk-cell/0/1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dpopup").is_some(), "点格就弹浮层");
+            window.click("dpopup-cancel", cx);
+            window.render_frame(cx);
+
+            // 唯一键页：同样点格即弹，不需要先点 …
+            window.click("dsub/3", cx);
+            window.render_frame(cx);
+            window.click("un-cell/0/1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dpopup").is_some(), "唯一键点格也弹浮层");
+            window.click("dpopup-cancel", cx);
+            window.render_frame(cx);
+
+            // 回到外键页，滚轮那半段要在外键网格可见时跑
+            window.click("dsub/2", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        // 补一行外键，让滚轮有行可走（锚点从 0 开始）
+        app.update(cx, |a, _| {
+            let ds = a.opened[0].dstate.as_mut().unwrap();
+            ds.fks.push(DesignForeignKey::default());
+            ds.fk_sel = 0;
+            ds.fk_cur = 1;
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            // 向下滚 → 锚点 +1；内容不足一屏时视图不动，格照样动
+            window.scroll(
+                "fk-grid-inner",
+                ScrollDelta::Pixels(point(px(0.), px(-40.))),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, _| {
+            let ds = a.opened[0].dstate.as_ref().unwrap();
+            assert_eq!(ds.fk_sel, 1, "滚轮下移一行");
+            assert_eq!(ds.fk_cur, 1, "当前列不跟着变");
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            window.scroll(
+                "fk-grid-inner",
+                ScrollDelta::Pixels(point(px(0.), px(40.))),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.update(cx, |a, _| {
+            let ds = a.opened[0].dstate.as_ref().unwrap();
+            assert_eq!(ds.fk_sel, 0, "滚回来锚点也回来");
+        });
     }
 
     /// 检查约束的表达式面板：文本域内容写回 checks[row]；取消不动。
@@ -49295,6 +51634,19 @@ mod designer_tests {
                 window.try_find("qinfo/sql").unwrap().label().as_deref(),
                 Some("SELECT 1"),
                 "SQL 原文"
+            );
+            // 信息页的 SQL 同样可手动选择复制
+            let sql_box = window.find("qinfo/sql").bounds();
+            window.drag(
+                point(sql_box.origin.x + px(2.), sql_box.origin.y + px(10.)),
+                point(sql_box.origin.x + px(120.), sql_box.origin.y + px(10.)),
+                cx,
+            );
+            window.render_frame(cx);
+            assert_eq!(
+                gpui_kit::base::TextSelection::selected_text(window, cx).trim_end(),
+                "SELECT 1",
+                "信息页 SQL 拖选"
             );
             assert!(window.try_find("qcell/0/0/0").is_none());
             app.update(cx, |a, _| {
@@ -51099,13 +53451,13 @@ mod designer_tests {
                 assert_eq!(ds.new_name.as_deref(), Some(""), "弹窗期间主窗口不动");
                 assert_ne!(ds.cols, ds.baseline, "弹窗期间不落基线");
             });
-            app.update(cx, |a, _| a.finish_new_design_save(did, "t1".into()));
+            app.update(cx, |a, cx| a.finish_new_design_save(did, "t1".into(), cx));
             app.update(cx, |a, _| {
                 let t = &a.opened[0];
                 let ds = t.dstate.as_ref().unwrap();
                 assert_eq!(ds.new_name.as_deref(), Some("t1"));
                 assert_eq!(ds.cols, ds.baseline, "保存后基线对齐");
-                assert_eq!(ds.note, Some("已创建（演示数据，不落库）"));
+                assert_eq!(ds.note.as_deref(), Some("已创建（演示数据，不落库）"));
                 let label = a.tab_label(t);
                 assert!(label.starts_with("t1 @"), "{label}");
                 assert!(label.ends_with(" (设计)"), "{label}");
@@ -51114,7 +53466,7 @@ mod designer_tests {
             app.update(cx, |a, cx| a.design_save(did, cx));
             app.update(cx, |a, _| {
                 let ds = a.opened[0].dstate.as_ref().unwrap();
-                assert_eq!(ds.note, Some("已保存（演示数据，不落库）"));
+                assert_eq!(ds.note.as_deref(), Some("已保存（演示数据，不落库）"));
             });
         })
         .unwrap();
@@ -51147,7 +53499,7 @@ mod designer_tests {
             window.render_frame(cx);
             app.update(cx, |a, cx| {
                 a.conns = vec![mock::Connection::new(
-                    "本地 SQLite",
+                    "SQLite 端到端",
                     DbKind::SQLite,
                     "",
                     0,
@@ -51203,7 +53555,7 @@ mod designer_tests {
         settle(cx, handle);
         app.update(cx, |a, _| {
             let page =
-                crate::sqlite_driver::select_table("本地 SQLite", "main", "member", None, &[], 0, 10)
+                crate::sqlite_driver::select_table("SQLite 端到端", "main", "member", None, &[], 0, 10)
                     .unwrap();
             assert_eq!(page.rows[0][1], "阿离改");
             assert!(!a.opened[0].dirty());
@@ -51218,7 +53570,7 @@ mod designer_tests {
         settle(cx, handle);
         app.update(cx, |a, _| {
             let page =
-                crate::sqlite_driver::select_table("本地 SQLite", "main", "member", None, &[], 0, 10)
+                crate::sqlite_driver::select_table("SQLite 端到端", "main", "member", None, &[], 0, 10)
                     .unwrap();
             assert_eq!(page.rows.len(), 1);
             assert_eq!(a.opened[0].data.len(), 1);
@@ -51233,7 +53585,7 @@ mod designer_tests {
         settle(cx, handle);
         app.update(cx, |a, _| {
             let page =
-                crate::sqlite_driver::select_table("本地 SQLite", "main", "member", None, &[], 0, 10)
+                crate::sqlite_driver::select_table("SQLite 端到端", "main", "member", None, &[], 0, 10)
                     .unwrap();
             assert_eq!(page.rows.len(), 2);
             assert!(page.rows.iter().any(|r| r[1] == "新成员"));
@@ -51276,8 +53628,133 @@ mod designer_tests {
             assert!(o.message.is_none());
         });
 
-        crate::sqlite_driver::close("本地 SQLite");
+        crate::sqlite_driver::close("SQLite 端到端");
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// 设计器「保存」真下发（用户报的「索引新增后 Ctrl+S 没反应」）：
+    /// 加一条索引 → design_save（Ctrl+S 走的同一入口）→ 库里真出现该索引，
+    /// 工具条留下回执，基线对齐后不再算脏。
+    #[gpui_kit::test]
+    fn sqlite_designer_save_creates_index(cx: &mut TestAppContext) {
+        isolate_store("sqlite-design-save");
+        let (conn, path) = sqlite_fixture(
+            "design_save",
+            &[
+                "CREATE TABLE member (id INTEGER PRIMARY KEY, name TEXT, score REAL)",
+                "INSERT INTO member (name, score) VALUES ('阿离', 88.5)",
+            ],
+        );
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![conn.clone()];
+                a.groups.clear();
+                a.sel = Act::Conn(0);
+                a.open_connection(0, cx);
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let c = &a.conns[0];
+            let _ = catalog::objects(c, "main", "", 0);
+        });
+        settle(cx, handle);
+
+        // 打开设计器：真表结构（列）由后台反查填回
+        let did = cx
+            .update_window(handle, |_, window, cx| {
+                app.update(cx, |a, cx| {
+                    a.open_designer(Act::Obj(0, 0, NO_SCHEMA, 0, 0), window, cx);
+                    let t = a.opened.last().unwrap();
+                    assert!(t.design, "打开的是设计页签");
+                    t.did
+                })
+            })
+            .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let ds = a.opened.last().unwrap().dstate.as_ref().unwrap();
+            assert!(!ds.loading, "表结构已回填");
+            assert_eq!(
+                ds.cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                ["id", "name", "score"]
+            );
+            assert!(!design_dirty(ds), "刚打开不算脏");
+        });
+
+        // 索引子页加两行：一行手填名字，一行留空（保存后应落成自动名）
+        app.update(cx, |a, _| {
+            let ds = a.opened.last_mut().unwrap().dstate.as_mut().unwrap();
+            ds.indexes.push(DesignIndex {
+                name: "member_name_idx".into(),
+                fields: vec![IndexField {
+                    name: "name".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            ds.indexes.push(DesignIndex {
+                name: String::new(),
+                fields: vec![IndexField {
+                    name: "score".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            assert!(design_dirty(ds), "加索引后为脏");
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| a.spawn_index_editors(did, window, cx));
+        })
+        .unwrap();
+
+        app.update(cx, |a, cx| a.design_save(did, cx));
+        app.update(cx, |a, _| {
+            let ds = a.opened.last().unwrap().dstate.as_ref().unwrap();
+            assert!(ds.saving, "脚本转到后台，页签先挂「保存中…」");
+        });
+        settle(cx, handle);
+        app.update(cx, |a, cx| {
+            let ds = a.opened.last().unwrap().dstate.as_ref().unwrap();
+            assert!(!ds.saving);
+            let note = ds.note.as_deref().unwrap_or_default();
+            assert!(note.starts_with("已保存（2 条语句"), "{note}");
+            assert!(!design_dirty(ds), "回执落地后基线对齐");
+            assert_eq!(
+                ds.indexes[1].name, "member_score_idx",
+                "留空的索引名落成实际下发的自动名"
+            );
+            assert_eq!(
+                ds.index_edits[1][0]
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .value()
+                    .to_string(),
+                "member_score_idx",
+                "名称输入框跟着刷新"
+            );
+        });
+        let rows = crate::sqlite_driver::select_sql(
+            &conn.name,
+            "SELECT name FROM sqlite_master WHERE type = 'index' \
+             AND name IN ('member_name_idx', 'member_score_idx') ORDER BY name",
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.rows,
+            vec![
+                vec!["member_name_idx".to_string()],
+                vec!["member_score_idx".to_string()],
+            ]
+        );
+
+        crate::sqlite_driver::close(&conn.name);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// PostgreSQL 档全链路（真机：datawalk 开发服务器上的独立测试库
@@ -52218,6 +54695,842 @@ mod designer_tests {
             );
         })
         .unwrap();
+    }
+
+    /// 「工具 ▸ 结构同步...」不再是死标签：点下去要开结构同步窗。
+    /// 无头夹具里的连接全是演示连接，不参与比较，落到的就是空态。
+    #[gpui_kit::test]
+    fn tools_structure_compare_opens_window(cx: &mut TestAppContext) {
+        isolate_store("structcomparemenu");
+        let (handle, _app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("title-menu", cx);
+            window.render_frame(cx);
+            window.click("工具", cx);
+        })
+        .unwrap();
+        let base = cx.windows().len();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            // 顶层第 6 行（0 基下标 5）是「结构同步...」
+            window.within("popup-menu").click(5usize, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let windows = cx.windows();
+        assert_eq!(windows.len(), base + 1, "点「结构同步...」应弹出结构同步窗");
+        let compare = *windows.last().unwrap();
+        cx.update_window(compare, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            // 空态只有一个「关闭」按钮：点得到就说明落到空态而不是选择页
+            window.click("sc-empty-close", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        assert_eq!(cx.windows().len(), base, "关掉结构同步窗应只剩主窗");
+    }
+
+    /// 结构同步用两个真 SQLite 库跑一轮：源端多一列、多一张表，
+    /// 比较页要出来，增量脚本里要有 ADD COLUMN 与建表语句。
+    #[gpui_kit::test]
+    fn structure_compare_sqlite_round_trip(cx: &mut TestAppContext) {
+        isolate_store("structcompare-sqlite");
+        let (handle, app) = open_app(cx);
+        let (mut src_conn, src_path) = sqlite_fixture(
+            "sc_cmp_src",
+            &[
+                "CREATE TABLE demo (id INTEGER PRIMARY KEY, name TEXT)",
+                "CREATE TABLE only_src (id INTEGER)",
+                "CREATE TABLE wide (id INTEGER PRIMARY KEY, c1 TEXT, c2 TEXT, c3 TEXT, c4 TEXT, c5 TEXT, c6 TEXT, c7 TEXT, c8 TEXT, c9 TEXT, c10 TEXT, c11 TEXT, c12 TEXT, c13 TEXT, c14 TEXT, c15 TEXT, c16 TEXT, c17 TEXT, c18 TEXT, c19 TEXT, c20 TEXT, c21 TEXT, c22 TEXT, c23 TEXT, c24 TEXT, c25 TEXT, c26 TEXT, c27 TEXT, c28 TEXT, c29 TEXT, c30 TEXT)",
+            ],
+        );
+        let (mut dst_conn, dst_path) = sqlite_fixture(
+            "sc_cmp_dst",
+            &[
+                "CREATE TABLE demo (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE wide (id INTEGER PRIMARY KEY, c1 TEXT, c2 TEXT, c3 TEXT, c4 TEXT, c5 TEXT, c6 TEXT, c7 TEXT, c8 TEXT, c9 TEXT, c10 TEXT, c11 TEXT, c12 TEXT, c13 TEXT, c14 TEXT, c15 TEXT, c16 TEXT, c17 TEXT, c18 TEXT, c19 TEXT, c20 TEXT, c21 TEXT, c22 TEXT, c23 TEXT, c24 TEXT, c25 TEXT, c26 TEXT, c27 TEXT, c28 TEXT, c29 TEXT)",
+            ],
+        );
+        src_conn.name = "cmp-src".into();
+        dst_conn.name = "cmp-dst".into();
+        let me = app.clone();
+        app.update(cx, |a, _| {
+            a.conns = vec![src_conn, dst_conn];
+        });
+        let dialog_view = cx
+            .update(|cx| {
+                let dark = app.read(cx).dark;
+                crate::structure_compare::open_structure_compare(me, dark, cx)
+            })
+            .expect("结构同步窗要打开");
+        settle(cx, handle);
+        assert_eq!(cx.windows().len(), 2, "结构同步窗要打开");
+        let dialog = *cx.windows().last().unwrap();
+        // 库清单在后台线程读，等「比较」能按下去
+        for _ in 0..50 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // 范围勾选按引擎收放：SQLite 只有表和视图；全勾掉后点「比较」应停在首屏
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("sc-options", cx);
+            window.render_frame(cx);
+            assert!(
+                window.within("popup-menu").try_find_by_label("表").is_some(),
+                "要有「表」"
+            );
+            assert!(
+                window.within("popup-menu").try_find_by_label("视图").is_some(),
+                "要有「视图」"
+            );
+            assert!(
+                window
+                    .within("popup-menu")
+                    .try_find_by_label("实体化视图")
+                    .is_none(),
+                "SQLite 没有实体化视图"
+            );
+            assert!(
+                window.within("popup-menu").try_find_by_label("函数").is_none(),
+                "SQLite 没有函数"
+            );
+            assert!(
+                window
+                    .within("popup-menu")
+                    .try_find_by_label("存储过程")
+                    .is_none(),
+                "SQLite 没有存储过程"
+            );
+            window.within("popup-menu").click(0usize, cx);
+            window.render_frame(cx);
+            let opts = dialog_view.read(cx).debug_opts();
+            assert_eq!(opts, [false, true, true, true, true], "点「表」要取消勾选：{opts:?}");
+            dialog_view.update(cx, |this, cx| {
+                this.debug_set_scope(false, false);
+                cx.notify();
+            });
+            window.click("sc-run", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            cx.update_window(dialog, |_, window, _| window.try_find("sc-setup").is_some())
+                .unwrap(),
+            "一类都不勾时不应开始比较"
+        );
+        dialog_view.update(cx, |this, cx| {
+            this.debug_set_scope(true, true);
+            cx.notify();
+        });
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("sc-run", cx);
+        })
+        .unwrap();
+        let mut done = false;
+        for _ in 0..200 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            done = cx
+                .update_window(dialog, |_, window, _| window.try_find("sc-compare").is_some())
+                .unwrap();
+            if done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(done, "比较应完成并切到结果页");
+        let rows = cx
+            .update_window(dialog, |_, window, _| {
+                (
+                    window.try_find("sc-all").is_some(),
+                    window.try_find("sc-obj-0").is_some(),
+                    window.try_find("sc-obj-1").is_some(),
+                    window.try_find("sc-obj-2").is_some(),
+                )
+            })
+            .unwrap();
+        assert!(rows.0, "结果页要有「全部对象」行");
+        assert!(rows.1 && rows.2 && rows.3, "三个对象（demo 改动、only_src 新增、wide 改动）都要列出来");
+        cx.update_window(dialog, |_, window, cx| {
+            window.click("sc-obj-2", cx);
+            for _ in 0..5 {
+                window.render_frame(cx);
+            }
+        })
+        .unwrap();
+        // 长 DDL 只能在自己的栏里滚：曾经两栏被内容撑到 680 高、又在 h_flex 里
+        // 居中，结果整块 DDL 漂到清单行上、把 tab 栏盖住。
+        cx.update_window(dialog, |_, window, _| {
+            let bounds = |id: &'static str| {
+                window
+                    .try_find(id)
+                    .unwrap_or_else(|| panic!("{id} 要渲染"))
+                    .bounds()
+            };
+            let root = bounds("structure-compare-root");
+            let compare = bounds("sc-compare");
+            assert_eq!(
+                compare.size.width, root.size.width,
+                "比较页不能被长内容撑宽"
+            );
+            let ddl = bounds("sc-ddl");
+            let head = bounds("sc-ddl-head");
+            let body = bounds("sc-ddl-body");
+            assert_eq!(
+                head.origin.y + head.size.height,
+                ddl.origin.y,
+                "tab 栏要贴着 DDL 正文上沿"
+            );
+            for id in ["sc-ddl-src", "sc-ddl-dst"] {
+                let pane = bounds(id);
+                assert_eq!(pane.origin.y, body.origin.y, "{id} 不能因为行多就居中漂到清单上");
+                assert!(
+                    pane.size.height <= body.size.height,
+                    "{id} 高度要收回正文槽，内部自己滚：{:?}",
+                    pane
+                );
+                assert!(
+                    pane.origin.y >= ddl.origin.y
+                        && pane.origin.y + pane.size.height <= ddl.origin.y + ddl.size.height,
+                    "{id} 要落在 DDL 区里：{:?}",
+                    pane
+                );
+            }
+        })
+        .unwrap();
+        cx.update_window(dialog, |_, window, cx| {
+            window.click("sc-obj-1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("sc-ddl").is_some(), "默认要显示 DDL 比较");
+            window.click("sc-tab-1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("sc-script").is_some(), "要能切到部署脚本");
+        })
+        .unwrap();
+        // 下一步 → 部署页：脚本全文、目标服务器行、复制脚本都在
+        cx.update_window(dialog, |_, window, cx| {
+            window.click("sc-next", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("sc-deploy").is_some(), "「下一步」要进部署页");
+            assert!(window.try_find("sc-deploy-script").is_some(), "默认显示部署脚本");
+            assert!(window.try_find("sc-deploy-copy").is_some(), "部署页要能复制脚本");
+            window.click("sc-deploy-tab-1", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("sc-deploy-log").is_none(),
+                "还没开始执行时日志页是空态"
+            );
+            assert!(
+                window.try_find("sc-deploy-stats").is_some(),
+                "日志页要带进度 / 成功 / 错误 / 时间计数"
+            );
+            assert!(
+                window.try_find("sc-deploy-copy").is_none(),
+                "复制脚本只留在部署脚本页"
+            );
+            window.click("sc-start", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut done = false;
+        for _ in 0..300 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let (n, _, busy) = cx.update(|cx| dialog_view.read(cx).debug_deploy());
+            if !busy && n > 0 {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (n, ok, busy) = cx.update(|cx| dialog_view.read(cx).debug_deploy());
+        assert!(done && n > 0 && !busy, "部署要跑完并留下回执：{n} 条 / busy={busy}");
+        assert_eq!(ok, n, "部署语句不该有失败：{n} 条里只有 {ok} 条成功");
+        // 开始后停在消息日志：计数还在，日志给出 --Start-- / Executed Query / --End--
+        cx.update_window(dialog, |_, window, _| {
+            assert!(
+                window.try_find("sc-deploy-stats").is_some(),
+                "执行完日志页要保留计数"
+            );
+            assert!(
+                window.try_find("sc-deploy-log").is_some(),
+                "执行完要给出汇总日志"
+            );
+            assert!(
+                window.try_find("sc-close").is_some(),
+                "执行完右端要换成「关闭」"
+            );
+            assert!(
+                window.try_find("sc-start").is_none(),
+                "执行完不再显示「开始」"
+            );
+        })
+        .unwrap();
+        // 目标库真的补上了源端多出的列（部署不是只写日志）
+        crate::sqlite_driver::open("sc_cmp_check", &dst_path).unwrap();
+        let demo_cols = crate::sqlite_driver::table_columns("sc_cmp_check", "main", "demo");
+        let wide_cols = crate::sqlite_driver::table_columns("sc_cmp_check", "main", "wide");
+        crate::sqlite_driver::close("sc_cmp_check");
+        assert!(
+            demo_cols.iter().any(|c| c.name == "name"),
+            "部署后 demo 要有 name 列：{demo_cols:?}"
+        );
+        assert!(
+            wide_cols.len() == 31,
+            "部署后 wide 要有 31 列（id + c1..c30）：{}",
+            wide_cols.len()
+        );
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&dst_path);
+    }
+
+    /// 真 PG 走一轮结构同步：Docker 里的 daro-pg-test（127.0.0.1:5432）。
+    /// 源端多表 / 视图 / 实体化视图 / 函数，两端表结构有类型、缺列、多索引的差；
+    /// 部署后按系统目录逐项核对，再比一次确认没有残留的可执行语句。
+    /// 需要真库：
+    /// `cargo test --bin daro-rs structure_compare_postgres_round_trip -- --ignored --nocapture`
+    #[gpui_kit::test]
+    #[ignore]
+    fn structure_compare_postgres_round_trip(cx: &mut TestAppContext) {
+        isolate_store("structcompare-pg");
+        let params = |dbname: &str| pg_driver::Params {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "postgres".into(),
+            password: "Daro#Test1".into(),
+            dbname: dbname.into(),
+        };
+        // 每次都从干净库起步：容器里的 postgres 是超级用户，直接重建两个库
+        pg_driver::open("sc-pg-admin", &params("postgres"))
+            .unwrap_or_else(|e| panic!("连不上 Docker 里的测试 PostgreSQL：{e}"));
+        for db in ["daro_sync_src", "daro_sync_dst"] {
+            pg_driver::execute_stmt(
+                "sc-pg-admin",
+                &format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"),
+                0,
+            )
+            .unwrap_or_else(|e| panic!("重建 {db} 失败：{e}"));
+            pg_driver::execute_stmt("sc-pg-admin", &format!("CREATE DATABASE {db}"), 0)
+                .unwrap_or_else(|e| panic!("重建 {db} 失败：{e}"));
+        }
+        pg_driver::close("sc-pg-admin");
+
+        let seed = |key: &str, dbname: &str, stmts: &[&str]| {
+            pg_driver::open(key, &params(dbname))
+                .unwrap_or_else(|e| panic!("连 {dbname} 失败：{e}"));
+            for stmt in stmts {
+                pg_driver::execute_stmt(key, stmt, 0)
+                    .unwrap_or_else(|e| panic!("{dbname} 夹具失败：{e}\n{stmt}"));
+            }
+            pg_driver::close(key);
+        };
+        seed(
+            "sc-pg-seed-src",
+            "daro_sync_src",
+            &[
+                "CREATE TABLE customers (
+                    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    name text NOT NULL,
+                    email text,
+                    status text DEFAULT 'active',
+                    decision integer DEFAULT 1
+                )",
+                "CREATE INDEX customers_email_ix ON customers (email)",
+                "CREATE UNIQUE INDEX customers_name_ux ON customers (name)",
+                "INSERT INTO customers (name, email) VALUES ('甲', 'a@example.com'), ('乙', 'b@example.com')",
+                "CREATE TABLE only_src (id integer)",
+                "CREATE VIEW v_active AS SELECT id, name FROM customers WHERE status = 'active'",
+                "CREATE MATERIALIZED VIEW mv_people AS SELECT name FROM customers",
+                "CREATE FUNCTION fn_double(n integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT n * 2'",
+            ],
+        );
+        seed(
+            "sc-pg-seed-dst",
+            "daro_sync_dst",
+            &[
+                "CREATE TABLE customers (
+                    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    name text NOT NULL,
+                    email varchar(100),
+                    decision text DEFAULT '1'
+                )",
+                "CREATE INDEX customers_name_old_ix ON customers (name)",
+                "INSERT INTO customers (name, email) VALUES ('旧数据', 'old@example.com')",
+                "CREATE TABLE only_dst (id integer)",
+            ],
+        );
+
+        let (handle, app) = open_app(cx);
+        let me = app.clone();
+        let conn = |name: &str, db: &str| {
+            Connection::new(
+                name,
+                DbKind::PostgreSql,
+                "127.0.0.1",
+                5432,
+                db,
+                "postgres",
+                "Daro#Test1",
+                "",
+                false,
+            )
+        };
+        app.update(cx, |a, _| {
+            a.conns = vec![
+                conn("pg-src", "daro_sync_src"),
+                conn("pg-dst", "daro_sync_dst"),
+            ];
+        });
+        let dialog_view = cx
+            .update(|cx| {
+                let dark = app.read(cx).dark;
+                crate::structure_compare::open_structure_compare(me, dark, cx)
+            })
+            .expect("结构同步窗要打开");
+        settle(cx, handle);
+        let dialog = *cx.windows().last().unwrap();
+
+        // 库清单和模式清单都是后台线程读的：等两侧落到夹具库，再多推几轮
+        // 让紧跟着的模式查询落地。
+        let mut ready = false;
+        for _ in 0..250 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let sides = cx.update(|cx| dialog_view.read(cx).debug_sides());
+            if sides[0].1 == "daro_sync_src" && sides[1].1 == "daro_sync_dst" {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(ready, "两侧库清单要带上夹具库");
+        for _ in 0..50 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // 比较（模式清单偶尔还没落地，没切到结果页就再点一次）
+        let mut compared = false;
+        for _ in 0..3 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("sc-run", cx);
+            })
+            .unwrap();
+            for _ in 0..200 {
+                cx.update_window(dialog, |_, window, cx| {
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                if cx
+                    .update_window(dialog, |_, window, _| window.try_find("sc-compare").is_some())
+                    .unwrap()
+                {
+                    compared = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if compared {
+                break;
+            }
+        }
+        assert!(compared, "比较应完成并切到结果页");
+
+        // 下一步 → 部署页，复制出脚本本身做断言
+        cx.update_window(dialog, |_, window, cx| {
+            window.click("sc-next", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("sc-deploy").is_some(), "「下一步」要进部署页");
+            window.click("sc-deploy-copy", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let script = app.update(cx, |_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        });
+        eprintln!("生成的部署脚本：\n{script}");
+        for want in [
+            "ALTER TABLE \"public\".\"customers\"",
+            "ALTER COLUMN \"email\" TYPE text",
+            "ALTER COLUMN \"decision\" TYPE integer USING CAST(\"decision\" AS integer)",
+            "ADD COLUMN \"status\"",
+            "DROP INDEX \"public\".\"customers_name_old_ix\";",
+            "customers_email_ix",
+            "customers_name_ux",
+            "CREATE TABLE \"public\".\"only_src\"",
+            "CREATE VIEW \"public\".\"v_active\"",
+            "CREATE MATERIALIZED VIEW \"public\".\"mv_people\"",
+            "fn_double",
+            "-- DROP TABLE \"public\".\"only_dst\";",
+        ] {
+            assert!(script.contains(want), "部署脚本里应有 {want:?}：\n{script}");
+        }
+        // 改类型前先摘掉旧默认值，否则 PG 会因为 '1'::text 转不成 integer 拒绝
+        let drop_default = script
+            .find("ALTER COLUMN \"decision\" DROP DEFAULT")
+            .unwrap_or_else(|| panic!("decision 改类型前要先 DROP DEFAULT：\n{script}"));
+        let cast = script
+            .find("USING CAST(\"decision\" AS integer)")
+            .expect("decision 要带 USING");
+        assert!(drop_default < cast, "DROP DEFAULT 要在改类型之前：\n{script}");
+        assert!(
+            !script
+                .lines()
+                .any(|l| l.trim_start().to_ascii_uppercase().starts_with("DROP TABLE")),
+            "目标端多出的表不能被直接删：\n{script}"
+        );
+
+        // 开始部署，等到执行线程收工
+        cx.update_window(dialog, |_, window, cx| {
+            window.click("sc-start", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut done = false;
+        for _ in 0..300 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let (n, _, busy) = cx.update(|cx| dialog_view.read(cx).debug_deploy());
+            if !busy && n > 0 {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (n, ok, busy) = cx.update(|cx| dialog_view.read(cx).debug_deploy());
+        assert!(done && n > 0 && !busy, "部署要跑完并留下回执：{n} 条 / busy={busy}");
+        assert_eq!(ok, n, "部署语句不该有失败：{n} 条里只有 {ok} 条成功");
+
+        // 部署结果直接读目标库系统目录核对（不信任回执，也不信任界面）
+        pg_driver::open("sc-pg-check", &params("daro_sync_dst"))
+            .unwrap_or_else(|e| panic!("核对连接打不开：{e}"));
+        let rows = |sql: &str| -> Vec<Vec<String>> {
+            pg_driver::execute_stmt("sc-pg-check", sql, 1000)
+                .unwrap_or_else(|e| panic!("核对查询失败：{e}\n{sql}"))
+                .select
+                .unwrap_or_else(|| panic!("核对语句要出结果集：{sql}"))
+                .rows
+        };
+        let col = |sql: &str| -> Vec<String> {
+            rows(sql)
+                .into_iter()
+                .map(|r| r.into_iter().next().unwrap_or_default())
+                .collect()
+        };
+        let cols = col(
+            "SELECT column_name || ':' || data_type || ':' || is_nullable || ':' || coalesce(column_default, '')
+             FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'customers'
+             ORDER BY ordinal_position",
+        );
+        assert_eq!(cols.len(), 5, "customers 应有 5 列：{cols:?}");
+        assert_eq!(cols[0], "id:bigint:NO:", "identity 主键列不对：{cols:?}");
+        assert_eq!(cols[1], "name:text:NO:", "name 列不对：{cols:?}");
+        assert_eq!(
+            cols[2], "email:text:YES:",
+            "email 应从 varchar(100) 改成 text：{cols:?}"
+        );
+        assert!(
+            cols[3].starts_with("decision:integer:YES:1"),
+            "decision 应从 text 改成 integer 并保留默认值：{cols:?}"
+        );
+        assert!(
+            cols[4].starts_with("status:text:YES:'active'"),
+            "新增 status 要带默认值：{cols:?}"
+        );
+
+        let indexes = col(
+            "SELECT indexname FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = 'customers'
+             ORDER BY indexname",
+        );
+        assert_eq!(
+            indexes,
+            ["customers_email_ix", "customers_name_ux", "customers_pkey"],
+            "索引应只留源端口径：{indexes:?}"
+        );
+
+        let tables = col(
+            "SELECT tablename FROM pg_tables
+             WHERE schemaname = 'public' ORDER BY tablename",
+        );
+        assert_eq!(
+            tables,
+            ["customers", "only_dst", "only_src"],
+            "只补源端对象、目标端多出的表要留着：{tables:?}"
+        );
+        let views = col(
+            "SELECT viewname FROM pg_views
+             WHERE schemaname = 'public' ORDER BY viewname",
+        );
+        assert_eq!(views, ["v_active"], "视图没同步过去：{views:?}");
+        let mvs = col(
+            "SELECT matviewname FROM pg_matviews
+             WHERE schemaname = 'public' ORDER BY matviewname",
+        );
+        assert_eq!(mvs, ["mv_people"], "实体化视图没同步过去：{mvs:?}");
+        let funcs = col(
+            "SELECT p.proname FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'public' AND p.prokind = 'f'
+             ORDER BY p.proname",
+        );
+        assert_eq!(funcs, ["fn_double"], "函数没同步过去：{funcs:?}");
+        let data = col("SELECT count(*)::text FROM customers");
+        assert_eq!(data, ["1"], "结构同步不该动数据：{data:?}");
+        pg_driver::close("sc-pg-check");
+
+        // 再比一次：目标端已对齐，部署页不该再有可执行语句
+        cx.update_window(dialog, |_, window, cx| {
+            window.click("sc-rerun", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut refreshed = false;
+        for _ in 0..200 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            if cx
+                .update_window(dialog, |_, window, _| window.try_find("sc-compare").is_some())
+                .unwrap()
+            {
+                refreshed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(refreshed, "第二次比较应完成");
+        cx.update_window(dialog, |_, window, cx| {
+            window.click("sc-next", cx);
+            window.render_frame(cx);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
+            window.click("sc-deploy-copy", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let copied = app.update(cx, |_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        });
+        let second = if copied == "sentinel" { String::new() } else { copied };
+        eprintln!("第二次比较的部署脚本：\n{second}");
+        let executable: Vec<&str> = second
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("--"))
+            .collect();
+        assert!(
+            executable.is_empty(),
+            "第二次比较不该还有可执行语句：{executable:?}\n脚本：\n{second}"
+        );
+
+        pg_driver::close_prefix("pg-src");
+        pg_driver::close_prefix("pg-dst");
+    }
+
+    /// 选中状态和重新拉取的库清单都要跟着走。
+    #[gpui_kit::test]
+    fn structure_compare_switches_connection_from_dropdown(cx: &mut TestAppContext) {
+        isolate_store("structcompare-switch");
+        let (handle, app) = open_app(cx);
+        let (mut src_conn, src_path) = sqlite_fixture("sc_sw_a", &["CREATE TABLE ta (id INTEGER)"]);
+        let (mut dst_conn, dst_path) = sqlite_fixture("sc_sw_b", &["CREATE TABLE tb (id INTEGER)"]);
+        let (mut third_conn, third_path) = sqlite_fixture("sc_sw_c", &["CREATE TABLE tc (id INTEGER)"]);
+        src_conn.name = "cmp-a".into();
+        dst_conn.name = "cmp-b".into();
+        third_conn.name = "cmp-c".into();
+        // 再塞一长串候选：下拉面板要封顶滚动，而不是把整串行画到页面上
+        let mut long_list = vec![src_conn, dst_conn, third_conn];
+        for i in 0..10 {
+            let mut c = long_list[2].clone();
+            c.name = format!("cmp-x{i}");
+            long_list.push(c);
+        }
+        let me = app.clone();
+        app.update(cx, |a, _| {
+            a.conns = long_list;
+        });
+        let dialog_view = cx
+            .update(|cx| {
+                let dark = app.read(cx).dark;
+                crate::structure_compare::open_structure_compare(me, dark, cx)
+            })
+            .expect("结构同步窗要打开");
+        settle(cx, handle);
+        assert_eq!(cx.windows().len(), 2, "结构同步窗要打开");
+        let dialog = *cx.windows().last().unwrap();
+        for _ in 0..50 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let sides = cx.update(|cx| dialog_view.read(cx).debug_sides());
+        assert_eq!(sides[0].0, "cmp-a", "源端默认第一条连接：{sides:?}");
+        assert_eq!(sides[1].0, "cmp-b", "目标端默认第二条连接：{sides:?}");
+
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            let setup = window.try_find("sc-setup").expect("首屏要渲染");
+            assert!(
+                setup.bounds().size.height >= gpui::px(600.),
+                "首屏要撑满窗口，否则下拉没处展开：{:?}",
+                setup.bounds()
+            );
+            window.click("sc-1-0-trigger", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("sc-pop-1-cmp-c").is_some(),
+                "连接下拉要列出可选连接"
+            );
+            let trigger = window.try_find("sc-1-0-trigger").expect("触发框要渲染");
+            let panel = window.try_find("sc-pop-1-0").expect("下拉面板要渲染");
+            assert_eq!(
+                panel.bounds().origin.y,
+                trigger.bounds().origin.y + trigger.bounds().size.height,
+                "面板要贴着触发框下沿"
+            );
+            assert_eq!(
+                panel.bounds().size.height,
+                gpui::px(220.),
+                "候选很多时面板要封顶 220 高"
+            );
+            let far = window.try_find("sc-pop-1-cmp-x9").expect("候选行在树里");
+            assert!(
+                !far.visible(),
+                "超出面板的候选行要被裁掉，不能画到页面上与说明 / 页脚重叠"
+            );
+            window.click("sc-pop-1-cmp-c", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("sc-pop-1-cmp-c").is_none(),
+                "选中后下拉要收起"
+            );
+        })
+        .unwrap();
+        for _ in 0..50 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let sides = cx.update(|cx| dialog_view.read(cx).debug_sides());
+        assert_eq!(sides[0].0, "cmp-a", "换目标不该动源端：{sides:?}");
+        assert_eq!(sides[1].0, "cmp-c", "目标连接要真的换成第三条：{sides:?}");
+        assert_eq!(sides[1].1, "main", "切换后要按新连接重新拉库清单：{sides:?}");
+
+        // ── 同一套组合框：打开回填当前值并全选，键入即过滤 ──────────
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("sc-1-0-trigger", cx);
+            window.render_frame(cx);
+            let (open, needle, active, text) = dialog_view.read(cx).debug_combo(cx);
+            assert!(open, "点触发框要展开下拉");
+            assert_eq!(needle, "", "回填的当前值不算筛选词：{needle:?}");
+            assert_eq!(active, Some(2), "打开时高亮当前连接 cmp-c");
+            assert_eq!(text, "cmp-c", "打开时把当前值回填进筛选输入框");
+            // 打开时正文已全选，键入直接替换当前值
+            window.input("x", cx);
+        })
+        .unwrap();
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            let (_, needle, active, _) = dialog_view.read(cx).debug_combo(cx);
+            assert_eq!(needle, "x", "键入即成为筛选词");
+            assert_eq!(active, None, "筛选词变了就回到无高亮");
+            assert!(
+                window.try_find("sc-pop-1-cmp-x9").is_some(),
+                "cmp-x9 应当命中筛选"
+            );
+            assert!(
+                window.try_find("sc-pop-1-cmp-a").is_none(),
+                "cmp-a 不含筛选词，应被筛掉"
+            );
+            // 方向键在筛选结果里移动高亮，回车取高亮项
+            window.press("down", cx);
+            window.press("down", cx);
+            let (_, _, active, _) = dialog_view.read(cx).debug_combo(cx);
+            assert_eq!(active, Some(1), "连按两次下键应停在第 2 条候选");
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("sc-pop-1-cmp-x1").is_none(),
+                "回车后下拉要收起"
+            );
+        })
+        .unwrap();
+        for _ in 0..50 {
+            cx.update_window(dialog, |_, window, cx| {
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let sides = cx.update(|cx| dialog_view.read(cx).debug_sides());
+        assert_eq!(sides[1].0, "cmp-x1", "回车要取筛选后高亮的第二条：{sides:?}");
+        assert_eq!(sides[1].1, "main", "换连接后仍按新连接拉库清单：{sides:?}");
+
+        // Esc 先收下拉，不关窗（与查询页组合框一致）
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("sc-1-0-trigger", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("sc-pop-1-0").is_some(),
+                "再点触发框要展开下拉"
+            );
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("sc-pop-1-0").is_none(),
+                "Esc 要收起下拉"
+            );
+        })
+        .unwrap();
+        assert_eq!(cx.windows().len(), 2, "Esc 只收下拉，不关结构同步窗");
+
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&dst_path);
+        let _ = std::fs::remove_file(&third_path);
     }
 
     /// MCP 设置已并入「工具 ▸ 选项...」：导航「扩展 ▸ MCP 服务」里能看到开关 /
@@ -54365,6 +57678,7 @@ mod designer_tests {
                 "CREATE INDEX ix_member_score ON member(score DESC)",
             ],
         );
+        let conn_name = conn.name.clone();
         let (handle, app) = open_app(cx);
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
@@ -54429,9 +57743,8 @@ mod designer_tests {
             assert_eq!(fk.ref_table, "dept");
             assert_eq!(fk.on_delete, "CASCADE");
         });
-        // 连接注册表 / 目录缓存按名字在进程内共享：一并放开，
-        // 后面的用例才能读到自己的库
-        crate::sqlite_driver::close("本地 SQLite");
+        // 连接注册表 / 目录缓存按名字在进程内共享：一并放开
+        crate::sqlite_driver::close(&conn_name);
         catalog::invalidate();
     }
 
@@ -54449,6 +57762,7 @@ mod designer_tests {
                 "CREATE VIEW menu AS SELECT id, name FROM menus WHERE id > 1",
             ],
         );
+        let conn_name = conn.name.clone();
         let (handle, app) = open_app(cx);
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
@@ -54514,7 +57828,7 @@ mod designer_tests {
             );
         })
         .unwrap();
-        crate::sqlite_driver::close("本地 SQLite");
+        crate::sqlite_driver::close(&conn_name);
         catalog::invalidate();
         let _ = std::fs::remove_file(&path);
     }
@@ -54989,8 +58303,6 @@ mod tree_menu_tests {
     #[gpui_kit::test]
     fn table_menu_drop_and_rename_run_on_real_db(cx: &mut TestAppContext) {
         isolate_store("menutable");
-        // 目录缓存按连接名建键，夹具统一叫「本地 SQLite」，会和别的测试串味，
-        // 这里换个只属于本测试的名字。
         let (seed, path) = sqlite_fixture(
             "menu-ddl",
             &[
@@ -55368,7 +58680,6 @@ mod tree_menu_tests {
     #[gpui_kit::test]
     fn view_menu_drop_runs_on_real_db_and_the_rest_stay_grey(cx: &mut TestAppContext) {
         isolate_store("menuview");
-        // 目录缓存按连接名建键，sqlite_fixture 的「本地 SQLite」会串别的测试
         let (seed, path) = sqlite_fixture(
             "menu-view",
             &[
@@ -55669,6 +58980,9 @@ mod ui_flows {
     fn update_prompt_opens_progress_window(cx: &mut TestAppContext) {
         isolate_store("update-flow");
         let (handle, app) = open_app(cx);
+        // 点「立即更新」会起真实下载线程，失败结果从后台线程回送；
+        // 不放行后台调度就是跨线程唤醒，会被判“用例不确定”。
+        cx.executor().allow_parking();
         let latest = crate::update::Latest {
             version: "9.9.9".to_string(),
             url: "https://example.invalid/release".to_string(),
@@ -55888,6 +59202,7 @@ mod ui_flows {
                 "INSERT INTO member (name, score) VALUES ('阿离', 88.5), ('老张', 60)",
             ],
         );
+        let conn_name = conn.name.clone();
         let (handle, app) = open_app(cx);
         with_failure_dump(cx, handle, |cx| {
             cx.update_window(handle, |_, window, cx| {
@@ -55963,7 +59278,7 @@ mod ui_flows {
                 assert_eq!(a.opened[0].data[0][1], "阿离改");
                 assert!(!a.opened[0].dirty(), "应用后工作集无变更");
                 let page = crate::sqlite_driver::select_table(
-                    "本地 SQLite",
+                    &conn_name,
                     "main",
                     "member",
                     None,
@@ -55975,7 +59290,7 @@ mod ui_flows {
                 assert_eq!(page.rows[0][1], "阿离改", "真库已更新");
             });
         });
-        crate::sqlite_driver::close("本地 SQLite");
+        crate::sqlite_driver::close(&conn_name);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -55994,6 +59309,7 @@ mod ui_flows {
                 ),
             ],
         );
+        let conn_name = conn.name.clone();
         let (handle, app) = open_app(cx);
         with_failure_dump(cx, handle, |cx| {
             cx.update_window(handle, |_, window, cx| {
@@ -56118,7 +59434,7 @@ mod ui_flows {
             .unwrap();
             app.update(cx, |a, _| assert!(!a.cell_viewer.open));
         });
-        crate::sqlite_driver::close("本地 SQLite");
+        crate::sqlite_driver::close(&conn_name);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -56196,6 +59512,7 @@ mod ui_flows {
                 "INSERT INTO member (name, score) VALUES ('阿离', 88.5), ('老张', 60)",
             ],
         );
+        let conn_name = conn.name.clone();
         let (handle, app) = open_app(cx);
         with_failure_dump(cx, handle, |cx| {
             cx.update_window(handle, |_, window, cx| {
@@ -56242,7 +59559,7 @@ mod ui_flows {
             })
             .unwrap();
         });
-        crate::sqlite_driver::close("本地 SQLite");
+        crate::sqlite_driver::close(&conn_name);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -56258,6 +59575,7 @@ mod ui_flows {
                 "INSERT INTO member (name, score) VALUES ('阿离', 88.5), ('老张', 60)",
             ],
         );
+        let conn_name = conn.name.clone();
         let (handle, app) = open_app(cx);
         cx.update(|cx| wire_global_keys(app.clone(), handle, cx));
         with_failure_dump(cx, handle, |cx| {
@@ -56359,7 +59677,7 @@ mod ui_flows {
                 assert_eq!(o.cell.0, 1);
             });
         });
-        crate::sqlite_driver::close("本地 SQLite");
+        crate::sqlite_driver::close(&conn_name);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -56483,8 +59801,7 @@ mod ui_flows {
             "flowempty",
             &["CREATE TABLE audit (id INTEGER PRIMARY KEY, tenant_id INTEGER, note TEXT)"],
         );
-        // 驱动注册表与目录缓存都按连接名记档：换个独占名，别把本用例的
-        // 表清单串给后面同名连接（「本地 SQLite」）的用例
+        // 驱动注册表与目录缓存都按连接名记档：换个独占名
         conn.name = "空表占位".into();
         let (handle, app) = open_app(cx);
         with_failure_dump(cx, handle, |cx| {
@@ -57089,7 +60406,6 @@ mod ui_flows {
         }
         let refs: Vec<&str> = stmts.iter().map(String::as_str).collect();
         let (seed, _path) = sqlite_fixture("objgridflow", &refs);
-        // 目录缓存按连接名建键，sqlite_fixture 的「本地 SQLite」会串别的测试
         let conn = mock::Connection::new(
             "对象网格流",
             seed.kind,
@@ -58107,6 +61423,7 @@ mod category_visibility_tests {
                 "CREATE VIEW v_member AS SELECT id FROM member",
             ],
         );
+        let conn_name = conn.name.clone();
         let (handle, app) = open_app(cx);
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
@@ -58121,8 +61438,8 @@ mod category_visibility_tests {
         settle(cx, handle);
         app.update(cx, |a, _| {
             assert!(a.conns[0].connected, "测试库连接成功");
-            let db = node_key("本地 SQLite", "main");
-            a.expanded.insert("本地 SQLite".to_string());
+            let db = node_key(&conn_name, "main");
+            a.expanded.insert(conn_name.clone());
             a.expanded.insert(db.clone());
             a.visited_dbs.insert(db);
         });
@@ -58158,7 +61475,7 @@ mod category_visibility_tests {
             });
         })
         .unwrap();
-        crate::sqlite_driver::close("本地 SQLite");
+        crate::sqlite_driver::close(&conn_name);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -60288,6 +63605,7 @@ mod explain_tests {
         use gpui_kit::test::TestQueryExt as _;
         isolate_store("viewsql");
         let (handle, app) = open_app(cx);
+        cx.update(|cx| wire_global_keys(app.clone(), handle, cx));
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             app.update(cx, |a, cx| {
@@ -60352,26 +63670,45 @@ mod explain_tests {
                             COMMENT ON VIEW \"Untitled\" IS '菜单视图';\n\n\
                             ALTER TABLE \"Untitled\" OWNER TO \"postgres\";";
             assert_eq!(window.find("dsql").label(), Some(expected), "DDL 页整串");
-            // 逐行铺：6 行（含两个空行），行高一律 20 —— 空行塌成 0 高就少一行、
-            // 语句之间的空行会在屏幕上消失，这里用行间距钉住。
-            let ids = [
-                "dsql-row/0",
-                "dsql-row/1",
-                "dsql-row/2",
-                "dsql-row/3",
-                "dsql-row/4",
-                "dsql-row/5",
-            ];
-            for (i, id) in ids.iter().enumerate() {
-                let r = window.find(*id).bounds();
-                assert_eq!(r.size.height, px(20.), "{id} 行高");
-                if i > 0 {
-                    let prev = window.find(ids[i - 1]).bounds();
-                    assert_eq!(r.origin.y - prev.origin.y, px(20.), "{id} 行距");
-                }
-            }
+            // 整块文字按 20px 一行铺：6 行（含两个空行）合计 120 —— 空行塌成 0 高
+            // 就少一行、语句之间的空行会在屏幕上消失。
+            let block = window.find("dsql-block").bounds();
+            assert_eq!(block.size.height, px(120.), "六行含空行的总高");
+            // 手动选择：从第 1 行拖到第 5 行，跨过中间的空行。起点避开左栏
+            // 分隔条（那几像素会拖成改栏宽），落在文字内部即可。
+            let from = point(block.origin.x + px(18.), block.origin.y + px(10.));
+            let to = point(
+                block.origin.x + block.size.width - px(1.),
+                block.origin.y + px(90.),
+            );
+            window.drag(from, to, cx);
+            window.render_frame(cx);
+            let picked = gpui_kit::base::TextSelection::selected_text(window, cx);
+            // 跨空行的连续片段：第二个语句之前的空行仍在，结束边界停在第四行。
+            assert!(
+                picked.contains(
+                    "SELECT id FROM menus;\n\nCOMMENT ON VIEW \"Untitled\" IS '菜单视图';"
+                ),
+                "拖选跨空行取到的片段是 {picked:?}"
+            );
+            assert!(!picked.contains("ALTER TABLE"), "选区止于拖拽终点：{picked:?}");
         })
         .unwrap();
+        // Ctrl+C 走全局复制动作：只读区拖选后已失焦，按键落到应用层
+        // 绑定的复制上，它优先拿窗口选区（复制在 defer 里落盘，先冲刷）
+        cx.update_window(handle, |_, window, cx| {
+            window.press("ctrl-c", cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        let clip = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        assert!(
+            clip.contains("SELECT id FROM menus;\n\nCOMMENT ON VIEW"),
+            "Ctrl+C 复制选区：{clip:?}"
+        );
     }
 
 }

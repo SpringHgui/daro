@@ -11,7 +11,7 @@ use crate::to_hsla;
 
 use crate::ui::{self, TITLE_H};
 
-type Submit = Box<dyn Fn(&mut DaroApp, String)>;
+type Submit = Box<dyn Fn(&mut DaroApp, &mut Context<DaroApp>, String)>;
 type Confirm = Box<dyn Fn(&mut DaroApp)>;
 
 pub fn open_text_prompt(
@@ -20,7 +20,7 @@ pub fn open_text_prompt(
     title: &'static str,
     label: &'static str,
     initial: String,
-    on_submit: impl Fn(&mut DaroApp, String) + 'static,
+    on_submit: impl Fn(&mut DaroApp, &mut Context<DaroApp>, String) + 'static,
     cx: &mut App,
 ) {
     let mut options = ui::dialog_options();
@@ -111,7 +111,7 @@ impl TextPrompt {
         let parent = self.parent.clone();
         let submit = &self.on_submit;
         parent.update(cx, |app, cx| {
-            submit(app, value.clone());
+            submit(app, cx, value.clone());
             cx.notify();
         });
         Some(value)

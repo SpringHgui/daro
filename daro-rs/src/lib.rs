@@ -21,9 +21,26 @@ pub mod redis_driver;
 pub mod sqlite_driver;
 pub mod sqlserver_driver;
 
-/// 数据目录：`DARO_DATA_DIR` 优先（开发 / 验证用）；绿色版在 exe 同目录放一个
-/// `daro-rs.portable` 标记，数据就落在旁边的 `daro-rs-data`；否则用用户本地数据目录。
+thread_local! {
+    /// 当前线程私有的数据目录。测试并行跑时每个用例各占一个线程，用线程
+    /// 局部覆盖才不会像进程级环境变量那样互相踩存档。
+    static THREAD_DATA_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 只给当前线程换数据目录（测试隔离用）；传 `None` 恢复默认解析。
+#[doc(hidden)]
+pub fn set_thread_data_dir(dir: Option<std::path::PathBuf>) {
+    THREAD_DATA_DIR.with(|slot| *slot.borrow_mut() = dir);
+}
+
+/// 数据目录：线程覆盖优先（测试隔离）；其次 `DARO_DATA_DIR`（开发 / 验证用）；
+/// 绿色版在 exe 同目录放一个 `daro-rs.portable` 标记，数据就落在旁边的
+/// `daro-rs-data`；否则用用户本地数据目录。
 pub fn data_dir() -> std::path::PathBuf {
+    if let Some(dir) = THREAD_DATA_DIR.with(|slot| slot.borrow().clone()) {
+        return dir;
+    }
     if let Ok(dir) = std::env::var("DARO_DATA_DIR") {
         return std::path::PathBuf::from(dir);
     }

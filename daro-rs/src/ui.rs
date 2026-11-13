@@ -16,14 +16,14 @@ use crate::palette::Palette;
 use crate::to_hsla;
 use crate::zed_icons::{self, ZedIcon};
 
-/// 标准按钮高度（Zed ButtonSize::Medium）
-pub const CONTROL_H: f32 = 28.;
+/// 标准按钮高度（对齐结构同步页「选项」按钮，全应用同一档）
+pub const CONTROL_H: f32 = 26.;
 /// 标准按钮水平留白
-pub const CONTROL_PAD_X: f32 = 14.;
+pub const CONTROL_PAD_X: f32 = 10.;
 /// 底栏按钮的最小宽度
 pub const BUTTON_MIN_W: f32 = 64.;
-/// 紧凑控件高度（Zed ButtonSize::Default）
-pub const COMPACT_H: f32 = 22.;
+/// 紧凑按钮高度（与标准按钮同高，只收窄左右留白）
+pub const COMPACT_H: f32 = 26.;
 /// 紧凑控件水平留白
 pub const COMPACT_PAD_X: f32 = 8.;
 /// 面板 / 对话框标题栏高度
@@ -71,7 +71,7 @@ pub fn primary_button(
         .h(px(CONTROL_H))
         .min_w(px(BUTTON_MIN_W))
         .px(px(CONTROL_PAD_X))
-        .text_size(px(13.))
+        .text_size(px(12.))
         .rounded(px(RADIUS))
         .bg(to_hsla(p.primary_face))
         .border(px(HAIRLINE))
@@ -110,7 +110,7 @@ pub fn secondary_button(id: impl Into<ElementId>, label: impl Into<SharedString>
         .h(px(CONTROL_H))
         .min_w(px(BUTTON_MIN_W))
         .px(px(CONTROL_PAD_X))
-        .text_size(px(13.))
+        .text_size(px(12.))
         .rounded(px(RADIUS))
 }
 
@@ -127,7 +127,7 @@ pub fn link_button(
         .text_color(to_hsla(p.accent))
         .h(px(CONTROL_H))
         .px(px(4.))
-        .text_size(px(13.))
+        .text_size(px(12.))
         .rounded(px(RADIUS))
 }
 
