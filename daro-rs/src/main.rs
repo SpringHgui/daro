@@ -40810,7 +40810,17 @@ impl DaroApp {
                                 ViewAct::Info,
                             )),
                     )
-                    .child(div().text_xs().text_color(muted).pl(px(8.)).child("v0.1")),
+                    // 右下角版本必须跟 Cargo 版本走，别硬编码：发版只改 Cargo.toml，
+                    // 这里跟着变，否则界面版本和安装包版本对不上。
+                    .child(
+                        div()
+                            .id("status-version")
+                            .test_support()
+                            .text_xs()
+                            .text_color(muted)
+                            .pl(px(8.))
+                            .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+                    ),
             )
     }
 }
