@@ -153,6 +153,18 @@ const CENTER_MIN_W: f32 = 160.;
 const SIDE_SPLITTER_W: f32 = 5.;
 /// 连接树底部筛选弹层的选项数：与新建连接向导共用同一份类型清单
 const TREE_TYPE_COUNT: usize = conn_dialog::TILES.len();
+/// 树顶搜索条高：筛选弹层锚在这一行右端按钮的正下方，两处要用同一个数
+const SEARCH_BAR_H: f32 = 30.;
+/// 搜索条右内边距（工具组与栏右边框之间留的缝）
+const SEARCH_BAR_PR: f32 = 4.;
+/// 树顶工具组：筛选 / 星标 / 定位 / 折叠，四枚方块加间距，整组靠右对齐
+const TREE_TOOL_W: f32 = 20.;
+const TREE_TOOL_GAP: f32 = 2.;
+const TREE_TOOL_N: f32 = 4.;
+/// 筛选弹层宽：弹层自身与锚点收口共用一份
+const TREE_FILTER_W: f32 = 260.;
+/// 左栏右边框宽：算栏内可用宽度要减掉
+const SIDE_BORDER_W: f32 = 1.;
 /// 单色工具条高度，取 Zed 的 panel 工具条尺寸。
 const RIBBON_H: f32 = 32.;
 /// 自绘标题栏高度，与 Zed Windows 标题栏一致。
@@ -30309,9 +30321,9 @@ impl DaroApp {
         let border = to_hsla(self.pal().border_soft);
         let has_text = !self.query.is_empty();
         h_flex()
-            .h(px(30.))
+            .h(px(SEARCH_BAR_H))
             .pl(px(2.))
-            .pr(px(4.))
+            .pr(px(SEARCH_BAR_PR))
             .gap(px(4.))
             .items_center()
             .flex_shrink_0()
@@ -30355,7 +30367,7 @@ impl DaroApp {
     /// 树顶工具按钮组：筛选 / 星标 / 定位 / 折叠，跟在搜索框右端。
     fn tree_tools(&self, ink: &TreeInk, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
-            .gap(px(2.))
+            .gap(px(TREE_TOOL_GAP))
             .items_center()
             .flex_shrink_0()
             .child({
@@ -30364,7 +30376,7 @@ impl DaroApp {
                 div()
                     .id("tree-filter-btn")
                     .test_support()
-                    .size(px(20.))
+                    .size(px(TREE_TOOL_W))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -30388,7 +30400,7 @@ impl DaroApp {
                 let active = self.starred_only;
                 div()
                     .id("tree-star-btn")
-                    .size(px(20.))
+                    .size(px(TREE_TOOL_W))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -30413,7 +30425,7 @@ impl DaroApp {
                 let hover = ink.hover;
                 div()
                     .id("tree-locate-btn")
-                    .size(px(20.))
+                    .size(px(TREE_TOOL_W))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -30434,7 +30446,7 @@ impl DaroApp {
                 let hover = ink.hover;
                 div()
                     .id("tree-collapse-btn")
-                    .size(px(20.))
+                    .size(px(TREE_TOOL_W))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -30451,8 +30463,17 @@ impl DaroApp {
             })
     }
 
-    /// 筛选弹层：参考界面树底三道杠按钮弹出的下拉，锚在树底工具条右上方的小浮层，
-    /// 只列 daro 已接入的连接类型。
+    /// 筛选弹层锚点（正文坐标系）：贴着漏斗按钮的左下沿。按钮在搜索条右端、
+    /// 整组靠右，所以横向跟着左栏宽走——拖动分栏后仍在按钮下面，不再钉死在
+    /// 窗口底部。右端收口：左栏拖到很宽时整块弹层不能溢出窗口。
+    fn tree_filter_anchor(&self) -> (f32, f32) {
+        let group_w = TREE_TOOL_N * TREE_TOOL_W + (TREE_TOOL_N - 1.) * TREE_TOOL_GAP;
+        let max_left = (self.viewport_w - TREE_FILTER_W - 8.).max(8.);
+        let left = (self.left_w - SIDE_BORDER_W - SEARCH_BAR_PR - group_w).clamp(8., max_left);
+        (left, SEARCH_BAR_H + 4.)
+    }
+
+    /// 筛选弹层：从树顶漏斗按钮正下方展开的下拉，只列 daro 已接入的连接类型。
     fn tree_filter_popup(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.pal();
         let fg = to_hsla(p.foreground);
@@ -30581,15 +30602,16 @@ impl DaroApp {
                 .child(div().text_size(px(12.)).text_color(accent).child("全部清除"))
         };
 
-        // 从树底工具条上方的右侧展开，只压在中间工作区上，不挡连接树。
+        // 锚在漏斗按钮正下方（见 tree_filter_anchor），压在树和工作区之上。
         // occlude：没有它，落在弹层里的点击会继续传给下面的背板，一勾选就关窗。
+        let (ax, ay) = self.tree_filter_anchor();
         div()
             .id("tree-filter-popup")
             .test_support()
             .absolute()
-            .left(px(self.left_w + 4.))
-            .bottom(px(34.))
-            .w(px(260.))
+            .left(px(ax))
+            .top(px(ay))
+            .w(px(TREE_FILTER_W))
             .occlude()
             .flex()
             .flex_col()
@@ -57424,6 +57446,39 @@ mod tree_filter_tests {
             assert!(window.try_find("tree-filter-popup").is_none(), "弹层已移除");
         })
         .unwrap();
+    }
+
+    /// 弹层锚点跟着漏斗按钮走：纵向贴在搜索条正下方（不再钉在窗口底部），
+    /// 横向随左栏宽 1:1 平移；左栏很宽 / 窗口很窄时右端收口，整块不溢出窗口。
+    #[gpui_kit::test]
+    fn filter_popup_anchor_follows_the_button(cx: &mut TestAppContext) {
+        isolate_store("treefilteranchor");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let (base_left, base_top) = app.update(cx, |a, _| {
+            a.left_w = LEFT_W;
+            a.viewport_w = 1440.;
+            a.tree_filter_anchor()
+        });
+        assert_eq!(base_top, SEARCH_BAR_H + 4., "弹层顶贴搜索条下沿");
+        assert!(base_top < 200., "不再按窗口底部定位");
+        // 按钮组整组靠右：栏每宽 1px，按钮左沿（也就是锚点）右移 1px
+        let wide_left = app.update(cx, |a, _| {
+            a.left_w = LEFT_W + 120.;
+            a.tree_filter_anchor().0
+        });
+        assert_eq!(wide_left, base_left + 120., "锚点跟着按钮横向平移");
+        // 收口：栏拖到上限而窗口只有 700 宽时，弹层右边不能出界
+        let clamped = app.update(cx, |a, _| {
+            a.left_w = LEFT_MAX_W;
+            a.viewport_w = 700.;
+            a.tree_filter_anchor().0
+        });
+        assert_eq!(clamped, 700. - TREE_FILTER_W - 8., "窄窗口右端收口");
     }
 
     /// 有搜索词时 🔍 让位给文字，空态再回来 —— 左栏窄时这 22px 很关键。
