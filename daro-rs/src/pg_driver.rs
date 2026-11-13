@@ -741,6 +741,28 @@ pub fn execute_on(client: &mut Client, stmt: &str, max_rows: usize) -> Result<Ex
     }
 }
 
+/// MCP / 单语句后台执行：自己开一条连接并挂上取消令牌，超时能真正掐断
+/// 服务端语句；连接用完即弃，不占注册表那条。
+#[allow(dead_code)] // 只有 MCP 后台（lib）调用，UI 那份拷贝用不到
+pub fn execute_job(
+    job: &Job,
+    p: &Params,
+    stmt: &str,
+    max_rows: usize,
+) -> Result<ExecOutcome, String> {
+    if job.is_cancelled() {
+        return Err("查询已取消".to_string());
+    }
+    let mut client = connect(p)?;
+    RUNNING_JOBS
+        .lock()
+        .unwrap()
+        .insert(job.id, client.cancel_token());
+    let result = execute_on(&mut client, stmt, max_rows);
+    RUNNING_JOBS.lock().unwrap().remove(&job.id);
+    result
+}
+
 // ── 后台脚本执行（查询页「运行」）───────────────────────────────
 
 /// 一次后台脚本的取消通道。PG 的中断走服务端：`CancelToken` 带着这条

@@ -408,6 +408,41 @@ pub fn execute_on(raw: &RawConn, stmt: &str, max_rows: usize) -> Result<ExecOutc
     }
 }
 
+/// MCP / 单语句后台执行：文件库自己开一条连接，跑完即弃；`:memory:` 只活在
+/// 进程内那条共享连接上，只能借用它，靠 InterruptHandle 中途打断。
+#[allow(dead_code)] // 只有 MCP 后台（lib）调用，UI 那份拷贝用不到
+pub fn execute_job(
+    key: &str,
+    path: &str,
+    job: &Job,
+    stmt: &str,
+    max_rows: usize,
+) -> Result<ExecOutcome, String> {
+    if job.is_cancelled() {
+        return Err("查询已取消".to_string());
+    }
+    if is_memory_path(path) {
+        ensure(key, path)?;
+        let raw = handle(key)?;
+        let raw = raw.lock().unwrap();
+        RUNNING_JOBS
+            .lock()
+            .unwrap()
+            .insert(job.id, raw.get_interrupt_handle());
+        let result = execute_on(&raw, stmt, max_rows);
+        RUNNING_JOBS.lock().unwrap().remove(&job.id);
+        return result;
+    }
+    let raw = open_raw(path)?;
+    RUNNING_JOBS
+        .lock()
+        .unwrap()
+        .insert(job.id, raw.get_interrupt_handle());
+    let result = execute_on(&raw, stmt, max_rows);
+    RUNNING_JOBS.lock().unwrap().remove(&job.id);
+    result
+}
+
 // ── 后台脚本执行（查询页「运行」）───────────────────────────────
 
 /// 一次后台脚本的取消通道。UI 侧持有它：点「停止」先置标志（下一条语句

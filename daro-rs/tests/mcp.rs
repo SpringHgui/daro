@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use daro_rs::mcp::{self, policy::{self, Mode, SqlClass}};
@@ -262,6 +264,8 @@ fn rpc(
     let mut resp = req
         .config()
         .http_status_as_error(false)
+        // 有界等待：路由回归时测试应当失败，而不是永远挂着
+        .timeout_global(Some(Duration::from_secs(20)))
         .build()
         .send(payload.to_string())
         .expect("http send");
@@ -311,6 +315,125 @@ fn sqlite_fixture(path: &Path) {
          INSERT INTO items (name) VALUES ('alpha'), ('beta'), ('gamma');",
     )
     .unwrap();
+}
+
+fn wait_active(data: &Path, at_least: u64, timeout: Duration) -> Value {
+    let deadline = Instant::now() + timeout;
+    let mut last = None;
+    while Instant::now() < deadline {
+        if let Some(beat) = read_heartbeat(data) {
+            if beat["active"].as_u64().unwrap_or(0) >= at_least {
+                return beat;
+            }
+            last = Some(beat);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("no MCP call became active; last heartbeat: {last:?}");
+}
+
+/// 一套起好的夹具：SQLite 库 + 后台进程 + 已初始化的会话。
+/// 字段顺序保证先杀进程再删临时目录（Windows 上进程还开着文件时删不掉）。
+struct Fixture {
+    _daemon: Daemon,
+    _dir: TempDir,
+    data: PathBuf,
+    db_path: PathBuf,
+    url: String,
+    token: String,
+    session: String,
+}
+
+fn start_fixture(mode: &str) -> Fixture {
+    let dir = TempDir::new();
+    let data = dir.path().to_path_buf();
+    let db_path = data.join("fixture.sqlite");
+    sqlite_fixture(&db_path);
+
+    let connections = json!({
+        "version": 1,
+        "connections": [{
+            "name": "fixture-sqlite",
+            "kind": "SQLite",
+            "host": "",
+            "port": 0,
+            "database": db_path.to_string_lossy(),
+            "user": "",
+            "password": "",
+            "group": "",
+            "connected": false,
+            "demo": false
+        }]
+    });
+    write_json(&data.join("connections.json"), &connections);
+
+    let port = free_port();
+    let token = "test-token-0123456789";
+    write_json(
+        &data.join("mcp.json"),
+        &json!({ "enabled": true, "port": port, "token": token, "defaultMode": mode }),
+    );
+
+    let child = Command::new(env!("CARGO_BIN_EXE_daro-mcpd"))
+        .env("DARO_DATA_DIR", &data)
+        .spawn()
+        .expect("spawn daro-mcpd");
+    let daemon = Daemon { child };
+    wait_listening(&data, port, Duration::from_secs(20));
+
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let init = rpc(
+        &url,
+        Some(token),
+        None,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "daro-test", "version": "0"}
+            }
+        }),
+    );
+    assert_eq!(init.status, 200, "initialize failed: {:?}", init.body);
+    let session = init.session.expect("initialize returns mcp-session-id");
+    let notified = rpc(
+        &url,
+        Some(token),
+        Some(&session),
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
+    assert!(
+        notified.status == 200 || notified.status == 202,
+        "initialized notification: {} {:?}",
+        notified.status,
+        notified.body
+    );
+
+    Fixture {
+        _daemon: daemon,
+        _dir: dir,
+        data,
+        db_path,
+        url,
+        token: token.to_string(),
+        session,
+    }
+}
+
+fn call(f: &Fixture, id: u32, name: &str, args: Value) -> Value {
+    let reply = rpc(
+        &f.url,
+        Some(&f.token),
+        Some(&f.session),
+        &json!({
+            "jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":name,"arguments":args}
+        }),
+    );
+    json_body(&reply)
 }
 
 #[test]
@@ -702,3 +825,110 @@ fn update_pause_stops_daemon_and_keeps_switch_on() {
     assert_eq!(cfg["enabled"], json!(true), "更新后开关要保持原值");
 }
 
+
+/// 慢语句跑在独立连接上：别的工具照样能用同一条连接名查目录。
+/// 旧实现所有调用共用一把连接锁，这条用例会在 list_tables 上被拖住。
+#[test]
+fn slow_statement_does_not_block_other_tools() {
+    let f = start_fixture("readWrite");
+
+    // 先让共享连接把库以 WAL 打开，后面的写锁才有意义
+    let first = call(
+        &f,
+        1,
+        "daro_list_tables",
+        json!({"connection":"fixture-sqlite","database":"main"}),
+    );
+    assert_eq!(tool_error_code(&first), None, "{first}");
+
+    // 测试进程拿住写锁：MCP 那条 INSERT 会卡在 busy 等待上
+    let locker = rusqlite::Connection::open(&f.db_path).unwrap();
+    locker
+        .execute_batch("BEGIN IMMEDIATE; INSERT INTO items (name) VALUES ('locked');")
+        .unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_in_worker = done.clone();
+    let (url, token, session) = (f.url.clone(), f.token.clone(), f.session.clone());
+    let worker = std::thread::spawn(move || {
+        let reply = rpc(
+            &url,
+            Some(&token),
+            Some(&session),
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"daro_execute_query","arguments":{
+                    "connection":"fixture-sqlite","database":"main",
+                    "sql":"INSERT INTO items (name) VALUES ('slow')"
+                }}
+            }),
+        );
+        done_in_worker.store(true, Ordering::SeqCst);
+        json_body(&reply)
+    });
+
+    // 等后台进程真的把这条调用收下并在等锁
+    wait_active(&f.data, 1, Duration::from_secs(10));
+    std::thread::sleep(Duration::from_millis(200));
+
+    let started = Instant::now();
+    let tables = call(
+        &f,
+        3,
+        "daro_list_tables",
+        json!({"connection":"fixture-sqlite","database":"main"}),
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "慢语句应仍在等锁，否则这个用例证明不了隔离"
+    );
+    assert_eq!(tool_error_code(&tables), None, "{tables}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "目录查询被慢语句堵住：{elapsed:?}"
+    );
+
+    locker.execute_batch("COMMIT;").unwrap();
+    let slow = worker.join().unwrap();
+    assert_eq!(tool_error_code(&slow), None, "{slow}");
+}
+
+/// 取消通道要能真正停掉正在跑的语句，而不是只让调用方放弃等待。
+#[test]
+fn interrupt_stops_running_statement() {
+    let dir = TempDir::new();
+    let db_path = dir.path().join("slow.sqlite");
+    sqlite_fixture(&db_path);
+
+    let key = format!("interrupt-{}", std::process::id());
+    daro_rs::sqlite_driver::ensure(&key, db_path.to_str().unwrap()).unwrap();
+
+    let job = daro_rs::sqlite_driver::create_job();
+    let worker = job.clone();
+    let worker_key = key.clone();
+    let path = db_path.to_string_lossy().to_string();
+    let handle = std::thread::spawn(move || {
+        let sql = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 200000000) \
+                   SELECT count(*) FROM c";
+        daro_rs::sqlite_driver::execute_job(&worker_key, &path, &worker, sql, 10)
+    });
+
+    // 等取消句柄挂上连接，再打断
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    job.interrupt();
+    let result = handle.join().unwrap();
+    let err = result.expect_err("被中断的语句应返回错误");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "中断后语句仍在跑：{:?}",
+        started.elapsed()
+    );
+    assert!(
+        err.to_lowercase().contains("interrupt"),
+        "返回的不是中断错误：{err}"
+    );
+
+    daro_rs::sqlite_driver::close(&key);
+}

@@ -631,6 +631,30 @@ pub fn execute_on(conn: &mut Conn, stmt: &str, max_rows: usize) -> Result<ExecOu
     }
 }
 
+/// MCP / 单语句后台执行：自己开一条连接并登记服务端连接号，超时用
+/// `KILL QUERY` 从服务端打断；连接用完即弃，不占注册表那条。
+#[allow(dead_code)] // 只有 MCP 后台（lib）调用，UI 那份拷贝用不到
+pub fn execute_job(
+    job: &Job,
+    p: &Params,
+    db: &str,
+    stmt: &str,
+    max_rows: usize,
+) -> Result<ExecOutcome, String> {
+    if job.is_cancelled() {
+        return Err("查询已取消".to_string());
+    }
+    let mut conn = connect(p)?;
+    use_db(&mut conn, db)?;
+    RUNNING_JOBS
+        .lock()
+        .unwrap()
+        .insert(job.id, conn.connection_id());
+    let result = execute_on(&mut conn, stmt, max_rows);
+    RUNNING_JOBS.lock().unwrap().remove(&job.id);
+    result
+}
+
 // ── 后台脚本执行（查询页「运行」）───────────────────────────────
 
 /// 一次后台脚本的取消通道。MySQL 的中断走服务端：`KILL QUERY <id>` 打断

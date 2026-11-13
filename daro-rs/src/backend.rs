@@ -519,6 +519,36 @@ impl Target {
         }
     }
 
+    /// MCP / 单语句后台执行：每次自开一条连接并挂上取消通道，超时可真正掐断
+    /// 语句，慢查询也不会堵住共享连接上的取数 / 目录调用；连接用完即弃，
+    /// 顺带把多语句脚本留下的事务一并丢掉。
+    #[allow(dead_code)] // 只有 MCP 后台（lib）调用，UI 那份拷贝用不到
+    pub fn run_statement(
+        &self,
+        job: &Job,
+        stmt: &str,
+        max_rows: usize,
+    ) -> Result<ExecOutcome, String> {
+        match (self, job) {
+            (Target::Sqlite { conn, path, .. }, Job::Sqlite(j)) => {
+                sqlite_driver::execute_job(conn, path, j, stmt, max_rows)
+            }
+            (Target::Pg { params, .. }, Job::Pg(j)) => {
+                pg_driver::execute_job(j, params, stmt, max_rows)
+            }
+            (Target::MySql { db, params, .. }, Job::MySql(j)) => {
+                mysql_driver::execute_job(j, params, db, stmt, max_rows)
+            }
+            (Target::SqlServer { .. }, Job::SqlServer(j)) => {
+                sqlserver_driver::execute_job(j, stmt, max_rows)
+            }
+            (Target::Access { .. } | Target::Mongo { .. }, _) => {
+                Err("该连接不支持执行 SQL 语句".to_string())
+            }
+            _ => Err("连接类型已变更，请重新执行".to_string()),
+        }
+    }
+
     /// 网格工作集写回。MongoDB / Access 只读。
     pub fn apply(&self, ch: &GridChanges<'_>) -> Result<String, String> {
         self.ensure()?;

@@ -4,8 +4,9 @@
 //! 加连接，下一句工具调用就按新值判。数据库口令只用来连库，既不出现在入参里，
 //! 也不出现在任何返回里。
 //!
-//! 驱动调用全部丢到阻塞线程池，并用当前档位的超时包住；SQLite 这类本地文件库
-//! 无法中途取消，超时后语句可能仍在后台跑完。
+//! 目录类调用丢到阻塞线程池，用只读档超时包住；`daro_execute_query` 另走一条
+//! 独立连接并挂取消通道，超时会真正中断语句（SQL Server 驱动没有语句级中断，
+//! 只能等它跑完再收回连接），慢查询也不会堵住后续工具调用。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -543,13 +544,11 @@ impl DaroMcp {
         }
         let limit = cfg.clamp_rows(args.max_rows);
         let schema = args.schema.clone();
+        let Some(target) = backend::Target::of(&conn, &database, &schema) else {
+            return tool_error(ToolError::database("该连接不能作为真库访问"));
+        };
         let started = Instant::now();
-        let result = blocking(mode, move || {
-            let target = backend::Target::of(&conn, &database, &schema)
-                .ok_or_else(|| "该连接不能作为真库访问".to_string())?;
-            target.execute(&sql, limit)
-        })
-        .await;
+        let result = run_cancellable(target, sql, limit, mode.timeout_secs()).await;
         let elapsed = started.elapsed().as_millis() as u64;
         match result {
             Ok(outcome) => {
@@ -770,6 +769,35 @@ where
             format!("查询超过 {secs} 秒未返回"),
             "本地文件库（SQLite）无法中途取消，服务端可能仍在执行；稍后用更小的查询重试",
         )),
+    }
+}
+
+/// 单语句执行：独立连接 + 可取消。超时后置取消标志并另起线程发中断请求，
+/// 不再只是「放弃等待」。
+async fn run_cancellable(
+    target: backend::Target,
+    stmt: String,
+    limit: usize,
+    secs: u64,
+) -> Result<crate::db_types::ExecOutcome, ToolError> {
+    let job = target.create_job();
+    let worker = job.clone();
+    let handle = tokio::task::spawn_blocking(move || target.run_statement(&worker, &stmt, limit));
+    match tokio::time::timeout(Duration::from_secs(secs), handle).await {
+        Ok(Ok(Ok(v))) => Ok(v),
+        Ok(Ok(Err(e))) => Err(ToolError::database(e)),
+        Ok(Err(join)) => Err(ToolError::internal(format!("后台任务失败: {join}"))),
+        Err(_) => {
+            // 中断要连服务器，可能阻塞；别占着异步工作线程
+            job.request_stop();
+            let breaker = job.clone();
+            let _ = tokio::task::spawn_blocking(move || breaker.interrupt());
+            Err(ToolError::new(
+                "QUERY_TIMEOUT",
+                format!("查询超过 {secs} 秒未返回，已请求取消"),
+                "语句跑在独立连接上，不会再堵住后续工具调用；SQL Server 无语句级中断，会等该语句结束后收回连接。稍后用更小的查询重试",
+            ))
+        }
     }
 }
 

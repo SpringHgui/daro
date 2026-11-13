@@ -759,6 +759,17 @@ pub fn execute_stmt(key: &str, stmt: &str, max_rows: usize) -> Result<ExecOutcom
     with_open_conn(key, |c| execute_on(c, stmt, max_rows))
 }
 
+/// MCP / 单语句后台执行：自己开一条连接，跑完即弃。驱动层没有语句级中断，
+/// 超时只能等这条语句结束后收回连接，但不会再堵住别的调用。
+#[allow(dead_code)] // 只有 MCP 后台（lib）调用，UI 那份拷贝用不到
+pub fn execute_job(job: &Job, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
+    if job.stop.load(Ordering::Relaxed) {
+        return Err("查询已取消".to_string());
+    }
+    let mut conn = connect(&job.params)?;
+    execute_on(&mut conn, stmt, max_rows)
+}
+
 fn row_text(row: Row) -> Vec<String> {
     row.into_iter().map(cell_text).collect()
 }
