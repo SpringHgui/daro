@@ -1,0 +1,11 @@
+# <type>(<scope>): <一句结论，40 字以内>
+#
+# type 取值（发布说明按它分组）：
+#   feat                     新功能
+#   fix                      Bug 修复
+#   perf refactor style     改进
+#   docs build ci test chore 改进
+#   scope 固定用 rust
+#
+# 正文空一行后写，只写为什么改、关键取舍、验证方式；
+# 实现细节不必逐条罗列，发布说明只读标题行。
