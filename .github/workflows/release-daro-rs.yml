@@ -271,5 +271,7 @@ jobs:
           fi
           # 正式版要占住 Latest；gh 的 --latest 各版本支持不一，直接走 API 置位。
           # make_latest 在 API 里是字符串枚举，"true" 才是合法值，用 -F 会按布尔提交被 422 拒掉。
-          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+          # PATCH 只认数字 release_id：先按 tag 取 id 再改，路径里直接拼 tag 会 404（步骤因此一直 exit 1）。
+          rid="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .id)"
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${rid}" \
             -F prerelease=false -f make_latest=true > /dev/null
