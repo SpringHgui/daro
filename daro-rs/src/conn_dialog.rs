@@ -864,24 +864,28 @@ impl NewConnectionDialog {
             .on_click(cx.listener(|this, _, window, cx| {
                 // Access 只读、不能新建库文件，永远只挑现有文件
                 let dialog = if this.kind == DbKind::Access {
-                    rfd::FileDialog::new()
+                    rfd::AsyncFileDialog::new()
                         .set_title("选择 Access 数据库文件")
                         .add_filter("Access 数据库", &["accdb", "mdb"])
                 } else {
-                    rfd::FileDialog::new()
+                    rfd::AsyncFileDialog::new()
                         .set_title("选择 SQLite 数据库文件")
                         .add_filter("SQLite 数据库", &["db", "sqlite", "sqlite3"])
                 };
-                let picked = if this.kind != DbKind::Access && this.sqlite_new != 0 {
-                    dialog.set_file_name("新建数据库.db").save_file()
-                } else {
-                    dialog.pick_file()
-                };
-                if let Some(path) = picked {
+                let set_path = |this: &mut Self,
+                                window: &mut Window,
+                                cx: &mut Context<Self>,
+                                path: std::path::PathBuf| {
                     let text = path.display().to_string();
                     this.database
                         .update(cx, |s, cx| s.set_value(text, window, cx));
                     cx.notify();
+                };
+                if this.kind != DbKind::Access && this.sqlite_new != 0 {
+                    let dialog = dialog.set_file_name("新建数据库.db");
+                    ui::save_file(window, dialog, cx, set_path);
+                } else {
+                    ui::pick_file(window, dialog, cx, set_path);
                 }
             }))
     }

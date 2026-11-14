@@ -149,6 +149,44 @@ pub fn dialog_options() -> WindowOptions {
     options
 }
 
+/// 原生「打开文件」对话框。必须走异步版：rfd 的同步 API 会在点击回调里起自己的
+/// 消息循环，期间投给 gpui 窗口的消息会重入并二次可变借用 App，进程直接 abort。
+/// 异步版把对话框放到工作线程上显示，选完再回 UI 线程改状态。
+pub fn pick_file<T: 'static>(
+    window: &Window,
+    dialog: rfd::AsyncFileDialog,
+    cx: &mut Context<T>,
+    on_pick: impl FnOnce(&mut T, &mut Window, &mut Context<T>, std::path::PathBuf) + 'static,
+) {
+    let dialog = dialog.set_parent(window);
+    cx.spawn(async move |this, cx| {
+        let Some(file) = dialog.pick_file().await else {
+            return;
+        };
+        let path = file.path().to_path_buf();
+        let _ = this.update_in(cx, |this, window, cx| on_pick(this, window, cx, path));
+    })
+    .detach();
+}
+
+/// 原生「保存文件」对话框，见 [`pick_file`]。
+pub fn save_file<T: 'static>(
+    window: &Window,
+    dialog: rfd::AsyncFileDialog,
+    cx: &mut Context<T>,
+    on_save: impl FnOnce(&mut T, &mut Window, &mut Context<T>, std::path::PathBuf) + 'static,
+) {
+    let dialog = dialog.set_parent(window);
+    cx.spawn(async move |this, cx| {
+        let Some(file) = dialog.save_file().await else {
+            return;
+        };
+        let path = file.path().to_path_buf();
+        let _ = this.update_in(cx, |this, window, cx| on_save(this, window, cx, path));
+    })
+    .detach();
+}
+
 /// 子窗口统一的 Esc 关窗。挂在按键拦截器上而不是内容根的 `on_key_down`：
 /// 无聚焦元素时按键只派发到窗口 Root，内容根收不到；聚焦输入框时 Esc 还可能
 /// 被编辑器的 Escape 动作消费。拦截器跑在动作派发之前，按窗口句柄限定作用域。

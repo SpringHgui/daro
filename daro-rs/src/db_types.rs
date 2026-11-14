@@ -47,6 +47,10 @@ pub fn leak_slice(v: Vec<&'static str>) -> &'static [&'static str] {
 /// - PostgreSQL：主键列的值，顺序与 `ColMeta::pk` 的列序一致；无主键表是空向量
 pub type RowKey = Vec<String>;
 
+/// 网格工作集里的一行：按 `Arc` 共享，基线 / 撤销快照只克隆指针列表，
+/// 改格时对目标行做写时复制，避免整页多份副本。
+pub type Row = std::sync::Arc<Vec<String>>;
+
 /// 一次 SELECT 的取回：列元数据 + 行 + 平行行身份。
 #[derive(Debug)]
 pub struct SelectPage {

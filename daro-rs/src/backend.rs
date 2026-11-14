@@ -155,6 +155,62 @@ pub enum Target {
     },
 }
 
+/// 用户常驻事务句柄。持有与读缓存隔离的独立物理连接；
+/// 未显式提交 / 回滚就被丢弃时，`Drop` 自动回滚（避免悬挂事务）。
+pub struct TxHandle {
+    inner: Box<dyn TxBackend>,
+    done: bool,
+}
+
+/// 事务后端统一接口：每个驱动实现一个持有独立连接的类型，
+/// `execute` 复用该驱动既有的 `execute_on`。
+pub trait TxBackend: Send {
+    fn execute(&mut self, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String>;
+    fn commit(&mut self) -> Result<(), String>;
+    fn rollback(&mut self) -> Result<(), String>;
+}
+
+impl TxHandle {
+    pub(crate) fn new(inner: Box<dyn TxBackend>) -> Self {
+        TxHandle { inner, done: false }
+    }
+    /// 在事务内执行一条语句（复用各驱动既有的 `execute_on`）。
+    pub fn execute(&mut self, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
+        self.inner.execute(stmt, max_rows)
+    }
+    /// 提交并消费句柄（drop 不再回滚）。
+    pub fn commit(mut self) -> Result<(), String> {
+        self.done = true;
+        self.inner.commit()
+    }
+    /// 回滚并消费句柄。
+    pub fn rollback(mut self) -> Result<(), String> {
+        self.done = true;
+        self.inner.rollback()
+    }
+    /// 是否仍在事务中（未被提交 / 回滚过）。
+    pub fn active(&self) -> bool {
+        !self.done
+    }
+}
+
+impl Drop for TxHandle {
+    fn drop(&mut self) {
+        if !self.done {
+            // 页签关闭 / 连接断开等异常路径：尽力回滚，失败忽略。
+            let _ = self.inner.rollback();
+        }
+    }
+}
+
+/// 数据库扩展清单（仅 PostgreSQL 有意义）。
+pub struct ExtensionLists {
+    /// 已安装：(extname, extversion)，按名字升序。
+    pub installed: Vec<(String, String)>,
+    /// 可安装：(name, default_version)，已刨掉已装的，按名字升序。
+    pub available: Vec<(String, String)>,
+}
+
 impl Target {
     /// 由连接 + 页签的库 / 模式坐标得到；还没有真驱动的引擎返回 None。
     /// `schema` 传空时 PG 兜到 `public`。
@@ -519,6 +575,34 @@ impl Target {
         }
     }
 
+    /// 该目标是否支持用户事务（SQLite / PG / MySQL / SQLServer 支持；
+    /// Access 只读、Mongo 无 SQL 故不支持）。
+    pub fn supports_tx(&self) -> bool {
+        !matches!(self, Target::Access { .. } | Target::Mongo { .. })
+    }
+
+    /// 开一条与读缓存隔离的独立连接并 `BEGIN`。返回的句柄走 `TxHandle`
+    /// （`Drop` 未提交自动回滚），调用方负责把它挂到对应的页签上。
+    pub fn begin_tx(&self) -> Result<TxHandle, String> {
+        match self {
+            Target::Sqlite { path, .. } => {
+                sqlite_driver::begin_tx(path).map(|t| TxHandle::new(Box::new(t)))
+            }
+            Target::Pg { params, .. } => {
+                pg_driver::begin_tx(params).map(|t| TxHandle::new(Box::new(t)))
+            }
+            Target::MySql { params, .. } => {
+                mysql_driver::begin_tx(params).map(|t| TxHandle::new(Box::new(t)))
+            }
+            Target::SqlServer { params, .. } => {
+                sqlserver_driver::begin_tx(params).map(|t| TxHandle::new(Box::new(t)))
+            }
+            Target::Access { .. } | Target::Mongo { .. } => {
+                Err("该连接类型不支持用户事务".to_string())
+            }
+        }
+    }
+
     /// MCP / 单语句后台执行：每次自开一条连接并挂上取消通道，超时可真正掐断
     /// 语句，慢查询也不会堵住共享连接上的取数 / 目录调用；连接用完即弃，
     /// 顺带把多语句脚本留下的事务一并丢掉。
@@ -564,6 +648,177 @@ impl Target {
         }
     }
 
+    /// 在目标服务器上新建一个库（DDL：`CREATE DATABASE`）。
+    ///
+    /// 走法：
+    /// - PostgreSQL：`CREATE DATABASE` 不能进事务块，用维护库（db 兜到
+    ///   `postgres`）的独立 autocommit 连接跑；
+    /// - MySQL：当前连接一条看全部库，空 db 即不切库，直接 `CREATE DATABASE`；
+    /// - SQL Server：本地 `master` 默认落点不影响跨库建库，直接 `CREATE DATABASE`；
+    /// - SQLite / Access / Mongo：无服务器级建库 DDL（SQLite 建库 = 新建文件，
+    ///   Access 只读），直接报错，由菜单层转去「新建连接」。
+    pub fn create_database(&self, name: &str) -> Result<(), String> {
+        let q = self.quote(name);
+        match self {
+            Target::Pg { conn, params, .. } => {
+                // CREATE DATABASE 不能进事务块：单开一条连到维护库 postgres
+                // 的 autocommit 连接，绕开当前库那条可能处于事务态的连接。
+                let maint = params.for_db("postgres");
+                let maint_key = pg_driver::key(conn, "postgres");
+                pg_driver::ensure(&maint_key, &maint)?;
+                pg_driver::execute_stmt(&maint_key, &format!("CREATE DATABASE {q}"), 0)
+                    .map(|_| ())
+            }
+            Target::MySql { conn, .. } => {
+                mysql_driver::execute_stmt(conn, "", &format!("CREATE DATABASE {q}"), 0)
+                    .map(|_| ())
+            }
+            Target::SqlServer { conn, .. } => {
+                sqlserver_driver::execute_stmt(conn, &format!("CREATE DATABASE {q}"), 0)
+                    .map(|_| ())
+            }
+            Target::Access { .. } | Target::Sqlite { .. } | Target::Mongo { .. } => Err(
+                "该连接类型不支持通过 DDL 新建库（SQLite 请使用「新建连接」新建库文件，Access 为只读）"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// 删除服务器上的一个库（DDL：`DROP DATABASE`）。与 [Self::create_database]
+    /// 同一套走法，破坏性更强：
+    /// - PostgreSQL：走维护库（`postgres`）的独立连接，并带 `WITH (FORCE)`——
+    ///   应用自己的连接池还挂着该库的连接，不带 FORCE 必然因「有人连着」失败；
+    ///   项目内 sql_dump / table_copy 的删库先例同此。
+    /// - MySQL：一条连接看全部库，空 db 即不切库，直接 `DROP DATABASE`；
+    /// - SQL Server：先 `USE master` 再删，否则连接停在目标库上会被「正在使用」挡路；
+    /// - SQLite / Access / Mongo：无服务器级删库 DDL（SQLite 删库 = 删文件，
+    ///   Access 只读），报错由菜单层提示用户去文件系统删。
+    pub fn drop_database(&self, name: &str) -> Result<(), String> {
+        let q = self.quote(name);
+        match self {
+            Target::Pg { conn, params, .. } => {
+                let maint = params.for_db("postgres");
+                let maint_key = pg_driver::key(conn, "postgres");
+                pg_driver::ensure(&maint_key, &maint)?;
+                pg_driver::execute_stmt(
+                    &maint_key,
+                    &format!("DROP DATABASE IF EXISTS {q} WITH (FORCE)"),
+                    0,
+                )
+                .map(|_| ())
+            }
+            Target::MySql { conn, .. } => {
+                mysql_driver::execute_stmt(conn, "", &format!("DROP DATABASE IF EXISTS {q}"), 0)
+                    .map(|_| ())
+            }
+            Target::SqlServer { conn, .. } => {
+                sqlserver_driver::execute_stmt(
+                    conn,
+                    &format!("USE master; DROP DATABASE IF EXISTS {q}"),
+                    0,
+                )
+                .map(|_| ())
+            }
+            Target::Access { .. } | Target::Sqlite { .. } | Target::Mongo { .. } => Err(
+                "该连接类型不支持通过 DDL 删除库（SQLite 请到文件系统删除库文件，Access 为只读）"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// 系统模式名单：PG 的 `public` / `information_schema` / `pg_*` 系列，
+    /// SQL Server 的 `dbo` / `sys` / `INFORMATION_SCHEMA` / 固定数据库角色。
+    /// 「删除模式」菜单据此置灰，[Self::drop_schema] 里再拦一道。
+    pub fn is_system_schema(name: &str) -> bool {
+        let n = name.trim().to_ascii_lowercase();
+        matches!(
+            n.as_str(),
+            "public"
+                | "information_schema"
+                | "dbo"
+                | "guest"
+                | "sys"
+                | "db_owner"
+                | "db_accessadmin"
+                | "db_securityadmin"
+                | "db_ddladmin"
+                | "db_backupoperator"
+                | "db_datareader"
+                | "db_datawriter"
+                | "db_denydatareader"
+                | "db_denydatawriter"
+        ) || n.starts_with("pg_")
+    }
+
+    /// 删除库内的一个模式（DDL：`DROP SCHEMA`）。仅 PG / SQL Server 有独立的
+    /// 模式层：
+    /// - PostgreSQL：`DROP SCHEMA ... CASCADE`——确认框已告知级联后果；
+    /// - SQL Server：T-SQL 没有 CASCADE 选项，模式非空时服务器报错原样透出；
+    /// - MySQL / SQLite / Access / Mongo：没有独立的模式层，报错引导
+    ///   （MySQL 删库走「删除数据库」）。
+    /// 系统模式（见 [Self::is_system_schema]）在菜单层置灰，这里再拦一道。
+    pub fn drop_schema(&self, schema: &str) -> Result<(), String> {
+        if Self::is_system_schema(schema) {
+            return Err("系统模式不可删除".to_string());
+        }
+        let q = self.quote(schema);
+        match self {
+            Target::Pg { .. } => {
+                pg_driver::execute_stmt(&self.keyed(), &format!("DROP SCHEMA {q} CASCADE"), 0)
+                    .map(|_| ())
+            }
+            Target::SqlServer { conn, .. } => {
+                sqlserver_driver::execute_stmt(conn, &format!("DROP SCHEMA {q}"), 0).map(|_| ())
+            }
+            Target::Access { .. } | Target::Sqlite { .. } | Target::Mongo { .. }
+            | Target::MySql { .. } => Err(
+                "该连接类型没有独立的模式层（MySQL 删库请用「删除数据库」）".to_string(),
+            ),
+        }
+    }
+
+    /// 数据库扩展清单（仅 PostgreSQL 有意义）：已安装 + 可安装两份，按名字升序。
+    pub fn list_extensions(&self) -> Result<ExtensionLists, String> {
+        match self {
+            Target::Pg { .. } => {
+                let key = self.keyed();
+                let installed = pg_driver::try_list_installed_extensions(&key)?;
+                let available = pg_driver::try_list_available_extensions(&key)?;
+                Ok(ExtensionLists {
+                    installed,
+                    available,
+                })
+            }
+            _ => Err("仅 PostgreSQL 支持数据库扩展".to_string()),
+        }
+    }
+
+    /// 安装一个数据库扩展（DDL：`CREATE EXTENSION`，装在当前库）。
+    /// 名字来自可安装清单，已装 / 不存在都会被服务器报错原样透出。
+    pub fn create_extension(&self, name: &str) -> Result<(), String> {
+        match self {
+            Target::Pg { .. } => {
+                let q = pg_driver::quote_ident(name);
+                pg_driver::execute_stmt(&self.keyed(), &format!("CREATE EXTENSION {q}"), 0)
+                    .map(|_| ())
+            }
+            _ => Err("仅 PostgreSQL 支持数据库扩展".to_string()),
+        }
+    }
+
+    /// 卸载一个数据库扩展（DDL：`DROP EXTENSION`）。plpgsql 等核心扩展
+    /// 服务器会拒绝删除，报错原样透出。
+    pub fn drop_extension(&self, name: &str) -> Result<(), String> {
+        match self {
+            Target::Pg { .. } => {
+                let q = pg_driver::quote_ident(name);
+                pg_driver::execute_stmt(&self.keyed(), &format!("DROP EXTENSION {q}"), 0)
+                    .map(|_| ())
+            }
+            _ => Err("仅 PostgreSQL 支持数据库扩展".to_string()),
+        }
+    }
+
     /// 是否适合丢到后台线程跑整段脚本。SQLite 的 `:memory:` 库只活在本进程
     /// 那条连接上，另开连接查不到内容，只能同步跑；其余远程服务器恒后台。
     pub fn background_ok(&self) -> bool {
@@ -589,12 +844,16 @@ impl Target {
     /// 后台跑整段脚本（自己开连接，不占用 UI 线程那条）。
     /// `continue_on_error` 对应运行下拉的「遇到错误时继续」：false 时第一条
     /// 报错就收手，后面的语句不再执行。
+    /// 后台跑整段脚本。`tx` 为 `Some` 时走用户常驻事务：语句复用事务连接
+    /// （与读缓存隔离），跑完把句柄原样还回（仍 open，等待用户提交 / 回滚）；
+    /// 为 `None` 时按原逻辑自开连接执行。返回 `(ScriptRun, 剩余 tx 句柄)`。
     pub fn run_script(
         &self,
         job: &Job,
         stmts: &[String],
         continue_on_error: bool,
-    ) -> ScriptRun {
+        tx: Option<TxHandle>,
+    ) -> (ScriptRun, Option<TxHandle>) {
         match (self, job) {
             (Target::Sqlite { path, .. }, Job::Sqlite(j)) => sqlite_driver::run_script(
                 j,
@@ -602,6 +861,7 @@ impl Target {
                 stmts,
                 sqlite_driver::QUERY_ROW_LIMIT,
                 continue_on_error,
+                tx,
             ),
             (Target::Pg { params, .. }, Job::Pg(j)) => pg_driver::run_script(
                 j,
@@ -609,6 +869,7 @@ impl Target {
                 stmts,
                 pg_driver::QUERY_ROW_LIMIT,
                 continue_on_error,
+                tx,
             ),
             (Target::MySql { params, .. }, Job::MySql(j)) => mysql_driver::run_script(
                 j,
@@ -616,6 +877,7 @@ impl Target {
                 stmts,
                 mysql_driver::QUERY_ROW_LIMIT,
                 continue_on_error,
+                tx,
             ),
             (Target::SqlServer { .. }, Job::SqlServer(j)) => {
                 sqlserver_driver::run_script(
@@ -623,26 +885,34 @@ impl Target {
                     stmts,
                     sqlserver_driver::QUERY_ROW_LIMIT,
                     continue_on_error,
+                    tx,
                 )
             }
-            // Access 只读：脚本入口在功能区就被置灰，这里兜住直接调用
-            (Target::Access { .. }, _) => ScriptRun {
-                runs: Vec::new(),
-                open_error: Some("Access 连接为只读，不支持运行 SQL 脚本".to_string()),
-                cancelled: false,
-                rolled_back: false,
-                aborted_tx: false,
-                total_ms: 0,
-            },
+            // Access 只读：脚本入口在功能区就被置灰，这里兜住直接调用。
+            // Access 不支持事务（supports_tx == false），tx 必为 None，原样还回。
+            (Target::Access { .. }, _) => (
+                ScriptRun {
+                    runs: Vec::new(),
+                    open_error: Some("Access 连接为只读，不支持运行 SQL 脚本".to_string()),
+                    cancelled: false,
+                    rolled_back: false,
+                    aborted_tx: false,
+                    total_ms: 0,
+                },
+                tx,
+            ),
             // 页签挂的任务和后端不配套（改过连接类型没重开）：当作没跑成
-            _ => ScriptRun {
-                runs: Vec::new(),
-                open_error: Some("连接类型已变更，请重新执行".to_string()),
-                cancelled: false,
-                rolled_back: false,
-                aborted_tx: false,
-                total_ms: 0,
-            },
+            _ => (
+                ScriptRun {
+                    runs: Vec::new(),
+                    open_error: Some("连接类型已变更，请重新执行".to_string()),
+                    cancelled: false,
+                    rolled_back: false,
+                    aborted_tx: false,
+                    total_ms: 0,
+                },
+                tx,
+            ),
         }
     }
 

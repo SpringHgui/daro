@@ -160,18 +160,17 @@ impl ExportDialog {
     }
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = rfd::FileDialog::new()
+        let dialog = rfd::AsyncFileDialog::new()
             .set_title("导出连接")
             .set_file_name(self.format.default_file_name())
-            .add_filter("连接文件", &["ncx", "ano"])
-            .save_file();
-        if let Some(path) = picked {
+            .add_filter("连接文件", &["ncx", "ano"]);
+        ui::save_file(window, dialog, cx, |this, window, cx, path| {
             let text = path.display().to_string();
-            self.path
+            this.path
                 .update(cx, |state, cx| state.set_value(text, window, cx));
-            self.error = None;
+            this.error = None;
             cx.notify();
-        }
+        });
     }
 
     fn export(&mut self, cx: &mut Context<Self>) {

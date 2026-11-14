@@ -20,6 +20,8 @@ mod data_import_dialog;
 mod export_format;
 mod table_export;
 mod table_export_dialog;
+mod sql_dump;
+mod sql_dump_dialog;
 mod export_result_dialog;
 mod filter;
 mod filter_value_dialog;
@@ -54,9 +56,13 @@ mod about_dialog;
 mod options_dialog;
 mod theme_dialog;
 mod extensions_dialog;
+mod db_extensions_dialog;
+mod column_dialog;
 mod mcp_page;
 mod favorites;
 mod saved_queries;
+mod history;
+mod history_dialog;
 mod sql_file_run_dialog;
 mod sql_assoc;
 mod save_query_dialog;
@@ -219,8 +225,7 @@ const CV_MAX_LINES: usize = 400;
 const PAGE_SIZE: usize = 1000;
 
 /// 真库表页打开时的默认页大小（同样落到限制记录设置里，之后可改）。
-const REMOTE_PAGE_SIZE: usize = 1000;
-
+pub(crate) const REMOTE_PAGE_SIZE: usize = 1000;
 /// 自适应列宽采样行数：一页 1000 行全量量宽会把每帧渲染变成 O(行×列)。
 const T_COL_W_SCAN: usize = 120;
 
@@ -678,6 +683,11 @@ fn table_copy_ready(conn: &mock::Connection) -> bool {
             conn.kind,
             DbKind::SQLite | DbKind::PostgreSql | DbKind::MySql | DbKind::SqlServer
         )
+}
+
+/// SQL 转储的门：演示连接与 NoSQL / 只读 Access 都不出假文件。
+fn sql_dump_ready(conn: &mock::Connection) -> bool {
+    backend::is_real_conn(conn) && sql_dump::supports(conn.kind)
 }
 
 /// 删光连接后各面板仍要能渲染：拿这个空连接当兜底，而不是在每个取值点判 Option。
@@ -1667,6 +1677,32 @@ fn ui_main() {
     });
 }
 
+/// 事务句柄槽。`TxHandle` 持有一条独立连接、不可复制，但 `OpenTab` 需要
+/// `Clone` 做只读快照：快照副本不带事务，免得克隆体析构时把真事务回滚掉。
+#[derive(Default)]
+struct TxSlot(Option<backend::TxHandle>);
+
+impl Clone for TxSlot {
+    fn clone(&self) -> Self {
+        TxSlot(None)
+    }
+}
+
+impl TxSlot {
+    fn take(&mut self) -> Option<backend::TxHandle> {
+        self.0.take()
+    }
+    fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+    fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+    fn set(&mut self, tx: backend::TxHandle) {
+        self.0 = Some(tx);
+    }
+}
+
 /// 打开的数据表标签页。双击树里的表 / 视图节点追加，0 号位是常驻「对象」页。
 /// 连接与库都按名字记（索引会随增删连接漂移），连接删了页签就地消失。
 #[derive(Clone)]
@@ -1710,9 +1746,10 @@ struct OpenTab {
     /// 数据页签的取数结果（可编辑工作集）；设计 / 查询页签恒空。
     /// mock 档把它物化成真实二维表：编辑 / 增删改的是这份副本而不是
     /// 每帧现算的 mock_cell，行为与参考界面的「改了没保存」一致。
-    data: Vec<Vec<String>>,
+    /// 行按 `Arc` 共享：基线 / 撤销快照只克隆指针列表，改格才复制那一行。
+    data: Vec<db_types::Row>,
     /// 上次「应用」✓ 时的快照；「撤销」× / 刷新把 data 退回这里。
-    baseline: Vec<Vec<String>>,
+    baseline: Vec<db_types::Row>,
     /// 当前列形：数据页来自真库（SQLite）或 MOCK_COLUMNS；查询 / 设计页恒空。
     cols: Vec<db_types::ColMeta>,
     /// data 每行的身份，写回时原样送回驱动：SQLite 是单元素 rowid，
@@ -1757,6 +1794,9 @@ struct OpenTab {
     scroll: ScrollHandle,
     /// 发布说明页签：Some 时内容走 [DaroApp::release_notes_page]，不挂连接。
     notes: Option<release_notes::ReleaseNotes>,
+    /// 用户事务句柄：Some 时该页签处于事务中，持有一条与读缓存隔离的
+    /// 独立连接。页签关闭时 `OpenTab` 被 drop，触发 `TxHandle::Drop` 自动回滚。
+    tx: TxSlot,
 }
 
 /// 单元格选区：anchor 是按下时的格，focus 是当前拖到的格（都可为区间端点）。
@@ -1794,7 +1834,8 @@ impl GridSel {
 /// 交织时，逆操作很容易算错；页大小有上限，整页快照更稳。
 #[derive(Clone)]
 struct GridSnapshot {
-    data: Vec<Vec<String>>,
+    /// 行按 `Arc` 共享：快照只克隆指针，不复制单元格。
+    data: Vec<db_types::Row>,
     inserted: Vec<Vec<String>>,
     row_keys: Vec<db_types::RowKey>,
     cell: (usize, usize),
@@ -1946,11 +1987,11 @@ impl OpenTab {
                 else {
                     continue;
                 };
-                changed += row.iter().zip(base_row).filter(|(a, b)| a != b).count();
+                changed += row.iter().zip(base_row.iter()).filter(|(a, b)| a != b).count();
             }
         } else if self.data.len() == self.baseline.len() {
             for (row, base_row) in self.data.iter().zip(&self.baseline) {
-                changed += row.iter().zip(base_row).filter(|(a, b)| a != b).count();
+                changed += row.iter().zip(base_row.iter()).filter(|(a, b)| a != b).count();
             }
         }
         let deleted = if has_key {
@@ -1974,10 +2015,12 @@ impl OpenTab {
     }
 
     /// 实际生效的列序：缓存非法（列数变了 / 重复下标）时退回自然序。
+    /// 非空且合法即视为有效——此时可能是「含隐藏列的有序子集」（列管理对话框
+    /// 隐藏列时只把可见列留在 `col_order` 里），渲染循环遍历它就自动跳过隐藏列。
     fn col_order(&self) -> Vec<usize> {
         let natural: Vec<usize> = (0..self.cols.len()).collect();
-        if self.col_order.len() != self.cols.len() {
-            return natural;
+        if self.col_order.is_empty() {
+            return natural; // 未初始化（刚开表、尚无布局缓存）：自然序全显示
         }
         let mut seen = vec![false; self.cols.len()];
         for &c in &self.col_order {
@@ -2551,7 +2594,7 @@ fn view_definition(tg: &backend::Target, sql: &str) -> String {
 }
 
 /// 从真库读一张表的完整设计。只在后台线程调用：每条目录查询都可能走网络。
-fn read_design_meta(tg: &backend::Target, table: &str) -> Result<DesignMeta, String> {
+pub(crate) fn read_design_meta(tg: &backend::Target, table: &str) -> Result<DesignMeta, String> {
     match tg {
         backend::Target::MySql { db, .. } => read_mysql_design(tg, db, table),
         backend::Target::Pg { schema, .. } => read_pg_design(tg, schema, table),
@@ -2624,7 +2667,7 @@ fn demo_member_rows_for(names: &[&str], self_name: &str) -> Vec<role_design::Mem
 /// 右栏 DDL 页：反查表结构后用设计器同一套拼装器生成 CREATE 语句，
 /// 与「SQL 预览 → DDL」输出同一份口径（PG 带 OWNER TO，其余按各自方言）。
 /// 只在后台线程调用：每条目录查询都可能走网络。
-fn read_table_ddl(tg: &backend::Target, schema: &str, table: &str) -> Result<String, String> {
+pub(crate) fn read_table_ddl(tg: &backend::Target, schema: &str, table: &str) -> Result<String, String> {
     let meta = read_design_meta(tg, table)?;
     Ok(design_create_sql_at(
         tg.kind(),
@@ -2864,13 +2907,13 @@ fn read_table_dependencies(
 
 /// 跑一条目录查询，返回纯文本行（驱动把 NULL 打成字面 `NULL`，所以调用方的
 /// SQL 一律用 COALESCE 把空值收敛成空串，避免把字面量当真值）。
-fn meta_rows(tg: &backend::Target, sql: &str) -> Result<Vec<Vec<String>>, String> {
+pub(crate) fn meta_rows(tg: &backend::Target, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let out = tg.execute(sql, 10_000)?;
     Ok(out.select.map(|p| p.rows).unwrap_or_default())
 }
 
 /// 附加信息（检查约束 / 表选项）读不到时降级为不预填，不牵连整次反查。
-fn meta_rows_or_empty(tg: &backend::Target, sql: &str) -> Vec<Vec<String>> {
+pub(crate) fn meta_rows_or_empty(tg: &backend::Target, sql: &str) -> Vec<Vec<String>> {
     meta_rows(tg, sql).unwrap_or_default()
 }
 
@@ -3679,7 +3722,7 @@ fn strip_create_view(raw: &str) -> String {
 }
 
 /// SQLite 标识符引号（双引号包名，内部双写）。
-fn sqlite_ident(name: &str) -> String {
+pub(crate) fn sqlite_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -6935,6 +6978,53 @@ fn load_table_page(
     ))
 }
 
+/// 流式导出 / 转储用的一页：与 [`load_table_page`] 同口径取数，但不额外跑
+/// COUNT——导出只需要按页拉到空页为止，总行数不是必需的。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fetch_table_page(
+    conn: &mock::Connection,
+    db: &str,
+    schema: &str,
+    table: &str,
+    where_sql: Option<&str>,
+    orders: &[(String, bool)],
+    offset: usize,
+    limit: usize,
+) -> Result<db_types::SelectPage, String> {
+    if conn.kind == DbKind::Access {
+        let path = catalog::access_path(conn);
+        access_driver::ensure(&conn.name, &path, backend::conn_password(conn).as_deref())?;
+        let page = access_driver::select_all(&conn.name, table)?;
+        let end = (offset + limit).min(page.rows.len());
+        let empty = offset >= page.rows.len();
+        return Ok(db_types::SelectPage {
+            columns: page.columns,
+            rows: if empty { Vec::new() } else { page.rows[offset..end].to_vec() },
+            keys: if empty { Vec::new() } else { page.keys[offset..end].to_vec() },
+            truncated: false,
+        });
+    }
+    if let Some(t) = backend::Target::of(conn, db, schema) {
+        return t.select_table(table, where_sql, orders, offset, limit);
+    }
+    let rows = materialize_rows(table);
+    let end = (offset + limit).min(rows.len());
+    let page_rows = if offset >= rows.len() {
+        Vec::new()
+    } else {
+        rows[offset..end].to_vec()
+    };
+    Ok(db_types::SelectPage {
+        columns: mock::MOCK_COLUMNS
+            .iter()
+            .map(|m| db_types::ColMeta::new(m.name, m.ty, m.numeric))
+            .collect(),
+        keys: vec![Vec::new(); page_rows.len()],
+        rows: page_rows,
+        truncated: false,
+    })
+}
+
 /// 重新从目录取数并替换页签工作集（真库查服务端，mock 取回物化数据）。
 /// 筛选 / 排序面板状态保留：刷新后条件仍生效；真库按当前页号重取。
 fn reload_table_page(conn: &mock::Connection, t: &mut OpenTab) -> Result<(), String> {
@@ -6958,8 +7048,8 @@ fn reload_table_page(conn: &mock::Connection, t: &mut OpenTab) -> Result<(), Str
         size,
     )?;
     t.cols = page.columns;
-    t.data = page.rows.clone();
-    t.baseline = page.rows;
+    t.data = page.rows.into_iter().map(std::sync::Arc::new).collect();
+    t.baseline = t.data.clone();
     t.row_keys = page.keys.clone();
     t.baseline_row_keys = page.keys;
     t.inserted.clear();
@@ -7036,66 +7126,10 @@ fn load_page_chunked(
     Ok(out)
 }
 
-/// 整表取数的终止原因：用户取消和真出错要分开报（取消不是失败）。
-pub(crate) enum FetchAbort {
-    Cancelled,
-    Failed(String),
-}
-
-/// 分块取回整表（导出 / 复制用）：按 REMOTE_PAGE_SIZE 翻完，避免一次性
-/// 把百万行压进内存的同时也避免只导出当前页。
-/// **只允许在后台线程调用**：网络取数可能跑几十秒，放界面上就是把窗口冻住。
-pub(crate) fn load_all_table_rows(
-    conn: &mock::Connection,
-    db: &str,
-    schema: &str,
-    table: &str,
-    where_sql: Option<&str>,
-    orders: &[(String, bool)],
-    progress: &mut dyn FnMut(usize, usize),
-    cancel: &AtomicBool,
-) -> Result<db_types::SelectPage, FetchAbort> {
-    let mut out = db_types::SelectPage {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        keys: Vec::new(),
-        truncated: false,
-    };
-    let mut offset = 0usize;
-    loop {
-        if cancel.load(AtomicOrdering::Relaxed) {
-            return Err(FetchAbort::Cancelled);
-        }
-        let (page, total) = load_table_page(
-            conn,
-            db,
-            schema,
-            table,
-            where_sql,
-            orders,
-            offset,
-            REMOTE_PAGE_SIZE,
-        )
-        .map_err(FetchAbort::Failed)?;
-        if out.columns.is_empty() {
-            out.columns = page.columns;
-        }
-        let got = page.rows.len();
-        out.rows.extend(page.rows);
-        out.keys.extend(page.keys);
-        offset += got;
-        progress(offset, total);
-        if got == 0 || offset >= total {
-            break;
-        }
-    }
-    Ok(out)
-}
-
 /// 排序后的显示序位 → 原行下标映射；无排序即恒等。稳定排序：同值行保持
 /// 原相对次序（Rust sort_by 稳定）。列下标越界（防御）也按恒等处理。
 fn sorted_row_order(
-    data: &[Vec<String>],
+    data: &[db_types::Row],
     cols: &[db_types::ColMeta],
     sort: Option<(usize, bool)>,
 ) -> Vec<usize> {
@@ -8459,6 +8493,10 @@ struct DaroApp {
     /// 刚建连失败的那些连接：它们名下的目录任务（列库 / 列表）注定报同一个
     /// 「连不上」错误，别再叠一个「目录读取失败」，连不上只提示一次。
     connect_failed: HashSet<String>,
+    /// 正在后台用常驻事务连接执行 SQL 的页签 rid 集合。此期间该页签的
+    /// `tx` 句柄被借到后台线程，`OpenTab.tx` 临时为 None，UI 据此把
+    /// 「提交 / 回滚」显示为禁用、避免后台占用期误触。
+    tx_busy: HashSet<u64>,
     /// 上一次点中的行与时刻，用来自己判双击（同节点 + 系统双击时间）
     last_click: Option<(Act, Instant)>,
     conn_colors: HashMap<String, u8>,
@@ -8474,6 +8512,10 @@ struct DaroApp {
     /// 起不了后台任务，所以先排在这里，帧尾和 catalog 一起投到后台线程
     /// （见 [Self::pump_table_ops]）。
     table_ops: Vec<TableOpJob>,
+    /// 库 / 模式节点右键菜单里确认过的删库、删模式任务：确认框回调只拿得到
+    /// `&mut DaroApp`，起不了后台任务，先排在这里，帧尾和表操作一起投后台
+    /// （见 [DaroApp::pump_drop_jobs]）。
+    drop_jobs: Vec<DropJob>,
     /// 对象页 Ctrl+C 复制的表：源上下文 + 表名。None = 剪贴板里没有表。
     table_clip: Option<table_copy::TableClip>,
     /// 已确认的粘贴批次（可能多张表）：帧尾和表操作一起投到后台。
@@ -8621,6 +8663,10 @@ struct DaroApp {
     /// 已保存查询（对象面板「查询」分类 + 查询页「已保存」下拉共用同一份），
     /// 落盘 `queries.json`。
     saved_queries: Vec<saved_queries::SavedQuery>,
+    /// 查询历史（自动记录已执行 SQL），落盘 `history.json`。
+    history: Vec<history::HistoryEntry>,
+    /// 历史记录自增 id 源。
+    hist_seq: u64,
     /// (连接, 库, 模式) → 查询分类清单。树 / 对象面板的目录接口只收
     /// `&'static`，保存 / 删除时整份重建（旧切片随进程结束回收）。
     saved_query_rows: Vec<(String, String, String, &'static [&'static str])>,
@@ -8679,6 +8725,7 @@ impl DaroApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = load_store();
         let saved_queries = saved_queries::load();
+        let history = history::load();
         let saved_query_rows = cached_query_rows(&saved_queries);
         let ui_font = store
             .as_ref()
@@ -8870,12 +8917,14 @@ impl DaroApp {
             loading: HashSet::new(),
             catalog_errors: Vec::new(),
             connect_failed: HashSet::new(),
+            tx_busy: HashSet::new(),
             last_click: None,
             conn_colors,
             ctx: None,
             ctx_blank: None,
             ctx_row_hit: false,
             table_ops: Vec::new(),
+            drop_jobs: Vec::new(),
             table_clip: None,
             table_copies: Vec::new(),
             object_clip: None,
@@ -8948,6 +8997,8 @@ impl DaroApp {
             next_rid: 1,
             next_kid: 1,
             saved_queries,
+            history,
+            hist_seq: 0,
             saved_query_rows,
             favorites: favorites::load(),
             tool_view: None,
@@ -9730,6 +9781,74 @@ impl DaroApp {
             );
         }
         cx.notify();
+    }
+
+    /// 右键「新建数据库…」：弹名称框，后台跑 `CREATE DATABASE`，
+    /// 成功就失效并重排该连接的库目录，让新库立即出现在树上。
+    pub(crate) fn create_database_action(
+        &mut self,
+        c: usize,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let Some(conn) = self.conns.get(c).cloned() else {
+            return;
+        };
+        let Some(target) = backend::Target::of(&conn, "", "") else {
+            open_notice(
+                self.dark,
+                "新建数据库",
+                "演示连接或未接入真库的连接不支持新建数据库".to_string(),
+                cx,
+            );
+            return;
+        };
+        let ent = cx.entity().downgrade();
+        let dark = self.dark;
+        let conn_name = conn.name.clone();
+        cx.spawn(async move |_, cx| {
+            // 任务闭包需要独占 name 的所有权，原串留给回执，这里先克隆一份。
+            let name_for_task = name.clone();
+            let res = cx
+                .background_executor()
+                .spawn(async move { target.create_database(&name_for_task) })
+                .await;
+            if let Some(e) = ent.upgrade() {
+                e.update(cx, |app, cx| {
+                    app.after_create_database(&conn_name, &name, res, dark, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 「新建数据库」后台结果回执：成功刷新目录 + 提示，失败弹错误。
+    fn after_create_database(
+        &mut self,
+        conn_name: &str,
+        name: &str,
+        res: Result<(), String>,
+        dark: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match res {
+            Ok(()) => {
+                // 失效目录并重新排队该连接的库清单：新库要立刻进树。
+                catalog::invalidate();
+                if let Some(conn) = self.conns.iter().find(|c| c.name == conn_name) {
+                    let _ = catalog::databases(conn);
+                }
+                cx.notify();
+                open_notice(dark, "新建数据库", format!("已创建数据库「{name}」"), cx);
+            }
+            Err(e) => {
+                open_confirm(cx.entity(), dark, "新建数据库失败", e, |_| {}, cx);
+            }
+        }
     }
 
     /// 树右键 / F5「刷新」：清掉目录缓存，已打开的连接重新排队加载。
@@ -11033,6 +11152,144 @@ impl DaroApp {
         }
     }
 
+    /// 库 / 模式节点菜单里确认过的删库、删模式：先排队（确认回调侧拿不到
+    /// cx），帧尾投后台。
+    fn queue_db_drop(&mut self, c: usize, db: String) {
+        self.drop_jobs.push(DropJob::Db { c, db });
+    }
+
+    /// 模式节点菜单里确认过的删模式：与删库同一条队列、同一套回执。
+    fn queue_schema_drop(&mut self, c: usize, db: String, schema: String) {
+        self.drop_jobs.push(DropJob::Schema { c, db, schema });
+    }
+
+    /// 帧尾把排队的删库 / 删模式任务投到后台线程（与表操作同一时机、同一套回执）。
+    /// 目标拿不到（演示 / 未接入真库）就直接给错误回执，不静默吞掉。
+    fn pump_drop_jobs(&mut self, cx: &mut Context<Self>) {
+        let jobs = std::mem::take(&mut self.drop_jobs);
+        if jobs.is_empty() {
+            return;
+        }
+        for job in jobs {
+            let ent = cx.entity().downgrade();
+            let dark = self.dark;
+            // 目标坐标：删库用连接默认库即可，删模式要绑到目标库。
+            let target = match &job {
+                DropJob::Db { c, .. } => self
+                    .conns
+                    .get(*c)
+                    .and_then(|conn| backend::Target::of(conn, "", "")),
+                DropJob::Schema { c, db, .. } => self
+                    .conns
+                    .get(*c)
+                    .and_then(|conn| backend::Target::of(conn, db, "")),
+            };
+            cx.spawn(async move |_, cx| {
+                // 按值匹配把 owned Target move 进后台 future：spawn 要求
+                // 'static，引用捕获（match &target）编译不过。
+                let res = match target {
+                    Some(t) => {
+                        let job = job.clone();
+                        cx.background_executor()
+                            .spawn(async move { job.run_on(&t) })
+                            .await
+                    }
+                    None => Err("演示连接或未接入真库的连接不支持该操作".to_string()),
+                };
+                if let Some(e) = ent.upgrade() {
+                    e.update(cx, |app, cx| app.after_drop(&job, res, dark, cx));
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// 删库 / 删模式回执：成功失效目录、清掉对应树节点标记并提示；失败弹错误
+    /// 明细（重名 / 被占用 / 无权限各有各的说法）。
+    fn after_drop(
+        &mut self,
+        job: &DropJob,
+        res: Result<(), String>,
+        dark: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match res {
+            Ok(()) => {
+                catalog::invalidate();
+                match job {
+                    DropJob::Db { c, db } => {
+                        if let Some(conn) = self.conns.get(*c) {
+                            let _ = catalog::databases(conn);
+                            self.visited_dbs.remove(&node_key(&conn.name, db));
+                        }
+                        cx.notify();
+                        open_notice(dark, "删除数据库", format!("已删除数据库「{db}」"), cx);
+                    }
+                    DropJob::Schema { c, db, schema } => {
+                        if let Some(conn) = self.conns.get(*c) {
+                            let _ = catalog::schemas(conn, db);
+                            // 模式节点的树 key 是 (连接, 库) 之下再套一层模式名
+                            let db_key = node_key(&conn.name, db);
+                            self.visited_dbs.remove(&node_key(&db_key, schema));
+                        }
+                        cx.notify();
+                        open_notice(dark, "删除模式", format!("已删除模式「{schema}」"), cx);
+                    }
+                }
+            }
+            Err(e) => {
+                let title = match job {
+                    DropJob::Db { .. } => "删除数据库失败",
+                    DropJob::Schema { .. } => "删除模式失败",
+                };
+                open_confirm(cx.entity(), dark, title, e, |_| {}, cx);
+            }
+        }
+    }
+
+    /// 库节点右键「管理扩展...」：后台拉已安装 + 可安装两份清单，拉完开窗；
+    /// 失败弹窗说明。仅 PostgreSQL（菜单层已按引擎置灰），清单与动作都绑到
+    /// 目标库的 Target。
+    pub(crate) fn open_db_extensions(&mut self, c: usize, d: usize, cx: &mut Context<Self>) {
+        let Some(conn) = self.conns.get(c).cloned() else {
+            return;
+        };
+        let db = catalog::databases(&conn)
+            .get(d)
+            .copied()
+            .unwrap_or("")
+            .to_string();
+        let Some(target) = backend::Target::of(&conn, &db, "") else {
+            open_notice(
+                self.dark,
+                "管理扩展",
+                "演示连接或未接入真库的连接不支持扩展管理".to_string(),
+                cx,
+            );
+            return;
+        };
+        let ent = cx.entity().downgrade();
+        let dark = self.dark;
+        let tg = target.clone();
+        cx.spawn(async move |_, cx| {
+            let lists = cx
+                .background_executor()
+                .spawn(async move { tg.list_extensions() })
+                .await;
+            if let Some(e) = ent.upgrade() {
+                e.update(cx, |_, cx| match lists {
+                    Ok(lists) => {
+                        db_extensions_dialog::open(dark, target, lists, cx);
+                    }
+                    Err(msg) => {
+                        open_notice(dark, "管理扩展", msg, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     /// 表操作回执：失败要说清是哪张表没改成；成功则失效那一段目录并立刻重新
     /// 排队——不重查的话，树上那张被删掉的表还挂在原处，看着像没执行。
     fn table_op_done(
@@ -11470,6 +11727,8 @@ impl DaroApp {
                 && t.obj == o
         });
         if existing.is_none() {
+            let data: Vec<db_types::Row> = page.rows.into_iter().map(std::sync::Arc::new).collect();
+            let baseline = data.clone();
             self.opened.push(OpenTab {
                 conn_name: conn.name.clone(),
                 db,
@@ -11492,8 +11751,8 @@ impl DaroApp {
                 sort: None,
                 head_hover: None,
                 head_menu: None,
-                data: page.rows.clone(),
-                baseline: page.rows,
+                data,
+                baseline,
                 cols: page.columns,
                 row_keys: page.keys.clone(),
                 baseline_row_keys: page.keys,
@@ -11512,6 +11771,7 @@ impl DaroApp {
                 col_widths: HashMap::new(),
                 scroll: ScrollHandle::new(),
                 notes: None,
+                tx: TxSlot(None),
             });
             // 客户端布局缓存（列宽 / 列序）只影响本机显示
             let layout = self
@@ -11728,6 +11988,7 @@ impl DaroApp {
             col_widths: HashMap::new(),
             scroll: ScrollHandle::new(),
             notes: None,
+            tx: TxSlot(None),
         });
         // 已开过的页签直接切过去；新页签落在当前聚焦窗格
         let ix = self
@@ -12076,6 +12337,7 @@ impl DaroApp {
             col_widths: HashMap::new(),
             scroll: ScrollHandle::new(),
             notes: None,
+            tx: TxSlot(None),
         });
         let ix = self.opened.len();
         self.dock.add_tab(ix);
@@ -12238,6 +12500,7 @@ impl DaroApp {
             col_widths: HashMap::new(),
             scroll: ScrollHandle::new(),
             notes: None,
+            tx: TxSlot(None),
         });
         let ix = self.opened.len();
         self.dock.add_tab(ix);
@@ -12643,9 +12906,9 @@ impl DaroApp {
         cx.spawn(async move |_, cx| {
             let job = tg.create_job();
             let worker_job = job.clone();
-            let run = cx
+            let (run, _) = cx
                 .background_executor()
-                .spawn(async move { tg.run_script(&worker_job, &stmts, true) })
+                .spawn(async move { tg.run_script(&worker_job, &stmts, true, None) })
                 .await;
             let _ = handle.update(cx, |_, window, app| {
                 let Some(ent) = entity.upgrade() else { return };
@@ -13764,6 +14027,7 @@ impl DaroApp {
             col_widths: HashMap::new(),
             scroll: ScrollHandle::new(),
             notes: None,
+            tx: TxSlot(None),
             qstate: Some(QueryState {
                 editor,
                 log,
@@ -13943,6 +14207,7 @@ impl DaroApp {
             col_widths: HashMap::new(),
             scroll: ScrollHandle::new(),
             notes: None,
+            tx: TxSlot(None),
         });
         let ix = self.opened.len();
         self.dock.add_tab(ix);
@@ -15574,13 +15839,13 @@ impl DaroApp {
 
     /// 文件菜单「打开文件 ▸ SQL 文件…」：选一个本地 .sql，内容载入新查询页签。
     fn open_sql_file_in_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = rfd::FileDialog::new()
+        let dialog = rfd::AsyncFileDialog::new()
             .add_filter("SQL 文件", &["sql", "txt"])
             .add_filter("所有文件", &["*"])
-            .set_title("打开 SQL 文件")
-            .pick_file();
-        let Some(path) = picked else { return };
-        self.open_sql_path_in_editor(path, window, cx);
+            .set_title("打开 SQL 文件");
+        ui::pick_file(window, dialog, cx, |this, window, cx, path| {
+            this.open_sql_path_in_editor(path, window, cx);
+        });
     }
 
     /// 双击 / 「打开方式」/ 拖入窗口 / 文件菜单共用的落点：读文件 → 新查询页签。
@@ -16149,20 +16414,36 @@ impl DaroApp {
         q.log.update(cx, |s, cx| s.set_value(hint, window, cx));
         cx.notify();
 
+        // 常驻事务：把页签上的 tx 句柄借到后台线程执行（仍 open，跑完还回）。
+        let tx = self
+            .opened
+            .iter_mut()
+            .find(|t| t.rid == qid)
+            .and_then(|t| t.tx.take());
+        if tx.is_some() {
+            self.tx_busy.insert(qid);
+        }
+
         let win = window.window_handle();
         let entity = cx.entity().downgrade();
         let worker_stmts = stmts.clone();
         cx.spawn(async move |_, cx| {
             let worker_job = job;
-            let run = cx
+            let (run, tx) = cx
                 .background_executor()
                 .spawn(async move {
-                    target.run_script(&worker_job, &worker_stmts, continue_on_error)
+                    target.run_script(&worker_job, &worker_stmts, continue_on_error, tx)
                 })
                 .await;
             let _ = win.update(cx, |_, window, app| {
                 let Some(entity) = entity.upgrade() else { return };
                 entity.update(app, |a, cx| {
+                    if let Some(tx) = tx {
+                        if let Some(t) = a.opened.iter_mut().find(|t| t.rid == qid) {
+                            t.tx.set(tx);
+                        }
+                    }
+                    a.tx_busy.remove(&qid);
                     a.query_apply_script(qid, &stmts, run, explain, window, cx)
                 });
             });
@@ -16240,6 +16521,42 @@ impl DaroApp {
             notes.push_str("检测到未提交事务（脚本中途失败），已自动回滚。\n\n");
         }
         let total_ms = run.total_ms;
+        // 自动记录查询历史：在 outcomes 移交 query_finish 之前（此时 q 借用已结束）。
+        {
+            let mut hist_entries: Vec<history::HistoryEntry> = Vec::new();
+            if let Some(t) = self.opened.iter().find(|tt| tt.qid == qid) {
+                let conn_name = t.conn_name.clone();
+                let db_name = t.db.to_string();
+                let schema_name = self
+                    .conns
+                    .iter()
+                    .find(|c| c.name == conn_name)
+                    .and_then(|c| catalog::schemas(c, &db_name).get(t.schema).copied())
+                    .unwrap_or("")
+                    .to_string();
+                for o in &outcomes {
+                    let ok = o
+                        .message
+                        .as_ref()
+                        .map_or(true, |m| !m.starts_with("错误"));
+                    let rows = o.result.as_ref().map(|r| r.len()).unwrap_or(0);
+                    hist_entries.push(history::HistoryEntry {
+                        id: self.next_hist_id(),
+                        ts: history::now_ts(),
+                        conn: conn_name.clone(),
+                        db: db_name.clone(),
+                        schema: schema_name.clone(),
+                        sql: o.sql.clone(),
+                        ok,
+                        rows,
+                        ms: o.elapsed_ms as u64,
+                    });
+                }
+            }
+            if !hist_entries.is_empty() {
+                self.append_history(hist_entries);
+            }
+        }
         self.query_finish(qid, outcomes, notes, total_ms, window, cx);
     }
 
@@ -26222,16 +26539,33 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             ds.note = None;
         }
         cx.notify();
+        // 设计器保存也可能在常驻事务里跑 DDL：借走 tx，跑完还回。
+        let tx = self
+            .opened
+            .iter_mut()
+            .find(|t| t.rid == did)
+            .and_then(|t| t.tx.take());
+        if tx.is_some() {
+            self.tx_busy.insert(did);
+        }
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let job = tg.create_job();
             let worker = job.clone();
-            let run = cx
+            let (run, tx) = cx
                 .background_executor()
-                .spawn(async move { tg.run_script(&worker, &stmts, false) })
+                .spawn(async move { tg.run_script(&worker, &stmts, false, tx) })
                 .await;
             let Some(ent) = entity.upgrade() else { return };
-            let _ = cx.update_entity(&ent, |a, cx| a.design_saved(did, run, cx));
+            let _ = cx.update_entity(&ent, |a, cx| {
+                if let Some(tx) = tx {
+                    if let Some(t) = a.opened.iter_mut().find(|t| t.rid == did) {
+                        t.tx.set(tx);
+                    }
+                }
+                a.tx_busy.remove(&did);
+                a.design_saved(did, run, cx)
+            });
         })
         .detach();
     }
@@ -26436,7 +26770,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             Vec::new()
         } else {
             load_table_page(conn, db, schema, name, None, &[], 0, PAGE_SIZE)
-                .map(|(p, _)| p.rows)
+                .map(|(p, _)| p.rows.into_iter().map(std::sync::Arc::new).collect())
                 .unwrap_or_default()
         };
         table_export_dialog::open_table_export(
@@ -26447,6 +26781,104 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             columns,
             rows,
             fetch,
+            cx,
+        );
+    }
+
+    /// 表对象菜单「转储 SQL 文件」：点名树 / 面板里右键那张表。
+    fn open_sql_dump_for(&mut self, act: Act, include_data: bool, cx: &mut Context<Self>) {
+        let Act::Obj(c, d, s, k, o) = act else {
+            return;
+        };
+        if k != 0 {
+            return;
+        }
+        let Some(conn) = self.conns.get(c) else {
+            return;
+        };
+        if !sql_dump_ready(conn) {
+            return;
+        }
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
+            return;
+        };
+        let schema = catalog::schemas(conn, db).get(s).copied().unwrap_or("");
+        let Some(table) = catalog::objects(conn, db, schema, k).get(o).copied() else {
+            return;
+        };
+        sql_dump_dialog::open_sql_dump(
+            self.dark,
+            sql_dump::DumpRequest {
+                conn: conn.clone(),
+                db: db.to_string(),
+                schema: schema.to_string(),
+                scope: sql_dump::DumpScope::Table,
+                table: table.to_string(),
+                include_data,
+                path: String::new(),
+            },
+            cx,
+        );
+    }
+
+    /// 库节点菜单「转储 SQL 文件」：PG / SQL Server 会按库下全部用户模式出。
+    fn open_sql_dump_db(&mut self, c: usize, d: usize, include_data: bool, cx: &mut Context<Self>) {
+        let Some(conn) = self.conns.get(c) else {
+            return;
+        };
+        if !sql_dump_ready(conn) {
+            return;
+        }
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
+            return;
+        };
+        sql_dump_dialog::open_sql_dump(
+            self.dark,
+            sql_dump::DumpRequest {
+                conn: conn.clone(),
+                db: db.to_string(),
+                schema: String::new(),
+                scope: sql_dump::DumpScope::Database,
+                table: String::new(),
+                include_data,
+                path: String::new(),
+            },
+            cx,
+        );
+    }
+
+    /// 模式节点菜单「转储 SQL 文件」。
+    fn open_sql_dump_schema(
+        &mut self,
+        c: usize,
+        d: usize,
+        s: usize,
+        include_data: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn) = self.conns.get(c) else {
+            return;
+        };
+        if !sql_dump_ready(conn) {
+            return;
+        }
+        let Some(db) = catalog::databases(conn).get(d).copied() else {
+            return;
+        };
+        let Some(schema) = catalog::schemas(conn, db).get(s).copied() else {
+            return;
+        };
+        sql_dump_dialog::open_sql_dump(
+            self.dark,
+            sql_dump::DumpRequest {
+                conn: conn.clone(),
+                db: db.to_string(),
+                schema: schema.to_string(),
+                scope: sql_dump::DumpScope::Schema,
+                table: String::new(),
+                include_data,
+                path: String::new(),
+            },
             cx,
         );
     }
@@ -26477,9 +26909,73 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             is_mysql,
             label,
             columns,
-            tab.data.clone(),
+            tab.data.iter().map(|r| (**r).clone()).collect(),
             cx,
         );
+    }
+
+    /// 数据页工具条「列」：打开列管理对话框，传入当前全部列名与可见子集。
+    fn open_column_manager(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_tab.checked_sub(1) else {
+            return;
+        };
+        let Some(t) = self.opened.get(ix) else {
+            return;
+        };
+        if t.design || t.query || t.cols.is_empty() {
+            return;
+        }
+        let names: Vec<String> = t.cols.iter().map(|m| m.name.clone()).collect();
+        let order = t.col_order();
+        let me = cx.entity().clone();
+        crate::column_dialog::open_column_manager(me, self.dark, names, order, cx);
+    }
+
+    /// 「列」管理对话框确定后写回：把可见列的有序子集存进活动数据页签的
+    /// `col_order`，并随布局缓存落盘（`connections.json`）。隐藏列即「不在
+    /// `col_order` 里」，网格渲染遍历 `col_order()` 会自动跳过。
+    pub(crate) fn set_column_order(&mut self, order: Vec<usize>, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_tab.checked_sub(1) else {
+            return;
+        };
+        // 先只读取布局键与可写回状态（不拿可变借用，避免与下方 `grid_layout_key`
+        // 的 `&self` 借用冲突）。
+        let key = {
+            let Some(t) = self.opened.get(ix) else {
+                return;
+            };
+            if t.design || t.query || t.cols.is_empty() {
+                return;
+            }
+            self.grid_layout_key(t)
+        };
+        let (widths, order_clone) = {
+            let t = &mut self.opened[ix];
+            t.col_order = order;
+            (t.col_widths.clone(), t.col_order.clone())
+        };
+        if let Some(key) = key {
+            self.table_layouts.insert(
+                key,
+                TableLayout {
+                    widths,
+                    order: order_clone,
+                },
+            );
+            self.save();
+        }
+        cx.notify();
+    }
+
+    /// 「命令列界面…」：拉起系统终端连到指定连接；`None` 时用当前选中的连接。
+    /// 引擎没有标准 CLI（Access）时直接打开库文件。
+    fn open_cli(&mut self, conn_ix: Option<usize>, _cx: &mut Context<Self>) {
+        let ix = conn_ix.or_else(|| self.sel_conn_ix());
+        if let Some(c) = ix {
+            if let Some(conn) = self.conns.get(c).cloned() {
+                spawn_db_terminal(&conn);
+            }
+        }
     }
 
     /// 打开「导入向导」：把 CSV / JSON 导入一张**已存在**的表。
@@ -26582,6 +27078,102 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         // 窗格侧的页签下标（1 基）整体前移；拖空的非 home 窗格会在这里塌掉
         self.dock.remove_tab(opened_ix + 1);
         self.active_tab = self.dock.focused_active();
+    }
+
+    /// 「开始事务」：取当前活动页签的连接 / 库 / 模式构造 `Target`，校验
+    /// `supports_tx` 后开一条隔离连接并 BEGIN，句柄挂到页签上（页签关闭时
+    /// `TxHandle::Drop` 自动回滚）。不支持事务的引擎直接忽略。
+    /// 打开「查询历史」对话框。
+    fn open_history(&mut self, cx: &mut Context<Self>) {
+        let me = cx.entity().clone();
+        crate::history_dialog::open_history_dialog(me, self.dark, cx);
+    }
+
+    /// 历史记录自增 id。
+    fn next_hist_id(&mut self) -> u64 {
+        self.hist_seq = self.hist_seq.wrapping_add(1);
+        self.hist_seq
+    }
+
+    /// 追加一批历史记录，截断到上限后落盘。
+    fn append_history(&mut self, mut entries: Vec<history::HistoryEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        self.history.append(&mut entries);
+        if self.history.len() > history::MAX_ENTRIES {
+            let drop = self.history.len() - history::MAX_ENTRIES;
+            self.history.drain(0..drop);
+        }
+        history::save(&self.history);
+    }
+
+    /// 清空历史：传 None 清空全部，传 Some(conn) 只删该连接。
+    fn clear_history(&mut self, conn: Option<String>, cx: &mut Context<Self>) {
+        match conn {
+            None => self.history.clear(),
+            Some(c) => self.history.retain(|e| e.conn != c),
+        }
+        history::save(&self.history);
+        cx.notify();
+    }
+
+    fn begin_transaction(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_tab.checked_sub(1) else { return; };
+        // 后台正用这条事务连接跑 SQL：tx 被借走，期间不允许再开事务
+        if self.opened.get(ix).is_some_and(|t| self.tx_busy.contains(&t.rid)) {
+            return;
+        }
+        let t = match self.opened.get(ix) {
+            Some(t) if t.tx.is_none() => t,
+            _ => return,
+        };
+        let conn_name = t.conn_name.clone();
+        let Some(conn) = self.conns.iter().find(|c| c.name == conn_name) else {
+            return;
+        };
+        let schema = tab_schema(conn, t);
+        let Some(target) = backend::Target::of(conn, t.db, schema) else {
+            return;
+        };
+        if !target.supports_tx() {
+            return;
+        }
+        match target.begin_tx() {
+            Ok(h) => {
+                self.opened[ix].tx.set(h);
+                cx.notify();
+            }
+            Err(e) => eprintln!("开始事务失败：{e}"),
+        }
+    }
+
+    /// 「提交」：消费事务句柄并提交（Drop 不再回滚）。
+    fn commit_transaction(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_tab.checked_sub(1) else { return; };
+        if self.opened.get(ix).is_some_and(|t| self.tx_busy.contains(&t.rid)) {
+            return;
+        }
+        if let Some(tx) = self.opened[ix].tx.take() {
+            if let Err(e) = tx.commit() {
+                eprintln!("提交事务失败：{e}");
+            }
+            cx.notify();
+        }
+    }
+
+    /// 「回滚」：消费事务句柄并回滚（Drop 不再回滚）。
+    fn rollback_transaction(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_tab.checked_sub(1) else { return; };
+        if self.opened.get(ix).is_some_and(|t| self.tx_busy.contains(&t.rid)) {
+            return;
+        }
+        if let Some(tx) = self.opened[ix].tx.take() {
+            if let Err(e) = tx.rollback() {
+                eprintln!("回滚事务失败：{e}");
+            }
+            cx.notify();
+        }
     }
 
     /// Ctrl+W：关当前页签。就地编辑态（改格 / 树改名）里不抢键，
@@ -26961,8 +27553,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                         p.total_where = where_now.clone();
                     }
                 } else {
-                    t.data = page.rows.clone();
-                    t.baseline = page.rows;
+                    t.data = page.rows.into_iter().map(std::sync::Arc::new).collect();
+                    t.baseline = t.data.clone();
                     t.cols = page.columns;
                     t.row_keys = page.keys.clone();
                     t.baseline_row_keys = page.keys;
@@ -27542,12 +28134,18 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             };
             if cur.is_some_and(|c| *c != value) {
                 t.push_grid_undo();
-                let row = if in_data {
-                    t.data.get_mut(order[edit.at.0])
-                } else {
-                    t.inserted.get_mut(edit.at.0 - order.len())
-                };
-                if let Some(cell) = row.and_then(|r| r.get_mut(edit.at.1)) {
+                if in_data {
+                    if let Some(arc) = t.data.get_mut(order[edit.at.0]) {
+                        let row = std::sync::Arc::make_mut(arc);
+                        if let Some(cell) = row.get_mut(edit.at.1) {
+                            *cell = value;
+                        }
+                    }
+                } else if let Some(cell) = t
+                    .inserted
+                    .get_mut(edit.at.0 - order.len())
+                    .and_then(|r| r.get_mut(edit.at.1))
+                {
                     *cell = value;
                 }
             }
@@ -27719,12 +28317,18 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             return;
         }
         t.push_grid_undo_snapshot(before);
-        let row = if disp < order.len() {
-            t.data.get_mut(order[disp])
-        } else {
-            t.inserted.get_mut(disp - order.len())
-        };
-        if let Some(cell) = row.and_then(|r| r.get_mut(cix)) {
+        if disp < order.len() {
+            if let Some(arc) = t.data.get_mut(order[disp]) {
+                let row = std::sync::Arc::make_mut(arc);
+                if let Some(cell) = row.get_mut(cix) {
+                    *cell = value;
+                }
+            }
+        } else if let Some(cell) = t
+            .inserted
+            .get_mut(disp - order.len())
+            .and_then(|r| r.get_mut(cix))
+        {
             *cell = value;
         }
         cx.notify();
@@ -28059,17 +28663,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         }
         let paste_w = matrix.iter().map(Vec::len).max().unwrap_or(1);
         let mut changed = false;
-        for (dr, line) in matrix.iter().enumerate() {
-            let r = r0 + dr;
-            if r >= rows {
-                break;
-            }
-            let row = if r < order.len() {
-                t.data.get_mut(order[r])
-            } else {
-                t.inserted.get_mut(r - order.len())
-            };
-            let Some(row) = row else { continue };
+        let mut write_row = |row: &mut Vec<String>, line: &[String]| {
             for (dc, val) in line.iter().enumerate() {
                 let Some(&cix) = disp_cols.get(c0 + dc) else { break };
                 if let Some(cell) = row.get_mut(cix)
@@ -28078,6 +28672,19 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                     *cell = val.clone();
                     changed = true;
                 }
+            }
+        };
+        for (dr, line) in matrix.iter().enumerate() {
+            let r = r0 + dr;
+            if r >= rows {
+                break;
+            }
+            if r < order.len() {
+                if let Some(arc) = t.data.get_mut(order[r]) {
+                    write_row(std::sync::Arc::make_mut(arc), line);
+                }
+            } else if let Some(row) = t.inserted.get_mut(r - order.len()) {
+                write_row(row, line);
             }
         }
         if changed || added {
@@ -28185,6 +28792,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             _ => return,
         };
         let cur = (*sel).min(total - 1);
+        let before = scroll.offset();
         let (next, _) = wheel_apply(
             scroll,
             dy,
@@ -28195,6 +28803,10 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             D_ROW_EXTENT,
             viewport_h,
         );
+        // 滚到页首/页尾后继续滚：格没动、视图也没动，别再整窗重绘
+        if next == *sel && scroll.offset() == before {
+            return;
+        }
         *sel = next;
         cx.notify();
     }
@@ -28249,6 +28861,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             .0
             .saturating_sub(page_start)
             .min(local_rows - 1);
+        let before = scroll.offset();
         let (next, _) = wheel_apply(
             scroll,
             dy,
@@ -28260,7 +28873,15 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             self.viewport_h,
         );
         let t = &mut self.opened[tab_ix];
-        t.cell.0 = page_start + next;
+        let target = page_start + next;
+        if target == t.cell.0
+            && scroll.offset() == before
+            && t.sel.is_none()
+            && self.grid_drag.is_none()
+        {
+            return;
+        }
+        t.cell.0 = target;
         // 同方向键：收掉旧选区 / 拖选，避免复制、右键仍指向旧的那块。
         t.sel = None;
         self.grid_drag = None;
@@ -28292,6 +28913,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             return;
         };
         let cur = out.cell.0.min(row_count - 1);
+        let before = scroll.offset();
         let (next, _) = wheel_apply(
             scroll,
             dy,
@@ -28302,6 +28924,9 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             Q_ROW_H,
             viewport_h,
         );
+        if next == out.cell.0 && scroll.offset() == before {
+            return;
+        }
         out.cell.0 = next;
         cx.notify();
     }
@@ -28805,7 +29430,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         }
         if let Some(t) = self.opened.get_mut(ix) {
             if !t.inserted.is_empty() {
-                t.data.extend(t.inserted.drain(..));
+                t.data
+                    .extend(t.inserted.drain(..).map(std::sync::Arc::new));
             }
             t.baseline = t.data.clone();
             t.undo.clear();
@@ -28904,8 +29530,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         c0 = c0.min(c1);
         // 整块原本就是空的：不动数据，也不留一步空撤销
         let any_filled = (r0..=r1).any(|r| {
-            let row = if r < order.len() {
-                t.data.get(order[r])
+            let row: Option<&Vec<String>> = if r < order.len() {
+                t.data.get(order[r]).map(|r| r.as_ref())
             } else {
                 t.inserted.get(r - order.len())
             };
@@ -28920,12 +29546,12 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         }
         t.push_grid_undo();
         for r in r0..=r1 {
-            let row = if r < order.len() {
-                t.data.get_mut(order[r])
+            let target: Option<&mut Vec<String>> = if r < order.len() {
+                t.data.get_mut(order[r]).map(std::sync::Arc::make_mut)
             } else {
                 t.inserted.get_mut(r - order.len())
             };
-            let Some(row) = row else { continue };
+            let Some(row) = target else { continue };
             for &cix in &disp_cols[c0..=c1] {
                 if let Some(cell) = row.get_mut(cix) {
                     cell.clear();
@@ -29913,6 +30539,9 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         if let Some((y0, h0)) = self.pane_drag {
             let nh = (h0 + (y - y0)).clamp(150., 640.);
             if let Some(t) = self.active_data_tab_mut() {
+                if (t.filter.pane_h - nh).abs() < f32::EPSILON {
+                    return;
+                }
                 t.filter.pane_h = nh;
             }
             cx.notify();
@@ -31117,8 +31746,8 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let col_ixs = &disp_cols[c0..=c1];
         let mut rows = Vec::with_capacity(r1 - r0 + 1);
         for r in r0..=r1 {
-            let src = if r < order.len() {
-                t.data.get(order[r])
+            let src: Option<&Vec<String>> = if r < order.len() {
+                t.data.get(order[r]).map(|r| r.as_ref())
             } else {
                 t.inserted.get(r - order.len())
             };
@@ -31610,9 +32239,9 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         let stmts = vec![sql];
         cx.spawn(async move |_, cx| {
             let worker_job = job;
-            let run = cx
+            let (run, _) = cx
                 .background_executor()
-                .spawn(async move { target.run_script(&worker_job, &stmts, true) })
+                .spawn(async move { target.run_script(&worker_job, &stmts, true, None) })
                 .await;
             let _ = win.update(cx, |_, _, app| {
                 let Some(entity) = entity.upgrade() else { return };
@@ -32112,6 +32741,10 @@ impl Render for DaroApp {
         // 右键菜单里确认过的表操作也在这一帧尾投出去（同一个时机、同一套回执）
         cx.defer_in(window, |this, window, cx| {
             this.pump_table_ops(window, cx)
+        });
+        // 删库 / 删模式确认后的任务同样帧尾投递（确认回调侧拿不到 cx）
+        cx.defer_in(window, |this, _window, cx| {
+            this.pump_drop_jobs(cx)
         });
         // 粘贴表批次同样在帧尾起后台任务
         cx.defer_in(window, |this, window, cx| {
@@ -35234,22 +35867,21 @@ impl DaroApp {
                         .rounded(px(2.))
                         .cursor_pointer()
                         .hover(|s| s.bg(to_hsla(0x4a4a4a)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             let name = format!("cell.{ext}");
-                            let Some(path) = rfd::FileDialog::new()
-                                .set_file_name(&name)
-                                .save_file()
-                            else {
-                                return;
-                            };
-                            if let Err(err) = std::fs::write(&path, &bytes) {
-                                prompt_dialog::open_notice(
-                                    this.dark,
-                                    "下载失败",
-                                    format!("无法写入 {}：{err}", path.display()),
-                                    cx,
-                                );
-                            }
+                            let bytes = bytes.clone();
+                            let dialog =
+                                rfd::AsyncFileDialog::new().set_file_name(&name);
+                            ui::save_file(window, dialog, cx, move |this, _window, cx, path| {
+                                if let Err(err) = std::fs::write(&path, &bytes) {
+                                    prompt_dialog::open_notice(
+                                        this.dark,
+                                        "下载失败",
+                                        format!("无法写入 {}：{err}", path.display()),
+                                        cx,
+                                    );
+                                }
+                            });
                         }))
                         .child(art::icon(
                             art::Glyph::Asset("TB_Save_To_Disk"),
@@ -35530,7 +36162,23 @@ impl DaroApp {
                     })),
             )
             .child(tsep())
-            .child(tbtn("txn", art::Glyph::Txn, "开始事务", false))
+            .when(t.tx.is_none() && !self.tx_busy.contains(&t.rid), |s| {
+                s.child(
+                    tbtn("txn", art::Glyph::Txn, "开始事务", true)
+                        .on_click(cx.listener(|this, _, _, cx| this.begin_transaction(cx))),
+                )
+            })
+            .when(t.tx.is_some() || self.tx_busy.contains(&t.rid), |s| {
+                let busy = self.tx_busy.contains(&t.rid);
+                s.child(
+                    tbtn("commit", art::Glyph::Txn, "提交", !busy)
+                        .on_click(cx.listener(|this, _, _, cx| this.commit_transaction(cx))),
+                )
+                .child(
+                    tbtn("rollback", art::Glyph::Txn, "回滚", !busy)
+                        .on_click(cx.listener(|this, _, _, cx| this.rollback_transaction(cx))),
+                )
+            })
             .child(tsep())
             .child(
                 tbtn("edit", art::Glyph::CellEdit, "单元格编辑器", true)
@@ -35539,9 +36187,15 @@ impl DaroApp {
             )
             .child(tsep())
             .child(self.filter_bar_btn(t, cx))
-            .child(tbtn("cols", art::Glyph::Columns, "列", false))
+            .child(
+                tbtn("cols", art::Glyph::Columns, "列", true)
+                    .on_click(cx.listener(|this, _, _, cx| this.open_column_manager(cx))),
+            )
             .child(tsep())
-            .child(tbtn("hist", art::Glyph::History, "历史", false))
+            .child(
+            tbtn("hist", art::Glyph::History, "历史", true)
+                .on_click(cx.listener(|this, _, _, cx| this.open_history(cx))),
+        )
             .child(
                 tbtn_ent("ai-fill", art::Glyph::AiTable, "AI 自动填充")
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -44300,6 +44954,26 @@ struct TableOpJob {
     table: String,
 }
 
+/// 库 / 模式节点菜单确认下来的一条删库 / 删模式任务：菜单回调侧只有
+/// `&mut DaroApp`，先把坐标排进 [DaroApp::drop_jobs]，帧尾统一投后台。
+#[derive(Clone, Debug)]
+enum DropJob {
+    /// 删库：连接下标 + 库名。
+    Db { c: usize, db: String },
+    /// 删模式：连接下标 + 库名 + 模式名。
+    Schema { c: usize, db: String, schema: String },
+}
+
+impl DropJob {
+    /// 在目标上执行对应的 DDL。
+    fn run_on(&self, t: &backend::Target) -> Result<(), String> {
+        match self {
+            DropJob::Db { db, .. } => t.drop_database(db),
+            DropJob::Schema { schema, .. } => t.drop_schema(schema),
+        }
+    }
+}
+
 /// 对象菜单里的 DDL 项（删除 / 清空 / 截断 / 重命名）。真连接才给点，
 /// 演示连接与没接驱动的引擎保持置灰；视图上没有清空 / 截断，也置灰。
 /// 文案按对象类型出：同一条目在表菜单是「删除表」，在视图菜单是「删除视图」。
@@ -45385,7 +46059,7 @@ fn favorites_bar_menu(
 }
 
 /// 顶栏「工具」菜单，照参考界面截图逐行：数据传输 / 数据生成 / 数据脱敏 /
-/// 数据字典 / 数据同步 / 结构同步 / 命令列界面（灰）/ 服务器监控（子菜单）/
+/// 数据字典 / 数据同步 / 结构同步 / 命令列界面（已接线）/ 服务器监控（子菜单）/
 /// 在数据库或模式中查找 ─ 历史日志 ─ 选项。
 ///
 /// 除「选项」外这些功能 daro 一件都没有实现，除子菜单留占位外全部保持死标签；
@@ -45411,7 +46085,14 @@ fn tools_bar_menu(
                 let _ = structure_compare::open_structure_compare(me_struct.clone(), dark, cx);
             }),
         )
-        .item(PopupMenuItem::new("命令列界面...").disabled(true))
+        .item(
+            PopupMenuItem::new("命令列界面...").on_click({
+                let target = me.clone();
+                move |_, _, cx| {
+                    target.update(cx, |a, cx| a.open_cli(None, cx));
+                }
+            }),
+        )
         .submenu("服务器监控", window, cx, |sub, _, _| {
             sub.label("（子菜单内容待截图核对）")
         })
@@ -45517,7 +46198,6 @@ fn help_bar_menu(
     _window: &mut Window,
     _cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
-    let me_about = me.clone();
     let me_update = me.clone();
     menu
         .item(
@@ -45533,7 +46213,7 @@ fn help_bar_menu(
         )
         .separator()
         .item(PopupMenuItem::new("关于...").on_click(move |_, _, cx| {
-            about_dialog::open_daro_about(me_about.clone(), dark, cx);
+            about_dialog::open_daro_about(dark, cx);
         }))
 }
 
@@ -46100,6 +46780,114 @@ fn ent_item(me: &Entity<DaroApp>, label: impl Into<SharedString>) -> PopupMenuIt
     })
 }
 
+/// 为某连接构造本地 CLI 客户端启动命令；无标准 CLI 的引擎（Access）返回 None，
+/// 由 [spawn_db_terminal] 另行处理（直接打开库文件）。
+fn db_cli_command(conn: &mock::Connection) -> Option<String> {
+    use mock::DbKind::*;
+    let host = if conn.host.is_empty() { "127.0.0.1" } else { conn.host.as_str() };
+    let port = if conn.port == 0 { conn.kind.default_port() } else { conn.port };
+    let db = conn.database.trim();
+    match conn.kind {
+        SQLite => {
+            if db.is_empty() {
+                return None;
+            }
+            Some(format!("sqlite3 \"{db}\""))
+        }
+        MySql => {
+            let mut s = format!("mysql -h {host} -P {port}");
+            if !conn.user.is_empty() {
+                s.push_str(&format!(" -u {}", conn.user));
+            }
+            s.push_str(" -p"); // 交互提示输密码，密码不落命令行
+            if !db.is_empty() {
+                s.push_str(&format!(" {db}"));
+            }
+            Some(s)
+        }
+        PostgreSql => {
+            let mut s = format!("psql -h {host} -p {port}");
+            if !conn.user.is_empty() {
+                s.push_str(&format!(" -U {}", conn.user));
+            }
+            if !db.is_empty() {
+                s.push_str(&format!(" -d {db}"));
+            }
+            Some(s)
+        }
+        SqlServer => {
+            let mut s = format!("sqlcmd -S {host},{port}");
+            if !conn.user.is_empty() {
+                s.push_str(&format!(" -U {}", conn.user));
+            }
+            if !db.is_empty() {
+                s.push_str(&format!(" -d {db}"));
+            }
+            Some(s)
+        }
+        MongoDb => {
+            let mut s = format!("mongosh --host {host} --port {port}");
+            if !conn.user.is_empty() {
+                s.push_str(&format!(" -u {}", conn.user));
+            }
+            if !db.is_empty() {
+                s.push_str(&format!(" {db}"));
+            }
+            Some(s)
+        }
+        Redis => {
+            let mut s = format!("redis-cli -h {host} -p {port}");
+            if !conn.password.is_empty() {
+                s.push_str(&format!(" -a {}", conn.password));
+            }
+            Some(s)
+        }
+        Access => None,
+    }
+}
+
+/// 「命令列界面…」的落地：按平台拉起系统终端并执行 [db_cli_command] 给出的命令；
+/// Access 没有标准 CLI，直接用系统默认程序打开 `.accdb`。拉起失败仅打印日志，
+/// 不弹窗（避免打断操作）。
+fn spawn_db_terminal(conn: &mock::Connection) {
+    if conn.kind == mock::DbKind::Access {
+        if let Err(e) = ::open::that(&conn.database) {
+            eprintln!("[open_cli] 打开 Access 库文件失败：{e}");
+        }
+        return;
+    }
+    let Some(cmd) = db_cli_command(conn) else {
+        eprintln!("[open_cli] 该引擎没有标准命令行客户端：{:?}", conn.kind);
+        return;
+    };
+    let res = match std::env::consts::OS {
+        "windows" => std::process::Command::new("cmd").arg("/K").arg(&cmd).spawn(),
+        "macos" => {
+            let script = format!(
+                "tell application \"Terminal\" to do script \"{}\"",
+                cmd.replace('"', "\\\"")
+            );
+            std::process::Command::new("osascript").args(["-e", &script]).spawn()
+        }
+        _ => {
+            let inner = format!("{cmd}; exec bash");
+            if std::process::Command::new("x-terminal-emulator")
+                .args(["-e", &inner])
+                .spawn()
+                .is_ok()
+            {
+                return;
+            }
+            std::process::Command::new("gnome-terminal")
+                .args(["--", "bash", "-c", &inner])
+                .spawn()
+        }
+    };
+    if let Err(e) = res {
+        eprintln!("[open_cli] 拉起终端失败：{e}（命令：{cmd}）");
+    }
+}
+
 /// 「刷新」：失效目录缓存并立即重查已打开的连接。真驱动下库内容可能被
 /// 外部改动，树只看缓存，不重查看不见；重查失败要弹窗，否则空树像空库。
 fn refresh_item(me: Entity<DaroApp>) -> PopupMenuItem {
@@ -46235,6 +47023,14 @@ fn db_menu(
             matches!(app.conns[c].kind, mock::DbKind::Redis),
         )
     };
+    // 「删除数据库」要把库名带进确认框，目录此刻已加载，取一次即可。
+    let db_name: Option<&'static str> = {
+        let app = me.read(cx);
+        app.conns
+            .get(c)
+            .and_then(|conn| catalog::databases(conn).get(d))
+            .copied()
+    };
     let mut menu = menu;
     let target = me.clone();
     if is_redis {
@@ -46264,9 +47060,55 @@ fn db_menu(
     menu = menu.separator();
     menu = menu
         .item(todo_item("编辑数据库..."))
-        .item(todo_item("新建数据库..."))
-        .item(todo_item("删除数据库"));
-    menu = menu.separator().item(todo_item("管理扩展..."));
+        .item(mi("新建数据库...").on_click({
+            let target = me.clone();
+            let c = c;
+            move |_, _, cx| {
+                let dark = target.read(cx).dark;
+                open_text_prompt(
+                    target.clone(),
+                    dark,
+                    "新建数据库",
+                    "数据库名称",
+                    String::new(),
+                    move |app, cx, name| app.create_database_action(c, name, cx),
+                    cx,
+                );
+            }
+        }))
+        .item(mi("删除数据库")
+            // 目录陈旧拿不到库名时置灰，不装「点了没反应」的假入口
+            .disabled(db_name.is_none())
+            .on_click({
+            let target = me.clone();
+            let c = c;
+            move |_, _, cx| {
+                let Some(db) = db_name else { return };
+                let dark = target.read(cx).dark;
+                open_confirm(
+                    target.clone(),
+                    dark,
+                    "删除数据库",
+                    format!(
+                        "确认删除数据库「{db}」吗？\n该操作不可恢复：库下所有对象与数据将一并删除，\n其他客户端的连接会被强制断开。"
+                    ),
+                    move |app| app.queue_db_drop(c, db.to_string()),
+                    cx,
+                );
+            }
+        }));
+    // 数据库扩展仅 PostgreSQL 有概念：其他引擎置灰，不装「点了没反应」的样子
+    menu = menu
+        .separator()
+        .item(mi("管理扩展...")
+            .disabled(!is_pg)
+            .on_click({
+                let target = me.clone();
+                let c = c;
+                move |_, _, cx| {
+                    target.update(cx, |app, cx| app.open_db_extensions(c, d, cx));
+                }
+            }));
     menu = menu.separator();
     // 实测：库没打开时「新建模式」是灰的
     menu = menu.item(mi("新建模式...").disabled(!opened));
@@ -46275,11 +47117,39 @@ fn db_menu(
         target.update(cx, |a, cx| a.open_query_tab(Some(c), window, cx));
     }));
     menu = menu.separator();
-    // 对话框还选不了库（目标由调用方定死），库层点它就只能猜一个库去跑语句，
-    // 所以这里继续置灰；分类 / 面板空白那层目标是看得见的库，已经接线。
     menu = menu
-        .item(todo_item("命令列界面..."))
-        .item(todo_item("运行 SQL 文件..."));
+        .item(mi("命令列界面...").on_click({
+            let target = me.clone();
+            move |_, _, cx| {
+                target.update(cx, |a, cx| a.open_cli(Some(c), cx));
+            }
+        }))
+        .item(mi("运行 SQL 文件...").on_click({
+            let target = me.clone();
+            move |_, _, cx| {
+                target.update(cx, |a, cx| a.run_sql_file_here(c, d, 0, cx));
+            }
+        }));
+    // 库级转储：MySQL / SQLite 一个库就是对象全集；PG / SQL Server 按库下
+    // 全部用户模式逐个出。演示 / NoSQL / 只读 Access 置灰。
+    let dump_ok = me.read(cx).conns.get(c).is_some_and(sql_dump_ready);
+    let me_data = me.clone();
+    let me_struct = me.clone();
+    menu = menu.submenu("转储 SQL 文件", window, cx, move |sub, _, _| {
+        if !dump_ok {
+            return sub
+                .item(todo_item("结构和数据..."))
+                .item(todo_item("仅结构..."));
+        }
+        let me_data = me_data.clone();
+        let me_struct = me_struct.clone();
+        sub.item(mi("结构和数据...").on_click(move |_, _, cx| {
+            me_data.update(cx, |app, cx| app.open_sql_dump_db(c, d, true, cx));
+        }))
+        .item(mi("仅结构...").on_click(move |_, _, cx| {
+            me_struct.update(cx, |app, cx| app.open_sql_dump_db(c, d, false, cx));
+        }))
+    });
     menu = if is_pg {
         // PG 实测：允许（库已允许连接所以是灰的）/ 不允许 / 分析数据库 /
         // 真空数据库▸（六个变体）/ 重建数据库索引。都是真实写库动作，
@@ -46322,6 +47192,24 @@ fn schema_menu(
 ) -> PopupMenu {
     let mut menu = menu;
     let target = me.clone();
+    // 「删除模式」要把库 / 模式名带进确认框与后台任务；引擎没有独立模式层时
+    // 该项置灰（MySQL 库下直接是表）。
+    let (db_name, schema_name, schema_ok) = {
+        let app = me.read(cx);
+        let conn = app.conns.get(c);
+        let db = conn
+            .and_then(|conn| catalog::databases(conn).get(d))
+            .copied();
+        let schema = conn
+            .zip(db)
+            .and_then(|(conn, db)| catalog::schemas(conn, db).get(s))
+            .copied();
+        (
+            db,
+            schema,
+            conn.is_some_and(|conn| catalog::has_schemas(conn.kind)),
+        )
+    };
     menu = menu.item(
         mi("打开模式").on_click(move |_, _, cx| {
             target.update(cx, |app, cx| {
@@ -46335,21 +47223,69 @@ fn schema_menu(
     menu = menu
         .item(todo_item("编辑模式..."))
         .item(todo_item("新建模式..."))
-        // 实测：public 的「删除模式」是灰的（系统模式不可删）
-        .item(mi("删除模式").disabled(true));
+        // 实测：public 的「删除模式」是灰的（系统模式不可删）；无模式层引擎同灰
+        .item(mi("删除模式")
+            .disabled(
+                !schema_ok
+                    || schema_name.is_none()
+                    || backend::Target::is_system_schema(schema_name.unwrap_or("")),
+            )
+            .on_click({
+                let target = me.clone();
+                let c = c;
+                move |_, _, cx| {
+                    let (Some(db), Some(schema)) = (db_name, schema_name) else { return };
+                    let dark = target.read(cx).dark;
+                    open_confirm(
+                        target.clone(),
+                        dark,
+                        "删除模式",
+                        format!(
+                            "确认删除模式「{schema}」吗？\n该操作不可恢复：模式下的所有对象（表、视图、函数等）将一并删除。"
+                        ),
+                        move |app| app.queue_schema_drop(c, db.to_string(), schema.to_string()),
+                        cx,
+                    );
+                }
+            }));
     menu = menu.separator();
     let target = me.clone();
     menu = menu.item(mi("新建查询").on_click(move |_, window, cx| {
         target.update(cx, |a, cx| a.open_query_tab(Some(c), window, cx));
     }));
     menu = menu.separator();
-    // 实测：模式层的「运行 SQL 文件...」本身就是灰的
     menu = menu
-        .item(todo_item("命令列界面..."))
-        .item(todo_item("运行 SQL 文件..."));
-    menu = menu.submenu("转储 SQL 文件", window, cx, |sub, _, _| {
-        sub.item(todo_item("结构和数据..."))
-            .item(todo_item("仅结构..."))
+        .item(mi("命令列界面...").on_click({
+            let target = me.clone();
+            move |_, _, cx| {
+                target.update(cx, |a, cx| a.open_cli(Some(c), cx));
+            }
+        }))
+        .item(mi("运行 SQL 文件...").on_click({
+            let target = me.clone();
+            move |_, _, cx| {
+                target.update(cx, |a, cx| a.run_sql_file_here(c, d, s, cx));
+            }
+        }));
+    let dump_ok = me.read(cx).conns.get(c).is_some_and(sql_dump_ready);
+    let me_data = me.clone();
+    let me_struct = me.clone();
+    menu = menu.submenu("转储 SQL 文件", window, cx, move |sub, _, _| {
+        if !dump_ok {
+            return sub
+                .item(todo_item("结构和数据..."))
+                .item(todo_item("仅结构..."));
+        }
+        let me_data = me_data.clone();
+        let me_struct = me_struct.clone();
+        sub.item(mi("结构和数据...").on_click(move |_, _, cx| {
+            me_data.update(cx, |app, cx| app.open_sql_dump_schema(c, d, s, true, cx));
+        }))
+        .item(mi("仅结构...").on_click(move |_, _, cx| {
+            me_struct.update(cx, |app, cx| {
+                app.open_sql_dump_schema(c, d, s, false, cx)
+            });
+        }))
     });
     menu = menu.item(ent_item(&me, "数据字典..."));
     menu = menu.separator().item(todo_item("共享..."));
@@ -46656,9 +47592,23 @@ fn obj_menu(
             .item(ent_item(&me, "数据生成..."))
             .item(ent_item(&me, "数据脱敏..."));
         menu = menu.separator();
-        menu = menu.submenu("转储 SQL 文件", window, cx, |sub, _, _| {
-            sub.item(todo_item("结构和数据..."))
-                .item(todo_item("仅结构..."))
+        let dump_ok = me.read(cx).conns.get(c).is_some_and(sql_dump_ready);
+        let me_data = me.clone();
+        let me_struct = me.clone();
+        menu = menu.submenu("转储 SQL 文件", window, cx, move |sub, _, _| {
+            if !dump_ok {
+                return sub
+                    .item(todo_item("结构和数据..."))
+                    .item(todo_item("仅结构..."));
+            }
+            let me_data = me_data.clone();
+            let me_struct = me_struct.clone();
+            sub.item(mi("结构和数据...").on_click(move |_, _, cx| {
+                me_data.update(cx, |app, cx| app.open_sql_dump_for(act, true, cx));
+            }))
+            .item(mi("仅结构...").on_click(move |_, _, cx| {
+                me_struct.update(cx, |app, cx| app.open_sql_dump_for(act, false, cx));
+            }))
         });
         menu = menu.submenu("维护", window, cx, |sub, window, cx| {
             sub.item(todo_item("分析表..."))
@@ -46805,8 +47755,8 @@ fn obj_menu(
 }
 
 /// 连接节点右键菜单，条目与分组顺序照参考界面实测结果。
-/// 还没做的功能（新建库 / 命令列 / 运行 SQL 文件 / 共享）先置灰，
-/// 不留「点了没反应」的假入口。
+/// 未实现的功能（新建库 / 共享）仍置灰，不留「点了没反应」的假入口；
+/// 「命令列界面」「运行 SQL 文件」已接线（后者取首个库，对话框会显示目标让用户确认）。
 fn conn_menu(
     me: Entity<DaroApp>,
     ix: usize,
@@ -46913,16 +47863,42 @@ fn conn_menu_body(
         menu = menu.separator();
 
         menu = menu
-            .item(PopupMenuItem::new("新建数据库...").disabled(true))
+            .item(PopupMenuItem::new("新建数据库...").on_click({
+                let target = me.clone();
+                let ix2 = ix;
+                move |_, _, cx| {
+                    open_text_prompt(
+                        target.clone(),
+                        dark,
+                        "新建数据库",
+                        "数据库名称",
+                        String::new(),
+                        move |app, cx, name| app.create_database_action(ix2, name, cx),
+                        cx,
+                    );
+                }
+            }))
             .item(PopupMenuItem::new("新建查询").on_click({
                 let target = me.clone();
                 move |_, window, cx| {
                     target.update(cx, |a, cx| a.open_query_tab(Some(ix), window, cx));
                 }
             }))
-            .item(PopupMenuItem::new("命令列界面...").disabled(true))
-            // 运行 SQL 文件的对话框选不了库，连接层点它没有确定目标 → 继续置灰
-            .item(PopupMenuItem::new("运行 SQL 文件...").disabled(true));
+            .item(
+                PopupMenuItem::new("命令列界面...").on_click({
+                    let target = me.clone();
+                    move |_, _, cx| {
+                        target.update(cx, |a, cx| a.open_cli(Some(ix), cx));
+                    }
+                }),
+            )
+            // 连接层没有确定库：取首个库，对话框会显示「连接 / 库」目标让用户确认后再执行。
+            .item(PopupMenuItem::new("运行 SQL 文件...").on_click({
+                let target = me.clone();
+                move |_, _, cx| {
+                    target.update(cx, |a, cx| a.run_sql_file_here(ix, 0, 0, cx));
+                }
+            }));
 
         menu = menu.separator();
 
@@ -52250,11 +53226,13 @@ mod designer_tests {
         assert_eq!(compare_cells("b", "a", false), Ordering::Greater);
 
         // 无排序：恒等映射
-        let data: Vec<Vec<String>> = (0..5)
+        let data: Vec<db_types::Row> = (0..5)
             .map(|r| {
-                (0..mock::MOCK_COLUMNS.len())
-                    .map(|c| mock::mock_cell("orders", r, c).to_string())
-                    .collect()
+                std::sync::Arc::new(
+                    (0..mock::MOCK_COLUMNS.len())
+                        .map(|c| mock::mock_cell("orders", r, c).to_string())
+                        .collect(),
+                )
             })
             .collect();
         let cols: Vec<db_types::ColMeta> = mock::MOCK_COLUMNS
@@ -52265,11 +53243,13 @@ mod designer_tests {
 
         // flags 列（值 = 行号 % 3）升序：0/1/2 三组，组内保持原行序（稳定）
         let rows = mock::mock_row_count("orders");
-        let data: Vec<Vec<String>> = (0..rows)
+        let data: Vec<db_types::Row> = (0..rows)
             .map(|r| {
-                (0..mock::MOCK_COLUMNS.len())
-                    .map(|c| mock::mock_cell("orders", r, c).to_string())
-                    .collect()
+                std::sync::Arc::new(
+                    (0..mock::MOCK_COLUMNS.len())
+                        .map(|c| mock::mock_cell("orders", r, c).to_string())
+                        .collect(),
+                )
             })
             .collect();
         let flag = |row: &Vec<String>| row[6].parse::<i64>().unwrap();
@@ -53342,7 +54322,7 @@ mod designer_tests {
             app.update(cx, |a, _| {
                 let t = a.opened.first_mut().unwrap();
                 assert!(!t.design && !t.query, "前置：数据页签");
-                t.data[0][1] = "dirty".into();
+                std::sync::Arc::make_mut(&mut t.data[0])[1] = "dirty".into();
                 t.inserted.push(vec![String::new(); t.data[0].len()]);
                 assert!(t.dirty());
             });
@@ -53549,7 +54529,7 @@ mod designer_tests {
 
         // 改单元格 → ✓ 写回真库
         app.update(cx, |a, cx| {
-            a.opened[0].data[0][1] = "阿离改".into();
+            std::sync::Arc::make_mut(&mut a.opened[0].data[0])[1] = "阿离改".into();
             a.grid_apply(cx);
         });
         settle(cx, handle);
@@ -53902,7 +54882,7 @@ mod designer_tests {
 
         // 改一行 → ✓：UPDATE 按主键定位，成功后重新取数
         app.update(cx, |a, cx| {
-            a.opened[0].data[0][1] = "阿离改".into();
+            std::sync::Arc::make_mut(&mut a.opened[0].data[0])[1] = "阿离改".into();
             a.grid_apply(cx);
         });
         settle(cx, handle);
@@ -53997,7 +54977,7 @@ mod designer_tests {
             let ix = a.opened.len() - 1;
             a.active_tab = ix + 1;
             assert!(a.opened[ix].row_keys.iter().all(|k| k.is_empty()), "无主键表没有行标识");
-            a.opened[ix].data[0][0] = "改不动".into();
+            std::sync::Arc::make_mut(&mut a.opened[ix].data[0])[0] = "改不动".into();
             a.grid_apply(cx);
             assert_eq!(a.opened[ix].data[0][0], "改不动", "写回被拦下，工作集保持原样");
         });
@@ -54292,7 +55272,7 @@ mod designer_tests {
         });
 
         // 脏页拦住翻页（改了会被下一次取数覆盖）
-        app.update(cx, |a, _| a.opened[0].data[0][1] = "脏".into());
+        app.update(cx, |a, _| std::sync::Arc::make_mut(&mut a.opened[0].data[0])[1] = "脏".into());
         app.update(cx, |a, cx| a.grid_page_to(0, cx));
         app.update(cx, |a, cx| {
             assert_eq!(
@@ -54630,7 +55610,7 @@ mod designer_tests {
     }
 
     /// 顶栏「工具」菜单照参考界面截图逐行：数据传输 / 数据生成 / 数据脱敏 / 数据字典 /
-    /// 数据同步 / 结构同步 / 命令列界面（灰）/ 服务器监控 / 在数据库或模式中查找 ─
+    /// 数据同步 / 结构同步 / 命令列界面（已接线）/ 服务器监控 / 在数据库或模式中查找 ─
     /// 历史日志 ─ 选项。除「选项...」外这些功能 daro 一件都没实现，除子菜单留占位外
     /// 全是死标签；截图上的 F6 / Ctrl+L / Ctrl+, 不搬进来（没有对应绑定，写了就是假提示）。
     #[gpui_kit::test]
@@ -54674,12 +55654,23 @@ mod designer_tests {
                     "工具菜单不该有「{absent}」"
                 );
             }
-            // 第 6 行「命令列界面...」截图里是灰的，置灰行不挂点击处理器
+            // 第 6 行「命令列界面...」现已接线：点击拉起系统终端（OS 进程，不增加
+            // gpui 窗口），故窗口数不变；Access 则打开库文件，同样不弹 gpui 窗。
             window.within("popup-menu").click(6usize, cx);
             window.render_frame(cx);
         })
         .unwrap();
         assert_eq!(cx.windows().len(), base, "灰项点下去不该弹东西");
+
+        // 点条目会让菜单收起，子菜单那步得重新把「工具」菜单拉起来
+        cx.update_window(handle, |_, window, cx| {
+            window.click("title-menu", cx);
+            window.render_frame(cx);
+            window.click("工具", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
 
         // 服务器监控是顶层第 7 行（0 基含分隔线）：下标对得上截图顺序，子菜单留占位
         cx.update_window(handle, |_, window, cx| {
@@ -61020,8 +62011,12 @@ mod grid_virtualization_tests {
             app.update(cx, |a, cx| {
                 a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx);
                 let n = a.opened[0].cols.len();
-                let rows: Vec<Vec<String>> = (0..REMOTE_PAGE_SIZE)
-                    .map(|r| (0..n).map(|c| format!("r{r}c{c}")).collect())
+                let rows: Vec<db_types::Row> = (0..REMOTE_PAGE_SIZE)
+                    .map(|r| {
+                        std::sync::Arc::new(
+                            (0..n).map(|c| format!("r{r}c{c}")).collect(),
+                        )
+                    })
                     .collect();
                 let t = &mut a.opened[0];
                 t.page = Some(RemotePage {
@@ -61069,8 +62064,12 @@ mod grid_virtualization_tests {
             app.update(cx, |a, cx| {
                 a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx);
                 let n = a.opened[0].cols.len();
-                let rows: Vec<Vec<String>> = (0..100)
-                    .map(|r| (0..n).map(|c| format!("r{r}c{c}")).collect())
+                let rows: Vec<db_types::Row> = (0..100)
+                    .map(|r| {
+                        std::sync::Arc::new(
+                            (0..n).map(|c| format!("r{r}c{c}")).collect(),
+                        )
+                    })
                     .collect();
                 a.opened[0].data = rows.clone();
                 a.opened[0].baseline = rows;
@@ -62767,7 +63766,11 @@ mod grid_hscroll_tests {
                 })
                 .collect();
             t.data = (0..4)
-                .map(|r| (0..16).map(|c| format!("r{r}c{c}")).collect())
+                .map(|r| {
+                    std::sync::Arc::new(
+                        (0..16).map(|c| format!("r{r}c{c}")).collect(),
+                    )
+                })
                 .collect();
             t.baseline = t.data.clone();
             t.col_order.clear();

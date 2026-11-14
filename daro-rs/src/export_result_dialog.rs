@@ -206,19 +206,18 @@ impl ExportResultDialog {
     }
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = rfd::FileDialog::new()
+        let dialog = rfd::AsyncFileDialog::new()
             .set_title("导出向导")
             .set_file_name(format!("{}.{}", safe_label(&self.label), self.format.ext()))
-            .add_filter(wizard_label(self.format), &[self.format.ext()])
-            .save_file();
-        if let Some(path) = picked {
+            .add_filter(wizard_label(self.format), &[self.format.ext()]);
+        ui::save_file(window, dialog, cx, |this, window, cx, path| {
             let text = path.display().to_string();
-            self.path
+            this.path
                 .update(cx, |state, cx| state.set_value(text, window, cx));
-            self.auto_path = false;
-            self.error = None;
+            this.auto_path = false;
+            this.error = None;
             cx.notify();
-        }
+        });
     }
 
     /// 生成本次要写出的文本；SQL 脚本走 INSERT，其余交给 export_format。

@@ -62,6 +62,7 @@ impl DaroApp {
             head_hover: None,
             head_menu: None,
             notes: Some(notes),
+            tx: crate::TxSlot(None),
             data: Vec::new(),
             baseline: Vec::new(),
             cols: Vec::new(),

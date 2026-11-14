@@ -387,7 +387,7 @@ fn deploy_script_text(kind: DbKind, result: &CompareResult, checked: &HashSet<us
 /// `ALTER TABLE … ADD …`，独立的 `ADD CONSTRAINT` 原样搬走，连带它们的
 /// `COMMENT ON CONSTRAINT`。SQLite 不支持事后加约束，建表也不校验引用对象，
 /// 原样返回。
-fn defer_fk_constraints(kind: DbKind, script: &str) -> (String, Vec<String>) {
+pub(crate) fn defer_fk_constraints(kind: DbKind, script: &str) -> (String, Vec<String>) {
     if kind == DbKind::SQLite {
         return (script.to_string(), Vec::new());
     }
@@ -1235,11 +1235,11 @@ impl StructureCompare {
         cx.notify();
         let total = stmts.len();
         cx.spawn(async move |this, cx| {
-            let run = cx
+            let (run, _) = cx
                 .background_executor()
                 .spawn(async move {
                     let job = tg.create_job();
-                    tg.run_script(&job, &stmts, false)
+                    tg.run_script(&job, &stmts, false, None)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| this.deploy_done(run, total, cx));
@@ -1294,18 +1294,10 @@ impl StructureCompare {
         cx.notify();
     }
 
-    fn save_profile(&mut self, cx: &mut Context<Self>) {
+    fn save_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((src, dst)) = self.side_specs() else {
             self.error = Some("先把源和目标选好再保存配置文件".into());
             cx.notify();
-            return;
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("保存结构同步配置")
-            .add_filter("结构同步配置", &["json"])
-            .set_file_name("结构同步.json")
-            .save_file()
-        else {
             return;
         };
         let data = ProfileFile {
@@ -1326,69 +1318,73 @@ impl StructureCompare {
             funcs: self.opts.funcs,
             procs: self.opts.procs,
         };
-        let written = serde_json::to_string_pretty(&data)
-            .map_err(|e| e.to_string())
-            .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
-        match written {
-            Ok(()) => {
-                self.error = None;
-                self.notice = Some(format!("配置已保存：{}", path.display()));
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title("保存结构同步配置")
+            .add_filter("结构同步配置", &["json"])
+            .set_file_name("结构同步.json");
+        ui::save_file(window, dialog, cx, move |this, _window, cx, path| {
+            let written = serde_json::to_string_pretty(&data)
+                .map_err(|e| e.to_string())
+                .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+            match written {
+                Ok(()) => {
+                    this.error = None;
+                    this.notice = Some(format!("配置已保存：{}", path.display()));
+                }
+                Err(e) => this.error = Some(format!("保存配置文件失败：{e}")),
             }
-            Err(e) => self.error = Some(format!("保存配置文件失败：{e}")),
-        }
-        cx.notify();
+            cx.notify();
+        });
     }
 
-    fn load_profile(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = rfd::FileDialog::new()
+    fn load_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = rfd::AsyncFileDialog::new()
             .set_title("加载结构同步配置")
-            .add_filter("结构同步配置", &["json"])
-            .pick_file()
-        else {
-            return;
-        };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) => {
-                self.error = Some(format!("读取配置文件失败：{e}"));
+            .add_filter("结构同步配置", &["json"]);
+        ui::pick_file(window, dialog, cx, |this, _window, cx, path| {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) => {
+                    this.error = Some(format!("读取配置文件失败：{e}"));
+                    cx.notify();
+                    return;
+                }
+            };
+            let data: ProfileFile = match serde_json::from_str(&text) {
+                Ok(data) => data,
+                Err(e) => {
+                    this.error = Some(format!("配置文件格式不对：{e}"));
+                    cx.notify();
+                    return;
+                }
+            };
+            let find = |name: &str| this.conns.iter().position(|c| c.name == name);
+            let (Some(src_ix), Some(dst_ix)) =
+                (find(&data.source.connection), find(&data.target.connection))
+            else {
+                this.error = Some("配置文件里的连接不在当前连接列表里".into());
                 cx.notify();
                 return;
-            }
-        };
-        let data: ProfileFile = match serde_json::from_str(&text) {
-            Ok(data) => data,
-            Err(e) => {
-                self.error = Some(format!("配置文件格式不对：{e}"));
-                cx.notify();
-                return;
-            }
-        };
-        let find = |name: &str| self.conns.iter().position(|c| c.name == name);
-        let (Some(src_ix), Some(dst_ix)) =
-            (find(&data.source.connection), find(&data.target.connection))
-        else {
-            self.error = Some("配置文件里的连接不在当前连接列表里".into());
-            cx.notify();
-            return;
-        };
-        self.pickers[0].conn_ix = src_ix;
-        self.pickers[1].conn_ix = dst_ix;
-        self.opts = CompareOptions {
-            tables: data.tables,
-            views: data.views,
-            matviews: data.matviews,
-            funcs: data.funcs,
-            procs: data.procs,
-        };
-        self.pending = [
-            Some((data.source.db, data.source.schema)),
-            Some((data.target.db, data.target.schema)),
-        ];
-        self.step = Step::Setup;
-        self.error = None;
-        self.notice = Some(format!("已载入配置：{}", path.display()));
-        self.reload_dbs(Side::Src, cx);
-        self.reload_dbs(Side::Dst, cx);
+            };
+            this.pickers[0].conn_ix = src_ix;
+            this.pickers[1].conn_ix = dst_ix;
+            this.opts = CompareOptions {
+                tables: data.tables,
+                views: data.views,
+                matviews: data.matviews,
+                funcs: data.funcs,
+                procs: data.procs,
+            };
+            this.pending = [
+                Some((data.source.db, data.source.schema)),
+                Some((data.target.db, data.target.schema)),
+            ];
+            this.step = Step::Setup;
+            this.error = None;
+            this.notice = Some(format!("已载入配置：{}", path.display()));
+            this.reload_dbs(Side::Src, cx);
+            this.reload_dbs(Side::Dst, cx);
+        });
     }
 
     // ── 首屏：选源与目标 ────────────────────────────────────────
@@ -1453,11 +1449,11 @@ impl StructureCompare {
         let mut footer = ui::footer_bar(dark)
             .child(
                 ui::secondary_button("sc-save-profile", "保存配置文件")
-                    .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.save_profile(window, cx))),
             )
             .child(
                 ui::secondary_button("sc-load-profile", "加载配置文件")
-                    .on_click(cx.listener(|this, _, _, cx| this.load_profile(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.load_profile(window, cx))),
             )
             .child(self.options_button(cx))
             .child(
@@ -2322,11 +2318,11 @@ impl StructureCompare {
             .min_w_0()
             .child(
                 ui::secondary_button("sc-save-profile", "保存配置文件")
-                    .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.save_profile(window, cx))),
             )
             .child(
                 ui::secondary_button("sc-load-profile", "加载配置文件")
-                    .on_click(cx.listener(|this, _, _, cx| this.load_profile(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.load_profile(window, cx))),
             )
             .child(
                 div()
@@ -2536,11 +2532,11 @@ impl StructureCompare {
             .min_w_0()
             .child(
                 ui::secondary_button("sc-save-profile", "保存配置文件")
-                    .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.save_profile(window, cx))),
             )
             .child(
                 ui::secondary_button("sc-load-profile", "加载配置文件")
-                    .on_click(cx.listener(|this, _, _, cx| this.load_profile(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.load_profile(window, cx))),
             )
             .child(
                 div()

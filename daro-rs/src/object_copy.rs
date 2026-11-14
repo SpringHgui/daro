@@ -84,14 +84,15 @@ pub fn fetch_ddl(tg: &Target, cat: usize, name: &str) -> Option<String> {
         // PostgreSQL 视图 / 实体化视图：`pg_views` / `pg_matviews` 的 definition
         // 只是 SELECT 正文（不带 CREATE 头），这里补上头与新名，改名交给 rename_ddl。
         (Target::Pg { schema, .. }, 1) | (Target::Pg { schema, .. }, 2) => {
-            let table = if cat == 2 {
-                "pg_matviews"
+            // 两张系统视图的列名不同：pg_views.viewname / pg_matviews.matviewname。
+            let (table, name_col) = if cat == 2 {
+                ("pg_matviews", "matviewname")
             } else {
-                "pg_views"
+                ("pg_views", "viewname")
             };
             let sql = format!(
                 "SELECT COALESCE(definition, '') FROM {table} \
-                 WHERE schemaname = {} AND viewname = {}",
+                 WHERE schemaname = {} AND {name_col} = {}",
                 sql_lit(schema),
                 sql_lit(name)
             );

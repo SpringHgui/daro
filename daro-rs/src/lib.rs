@@ -12,6 +12,11 @@ pub mod backend;
 pub mod catalog;
 pub mod daemon;
 pub mod db_types;
+// 导出编码是纯数据层（不碰 gpui）：驱动测试里要核对导出的 INSERT 方言。
+#[cfg(test)]
+pub mod export_format;
+#[cfg(test)]
+pub mod table_export;
 pub mod mcp;
 pub mod mock;
 pub mod mongo_driver;

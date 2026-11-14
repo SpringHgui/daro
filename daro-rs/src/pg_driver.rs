@@ -318,6 +318,38 @@ pub fn try_list_schemas(key: &str) -> Result<Vec<String>, String> {
     catalog_list(key, SCHEMA_SQL)
 }
 
+/// 数据库扩展：已安装清单（extname, extversion），按名字升序。
+pub fn try_list_installed_extensions(key: &str) -> Result<Vec<(String, String)>, String> {
+    Ok(pairs(&catalog_query(
+        key,
+        "SELECT extname, extversion FROM pg_extension ORDER BY 1",
+    )?))
+}
+
+/// 可安装清单（name, default_version）：`pg_available_extensions` 刨掉已装的。
+pub fn try_list_available_extensions(key: &str) -> Result<Vec<(String, String)>, String> {
+    Ok(pairs(&catalog_query(
+        key,
+        "SELECT a.name, a.default_version FROM pg_available_extensions a \
+         WHERE NOT EXISTS (SELECT 1 FROM pg_extension e WHERE e.extname = a.name) \
+         ORDER BY 1",
+    )?))
+}
+
+/// 两列文本行转 (名字, 版本) 对；缺列的行名字兜成空串。
+fn pairs(msgs: &[SimpleQueryMessage]) -> Vec<(String, String)> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => {
+                let name = r.get(0).map(str::to_string).unwrap_or_default();
+                let v = r.get(1).map(str::to_string).unwrap_or_default();
+                Some((name, v))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn objects_sql(schema: &str, relkinds: &str) -> String {
     format!(
         "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -702,6 +734,32 @@ pub fn query_is_select(stmt: &str) -> bool {
 // ── 语句执行 ─────────────────────────────────────────────────────
 
 /// 执行一条语句（调用方已按分号切好）。SELECT 出结果页，其余出影响行数。
+use crate::backend::TxBackend;
+
+/// PG 事务：独立于 `CONNS` 缓存的新 `Client`，BEGIN 后复用 `execute_on`。
+pub struct PgTx {
+    client: Client,
+}
+
+impl TxBackend for PgTx {
+    fn execute(&mut self, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
+        execute_on(&mut self.client, stmt, max_rows)
+    }
+    fn commit(&mut self) -> Result<(), String> {
+        self.client.batch_execute("COMMIT").map_err(|e| e.to_string())
+    }
+    fn rollback(&mut self) -> Result<(), String> {
+        self.client.batch_execute("ROLLBACK").map_err(|e| e.to_string())
+    }
+}
+
+/// 开一条独立连接并 BEGIN。
+pub fn begin_tx(p: &Params) -> Result<PgTx, String> {
+    let mut client = connect(p)?;
+    client.batch_execute("BEGIN").map_err(|e| e.to_string())?;
+    Ok(PgTx { client })
+}
+
 pub fn execute_stmt(key: &str, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
     with_conn(key, |client| execute_on(client, stmt, max_rows))
 }
@@ -844,19 +902,54 @@ pub fn run_script(
     stmts: &[String],
     max_rows: usize,
     continue_on_error: bool,
-) -> ScriptRun {
+    tx: Option<crate::backend::TxHandle>,
+) -> (ScriptRun, Option<crate::backend::TxHandle>) {
+    // 用户常驻事务：复用事务连接，不再自开读连接。
+    if let Some(mut tx) = tx {
+        let started = std::time::Instant::now();
+        let mut runs = Vec::with_capacity(stmts.len());
+        let mut cancelled = false;
+        for stmt in stmts {
+            if job.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            let sw = std::time::Instant::now();
+            let result = tx.execute(stmt, max_rows);
+            let failed = result.is_err();
+            runs.push(StmtRun {
+                elapsed_ms: sw.elapsed().as_millis(),
+                result,
+            });
+            if failed && !continue_on_error {
+                break;
+            }
+        }
+        let run = ScriptRun {
+            runs,
+            open_error: None,
+            cancelled,
+            rolled_back: false,
+            aborted_tx: false,
+            total_ms: started.elapsed().as_millis(),
+        };
+        return (run, Some(tx));
+    }
     let started = Instant::now();
     let mut client = match connect(p) {
         Ok(c) => c,
         Err(e) => {
-            return ScriptRun {
-                runs: Vec::new(),
-                open_error: Some(e),
-                cancelled: false,
-                rolled_back: false,
-                aborted_tx: false,
-                total_ms: started.elapsed().as_millis(),
-            };
+            return (
+                ScriptRun {
+                    runs: Vec::new(),
+                    open_error: Some(e),
+                    cancelled: false,
+                    rolled_back: false,
+                    aborted_tx: false,
+                    total_ms: started.elapsed().as_millis(),
+                },
+                None,
+            );
         }
     };
     RUNNING_JOBS
@@ -905,14 +998,17 @@ pub fn run_script(
         rolled_back = client.batch_execute("ROLLBACK").is_ok();
     }
     RUNNING_JOBS.lock().unwrap().remove(&job.id);
-    ScriptRun {
-        runs,
-        open_error: None,
-        cancelled,
-        rolled_back,
-        aborted_tx,
-        total_ms: started.elapsed().as_millis(),
-    }
+    (
+        ScriptRun {
+            runs,
+            open_error: None,
+            cancelled,
+            rolled_back,
+            aborted_tx,
+            total_ms: started.elapsed().as_millis(),
+        },
+        None,
+    )
 }
 
 // ── 网格写回（apply）────────────────────────────────────────────
@@ -1564,10 +1660,8 @@ pub(crate) mod tests {
             1,
         )
         .unwrap();
-        // 一次执行整批（多语句串走 batch_execute 口径：逐条切给 execute_stmt）
-        for stmt in crate::split_sql_statements(&sql) {
-            execute_stmt(&k, &stmt, 100).unwrap_or_else(|e| panic!("导出的 INSERT 跑不通：{e}\n{stmt}"));
-        }
+        // sql_insert 出的是一整条多值 INSERT，直接交给真库
+        execute_stmt(&k, &sql, 100).unwrap_or_else(|e| panic!("导出的 INSERT 跑不通：{e}\n{sql}"));
         let back = select_table(&k, "public", "member_copy", None, &[], 0, 100).unwrap();
         assert_eq!(back.rows, page.rows, "文本值原样导回来，类型也都接得住");
     }
@@ -1826,7 +1920,7 @@ pub(crate) mod tests {
     #[ignore = "打 datawalk 开发库，需要网络可达"]
     fn pg_script_continues_past_errors_but_aborts_inside_transaction() {
         let (_g, p, _k) = pg_setup();
-        let run = run_script(
+        let (run, _) = run_script(
             &create_job(),
             &p,
             &[
@@ -1836,6 +1930,7 @@ pub(crate) mod tests {
             ],
             QUERY_ROW_LIMIT,
             true,
+            None,
         );
         assert!(run.open_error.is_none(), "{:?}", run.open_error);
         assert_eq!(run.runs.len(), 3, "事务外的报错不拦后面的语句");
@@ -1845,7 +1940,7 @@ pub(crate) mod tests {
 
         // 事务里报错：PG 把事务标成中止，之后每条都会连带失败，
         // 所以就地回滚并停下，而不是攒一串假错误
-        let run = run_script(
+        let (run, _) = run_script(
             &create_job(),
             &p,
             &[
@@ -1856,6 +1951,7 @@ pub(crate) mod tests {
             ],
             QUERY_ROW_LIMIT,
             false,
+            None,
         );
         assert_eq!(run.runs.len(), 3, "第 4 条不该再跑");
         assert!(run.aborted_tx, "事务中止要单独报出去");
@@ -1868,7 +1964,7 @@ pub(crate) mod tests {
         );
 
         // 脚本停在 BEGIN 里没提交：收尾回滚，不把事务挂在连接上
-        let run = run_script(
+        let (run, _) = run_script(
             &create_job(),
             &p,
             &[
@@ -1877,6 +1973,7 @@ pub(crate) mod tests {
             ],
             QUERY_ROW_LIMIT,
             false,
+            None,
         );
         assert!(run.rolled_back && !run.aborted_tx);
         assert_eq!(
@@ -1885,7 +1982,7 @@ pub(crate) mod tests {
         );
 
         // 事务正常提交后，写入对下一条语句可见
-        let run = run_script(
+        let (run, _) = run_script(
             &create_job(),
             &p,
             &[
@@ -1895,6 +1992,7 @@ pub(crate) mod tests {
             ],
             QUERY_ROW_LIMIT,
             false,
+            None,
         );
         assert!(run.runs.iter().all(|r| r.result.is_ok()));
         assert!(!run.rolled_back);
@@ -1912,11 +2010,11 @@ pub(crate) mod tests {
         let stmts = vec!["SELECT pg_sleep(20)".to_string(), "SELECT 1".to_string()];
         let worker_p = p.clone();
         let bg = job.clone();
-        let h = std::thread::spawn(move || run_script(&bg, &worker_p, &stmts, QUERY_ROW_LIMIT, true));
+        let h = std::thread::spawn(move || run_script(&bg, &worker_p, &stmts, QUERY_ROW_LIMIT, true, None));
         // 让第一条语句真的跑起来再点「停止」
         std::thread::sleep(std::time::Duration::from_millis(600));
         job.cancel();
-        let run = h.join().unwrap();
+        let (run, _) = h.join().unwrap();
         assert!(run.cancelled, "停止标志要落到回执");
         let msg = run
             .runs

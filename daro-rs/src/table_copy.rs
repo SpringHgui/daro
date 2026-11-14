@@ -256,32 +256,32 @@ fn require_same_connection(src: &Target, dst: &Target, engine: &str) -> Result<(
 // 两端各开一条临时连接，不占 UI 用的注册表句柄；目标库上的 DDL 与数据在
 // 同一个事务里，任一步失败整表回滚，不会留下半成品。
 
-struct PgCol {
-    name: String,
-    ty: String,
-    collation: Option<String>,
-    not_null: bool,
-    default: Option<String>,
-    identity: char,
-    generated: char,
-    serial: bool,
+pub(crate) struct PgCol {
+    pub(crate) name: String,
+    pub(crate) ty: String,
+    pub(crate) collation: Option<String>,
+    pub(crate) not_null: bool,
+    pub(crate) default: Option<String>,
+    pub(crate) identity: char,
+    pub(crate) generated: char,
+    pub(crate) serial: bool,
 }
 
-struct PgFk {
-    name: String,
-    def: String,
-    ref_schema: String,
-    ref_table: String,
-    self_ref: bool,
+pub(crate) struct PgFk {
+    pub(crate) name: String,
+    pub(crate) def: String,
+    pub(crate) ref_schema: String,
+    pub(crate) ref_table: String,
+    pub(crate) self_ref: bool,
 }
 
-struct PgTable {
-    columns: Vec<PgCol>,
-    constraints: Vec<(String, String)>,
-    fks: Vec<PgFk>,
-    indexes: Vec<(String, String)>,
-    comment: Option<String>,
-    col_comments: Vec<(String, String)>,
+pub(crate) struct PgTable {
+    pub(crate) columns: Vec<PgCol>,
+    pub(crate) constraints: Vec<(String, String)>,
+    pub(crate) fks: Vec<PgFk>,
+    pub(crate) indexes: Vec<(String, String)>,
+    pub(crate) comment: Option<String>,
+    pub(crate) col_comments: Vec<(String, String)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -322,7 +322,7 @@ fn copy_pg(
 }
 
 /// 从源库目录读出一张表的完整结构（只看普通表）。
-fn read_pg_table(
+pub(crate) fn read_pg_table(
     src: &mut pg_driver::CopySession,
     schema: &str,
     table: &str,
@@ -538,7 +538,7 @@ fn write_pg_table(
     Ok(())
 }
 
-fn pg_create_table(schema: &str, table: &str, def: &PgTable) -> String {
+pub(crate) fn pg_create_table(schema: &str, table: &str, def: &PgTable) -> String {
     let cols: Vec<String> = def.columns.iter().map(pg_column_sql).collect();
     format!(
         "CREATE TABLE {}.{} (\n    {}\n)",
@@ -905,7 +905,7 @@ fn sql_literal(s: &str) -> String {
 
 /// 把 SQL 里第一个 `keyword`（引号外、整词）后面的标识符换成 `replacement`。
 /// `TABLE` / `INDEX` 后面会跳过可选的 `IF NOT EXISTS`。
-fn replace_name_after(sql: &str, keyword: &str, replacement: &str) -> Result<String, String> {
+pub(crate) fn replace_name_after(sql: &str, keyword: &str, replacement: &str) -> Result<String, String> {
     let kw =
         find_keyword(sql, keyword).ok_or_else(|| format!("DDL 里找不到关键字 {keyword}：{sql}"))?;
     let mut i = skip_ws(sql, kw + keyword.len());

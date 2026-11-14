@@ -755,6 +755,32 @@ pub fn query_is_select(stmt: &str) -> bool {
     head == "select" || head == "with" || head.starts_with("exec") || head.starts_with("show")
 }
 
+use crate::backend::TxBackend;
+
+/// SQL Server 事务：独立于 `CONNS` 缓存的新 `Conn`，BEGIN TRAN 后复用 `execute_on`。
+pub struct SqlServerTx {
+    conn: Conn,
+}
+
+impl TxBackend for SqlServerTx {
+    fn execute(&mut self, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
+        execute_on(&mut self.conn, stmt, max_rows)
+    }
+    fn commit(&mut self) -> Result<(), String> {
+        run_affected(&mut self.conn, "COMMIT").map(|_| ())
+    }
+    fn rollback(&mut self) -> Result<(), String> {
+        run_affected(&mut self.conn, "ROLLBACK").map(|_| ())
+    }
+}
+
+/// 开一条独立连接并 BEGIN TRAN。
+pub fn begin_tx(p: &Params) -> Result<SqlServerTx, String> {
+    let mut conn = connect(p)?;
+    run_affected(&mut conn, "BEGIN TRAN").map(|_| ())?;
+    Ok(SqlServerTx { conn })
+}
+
 pub fn execute_stmt(key: &str, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
     with_open_conn(key, |c| execute_on(c, stmt, max_rows))
 }
@@ -1016,6 +1042,10 @@ impl Job {
     pub fn cancel(&self) {
         self.request_stop();
     }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
 }
 
 pub fn create_job(p: &Params) -> Job {
@@ -1033,21 +1063,56 @@ pub fn run_script(
     stmts: &[String],
     max_rows: usize,
     continue_on_error: bool,
-) -> ScriptRun {
+    tx: Option<crate::backend::TxHandle>,
+) -> (ScriptRun, Option<crate::backend::TxHandle>) {
+    // 用户常驻事务：复用事务连接，不再自开读连接。
+    if let Some(mut tx) = tx {
+        let started = std::time::Instant::now();
+        let mut runs = Vec::with_capacity(stmts.len());
+        let mut cancelled = false;
+        for stmt in stmts {
+            if job.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            let t0 = std::time::Instant::now();
+            let result = tx.execute(stmt, max_rows);
+            let failed = result.is_err();
+            runs.push(StmtRun {
+                elapsed_ms: t0.elapsed().as_millis(),
+                result,
+            });
+            if failed && !continue_on_error {
+                break;
+            }
+        }
+        let run = ScriptRun {
+            runs,
+            open_error: None,
+            cancelled,
+            rolled_back: false,
+            aborted_tx: false,
+            total_ms: started.elapsed().as_millis(),
+        };
+        return (run, Some(tx));
+    }
     let started = std::time::Instant::now();
     let mut runs = Vec::new();
     let conn = connect(&job.params);
     let mut conn = match conn {
         Ok(c) => c,
         Err(e) => {
-            return ScriptRun {
-                runs: Vec::new(),
-                open_error: Some(e),
-                cancelled: false,
-                rolled_back: false,
-                aborted_tx: false,
-                total_ms: started.elapsed().as_millis(),
-            }
+            return (
+                ScriptRun {
+                    runs: Vec::new(),
+                    open_error: Some(e),
+                    cancelled: false,
+                    rolled_back: false,
+                    aborted_tx: false,
+                    total_ms: started.elapsed().as_millis(),
+                },
+                None,
+            );
         }
     };
     let _ = &job.dbname;
@@ -1068,14 +1133,17 @@ pub fn run_script(
             break;
         }
     }
-    ScriptRun {
-        runs,
-        open_error: None,
-        cancelled,
-        rolled_back: false,
-        aborted_tx: false,
-        total_ms: started.elapsed().as_millis(),
-    }
+    (
+        ScriptRun {
+            runs,
+            open_error: None,
+            cancelled,
+            rolled_back: false,
+            aborted_tx: false,
+            total_ms: started.elapsed().as_millis(),
+        },
+        None,
+    )
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 
 use std::sync::LazyLock;
 
-#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DbKind {
     MySql,
     PostgreSql,

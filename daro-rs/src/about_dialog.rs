@@ -10,7 +10,7 @@ use gpui_kit::*;
 use crate::db_icons;
 use crate::palette::Palette;
 use crate::ui;
-use crate::{to_hsla, DaroApp};
+use crate::to_hsla;
 
 /// 项目主页：同一仓库在 GitHub / Gitee 的双平台镜像，两个入口都摆在「关于」里。
 pub const GITHUB_HOME: &str = "https://github.com/SpringHgui/daro";
@@ -23,7 +23,7 @@ pub fn open_issue_tracker() {
     open_link(ISSUES_URL);
 }
 
-pub fn open_daro_about(parent: Entity<DaroApp>, dark: bool, cx: &mut App) {
+pub fn open_daro_about(dark: bool, cx: &mut App) {
     let mut options = ui::dialog_options();
     options.window_min_size = Some(size(px(360.), px(320.)));
     options.window_bounds = Some(WindowBounds::centered(size(px(400.), px(360.)), cx));
@@ -33,11 +33,7 @@ pub fn open_daro_about(parent: Entity<DaroApp>, dark: bool, cx: &mut App) {
     let opened = gpui_kit::open_window(options, cx, move |window, cx| {
         cx.new(|cx| {
             let esc = ui::close_on_escape(window, cx);
-            AboutDialog {
-                parent,
-                dark,
-                _esc: esc,
-            }
+            AboutDialog { dark, _esc: esc }
         })
     });
     if opened.is_err() {
@@ -46,7 +42,6 @@ pub fn open_daro_about(parent: Entity<DaroApp>, dark: bool, cx: &mut App) {
 }
 
 struct AboutDialog {
-    parent: Entity<DaroApp>,
     dark: bool,
     _esc: Subscription,
 }
@@ -156,17 +151,6 @@ impl Render for AboutDialog {
             )
             .child(
                 ui::footer_bar(dark)
-                    .child(
-                        ui::secondary_button("about-update", "检查更新")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                window.remove_window();
-                                crate::update_dialog::open_center(
-                                    this.parent.clone(),
-                                    this.dark,
-                                    cx,
-                                );
-                            })),
-                    )
                     .child(div().flex_1())
                     .child(
                         ui::secondary_button("about-close", "关闭")
@@ -201,7 +185,7 @@ mod tests {
         let (_main, app) = open_app(cx);
         let handle = cx
             .update(|cx| {
-                open_daro_about(app, false, cx);
+                open_daro_about(false, cx);
                 cx.windows().last().copied()
             })
             .expect("about window opened");

@@ -666,7 +666,7 @@ pub fn row_matches(row: &[String], cols: &[ColMeta], m: &FilterModel) -> bool {
 
 /// 多键排序：返回 (data 里的) 行下标序。sorts 逐键比较，数值列按数值。
 pub fn multi_sort_order(
-    data: &[Vec<String>],
+    data: &[crate::db_types::Row],
     picks: &[usize],
     sorts: &[(usize, bool)],
     cols: &[ColMeta],
@@ -690,7 +690,7 @@ pub fn multi_sort_order(
 }
 
 /// 一列的去重值（建议值候选，保持首现顺序）。
-pub fn distinct_values(data: &[Vec<String>], col: usize) -> Vec<String> {
+pub fn distinct_values(data: &[crate::db_types::Row], col: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for row in data {
         if let Some(v) = row.get(col)
@@ -1493,14 +1493,14 @@ mod tests {
 
     #[test]
     fn multi_key_sort_and_distinct() {
-        let data: Vec<Vec<String>> = (0..12)
+        let data: Vec<crate::db_types::Row> = (0..12)
             .map(|r| {
                 let mut row: Vec<String> = (0..11)
                     .map(|c| mock_cell_of(r, c))
                     .collect();
                 row[6] = (r % 3).to_string(); // flags 0/1/2 循环
                 row[0] = (100 - r).to_string(); // id 递减
-                row
+                std::sync::Arc::new(row)
             })
             .collect();
         let c = cols();

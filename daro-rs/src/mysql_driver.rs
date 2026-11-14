@@ -593,6 +593,32 @@ fn use_db(conn: &mut Conn, db: &str) -> Result<(), String> {
 
 /// 执行一条语句（调用方已按分号切好）。SELECT 出结果页，其余出影响行数。
 /// `db` 是页签当前选的库：注册连接是跨库共用的，每次执行前先对准。
+use crate::backend::TxBackend;
+
+/// MySQL 事务：独立于 `CONNS` 缓存的新 `Conn`，BEGIN 后复用 `execute_on`。
+pub struct MySqlTx {
+    conn: Conn,
+}
+
+impl TxBackend for MySqlTx {
+    fn execute(&mut self, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
+        execute_on(&mut self.conn, stmt, max_rows)
+    }
+    fn commit(&mut self) -> Result<(), String> {
+        self.conn.query_drop("COMMIT").map_err(|e| e.to_string())
+    }
+    fn rollback(&mut self) -> Result<(), String> {
+        self.conn.query_drop("ROLLBACK").map_err(|e| e.to_string())
+    }
+}
+
+/// 开一条独立连接并 BEGIN。
+pub fn begin_tx(p: &Params) -> Result<MySqlTx, String> {
+    let mut conn = connect(p)?;
+    conn.query_drop("BEGIN").map_err(|e| e.to_string())?;
+    Ok(MySqlTx { conn })
+}
+
 pub fn execute_stmt(
     key: &str,
     db: &str,
@@ -736,19 +762,54 @@ pub fn run_script(
     stmts: &[String],
     max_rows: usize,
     continue_on_error: bool,
-) -> ScriptRun {
+    tx: Option<crate::backend::TxHandle>,
+) -> (ScriptRun, Option<crate::backend::TxHandle>) {
+    // 用户常驻事务：复用事务连接，不再自开读连接。
+    if let Some(mut tx) = tx {
+        let started = std::time::Instant::now();
+        let mut runs = Vec::with_capacity(stmts.len());
+        let mut cancelled = false;
+        for stmt in stmts {
+            if job.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            let sw = std::time::Instant::now();
+            let result = tx.execute(stmt, max_rows);
+            let failed = result.is_err();
+            runs.push(StmtRun {
+                elapsed_ms: sw.elapsed().as_millis(),
+                result,
+            });
+            if failed && !continue_on_error {
+                break;
+            }
+        }
+        let run = ScriptRun {
+            runs,
+            open_error: None,
+            cancelled,
+            rolled_back: false,
+            aborted_tx: false,
+            total_ms: started.elapsed().as_millis(),
+        };
+        return (run, Some(tx));
+    }
     let started = Instant::now();
     let mut conn = match connect(p) {
         Ok(c) => c,
         Err(e) => {
-            return ScriptRun {
-                runs: Vec::new(),
-                open_error: Some(e),
-                cancelled: false,
-                rolled_back: false,
-                aborted_tx: false,
-                total_ms: started.elapsed().as_millis(),
-            };
+            return (
+                ScriptRun {
+                    runs: Vec::new(),
+                    open_error: Some(e),
+                    cancelled: false,
+                    rolled_back: false,
+                    aborted_tx: false,
+                    total_ms: started.elapsed().as_millis(),
+                },
+                None,
+            );
         }
     };
     RUNNING_JOBS
@@ -785,14 +846,17 @@ pub fn run_script(
         rolled_back = conn.query_drop("ROLLBACK").is_ok();
     }
     RUNNING_JOBS.lock().unwrap().remove(&job.id);
-    ScriptRun {
-        runs,
-        open_error: None,
-        cancelled,
-        rolled_back,
-        aborted_tx: false,
-        total_ms: started.elapsed().as_millis(),
-    }
+    (
+        ScriptRun {
+            runs,
+            open_error: None,
+            cancelled,
+            rolled_back,
+            aborted_tx: false,
+            total_ms: started.elapsed().as_millis(),
+        },
+        None,
+    )
 }
 
 // ── 网格写回（apply）────────────────────────────────────────────
@@ -1405,7 +1469,7 @@ mod live_tests {
     #[ignore = "需要一台可达的 MySQL"]
     fn mysql_script_continues_past_errors_and_rolls_back_open_tx() {
         let (_g, p) = setup();
-        let run = run_script(
+        let (run, _) = run_script(
             &create_job(&p),
             &p,
             &[
@@ -1415,6 +1479,7 @@ mod live_tests {
             ],
             QUERY_ROW_LIMIT,
             true,
+            None,
         );
         assert!(run.open_error.is_none(), "{:?}", run.open_error);
         assert_eq!(run.runs.len(), 3, "事务外的报错不拦后面的语句");
@@ -1424,7 +1489,7 @@ mod live_tests {
         assert!(!run.aborted_tx);
 
         // 脚本停在 BEGIN 里没提交：收尾回滚，不把事务挂在连接上
-        let run = run_script(
+        let (run, _) = run_script(
             &create_job(&p),
             &p,
             &[
@@ -1433,6 +1498,7 @@ mod live_tests {
             ],
             QUERY_ROW_LIMIT,
             false,
+            None,
         );
         assert!(run.rolled_back, "没收尾的事务被回滚");
     }

@@ -214,18 +214,16 @@ impl RunSqlDialog {
     }
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 用 rfd 选文件（原生对话框，阻塞当前点击；与导出连接对话框同款）
-        let picked = rfd::FileDialog::new()
+        let dialog = rfd::AsyncFileDialog::new()
             .add_filter("SQL 文件", &["sql", "txt"])
             .add_filter("所有文件", &["*"])
-            .set_title("选择 SQL 文件")
-            .pick_file();
-        if let Some(p) = picked {
-            let p = p.display().to_string();
-            self.path.update(cx, |s, cx| s.set_value(p, window, cx));
-            self.error = None;
+            .set_title("选择 SQL 文件");
+        ui::pick_file(window, dialog, cx, |this, window, cx, path| {
+            let p = path.display().to_string();
+            this.path.update(cx, |s, cx| s.set_value(p, window, cx));
+            this.error = None;
             cx.notify();
-        }
+        });
     }
 }
 

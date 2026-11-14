@@ -173,6 +173,210 @@ pub fn csv_encode_row(cells: &[String], style: DelimitedStyle, quote_all: bool) 
     out
 }
 
+/// 行批次编码器：表头 / 前后缀只算一次，行按批追加到调用方的缓冲区，
+/// 导出不再把整表编码进一个 String。
+pub struct RowEncoder {
+    format: ExportFormat,
+    table: String,
+    columns: Vec<String>,
+    style: DelimitedStyle,
+    with_header: bool,
+    quote_all: bool,
+    bom: bool,
+    pretty: bool,
+    /// JSON：是否已经写过第一行（逗号分隔用）
+    first: bool,
+}
+
+impl RowEncoder {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        format: ExportFormat,
+        table: &str,
+        columns: &[String],
+        csv_style: DelimitedStyle,
+        with_header: bool,
+        quote_all: bool,
+        bom: bool,
+        pretty: bool,
+    ) -> Self {
+        let style = if format == ExportFormat::Txt {
+            ExportFormat::Txt.style()
+        } else {
+            csv_style
+        };
+        Self {
+            format,
+            table: table.to_string(),
+            columns: columns.to_vec(),
+            style,
+            with_header,
+            quote_all,
+            bom,
+            pretty,
+            first: true,
+        }
+    }
+
+    /// 文件前导（BOM / 表头 / 容器开头）。
+    pub fn start(&self) -> String {
+        let eol = DelimitedStyle::STANDARD.eol;
+        match self.format {
+            ExportFormat::Txt | ExportFormat::Csv => {
+                let mut out = String::new();
+                if self.bom {
+                    out.push('\u{feff}');
+                }
+                if self.with_header && !self.columns.is_empty() {
+                    out.push_str(&csv_encode_row(&self.columns, self.style, self.quote_all));
+                    out.push_str(self.style.eol);
+                }
+                out
+            }
+            ExportFormat::Json => {
+                let mut out = String::from("[");
+                if self.pretty {
+                    out.push('\n');
+                }
+                out
+            }
+            ExportFormat::Xml => {
+                let mut out = String::new();
+                out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+                out.push_str(eol);
+                out.push_str(&format!("<table name=\"{}\">", xml_escape(&self.table)));
+                out.push_str(eol);
+                out
+            }
+            ExportFormat::Html => {
+                let mut out = String::new();
+                out.push_str("<!DOCTYPE html>");
+                out.push_str(eol);
+                out.push_str("<html lang=\"zh-CN\">\n<head><meta charset=\"UTF-8\">");
+                out.push_str(&format!("<title>{}</title>", html_escape(&self.table)));
+                out.push_str(eol);
+                out.push_str("<style>body{font-family:\"Microsoft YaHei\",sans-serif}table{border-collapse:collapse}th,td{border:1px solid #bbb;padding:2px 8px;font-weight:normal}th{background:#f2f2f2}td.null{color:#999;font-style:italic}</style>");
+                out.push_str("</head>\n<body>");
+                out.push_str(&format!("<h3>{}</h3>", html_escape(&self.table)));
+                out.push_str(eol);
+                out.push_str("<table>");
+                out.push_str(eol);
+                out.push_str("<thead><tr>");
+                for col in &self.columns {
+                    out.push_str(&format!("<th>{}</th>", html_escape(col)));
+                }
+                out.push_str("</tr></thead>");
+                out.push_str(eol);
+                out.push_str("<tbody>");
+                out.push_str(eol);
+                out
+            }
+        }
+    }
+
+    /// 追加一行到 `out`。
+    pub fn push_row(&mut self, row: &[String], out: &mut String) {
+        let eol = DelimitedStyle::STANDARD.eol;
+        match self.format {
+            ExportFormat::Txt | ExportFormat::Csv => {
+                out.push_str(&csv_encode_row(row, self.style, self.quote_all));
+                out.push_str(self.style.eol);
+            }
+            ExportFormat::Json => {
+                if !self.first {
+                    out.push(',');
+                }
+                self.first = false;
+                if self.pretty {
+                    out.push_str("  ");
+                }
+                out.push('{');
+                for (cix, col) in self.columns.iter().enumerate() {
+                    if cix > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push('"');
+                    out.push_str(&json_escape(col));
+                    out.push_str("\": ");
+                    let cell = row.get(cix).map(|s| s.as_str()).unwrap_or("");
+                    if is_null(cell) {
+                        out.push_str("null");
+                    } else {
+                        out.push('"');
+                        out.push_str(&json_escape(cell));
+                        out.push('"');
+                    }
+                }
+                out.push('}');
+                if self.pretty {
+                    out.push('\n');
+                }
+            }
+            ExportFormat::Xml => {
+                out.push_str("  <row>");
+                for (cix, col) in self.columns.iter().enumerate() {
+                    let cell = row.get(cix).map(|s| s.as_str()).unwrap_or("");
+                    if is_null(cell) {
+                        out.push_str(&format!(
+                            "<field name=\"{}\" null=\"true\" />",
+                            xml_escape(col)
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "<field name=\"{}\">{}</field>",
+                            xml_escape(col),
+                            xml_escape(cell)
+                        ));
+                    }
+                }
+                out.push_str("</row>");
+                out.push_str(eol);
+            }
+            ExportFormat::Html => {
+                out.push_str("<tr>");
+                for (cix, _) in self.columns.iter().enumerate() {
+                    let cell = row.get(cix).map(|s| s.as_str()).unwrap_or("");
+                    if is_null(cell) {
+                        out.push_str("<td class=\"null\"></td>");
+                    } else {
+                        out.push_str(&format!("<td>{}</td>", html_escape(cell)));
+                    }
+                }
+                out.push_str("</tr>");
+                out.push_str(eol);
+            }
+        }
+    }
+
+    /// 文件收尾（容器结尾）。
+    pub fn finish(&self) -> String {
+        let eol = DelimitedStyle::STANDARD.eol;
+        match self.format {
+            ExportFormat::Txt | ExportFormat::Csv => String::new(),
+            ExportFormat::Json => {
+                let mut out = String::from("]");
+                if self.pretty {
+                    out.push('\n');
+                }
+                out
+            }
+            ExportFormat::Xml => format!("</table>{eol}"),
+            ExportFormat::Html => {
+                let mut out = String::new();
+                out.push_str("</tbody>");
+                out.push_str(eol);
+                out.push_str("</table>");
+                out.push_str(eol);
+                out.push_str("</body>");
+                out.push_str(eol);
+                out.push_str("</html>");
+                out.push_str(eol);
+                out
+            }
+        }
+    }
+}
+
 /// 编码整张表（txt / csv）。`with_header` 控制首行列名，`bom` 只在开头写一次。
 pub fn encode_delimited(
     columns: &[String],
@@ -182,18 +386,17 @@ pub fn encode_delimited(
     quote_all: bool,
     bom: bool,
 ) -> String {
-    let mut out = String::new();
-    if bom {
-        out.push('\u{feff}');
-    }
-    if with_header && !columns.is_empty() {
-        out.push_str(&csv_encode_row(columns, style, quote_all));
-        out.push_str(style.eol);
-    }
+    let format = if style.delimiter == '\t' {
+        ExportFormat::Txt
+    } else {
+        ExportFormat::Csv
+    };
+    let mut enc = RowEncoder::new(format, "", columns, style, with_header, quote_all, bom, false);
+    let mut out = enc.start();
     for row in rows {
-        out.push_str(&csv_encode_row(row, style, quote_all));
-        out.push_str(style.eol);
+        enc.push_row(row, &mut out);
     }
+    out.push_str(&enc.finish());
     out
 }
 

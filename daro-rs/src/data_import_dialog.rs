@@ -238,16 +238,15 @@ impl ImportDialog {
     }
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = rfd::FileDialog::new()
+        let dialog = rfd::AsyncFileDialog::new()
             .set_title("选择导入文件")
-            .add_filter("数据文件", &["csv", "txt", "json"])
-            .pick_file();
-        if let Some(path) = picked {
+            .add_filter("数据文件", &["csv", "txt", "json"]);
+        ui::pick_file(window, dialog, cx, |this, window, cx, path| {
             let text = path.display().to_string();
-            self.path
+            this.path
                 .update(cx, |state, cx| state.set_value(text.clone(), window, cx));
-            self.load_source(text, cx);
-        }
+            this.load_source(text, cx);
+        });
     }
 
     /// 换格式 / 改解析选项后重读预览（文件内容已在内存里，重解析即可）

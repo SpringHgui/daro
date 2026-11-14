@@ -379,6 +379,33 @@ pub fn render_value(v: ValueRef<'_>) -> String {
 // ── 写路径 ───────────────────────────────────────────────────────
 
 /// 执行一条语句（调用方已按分号切好）。SELECT 出结果页，其余出影响行数。
+use crate::backend::TxBackend;
+
+/// SQLite 事务：独立文件句柄，BEGIN 后复用 `execute_on`。不进 `CONNS` 缓存，
+/// 与读连接隔离，避免污染目录 / 网格翻页的取数连接。
+pub struct SqliteTx {
+    raw: RawConn,
+}
+
+impl TxBackend for SqliteTx {
+    fn execute(&mut self, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
+        execute_on(&self.raw, stmt, max_rows)
+    }
+    fn commit(&mut self) -> Result<(), String> {
+        self.raw.execute_batch("COMMIT").map_err(|e| e.to_string())
+    }
+    fn rollback(&mut self) -> Result<(), String> {
+        self.raw.execute_batch("ROLLBACK").map_err(|e| e.to_string())
+    }
+}
+
+/// 开一条独立连接并 BEGIN（Drop 未提交自动回滚由 `TxHandle` 负责）。
+pub fn begin_tx(path: &str) -> Result<SqliteTx, String> {
+    let mut raw = open_raw(path)?;
+    raw.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+    Ok(SqliteTx { raw })
+}
+
 pub fn execute_stmt(key: &str, stmt: &str, max_rows: usize) -> Result<ExecOutcome, String> {
     with_conn(key, |raw| execute_on(raw, stmt, max_rows))
 }
@@ -497,19 +524,54 @@ pub fn run_script(
     stmts: &[String],
     max_rows: usize,
     continue_on_error: bool,
-) -> ScriptRun {
+    tx: Option<crate::backend::TxHandle>,
+) -> (ScriptRun, Option<crate::backend::TxHandle>) {
+    // 用户常驻事务：复用事务连接，不再自开读连接。
+    if let Some(mut tx) = tx {
+        let started = std::time::Instant::now();
+        let mut runs = Vec::with_capacity(stmts.len());
+        let mut cancelled = false;
+        for stmt in stmts {
+            if job.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            let sw = std::time::Instant::now();
+            let result = tx.execute(stmt, max_rows);
+            let failed = result.is_err();
+            runs.push(StmtRun {
+                elapsed_ms: sw.elapsed().as_millis(),
+                result,
+            });
+            if failed && !continue_on_error {
+                break;
+            }
+        }
+        let run = ScriptRun {
+            runs,
+            open_error: None,
+            cancelled,
+            rolled_back: false,
+            aborted_tx: false,
+            total_ms: started.elapsed().as_millis(),
+        };
+        return (run, Some(tx));
+    }
     let started = Instant::now();
     let raw = match open_raw(path) {
         Ok(raw) => raw,
         Err(e) => {
-            return ScriptRun {
-                runs: Vec::new(),
-                open_error: Some(e),
-                cancelled: false,
-                rolled_back: false,
-                aborted_tx: false,
-                total_ms: started.elapsed().as_millis(),
-            };
+            return (
+                ScriptRun {
+                    runs: Vec::new(),
+                    open_error: Some(e),
+                    cancelled: false,
+                    rolled_back: false,
+                    aborted_tx: false,
+                    total_ms: started.elapsed().as_millis(),
+                },
+                None,
+            );
         }
     };
     RUNNING_JOBS
@@ -540,14 +602,17 @@ pub fn run_script(
     }
     let rolled_back = had_error && !raw.is_autocommit() && raw.execute_batch("ROLLBACK").is_ok();
     RUNNING_JOBS.lock().unwrap().remove(&job.id);
-    ScriptRun {
-        runs,
-        open_error: None,
-        cancelled,
-        rolled_back,
-        aborted_tx: false,
-        total_ms: started.elapsed().as_millis(),
-    }
+    (
+        ScriptRun {
+            runs,
+            open_error: None,
+            cancelled,
+            rolled_back,
+            aborted_tx: false,
+            total_ms: started.elapsed().as_millis(),
+        },
+        None,
+    )
 }
 
 static RUNNING_JOBS: LazyLock<Mutex<HashMap<u64, InterruptHandle>>> =
@@ -1136,18 +1201,19 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let run = run_script(&create_job(), &path, &stmts, QUERY_ROW_LIMIT, true);
+        let (run, _) = run_script(&create_job(), &path, &stmts, QUERY_ROW_LIMIT, true, None);
         assert!(run.open_error.is_none());
         assert!(!run.cancelled);
         assert_eq!(run.runs.len(), 6, "一条报错不拦后面的语句");
         assert!(run.runs[4].result.is_err(), "不存在的表要报错而不是空结果");
         assert!(run.rolled_back, "BEGIN 挂着的半成品事务被回滚");
-        let check = run_script(
+        let (check, _) = run_script(
             &create_job(),
             &path,
             &["SELECT count(*) FROM r".to_string()],
             QUERY_ROW_LIMIT,
             true,
+            None,
         );
         assert_eq!(rows_of(&check, 0), vec![vec!["1".to_string()]], "回滚只回事务内的");
         let _ = std::fs::remove_file(&path);
@@ -1165,17 +1231,18 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let run = run_script(&create_job(), &path, &stmts, QUERY_ROW_LIMIT, false);
+        let (run, _) = run_script(&create_job(), &path, &stmts, QUERY_ROW_LIMIT, false, None);
         assert!(run.open_error.is_none());
         assert!(!run.cancelled, "遇错收手不是用户停止");
         assert_eq!(run.runs.len(), 2, "第一条报错后不再跑后面的语句");
         assert!(run.runs[1].result.is_err());
-        let check = run_script(
+        let (check, _) = run_script(
             &create_job(),
             &path,
             &["SELECT count(*) FROM e".to_string()],
             QUERY_ROW_LIMIT,
             false,
+            None,
         );
         assert_eq!(
             rows_of(&check, 0),
@@ -1196,15 +1263,16 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let run = run_script(&job, &path, &stmts, QUERY_ROW_LIMIT, true);
+        let (run, _) = run_script(&job, &path, &stmts, QUERY_ROW_LIMIT, true, None);
         assert!(run.cancelled);
         assert!(run.runs.is_empty(), "取消后不留半截回执");
-        let check = run_script(
+        let (check, _) = run_script(
             &create_job(),
             &path,
             &["SELECT name FROM sqlite_master WHERE name = 's'".to_string()],
             QUERY_ROW_LIMIT,
             true,
+            None,
         );
         assert!(rows_of(&check, 0).is_empty(), "语句确实一条没跑");
         let _ = std::fs::remove_file(&path);

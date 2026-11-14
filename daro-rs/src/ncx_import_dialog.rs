@@ -137,18 +137,15 @@ impl ImportDialog {
     }
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // rfd 的同步文件对话框自带消息循环；放在点击回调里会把 gpui 事件循环
-        // 卡住到用户关对话框为止——与原生 modal 的表现一致，可接受。
-        let picked = rfd::FileDialog::new()
+        let dialog = rfd::AsyncFileDialog::new()
             .set_title("导入连接")
-            .add_filter("连接文件", &["ncx", "ano"])
-            .pick_file();
-        if let Some(path) = picked {
+            .add_filter("连接文件", &["ncx", "ano"]);
+        ui::pick_file(window, dialog, cx, |this, window, cx, path| {
             let text = path.display().to_string();
-            self.path
+            this.path
                 .update(cx, |state, cx| state.set_value(text.clone(), window, cx));
-            self.parse_path(text, cx);
-        }
+            this.parse_path(text, cx);
+        });
     }
 
     fn toggle_all(&mut self, checked: bool, cx: &mut Context<Self>) {
