@@ -32024,11 +32024,11 @@ fn ribbon_tile_left(target: usize, shown: impl Fn(usize) -> bool) -> f32 {
     x
 }
 
-/// 横排图标+文字的磁贴宽度：左右内边距 12 + 图标 15 + 间距 4 + 文字（11px
-/// 字号中文一字 11px）+ 下拉箭头的间距 4 + 箭头 8。与渲染共用同一份公式，
+/// 横排图标+文字的磁贴宽度：左右内边距 12 + 图标 15 + 间距 4 + 文字（text_xs
+/// 下中文一字 12px）+ 下拉箭头的间距 4 + 箭头 8。与渲染共用同一份公式，
 /// 「其它」下拉面板的对齐才不会飘。
 fn ribbon_tile_w(ix: usize) -> f32 {
-    let text = RIBBON[ix].1.chars().count() as f32 * 11.;
+    let text = RIBBON[ix].1.chars().count() as f32 * 12.;
     12. + 15. + 4. + text + if RIBBON[ix].4 { 12. } else { 0. }
 }
 
@@ -32812,7 +32812,7 @@ impl DaroApp {
                             .with_size(px(15.))
                             .text_color(if active { accent } else { ink }),
                     )
-                    .child(div().text_size(px(11.)).text_color(ink).child(*label))
+                    .child(div().text_xs().text_color(ink).child(*label))
                     .when(*caret, |s| {
                         s.child(
                             Icon::new(ZedIcon::ChevronDown)

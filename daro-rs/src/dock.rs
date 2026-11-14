@@ -742,7 +742,10 @@ impl DaroApp {
                         if is_active { to_hsla(accent) } else { muted },
                     )))
                     .child(
+                        // 最小宽把活动页签撑出来的余量交给标题吸收；
+                        // 让给末尾的话全堆在 × 右边，看着像一块空白
                         div()
+                            .flex_grow_1()
                             .min_w_0()
                             .truncate()
                             .text_xs()
