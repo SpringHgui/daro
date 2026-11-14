@@ -612,29 +612,18 @@ impl DaroApp {
         // 再点一下收回对象清单——面板没有别的关闭入口。
         let object_label = self.tool_view.map(|v| v.label()).unwrap_or("对象");
 
-        // 页签之间的短竖线：上下各让出 6px，不画到条带两端。
-        let object_sep = div()
-            .absolute()
-            .right(px(0.))
-            .top(px(6.))
-            .h(px(20.))
-            .w(px(1.))
-            .bg(tab_line);
-
         let object_tab = h_flex()
             .id(("tab-objects", pane_id))
             .role(Role::Tab)
             .aria_selected(active == 0)
             .aria_label(object_label)
             .h_full()
-            .px(px(11.))
+            .px(px(8.))
             .items_center()
             .flex_none()
             .relative()
-            // 活动页签两侧不画分隔线，与它相邻的这条也一并收掉
-            .when(!tabs.is_empty() && active != 0 && tabs[0] != active, |s| {
-                s.child(object_sep)
-            })
+            // 条带里只有它一个时补右框线；有数据页签时由后者的左框线分界
+            .when(tabs.is_empty(), |s| s.border_r(px(1.)).border_color(tab_line))
             .cursor_pointer()
             .when(active == 0, move |s| s.bg(active_bg))
             .when(active > 0, move |s| {
@@ -664,12 +653,17 @@ impl DaroApp {
             let is_active = active == ix;
             let title = self.tab_label(t);
             let chip_label = title.clone();
+            // 悬停提示：页签标题被截断时，像网页 title 一样给出完整名称
+            let tip_label = title.clone();
             // 页签跟着所属连接的颜色标签走：顶边一条原色细线 + 淡色底，
             // 没设颜色的连接保持原来的灰白页签。
             let tint = self.conn_tint_for(&t.conn_name);
             let chip_active_bg = tint.map_or(active_bg, |c| c.tab_active);
             let chip_idle_bg = tint.map(|c| c.tab);
             let chip_hover = tint.map_or(to_hsla(p.hover), |c| c.tab_hover);
+            // × 单独再深一档：非活动页签的 × 平时就是页签 hover 色，
+            // 指针落到 × 上时不变色的话会看不出这里能点
+            let close_hover = to_hsla(p.selection);
             Some(
                 h_flex()
                     .id(format!("tab/{ix}"))
@@ -677,27 +671,28 @@ impl DaroApp {
                     .aria_selected(is_active)
                     .aria_label(chip_label.clone())
                     .h_full()
-                    .px(px(11.))
-                    .gap(px(6.))
+                    .px(px(8.))
+                    .gap(px(4.))
                     .items_center()
                     // 条带放不下时先收缩页签（文字截断出省略号），
-                    // 缩到最小宽仍放不下才整段滚动
+                    // 缩到最小宽仍放不下才整段滚动；最小宽压得比较小，
+                    // 让短标题的页签把宽度让给长标题的页签
                     .flex_shrink_1()
-                    .min_w(px(108.))
+                    .min_w(px(84.))
+                    // 活动页签的 × 实体占位，窄到这个程度标题就没地方了，
+                    // 单独给它留出放完整短标题的宽度
+                    .when(is_active, |s| s.min_w(px(108.)))
                     .cursor_pointer()
                     .relative()
-                    // 首页窗格的首个页签左边紧挨「对象」的右分隔线，不重复画；
-                    // 活动页签左右两条分隔线都不画
-                    .when(pos > 0 && !is_active && tabs[pos - 1] != active, |s| {
-                        s.child(
-                            div()
-                                .absolute()
-                                .left(px(0.))
-                                .top(px(6.))
-                                .h(px(20.))
-                                .w(px(1.))
-                                .bg(tab_line),
-                        )
+                    // Zed 页签分格：相邻页签共用一条 1px 全高竖线，由右侧页签
+                    // 的左框线画；条带最左端不描边，最后一个页签补右框线收口。
+                    // 活动页签左右框线都在、只去掉底边线，于是和下方内容连成一片。
+                    .group("tab")
+                    .when(pos > 0 || is_home, |s| {
+                        s.border_l(px(1.)).border_color(tab_line)
+                    })
+                    .when(pos + 1 == tabs.len(), |s| {
+                        s.border_r(px(1.)).border_color(tab_line)
                     })
                     .when(is_active, move |s| s.bg(chip_active_bg))
                     .when(!is_active, move |s| {
@@ -726,6 +721,20 @@ impl DaroApp {
                         },
                     )
                     .test_support()
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(tip_label.clone())
+                            // 字号与页签一致、内边距收到最小；外边距保持默认，
+                            // 它同时是浮层跟指针之间的距离
+                            .text_xs()
+                            .py(px(2.))
+                            .px(px(6.))
+                            // 弹层默认的白面比内容区还亮，边界和阴影都看不出来；
+                            // 换成工具栏面 + 深一档描边，浮层和背后界面分开
+                            .bg(to_hsla(p.button_face))
+                            .border_color(to_hsla(p.field_border))
+                            .shadow_lg()
+                            .build(window, cx)
+                    })
                     .context_menu(tab_context_menu(cx.entity().clone(), pane_id, Some(ix)))
                     .child(div().flex_none().child(art::icon(
                         glyph,
@@ -741,25 +750,44 @@ impl DaroApp {
                             .child(title),
                     )
                     .child(
+                        // 活动页签的 × 正常占位（不会被悬停遮住标题）；
+                        // 非活动页签的 × 悬浮在右端、悬停才显形，平时不占
+                        // 宽度，那 18px 让给标题文字
                         h_flex()
                             .id(format!("tab-close/{ix}"))
-                            .size(px(14.))
-                            .flex_none()
                             .items_center()
-                            .justify_center()
-                            .rounded(px(2.))
                             .cursor_pointer()
-                            .when(!is_active, |s| s.opacity(0.))
-                            .hover(move |s| s.opacity(1.).bg(to_hsla(p.hover)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_tab(ix - 1);
                                 this.active_tab = this.dock.focused_active();
                                 cx.notify();
                             }))
+                            .when(is_active, |s| s.flex_none())
+                            .when(!is_active, |s| {
+                                s.absolute()
+                                    .top(px(0.))
+                                    .right(px(1.))
+                                    .h_full()
+                                    .opacity(0.)
+                                    .group_hover("tab", |s| s.opacity(1.))
+                            })
                             .child(
-                                Icon::new(ZedIcon::Close)
-                                    .with_size(px(11.))
-                                    .text_color(muted),
+                                h_flex()
+                                    .id(format!("tab-close-box/{ix}"))
+                                    .size(px(18.))
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(2.))
+                                    // 非活动页签的 × 是一块实底遮罩：显形时把压在
+                                    // 它下面的标题文字完全盖住，点哪里都不会误触标题
+                                    .when(!is_active, move |s| s.bg(chip_hover))
+                                    // 指针直接落到 × 上时再深一档，给出可点的回执
+                                    .hover(move |s| s.bg(close_hover))
+                                    .child(
+                                        Icon::new(ZedIcon::Close)
+                                            .with_size(px(13.))
+                                            .text_color(muted),
+                                    ),
                             ),
                     )
                     // 顶边色条：绝对定位，不占页签的 flex 宽度
@@ -815,20 +843,21 @@ impl DaroApp {
         let mut right_arrow = None;
         let max_x = tab_scroll.max_offset().x;
         if max_x > px(0.5) {
-            let off_x = tab_scroll.offset().x;
+            // gpui 的滚动 offset 向右滚为负、停在最左为 0，换算成正的「已滚距离」
+            let scrolled = -tab_scroll.offset().x;
             for (left, id, icon, enabled, backward) in [
                 (
                     true,
                     "tab-arrow-left",
                     ZedIcon::ChevronLeft,
-                    off_x > px(0.5),
+                    scrolled > px(0.5),
                     true,
                 ),
                 (
                     false,
                     "tab-arrow-right",
                     ZedIcon::ChevronRight,
-                    off_x < max_x,
+                    scrolled < max_x - px(0.5),
                     false,
                 ),
             ] {
@@ -842,7 +871,9 @@ impl DaroApp {
                     .justify_center()
                     .border_b(px(1.))
                     .border_color(tab_line)
-                    .opacity(if enabled { 1. } else { 0.4 })
+                    // 到边只暗图标，底边线始终与页签同色：
+                    // 整个格子叠 transparency 会把这条 1px 线也一起淡掉，
+                    // 两端的箭头看起来就一条深一条浅
                     .when(enabled, |s| s.cursor_pointer().hover(move |s| s.bg(to_hsla(p.hover))))
                     .when(enabled, |s| {
                         s.on_click(cx.listener(move |this, _, _, cx| {
@@ -853,10 +884,11 @@ impl DaroApp {
                             let max = pn.tab_scroll.max_offset().x;
                             let view = pn.tab_scroll.bounds().size.width;
                             let step = if view > px(16.) { view - px(16.) } else { px(160.) };
+                            // offset 落在 [-max, 0]：左箭头朝 0 回，右箭头朝 -max 走
                             o.x = if backward {
-                                (o.x - step).min(max).max(Pixels::ZERO)
+                                (o.x + step).min(Pixels::ZERO)
                             } else {
-                                (o.x + step).min(max).max(Pixels::ZERO)
+                                (o.x - step).max(-max)
                             };
                             pn.tab_scroll.set_offset(o);
                             cx.notify();
