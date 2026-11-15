@@ -16,6 +16,10 @@ use redis::{Connection, Value};
 
 /// 一次值读取最多返回的条目数（hash / list / set / zset / stream）。
 pub const VALUE_LIMIT: usize = 1000;
+/// hash 表格 value 列只显示一行预览，缓存的展示串按字符截断到这个长度。
+/// 不截断会把几 MB 的 value 全量转成 String 常驻内存（1000 行直接爆），
+/// 且每帧 replace 一次大串；要看完整值走编辑弹窗 / 复制，读原始字节。
+pub const HASH_PREVIEW_CHARS: usize = 256;
 /// 累计载入越过取全阈值后，每轮续读的字节数。
 pub const STRING_PREVIEW: usize = 64 * 1024;
 /// 不超过这个字节数的字符串一次取全，可以直接编辑；更大的先给预览，
@@ -225,11 +229,34 @@ pub fn bytes_display(b: &[u8]) -> String {
 }
 
 fn hex_upper(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        s.push_str(&format!("{x:02X}"));
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(b.len() * 2);
+    for &x in b {
+        out.push(HEX[(x >> 4) as usize] as char);
+        out.push(HEX[(x & 0x0f) as usize] as char);
     }
-    s
+    out
+}
+
+/// hash 表格 value 列的单行预览：按字符截断到 `HASH_PREVIEW_CHARS`，并把换行 /
+/// 制表符压成空格，避免一行撑高表格。只读取 value 的前缀，不把整个大 value
+/// 转成 UTF-8 String / 十六进制串——否则 1000 行大 value 会同时吃满内存和 CPU。
+fn value_preview_of(b: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(b) {
+        // UTF-8：按字符计数截断，不会切在字符中间。
+        return s
+            .chars()
+            .take(HASH_PREVIEW_CHARS)
+            .map(|c| if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c })
+            .collect();
+    }
+    // 非 UTF-8：走 HEX 展示，但只编码前若干个字节（两个十六进制字符算一个
+    // 展示字符，扣掉 "HEX:" 前缀 4 个字符的预算）。
+    let budget = HASH_PREVIEW_CHARS.saturating_sub(4) / 2;
+    let mut out = String::with_capacity(HASH_PREVIEW_CHARS);
+    out.push_str("HEX:");
+    out.push_str(&hex_upper(&b[..b.len().min(budget)]));
+    out
 }
 
 /// 界面输入的键名：`HEX:` 前缀按十六进制解析，其余按 UTF-8。
@@ -358,7 +385,7 @@ fn pop_int(it: &mut impl Iterator<Item = Value>, def: i64) -> i64 {
 }
 
 /// 值面板的一行。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ValueRow {
     /// 字段名 / 下标 / 条目 ID；字符串类型的值行没有标签
     pub label: String,
@@ -366,6 +393,13 @@ pub struct ValueRow {
     pub score: Option<f64>,
     /// list 的下标（写回 / 删除时用）
     pub index: Option<i64>,
+    /// 字段名的原始字节（hash field）。载入时算好，渲染删除按钮不必每帧
+    /// 从 label 反解 `bytes_from_input`（1000 行 × 每帧的堆分配是卡顿源）。
+    /// 非 hash 类型留空，渲染侧对 hash 才有意义。
+    pub field_bytes: Vec<u8>,
+    /// value 的展示预览（已把换行/制表符压成空格）。载入时算好，渲染
+    /// 直接取用，避免每帧 `bytes_display` + `replace` 两次 String 分配。
+    pub value_preview: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -431,6 +465,8 @@ pub fn read_value(
                     value: bytes,
                     score: None,
                     index: None,
+                    field_bytes: Vec::new(),
+                    value_preview: String::new(),
                 });
             }
             "list" => {
@@ -451,6 +487,8 @@ pub fn read_value(
                         value: v,
                         score: None,
                         index: Some(ix),
+                        field_bytes: Vec::new(),
+                        value_preview: String::new(),
                     });
                 }
             }
@@ -458,6 +496,10 @@ pub fn read_value(
                 let total: i64 = redis::cmd("HLEN").arg(key).query(c).map_err(err)?;
                 out.total = Some(total);
                 let mut cursor = 0u64;
+                // offset 跳过已经载入的 field，供界面「载入更多」续读。
+                // HSCAN 的遍历顺序在 key 未被改动时是稳定的，所以按条数跳过
+                // 能接上上一页；界面侧还会按 field 去重兜底 rehash 期间的重复。
+                let mut skipped = 0usize;
                 while out.rows.len() < limit.max(1) {
                     let (next, flat): (String, Vec<Vec<u8>>) = redis::cmd("HSCAN")
                         .arg(key)
@@ -468,11 +510,21 @@ pub fn read_value(
                         .map_err(err)?;
                     let mut it = flat.into_iter();
                     while let (Some(f), Some(v)) = (it.next(), it.next()) {
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        // 展示串与 field 原始字节在载入时算一次并缓存，
+                        // 渲染每帧直接取用。预览按字符截断（见 value_preview_of），
+                        // 绝不把整个 value 转成 String 常驻。
+                        let value_preview = value_preview_of(&v);
                         out.rows.push(ValueRow {
                             label: bytes_display(&f),
                             value: v,
                             score: None,
                             index: None,
+                            field_bytes: f,
+                            value_preview,
                         });
                         if out.rows.len() >= limit.max(1) {
                             break;
@@ -483,7 +535,8 @@ pub fn read_value(
                         break;
                     }
                 }
-                out.truncated = out.rows.len() < total as usize;
+                // 用「跳过数 + 本页条数」对 HLEN 判断，语义与 string/list/zset 一致。
+                out.truncated = (offset + out.rows.len()) < total as usize;
             }
             "set" => {
                 let total: i64 = redis::cmd("SCARD").arg(key).query(c).map_err(err)?;
@@ -503,6 +556,8 @@ pub fn read_value(
                             value: v,
                             score: None,
                             index: None,
+                            field_bytes: Vec::new(),
+                            value_preview: String::new(),
                         });
                         if out.rows.len() >= limit.max(1) {
                             break;
@@ -533,6 +588,8 @@ pub fn read_value(
                         value: m,
                         score: String::from_utf8_lossy(&s).parse().ok(),
                         index: None,
+                        field_bytes: Vec::new(),
+                        value_preview: String::new(),
                     });
                 }
                 out.truncated = (offset + out.rows.len()) < total as usize;
@@ -566,6 +623,8 @@ pub fn read_value(
                         value: parts.join("; ").into_bytes(),
                         score: None,
                         index: None,
+                        field_bytes: Vec::new(),
+                        value_preview: String::new(),
                     });
                 }
                 out.truncated = out.rows.len() < total as usize;
@@ -794,6 +853,52 @@ mod tests {
         assert_eq!(bytes_from_input("HEX:41 42"), Some(b"AB".to_vec()));
         assert_eq!(bytes_from_input("HEX:4"), None);
         assert_eq!(bytes_from_input("HEX:4G"), None);
+    }
+
+    #[test]
+    fn display_input_roundtrip_is_lossless() {
+        // hash 逐字段编辑靠「display 文本 → input 字节」往返比对原值，
+        // field 名和值都可能是二进制，往返必须逐字节无损。
+        let samples: Vec<Vec<u8>> = vec![
+            b"user:1".to_vec(),
+            vec![0xFF, 0x00, 0x1A],
+            b"".to_vec(),
+            "中文 key".as_bytes().to_vec(),
+            vec![0x0A, 0x0D, 0x20],
+        ];
+        for raw in samples {
+            assert_eq!(bytes_from_input(&bytes_display(&raw)), Some(raw));
+        }
+    }
+
+    #[test]
+    fn value_preview_caps_length_and_flattens_newlines() {
+        // 表格只显示一行预览：大 value 绝不能被整个转成 String 常驻。
+        let big = "x".repeat(10_000);
+        let preview = value_preview_of(big.as_bytes());
+        assert_eq!(preview.chars().count(), HASH_PREVIEW_CHARS);
+        assert!(preview.chars().all(|c| c == 'x'));
+
+        // 换行/制表符压成空格，但按「字符」而不是字节计数截断（中文不切坏）。
+        let mixed = "a\nb\tc\r中";
+        assert_eq!(value_preview_of(mixed.as_bytes()), "a b c 中");
+        let cn = "中".repeat(300);
+        assert_eq!(
+            value_preview_of(cn.as_bytes()).chars().count(),
+            HASH_PREVIEW_CHARS
+        );
+    }
+
+    #[test]
+    fn value_preview_hexes_binary_without_encoding_everything() {
+        // 非 UTF-8 走 HEX 展示；只编码前缀预算内的字节，不碰整个大 value。
+        let raw: Vec<u8> = vec![0xFF; 10_000];
+        let preview = value_preview_of(&raw);
+        assert!(preview.starts_with("HEX:"));
+        assert_eq!(preview.len(), 4 + (HASH_PREVIEW_CHARS - 4) / 2 * 2);
+        assert!(preview[4..].chars().all(|c| c == 'F'));
+        // 顺便守住 hex_upper 查表改写后的正确性
+        assert_eq!(hex_upper(&[0x00, 0x0F, 0xA5, 0xFF]), "000FA5FF");
     }
 
     #[test]

@@ -60,6 +60,7 @@ mod theme_dialog;
 mod extensions_dialog;
 mod db_extensions_dialog;
 mod column_dialog;
+mod hash_value_dialog;
 mod mcp_page;
 mod favorites;
 mod saved_queries;
@@ -8149,7 +8150,7 @@ struct KvState {
     pattern: Entity<InputState>,
     /// 设置 TTL 的秒数；空 = PERSIST
     ttl: Entity<InputState>,
-    /// 字符串值的编辑框；容器类型只读展示，不渲染它。用代码编辑器而非
+    /// 字符串值的编辑框；容器类型不渲染它。用代码编辑器而非
     /// 纯文本框：Json 视图的语法高亮只在 code-editor 模式下生效。
     value_text: Entity<EditorState>,
     /// 字符串值的显示格式；None = 按已载入内容自动探测
@@ -14461,7 +14462,7 @@ impl DaroApp {
         cx.notify();
     }
 
-    /// 大值续读：从已载入字节处再取一块，拼完按同一格式重铺。
+    /// 续读：string 从已载入字节处再取一块重铺，hash 按已载入 field 数取下一批。
     fn kv_load_more(&mut self, kid: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(t) = self.opened.iter().find(|t| t.kid == kid) else {
             return;
@@ -14471,10 +14472,16 @@ impl DaroApp {
         };
         let Some(k) = t.kstate.as_ref() else { return };
         let Some(v) = k.value.as_ref() else { return };
-        if v.rtype != "string" || !v.truncated {
+        if !v.truncated || (v.rtype != "string" && v.rtype != "hash") {
             return;
         }
-        let (db, key, offset) = (k.db, v.key.clone(), k.value_bytes.len());
+        // string 按字节偏移续读；hash 按已载入的 field 条数续读。
+        let offset = if v.rtype == "hash" {
+            v.rows.len()
+        } else {
+            k.value_bytes.len()
+        };
+        let (db, key) = (k.db, v.key.clone());
         let conn_name = conn.name.clone();
         let params = backend::redis_params(&conn);
         if let Some(k) = Self::kv_state_mut(&mut self.opened, kid) {
@@ -14520,20 +14527,54 @@ impl DaroApp {
         k.value_loading = false;
         match res {
             Ok(chunk) => {
+                let is_hash = k
+                    .value
+                    .as_ref()
+                    .map(|v| v.rtype == "hash")
+                    .unwrap_or(false);
                 let Some(v) = k.value.as_mut() else { return };
-                if let Some(r) = chunk.rows.first() {
-                    k.value_bytes.extend_from_slice(&r.value);
-                }
-                // 以累计字节对 STRLEN 判断是否还有后续，本轮拿到 0 字节时按钮
-                // 留着让用户能重试，而不是自己转圈
-                v.truncated = (k.value_bytes.len() as i64) < v.total.unwrap_or(0);
-                if v.truncated {
-                    k.note = Some(format!(
-                        "已载入 {} 字节（共 {} 字节）",
-                        k.value_bytes.len(),
-                        v.total.unwrap_or(0)
-                    ));
+                if is_hash {
+                    // hash：追加新载入的 field，按 field 去重（rehash 期间 HSCAN 可能
+                    // 吐出重复项）。表格视图只读渲染 rows，不再需要按行建编辑框。
+                    let existing: HashSet<Vec<u8>> = v
+                        .rows
+                        .iter()
+                        .map(|r| r.field_bytes.clone())
+                        .collect();
+                    let mut added = 0usize;
+                    for r in chunk.rows {
+                        if existing.contains(&r.field_bytes) {
+                            continue;
+                        }
+                        v.rows.push(r);
+                        added += 1;
+                    }
+                    v.truncated = (v.rows.len() as i64) < v.total.unwrap_or(0);
+                    let (loaded, total, truncated) =
+                        (v.rows.len(), v.total.unwrap_or(0), v.truncated);
+                    k.note = Some(if truncated {
+                        format!(
+                            "已载入 {loaded} 字段（共 {total} 字段），本轮新增 {added}"
+                        )
+                    } else {
+                        format!("已载入全部 {loaded} 字段，本轮新增 {added}")
+                    });
                     k.note_bad = false;
+                } else {
+                    if let Some(r) = chunk.rows.first() {
+                        k.value_bytes.extend_from_slice(&r.value);
+                    }
+                    // 以累计字节对 STRLEN 判断是否还有后续，本轮拿到 0 字节时按钮
+                    // 留着让用户能重试，而不是自己转圈
+                    v.truncated = (k.value_bytes.len() as i64) < v.total.unwrap_or(0);
+                    if v.truncated {
+                        k.note = Some(format!(
+                            "已载入 {} 字节（共 {} 字节）",
+                            k.value_bytes.len(),
+                            v.total.unwrap_or(0)
+                        ));
+                        k.note_bad = false;
+                    }
                 }
                 Self::kv_render_value(k, window, cx);
             }
@@ -14638,6 +14679,178 @@ impl DaroApp {
             });
         })
         .detach();
+    }
+
+    /// hash 单字段写回（编辑 / 新增弹窗点 OK 的回调）：HSET 新 field；
+    /// 若字段名被改（Redis 无 rename）则先 HDEL 旧 field 再 HSET 新 field。
+    /// 未载入的字段不会被碰——HSET/HDEL 只针对明确列出的 field。
+    fn kv_hash_commit(
+        &mut self,
+        kid: u64,
+        old_field: Vec<u8>,
+        new_field: Vec<u8>,
+        value: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(t) = self.opened.iter().find(|t| t.kid == kid) else {
+            return;
+        };
+        let Some(conn) = self.conns.iter().find(|c| c.name == t.conn_name).cloned() else {
+            return;
+        };
+        let Some(k) = t.kstate.as_ref() else { return };
+        let Some(v) = k.value.as_ref() else { return };
+        if v.rtype != "hash" {
+            return;
+        }
+        let (db, key) = (k.db, v.key.clone());
+        let conn_name = conn.name.clone();
+        let params = backend::redis_params(&conn);
+        let renamed = !old_field.is_empty() && old_field != new_field;
+        let set = vec![(new_field, value)];
+        let remove: Vec<Vec<u8>> = if renamed { vec![old_field] } else { vec![] };
+        let Some(handle) = self.win else { return };
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    redis_driver::hash_write(&conn_name, &params, db, &key, &set, &remove)
+                })
+                .await;
+            let _ = handle.update(cx, |_, window, app| {
+                let Some(ent) = entity.upgrade() else { return };
+                ent.update(app, |a, cx| match res {
+                    Ok(()) => {
+                        if let Some(k) = Self::kv_state_mut(&mut a.opened, kid) {
+                            k.note = Some(if renamed {
+                                "字段已更新（改名）".to_string()
+                            } else {
+                                "字段已保存".to_string()
+                            });
+                            k.note_bad = false;
+                        }
+                        a.kv_reload_value(kid, window, cx);
+                    }
+                    Err(e) => {
+                        if let Some(k) = Self::kv_state_mut(&mut a.opened, kid) {
+                            k.note = Some(e);
+                            k.note_bad = true;
+                        }
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// hash 删除单个字段：立即 HDEL（表格行尾删除按钮）。
+    /// 传行索引而非字节：渲染时不 clone，点击这一刻才从缓存取 field 字节。
+    fn kv_hash_delete_field(&mut self, kid: u64, i: usize, cx: &mut Context<Self>) {
+        let Some(t) = self.opened.iter().find(|t| t.kid == kid) else {
+            return;
+        };
+        let Some(conn) = self.conns.iter().find(|c| c.name == t.conn_name).cloned() else {
+            return;
+        };
+        let Some(k) = t.kstate.as_ref() else { return };
+        let Some(v) = k.value.as_ref() else { return };
+        if v.rtype != "hash" {
+            return;
+        }
+        let Some(row) = v.rows.get(i) else { return };
+        let field = row.field_bytes.clone();
+        let (db, key) = (k.db, v.key.clone());
+        let conn_name = conn.name.clone();
+        let params = backend::redis_params(&conn);
+        let field_show = row.label.clone();
+        let Some(handle) = self.win else { return };
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    redis_driver::hash_write(&conn_name, &params, db, &key, &[], &[field])
+                })
+                .await;
+            let _ = handle.update(cx, |_, window, app| {
+                let Some(ent) = entity.upgrade() else { return };
+                ent.update(app, |a, cx| match res {
+                    Ok(()) => {
+                        if let Some(k) = Self::kv_state_mut(&mut a.opened, kid) {
+                            k.note = Some(format!("已删除字段 {field_show}"));
+                            k.note_bad = false;
+                        }
+                        a.kv_reload_value(kid, window, cx);
+                    }
+                    Err(e) => {
+                        if let Some(k) = Self::kv_state_mut(&mut a.opened, kid) {
+                            k.note = Some(e);
+                            k.note_bad = true;
+                        }
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 打开某行字段的编辑弹窗。
+    fn kv_hash_open_editor(&mut self, kid: u64, i: usize, cx: &mut Context<Self>) {
+        let Some(t) = self.opened.iter().find(|t| t.kid == kid) else {
+            return;
+        };
+        let Some(k) = t.kstate.as_ref() else { return };
+        let Some(v) = k.value.as_ref() else { return };
+        let Some(r) = v.rows.get(i) else { return };
+        let field_text = r.label.clone();
+        let old_field = redis_driver::bytes_from_input(&field_text);
+        let value_bytes = r.value.clone();
+        hash_value_dialog::open_hash_value_dialog(
+            cx.entity(),
+            self.dark,
+            old_field,
+            field_text,
+            value_bytes,
+            move |app, cx, old, field, value| app.kv_hash_commit(kid, old, field, value, cx),
+            cx,
+        );
+    }
+
+    /// 打开新增字段弹窗（空 field / 空 value）。
+    fn kv_hash_add_field(&mut self, kid: u64, cx: &mut Context<Self>) {
+        hash_value_dialog::open_hash_value_dialog(
+            cx.entity(),
+            self.dark,
+            None,
+            String::new(),
+            Vec::new(),
+            move |app, cx, old, field, value| app.kv_hash_commit(kid, old, field, value, cx),
+            cx,
+        );
+    }
+
+    /// 复制字段名 / 值 / HSET 命令（表格行尾操作）。
+    fn kv_hash_copy(&self, kid: u64, i: usize, what: &str, cx: &mut Context<Self>) {
+        let Some(t) = self.opened.iter().find(|t| t.kid == kid) else {
+            return;
+        };
+        let Some(k) = t.kstate.as_ref() else { return };
+        let Some(v) = k.value.as_ref() else { return };
+        let Some(r) = v.rows.get(i) else { return };
+        let field = r.label.clone();
+        let text = match what {
+            "field" => field.clone(),
+            "cmd" => {
+                let key = redis_driver::bytes_display(&v.key);
+                let val = redis_driver::bytes_display(&r.value);
+                format!("HSET {key} {field} {val}")
+            }
+            _ => redis_driver::bytes_display(&r.value),
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
     }
 
     fn kv_delete(&mut self, kid: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -15268,6 +15481,252 @@ impl DaroApp {
                                     ),
                             )
                             .when_some(note, |s, n| s.child(n)),
+                    )
+                    .into_any_element()
+            } else if v.rtype == "hash" {
+                // hash 表格视图：每行 Field（只读）+ Value 预览，行尾四个操作
+                // 按钮——复制值 / 编辑（弹窗）/ 删除 / 复制 HSET 命令。编辑弹窗
+                // 点 OK 立即写回 Redis，不需要统一的「保存」按钮。
+                //
+                // 性能：1000 行 × 每帧，行内一律用 tuple id（避免 5000 次
+                // format!），展示串取载入时缓存，不再每帧转换/分配大字符串。
+                // tuple id 由父容器 `kv/hash/values/{kid}` 区分作用域，故无需
+                // 在每行再拼 kid。
+                let mut vrows: Vec<AnyElement> = Vec::with_capacity(v.rows.len());
+                for (i, r) in v.rows.iter().enumerate() {
+                    // 展示预览在载入时算好缓存，渲染每帧直接取引用；
+                    // field 字节同样缓存，删除/编辑在点击时才按索引取用。
+                    let val_preview = &r.value_preview;
+                    let mut ops = h_flex()
+                        .w(px(140.))
+                        .flex_none()
+                        .gap(px(8.))
+                        .items_center()
+                        .justify_end();
+                    // 复制值
+                    ops = ops.child(
+                        div()
+                            .id(("kv-hash-copy", i))
+                            .w(px(28.))
+                            .h(px(26.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.kv_hash_copy(kid, i, "value", cx)
+                            }))
+                            .child(art::icon(art::Glyph::Zed(ZedIcon::Copy), 15., muted)),
+                    );
+                    // 编辑（弹窗）
+                    ops = ops.child(
+                        div()
+                            .id(("kv-hash-edit", i))
+                            .w(px(28.))
+                            .h(px(26.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.kv_hash_open_editor(kid, i, cx)
+                            }))
+                            .child(art::icon(art::Glyph::Zed(ZedIcon::Pencil), 15., muted)),
+                    );
+                    // 删除（立即 HDEL）：按行索引回调，点击时才取 field 字节，
+                    // 避免渲染每帧为 1000 行各 clone 一次 Vec<u8>。
+                    ops = ops.child(
+                        div()
+                            .id(("kv-hash-del", i))
+                            .w(px(28.))
+                            .h(px(26.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.kv_hash_delete_field(kid, i, cx)
+                            }))
+                            .child(art::icon(art::Glyph::Zed(ZedIcon::Trash), 15., muted)),
+                    );
+                    // 复制 HSET 命令
+                    ops = ops.child(
+                        div()
+                            .id(("kv-hash-cmd", i))
+                            .w(px(28.))
+                            .h(px(26.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.kv_hash_copy(kid, i, "cmd", cx)
+                            }))
+                            .child(art::icon(art::Glyph::Zed(ZedIcon::Terminal), 15., muted)),
+                    );
+                    vrows.push(
+                        h_flex()
+                            .id(("kv-hash-row", i))
+                            .h(px(34.))
+                            .flex_none()
+                            .px(px(8.))
+                            .gap(px(8.))
+                            .items_center()
+                            .border_b_1()
+                            .border_color(soft)
+                            .child(
+                                div()
+                                    .w(px(32.))
+                                    .flex_none()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .text_color(muted)
+                                    .child((i + 1).to_string()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(160.))
+                                    .flex_none()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .text_color(muted)
+                                    .child(r.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .text_color(fg)
+                                    .child(val_preview.clone()),
+                            )
+                            .child(ops)
+                            .into_any_element(),
+                    );
+                }
+                let total = v.total.unwrap_or(v.rows.len() as i64);
+                let trunc = if v.truncated {
+                    format!("已载入 {} 条（共 {total} 条）", v.rows.len())
+                } else {
+                    format!("共 {total} 条")
+                };
+                let add_btn = h_flex()
+                    .id(rid("kv/hash/add"))
+                    .h(px(22.))
+                    .px(px(7.))
+                    .gap(px(4.))
+                    .items_center()
+                    .rounded(px(2.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kv_hash_add_field(kid, cx)
+                    }))
+                    .child(art::icon(art::Glyph::Zed(ZedIcon::Plus), 13., muted))
+                    .child(div().text_size(px(12.)).text_color(fg).child("新增字段"))
+                    .test_support();
+                let more_btn = v.truncated.then(|| {
+                    h_flex()
+                        .id(rid("kv/hash/more"))
+                        .h(px(22.))
+                        .px(px(7.))
+                        .items_center()
+                        .rounded(px(2.))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.kv_load_more(kid, window, cx)
+                        }))
+                        .child(div().text_size(px(12.)).text_color(fg).child("载入更多"))
+                        .test_support()
+                });
+                let note = k.note.clone().map(|n| {
+                    div()
+                        .truncate()
+                        .text_size(px(11.5))
+                        .text_color(if k.note_bad { to_hsla(0xDC2626) } else { muted })
+                        .child(n)
+                });
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(
+                        h_flex()
+                            .h(px(26.))
+                            .flex_none()
+                            .px(px(8.))
+                            .gap(px(8.))
+                            .items_center()
+                            .bg(chrome)
+                            .border_b_1()
+                            .border_color(soft)
+                            .child(
+                                h_flex()
+                                    .w(px(32.))
+                                    .text_size(px(11.))
+                                    .text_color(muted)
+                                    .child("ID"),
+                            )
+                            .child(
+                                div()
+                                    .w(px(160.))
+                                    .text_size(px(11.))
+                                    .text_color(muted)
+                                    .child("Field"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(11.))
+                                    .text_color(muted)
+                                    .child("Value"),
+                            )
+                            .child(div().w(px(140.)).flex_none()),
+                    )
+                    .child(
+                        div()
+                            .id(rid(&format!("kv/hash/values/{kid}")))
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scrollbar()
+                            .children(vrows),
+                    )
+                    .child(
+                        h_flex()
+                            .h(px(32.))
+                            .flex_none()
+                            .px(px(8.))
+                            .gap(px(8.))
+                            .items_center()
+                            .border_t_1()
+                            .border_color(soft)
+                            .bg(chrome)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .text_color(muted)
+                                    .child(trunc),
+                            )
+                            .when_some(note, |s, n| s.child(n))
+                            .when_some(more_btn, |s, b| s.child(b))
+                            .child(add_btn),
                     )
                     .into_any_element()
             } else {
