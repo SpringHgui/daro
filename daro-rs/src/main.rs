@@ -39,6 +39,7 @@ mod sql_completion;
 mod snippet;
 mod sql_format;
 mod sql_highlight;
+mod json_highlight;
 mod sql_preview;
 mod structure_compare;
 mod table_copy;
@@ -46,6 +47,7 @@ mod object_copy;
 mod table_ops;
 mod table_paste_dialog;
 mod ui;
+mod value_format;
 mod update;
 mod update_dialog;
 mod update_badge;
@@ -8147,8 +8149,13 @@ struct KvState {
     pattern: Entity<InputState>,
     /// 设置 TTL 的秒数；空 = PERSIST
     ttl: Entity<InputState>,
-    /// 字符串值的编辑框；容器类型只读展示，不渲染它
-    value_text: Entity<TextareaState>,
+    /// 字符串值的编辑框；容器类型只读展示，不渲染它。用代码编辑器而非
+    /// 纯文本框：Json 视图的语法高亮只在 code-editor 模式下生效。
+    value_text: Entity<EditorState>,
+    /// 字符串值的显示格式；None = 按已载入内容自动探测
+    format: Option<value_format::Format>,
+    /// 已载入的原始字节前缀（大值靠「载入更多」往后拼）
+    value_bytes: Vec<u8>,
     /// 类型过滤，空串 = 全部
     rtype: &'static str,
     keys: Vec<redis_driver::KeyMeta>,
@@ -8168,10 +8175,16 @@ struct KvState {
     note_bad: bool,
 }
 
-impl KvState {
-    fn selected(&self) -> Option<&redis_driver::KeyMeta> {
-        self.sel.and_then(|ix| self.keys.get(ix))
-    }
+/// SCAN 回的是库内部哈希顺序，列表铺成键名升序（与 ARDM 的 sortByTreeNodes 一致）；
+/// 重排后选中行跟着键名走，续扫时不会跳到别的键上。
+fn sort_key_rows(keys: &mut Vec<redis_driver::KeyMeta>, sel: &mut Option<usize>) {
+    let selected = sel
+        .and_then(|ix| keys.get(ix))
+        .map(|m| m.key.clone());
+    keys.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    *sel = selected
+        .as_ref()
+        .and_then(|key| keys.iter().position(|m| &m.key == key));
 }
 
 /// 代码段参数标绿：浅绿填充 + 细框，对应参考界面里待填参数的绿底。
@@ -9069,6 +9082,7 @@ impl DaroApp {
     fn apply_palette(dark: bool, ui_font: &str, cx: &mut Context<Self>) {
         // SQL 高亮的明暗是固定中调色，靠这个全局标志切换（编辑器下一帧取色）
         sql_highlight::set_dark(dark);
+        json_highlight::set_dark(dark);
         // 滚动条常显：默认 Scrolling 模式只在滚动瞬间淡入，水平条平时完全
         // 看不见；普通鼠标又没有水平滚轮，列一多就会被当成「表格不能横滚」。
         // 数据页 / 查询结果 / 设计器各子页 / 对象网格态都用同一套滚动条，
@@ -14129,7 +14143,25 @@ impl DaroApp {
             InputState::new(window, cx).placeholder("键名匹配，如 user:*（空 = 全部）")
         });
         let ttl = cx.new(|cx| InputState::new(window, cx).placeholder("秒，空 = 持久"));
-        let value_text = cx.new(|cx| TextareaState::new(window, cx));
+        let value_text = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .placeholder("（无值）")
+                .line_number(false)
+                .searchable(true);
+            // 语言由值面板的格式决定：Json 上色，Text/Hex 走工厂返回 None 保持正文色
+            state.set_highlighter_factory(
+                std::rc::Rc::new(|lang: &str| {
+                    if lang == "json" {
+                        Some(Box::new(json_highlight::JsonHighlighter::new())
+                            as Box<dyn gpui_kit::component::input::InputHighlighter>)
+                    } else {
+                        None
+                    }
+                }),
+                cx,
+            );
+            state
+        });
         let kid = self.next_kid;
         self.next_kid += 1;
         // 回车等同「刷新」：改完匹配词不用再去点按钮
@@ -14171,6 +14203,8 @@ impl DaroApp {
                 pattern,
                 ttl,
                 value_text,
+                format: None,
+                value_bytes: Vec::new(),
                 rtype: "",
                 keys: Vec::new(),
                 cursor: Some(0),
@@ -14281,6 +14315,7 @@ impl DaroApp {
                     k.keys.clear();
                 }
                 k.keys.extend(page.keys);
+                sort_key_rows(&mut k.keys, &mut k.sel);
                 k.cursor = page.next;
                 k.done = page.next.is_none();
             }
@@ -14368,20 +14403,141 @@ impl DaroApp {
         match res {
             Ok(v) => {
                 let is_string = v.rtype == "string";
-                let text = v
-                    .rows
-                    .first()
-                    .map(|r| redis_driver::bytes_display(&r.value))
-                    .unwrap_or_default();
+                let bytes = if is_string {
+                    v.rows.first().map(|r| r.value.clone()).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 k.value = Some(v);
-                k.value_dirty = false;
+                k.value_bytes = bytes;
+                // 换键回到自动探测：上一个键的格式不该跟着跳过来
+                k.format = None;
                 if is_string {
-                    let editor = k.value_text.clone();
-                    editor.update(cx, |s, cx| s.set_value(text, window, cx));
+                    Self::kv_render_value(k, window, cx);
+                } else {
+                    k.value_dirty = false;
                 }
             }
             Err(e) => {
                 k.value = None;
+                k.value_bytes.clear();
+                k.note = Some(e);
+                k.note_bad = true;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 当前生效的格式：用户没手选过就按已载入内容探测。
+    fn kv_format(k: &KvState) -> value_format::Format {
+        k.format.unwrap_or_else(|| value_format::detect(&k.value_bytes))
+    }
+
+    /// 按当前格式把已载入字节铺进编辑框，并同步高亮语言。
+    ///
+    /// 只在载入 / 切格式 / 续读时调用：用户在编辑框里的改动不会被覆盖。
+    fn kv_render_value(k: &mut KvState, window: &mut Window, cx: &mut App) {
+        let fmt = Self::kv_format(k);
+        let text = value_format::render(&k.value_bytes, fmt);
+        let editor = k.value_text.clone();
+        editor.update(cx, |s, cx| {
+            s.set_value(text, window, cx);
+            s.set_highlighter(fmt.highlight_lang(), cx);
+        });
+        // 上面这次写入会触发 Change 订阅，铺完再清脏，否则一进来就显示「未保存」
+        k.value_dirty = false;
+    }
+
+    /// 手选格式：内容不变，只换渲染方式与高亮。
+    fn kv_set_format(&mut self, kid: u64, fmt: value_format::Format, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(k) = Self::kv_state_mut(&mut self.opened, kid) else {
+            return;
+        };
+        if Self::kv_format(k) == fmt {
+            return;
+        }
+        k.format = Some(fmt);
+        Self::kv_render_value(k, window, cx);
+        cx.notify();
+    }
+
+    /// 大值续读：从已载入字节处再取一块，拼完按同一格式重铺。
+    fn kv_load_more(&mut self, kid: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.opened.iter().find(|t| t.kid == kid) else {
+            return;
+        };
+        let Some(conn) = self.conns.iter().find(|c| c.name == t.conn_name).cloned() else {
+            return;
+        };
+        let Some(k) = t.kstate.as_ref() else { return };
+        let Some(v) = k.value.as_ref() else { return };
+        if v.rtype != "string" || !v.truncated {
+            return;
+        }
+        let (db, key, offset) = (k.db, v.key.clone(), k.value_bytes.len());
+        let conn_name = conn.name.clone();
+        let params = backend::redis_params(&conn);
+        if let Some(k) = Self::kv_state_mut(&mut self.opened, kid) {
+            k.value_loading = true;
+            k.note = None;
+            k.note_bad = false;
+        }
+        cx.notify();
+        let handle = window.window_handle();
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    redis_driver::read_value(
+                        &conn_name,
+                        &params,
+                        db,
+                        &key,
+                        offset,
+                        redis_driver::VALUE_LIMIT,
+                    )
+                })
+                .await;
+            let _ = handle.update(cx, |_, window, app| {
+                let Some(ent) = entity.upgrade() else { return };
+                ent.update(app, |a, cx| a.kv_more_loaded(kid, res, window, cx));
+            });
+        })
+        .detach();
+    }
+
+    fn kv_more_loaded(
+        &mut self,
+        kid: u64,
+        res: Result<redis_driver::ValueRead, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(k) = Self::kv_state_mut(&mut self.opened, kid) else {
+            return;
+        };
+        k.value_loading = false;
+        match res {
+            Ok(chunk) => {
+                let Some(v) = k.value.as_mut() else { return };
+                if let Some(r) = chunk.rows.first() {
+                    k.value_bytes.extend_from_slice(&r.value);
+                }
+                // 以累计字节对 STRLEN 判断是否还有后续，本轮拿到 0 字节时按钮
+                // 留着让用户能重试，而不是自己转圈
+                v.truncated = (k.value_bytes.len() as i64) < v.total.unwrap_or(0);
+                if v.truncated {
+                    k.note = Some(format!(
+                        "已载入 {} 字节（共 {} 字节）",
+                        k.value_bytes.len(),
+                        v.total.unwrap_or(0)
+                    ));
+                    k.note_bad = false;
+                }
+                Self::kv_render_value(k, window, cx);
+            }
+            Err(e) => {
                 k.note = Some(e);
                 k.note_bad = true;
             }
@@ -14399,6 +14555,20 @@ impl DaroApp {
         self.kv_scan(kid, true, cx);
     }
 
+    /// 复制编辑框里当前呈现的文本（所见即所拷，与面板里看到的格式一致）。
+    fn kv_copy_value(&self, kid: u64, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .opened
+            .iter()
+            .find(|t| t.kid == kid)
+            .and_then(|t| t.kstate.as_ref())
+            .map(|k| k.value_text.read(cx).value().to_string())
+        else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
     /// 字符串写回：TTL 保持原样（KEEPTTL）。
     fn kv_save_string(&mut self, kid: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(t) = self.opened.iter().find(|t| t.kid == kid) else {
@@ -14412,14 +14582,27 @@ impl DaroApp {
         if v.rtype != "string" {
             return;
         }
-        let text = k.value_text.read(cx).value().to_string();
-        let Some(bytes) = redis_driver::bytes_from_input(&text) else {
+        if v.truncated {
+            // 只载入了前缀就把整段写回，等于把原值截断——必须先载入完
             if let Some(k) = Self::kv_state_mut(&mut self.opened, kid) {
-                k.note = Some("HEX: 前缀后应为偶数位十六进制".to_string());
+                k.note = Some("值未载入完整，先点「载入更多」再保存".to_string());
                 k.note_bad = true;
             }
             cx.notify();
             return;
+        }
+        let fmt = Self::kv_format(k);
+        let text = k.value_text.read(cx).value().to_string();
+        let bytes = match value_format::encode(&text, fmt) {
+            Ok(b) => b,
+            Err(e) => {
+                if let Some(k) = Self::kv_state_mut(&mut self.opened, kid) {
+                    k.note = Some(e);
+                    k.note_bad = true;
+                }
+                cx.notify();
+                return;
+            }
         };
         let (db, key) = (k.db, v.key.clone());
         let conn_name = conn.name.clone();
@@ -14838,18 +15021,16 @@ impl DaroApp {
                     -2 => "—".to_string(),
                     sec => format!("{sec}s"),
                 },
-                k.selected()
-                    .map(|m| {
-                        let mut parts = Vec::new();
-                        if !m.encoding.is_empty() {
-                            parts.push(m.encoding.clone());
-                        }
-                        if m.size > 0 {
-                            parts.push(format!("{} B", m.size));
-                        }
-                        parts.join(" · ")
-                    })
-                    .unwrap_or_default(),
+                {
+                    let mut parts = Vec::new();
+                    if !v.encoding.is_empty() {
+                        parts.push(v.encoding.clone());
+                    }
+                    if v.size > 0 {
+                        parts.push(format!("{} B", v.size));
+                    }
+                    parts.join(" · ")
+                },
             ),
             None => (String::new(), String::new(), String::new(), String::new()),
         };
@@ -14911,12 +15092,70 @@ impl DaroApp {
                 .into_any_element()
         } else if let Some(v) = k.value.as_ref() {
             if v.rtype == "string" {
+                let fmt = Self::kv_format(k);
                 let total = v.total.unwrap_or(0);
+                let loaded = k.value_bytes.len() as i64;
+                // 没取全时如实报「已载入 / 共」，取全了只报总数
                 let trunc = if v.truncated {
-                    format!("仅显示前 {} 字节（共 {total} 字节）", v.rows.first().map(|r| r.value.len()).unwrap_or(0))
+                    format!("已载入 {loaded} / {total} 字节")
                 } else {
                     format!("{total} 字节")
                 };
+                let me = cx.entity().downgrade();
+                let fmt_btn = Button::new(rid("kv/format"))
+                    .ghost()
+                    .with_size(gpui_kit::component::Size::XSmall)
+                    .dropdown_caret(true)
+                    .label(fmt.label())
+                    .dropdown_menu(move |menu, _window, _cx| {
+                        let mut m = menu;
+                        for f in value_format::Format::ALL {
+                            let ent = me.clone();
+                            m = m.item(
+                                PopupMenuItem::new(f.label())
+                                    .checked(f == fmt)
+                                    .on_click(move |_, window, app| {
+                                        let _ = ent.update(app, |this, cx| {
+                                            this.kv_set_format(kid, f, window, cx)
+                                        });
+                                    }),
+                            );
+                        }
+                        m
+                    });
+                let size_tag = div()
+                    .flex_none()
+                    .text_size(px(11.5))
+                    .text_color(muted)
+                    .child(format!(
+                        "Size: {}",
+                        value_format::human_size(total.max(0) as usize)
+                    ));
+                let copy_btn = h_flex()
+                    .id(rid("kv/copy"))
+                    .h(px(22.))
+                    .px(px(7.))
+                    .gap(px(4.))
+                    .items_center()
+                    .rounded(px(2.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_copy_value(kid, cx)))
+                    .child(art::icon(art::Glyph::Zed(ZedIcon::Copy), 13., muted))
+                    .child(div().text_size(px(12.)).text_color(fg).child("Copy"))
+                    .test_support();
+                let fmt_bar = h_flex()
+                    .h(px(30.))
+                    .flex_none()
+                    .px(px(8.))
+                    .gap(px(8.))
+                    .items_center()
+                    .border_b_1()
+                    .border_color(soft)
+                    .bg(chrome)
+                    .child(fmt_btn)
+                    .child(size_tag)
+                    .child(copy_btn);
                 let ttl_btn = h_flex()
                     .id(rid("kv/ttl"))
                     .h(px(22.))
@@ -14930,20 +15169,40 @@ impl DaroApp {
                     }))
                     .child(div().text_size(px(12.)).text_color(fg).child("设置 TTL"))
                     .test_support();
-                let save_btn = h_flex()
+                let mut save_btn = h_flex()
                     .id(rid("kv/save"))
                     .h(px(22.))
                     .px(px(7.))
                     .items_center()
                     .rounded(px(2.))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.kv_save_string(kid, window, cx)
-                    }))
                     .child(art::icon(art::Glyph::SaveFile, 13., muted))
-                    .child(div().text_size(px(12.)).text_color(fg).child("保存"))
-                    .test_support();
+                    .child(div().text_size(px(12.)).text_color(fg).child("保存"));
+                // 半截值写回会把原值截断，没取全之前不给保存
+                if !v.truncated {
+                    save_btn = save_btn
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.kv_save_string(kid, window, cx)
+                        }));
+                } else {
+                    save_btn = save_btn.text_color(muted);
+                }
+                let more_btn = v.truncated.then(|| {
+                    h_flex()
+                        .id(rid("kv/more-value"))
+                        .h(px(22.))
+                        .px(px(7.))
+                        .items_center()
+                        .rounded(px(2.))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.kv_load_more(kid, window, cx)
+                        }))
+                        .child(div().text_size(px(12.)).text_color(fg).child("载入更多"))
+                        .test_support()
+                });
                 let note = k.note.clone().map(|n| {
                     div()
                         .truncate()
@@ -14955,6 +15214,7 @@ impl DaroApp {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
+                    .child(fmt_bar)
                     .child(
                         div()
                             .flex_1()
@@ -14965,10 +15225,11 @@ impl DaroApp {
                             .rounded(px(2.))
                             .bg(bg)
                             .child(
-                                Textarea::new(&k.value_text)
+                                Editor::new(&k.value_text)
                                     .appearance(false)
                                     .bordered(false)
-                                    .size_full()
+                                    .readonly(v.truncated)
+                                    .h_full()
                                     .text_size(px(12.5)),
                             ),
                     )
@@ -14991,6 +15252,7 @@ impl DaroApp {
                             )
                             .child(ttl_btn)
                             .child(save_btn)
+                            .children(more_btn)
                             .child(
                                 div()
                                     .flex_1()
@@ -60080,6 +60342,44 @@ mod ui_flows {
         .unwrap();
     }
 
+    /// 悬浮更新按钮时先展示本次更新内容，不展开详情浮层、也不开始下载。
+    #[gpui_kit::test]
+    fn update_badge_hover_previews_release_notes(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestQueryExt as _;
+
+        isolate_store("update-hover");
+        let (handle, app) = open_app(cx);
+        let latest = crate::update::Latest {
+            version: "9.9.9".to_string(),
+            url: "https://example.invalid/release".to_string(),
+            asset: "not-a-url".to_string(),
+            notes: "# 更新说明\n\n- 支持 **Markdown** 与 `代码`".to_string(),
+            published_at: Some("2026-11-10T08:00:00Z".to_string()),
+        };
+        app.update(cx, |app, cx| app.set_available_update(latest, cx));
+        settle(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover("update-button", cx);
+        })
+        .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(700));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("update-hover-card").is_some(),
+                "悬浮更新按钮要弹出更新内容"
+            );
+            assert!(
+                window.try_find("update-popover").is_none(),
+                "仅悬浮不应展开下载浮层"
+            );
+        })
+        .unwrap();
+    }
+
     /// 下载过程中，界面上要真的出现「已下载 / 总量 · 百分比 · 速度」并随字节数刷新。
     /// 本地慢速服务只发一部分就停住，看到进度后立刻关窗取消，避免走到真安装。
     #[gpui_kit::test]
@@ -64953,5 +65253,46 @@ mod access_tests {
         });
 
         let _ = std::fs::remove_file(&file);
+    }
+}
+
+#[cfg(test)]
+mod key_order_tests {
+    use super::*;
+    // `use super::*` 会把 gpui 的同名 test 宏带进来，显式引回标准 test 宏
+    use core::prelude::v1::test;
+
+    fn meta(name: &str) -> redis_driver::KeyMeta {
+        redis_driver::KeyMeta {
+            key: name.as_bytes().to_vec(),
+            rtype: "string".to_string(),
+            ttl: -1,
+        }
+    }
+
+    fn names(keys: &[redis_driver::KeyMeta]) -> Vec<String> {
+        keys.iter()
+            .map(|m| String::from_utf8_lossy(&m.key).to_string())
+            .collect()
+    }
+
+    /// SCAN 回的是库内部哈希顺序，列表必须铺成键名升序。
+    #[test]
+    fn scanned_keys_sort_by_name() {
+        let mut keys = vec![meta("b"), meta("d"), meta("a"), meta("c")];
+        let mut sel: Option<usize> = Some(1);
+        sort_key_rows(&mut keys, &mut sel);
+        assert_eq!(names(&keys), ["a", "b", "c", "d"]);
+        assert_eq!(sel, Some(3), "选中行跟着键名挪位，不能还钉在旧下标");
+    }
+
+    /// 续扫拼页后重排，选中的键还是那个键。
+    #[test]
+    fn selection_follows_the_key_across_pages() {
+        let mut keys = vec![meta("k10"), meta("k2")];
+        let mut sel = Some(0usize);
+        keys.push(meta("k1"));
+        sort_key_rows(&mut keys, &mut sel);
+        assert_eq!(keys[sel.unwrap()].key, b"k10".to_vec());
     }
 }

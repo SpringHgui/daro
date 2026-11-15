@@ -5,6 +5,8 @@
 //! - 键一律按二进制收，界面自己决定 UTF-8 还是 `HEX:` 显示
 //! - 扫描只走 SCAN，一次调用只取一轮；游标为 0 表示遍历完
 //! - 容器类型的读值有行数上限，超出标 `truncated`
+//! - 字符串值累计取到 `STRING_FULL_LIMIT` 为止（阈值内一次取全），更大的每轮
+//!   `STRING_PREVIEW` 按 offset 续读，未取全标 `truncated`
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -14,8 +16,11 @@ use redis::{Connection, Value};
 
 /// 一次值读取最多返回的条目数（hash / list / set / zset / stream）。
 pub const VALUE_LIMIT: usize = 1000;
-/// 字符串值一次最多预览的字节数（与 Flutter 版的 64KB 对齐）。
+/// 累计载入越过取全阈值后，每轮续读的字节数。
 pub const STRING_PREVIEW: usize = 64 * 1024;
+/// 不超过这个字节数的字符串一次取全，可以直接编辑；更大的先给预览，
+/// 由界面「载入更多」按 offset 续读。取全阈值定在 2MB：再大编辑器要卡。
+pub const STRING_FULL_LIMIT: usize = 2 * 1024 * 1024;
 /// 建连超时；命令读写超时。远端失联时不能把界面永久挂住。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -274,8 +279,6 @@ pub struct KeyMeta {
     pub key: Vec<u8>,
     pub rtype: String,
     pub ttl: i64,
-    pub encoding: String,
-    pub size: i64,
 }
 
 impl KeyMeta {
@@ -291,7 +294,8 @@ pub struct ScanPage {
     pub next: Option<u64>,
 }
 
-/// SCAN 一轮 + 元数据流水线。
+/// SCAN 一轮 + 类型/TTL 流水线。存储细节（编码、字节数）只在选中时取，
+/// 见 [`read_value`]：一页几百个键都问 MEMORY USAGE 会拖慢整库。
 pub fn scan(
     conn: &str,
     p: &Params,
@@ -312,9 +316,22 @@ pub fn scan(
         }
         let (next, keys): (String, Vec<Vec<u8>>) = cmd.query(c).map_err(err)?;
         let next = next.parse::<u64>().unwrap_or(0);
+        // 整页一次流水线发出：远端两次往返填满一页。逐键串着问是每键两次往返，
+        // 200 键的一页在杭州那台库上要等十几秒。
+        let mut pipe = redis::pipe();
+        for key in &keys {
+            pipe.cmd("TYPE").arg(key);
+            pipe.cmd("TTL").arg(key);
+        }
+        let replies: Vec<Value> = pipe.query(c).map_err(err)?;
+        let mut it = replies.into_iter();
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            out.push(meta_of(c, key));
+            out.push(KeyMeta {
+                rtype: pop_text(&mut it, "unknown"),
+                ttl: pop_int(&mut it, -1),
+                key,
+            });
         }
         Ok(ScanPage {
             keys: out,
@@ -323,31 +340,20 @@ pub fn scan(
     })
 }
 
-fn meta_of(c: &mut Connection, key: Vec<u8>) -> KeyMeta {
-    let rtype = redis::cmd("TYPE")
-        .arg(&key)
-        .query::<String>(c)
-        .unwrap_or_else(|_| "unknown".to_string());
-    let ttl = redis::cmd("TTL")
-        .arg(&key)
-        .query::<i64>(c)
-        .unwrap_or(-1);
-    let encoding = redis::cmd("OBJECT")
-        .arg("ENCODING")
-        .arg(&key)
-        .query::<String>(c)
-        .unwrap_or_default();
-    let size = redis::cmd("MEMORY")
-        .arg("USAGE")
-        .arg(&key)
-        .query::<i64>(c)
-        .unwrap_or(0);
-    KeyMeta {
-        key,
-        rtype,
-        ttl,
-        encoding,
-        size,
+/// 流水线回包里取文本（简单串 / 批量串）；错误、Nil 或断流按 `def`。
+fn pop_text(it: &mut impl Iterator<Item = Value>, def: &str) -> String {
+    match it.next() {
+        Some(Value::BulkString(b)) => String::from_utf8(b).unwrap_or_default(),
+        Some(Value::SimpleString(s)) => s,
+        _ => def.to_string(),
+    }
+}
+
+/// 流水线回包里取整数；错误、Nil 或断流按 `def`。
+fn pop_int(it: &mut impl Iterator<Item = Value>, def: i64) -> i64 {
+    match it.next() {
+        Some(Value::Int(n)) => n,
+        _ => def,
     }
 }
 
@@ -372,6 +378,10 @@ pub struct ValueRead {
     pub ttl: i64,
     pub truncated: bool,
     pub bytes: Option<i64>,
+    /// OBJECT ENCODING，取不到为空
+    pub encoding: String,
+    /// MEMORY USAGE 的字节数，取不到为 0
+    pub size: i64,
 }
 
 pub fn read_value(
@@ -384,11 +394,19 @@ pub fn read_value(
 ) -> Result<ValueRead, String> {
     with_conn(conn, p, db, |c| {
         let rtype: String = redis::cmd("TYPE").arg(key).query(c).map_err(err)?;
-        let ttl = redis::cmd("TTL").arg(key).query::<i64>(c).unwrap_or(-1);
+        // TTL 与存储细节一次流水线问齐：列表页不再替每个键问 MEMORY USAGE
+        let mut pipe = redis::pipe();
+        pipe.cmd("TTL").arg(key);
+        pipe.cmd("OBJECT").arg("ENCODING").arg(key);
+        pipe.cmd("MEMORY").arg("USAGE").arg(key);
+        let replies: Vec<Value> = pipe.query(c).unwrap_or_default();
+        let mut it = replies.into_iter();
         let mut out = ValueRead {
             key: key.to_vec(),
             rtype: rtype.clone(),
-            ttl,
+            ttl: pop_int(&mut it, -1),
+            encoding: pop_text(&mut it, ""),
+            size: pop_int(&mut it, 0),
             ..Default::default()
         };
         match rtype.as_str() {
@@ -396,18 +414,18 @@ pub fn read_value(
                 let total: i64 = redis::cmd("STRLEN").arg(key).query(c).map_err(err)?;
                 out.total = Some(total);
                 out.bytes = Some(total);
-                let end = if limit == 0 {
-                    STRING_PREVIEW.saturating_sub(1)
-                } else {
-                    limit.saturating_sub(1)
-                };
+                // limit 只管容器条目数；字符串按 offset（字节偏移）取一块：
+                // 累计没到取全阈值前一次给满（阈值内的值即一次取全），
+                // 之后每轮 STRING_PREVIEW，由界面「载入更多」续读
+                let want = STRING_FULL_LIMIT.saturating_sub(offset).max(STRING_PREVIEW);
+                let end = offset + want - 1;
                 let bytes: Vec<u8> = redis::cmd("GETRANGE")
                     .arg(key)
                     .arg(offset)
                     .arg(end)
                     .query(c)
                     .map_err(err)?;
-                out.truncated = (bytes.len() as i64) < total;
+                out.truncated = (offset + bytes.len()) < total as usize;
                 out.rows.push(ValueRow {
                     label: String::new(),
                     value: bytes,
@@ -782,5 +800,216 @@ mod tests {
     fn cache_key_scopes_connection_and_db() {
         assert_ne!(cache_key("a", 0), cache_key("a", 1));
         assert_ne!(cache_key("a", 0), cache_key("b", 0));
+    }
+
+    /// 最小 RESP 服务端：只答键列表与字符串读写用到的命令，够把往返次数、分页、
+    /// 保存口径跑在真 socket 上。一条连接持续服务，顺带验证驱动复用同一会话。
+    /// 第二个返回值是「命令批次数」：一批 = 服务端一次读到的命令组，即往返次数。
+    fn serve(
+        keys: Vec<Vec<u8>>,
+        seed: Vec<u8>,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let lst = std::net::TcpListener::bind("127.0.0.1:0").expect("占用本地端口");
+        let port = lst.local_addr().unwrap().port();
+        let batches = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = batches.clone();
+        std::thread::spawn(move || {
+            let Ok(mut sock) = lst.accept().map(|(s, _)| s) else {
+                return;
+            };
+            let mut value = seed;
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                let mut handled = 0usize;
+                while let Some((cmd, used)) = parse_command(&buf) {
+                    buf.drain(..used);
+                    handled += 1;
+                    let out = reply(&cmd, &keys, &mut value);
+                    if sock.write_all(&out).is_err() {
+                        return;
+                    }
+                }
+                if handled > 0 {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                }
+                match sock.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+        (port, batches)
+    }
+
+    /// 单条命令的回包；未知命令一律 +OK（握手用）。
+    fn reply(cmd: &[Vec<u8>], keys: &[Vec<u8>], value: &mut Vec<u8>) -> Vec<u8> {
+        let name = cmd.first().map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+        let arg = |ix: usize| {
+            cmd.get(ix)
+                .and_then(|a| std::str::from_utf8(a).ok())
+                .and_then(|s| s.parse::<i64>().ok())
+        };
+        match name.as_slice() {
+            b"SCAN" => {
+                let mut out = b"*2\r\n$1\r\n0\r\n".to_vec();
+                out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                for k in keys {
+                    out.extend_from_slice(&bulk(k));
+                }
+                out
+            }
+            b"TYPE" => b"+string\r\n".to_vec(),
+            b"TTL" => b":3600\r\n".to_vec(),
+            b"OBJECT" => bulk(b"raw"),
+            b"MEMORY" | b"STRLEN" => int(value.len() as i64),
+            b"GETRANGE" => {
+                let from = arg(2).unwrap_or(0);
+                let to = arg(3).unwrap_or(-1).min(value.len() as i64 - 1);
+                let slice: &[u8] =
+                    if from < 0 || to < from || from as usize >= value.len() {
+                        &[]
+                    } else {
+                        &value[from as usize..=to as usize]
+                    };
+                bulk(slice)
+            }
+            // 第三参是要写入的值；KEEPTTL / EX 这里不建模，只记下负载
+            b"SET" => {
+                if let Some(v) = cmd.get(2) {
+                    *value = v.clone();
+                }
+                b"+OK\r\n".to_vec()
+            }
+            _ => b"+OK\r\n".to_vec(),
+        }
+    }
+
+    fn bulk(bytes: &[u8]) -> Vec<u8> {
+        let mut out = format!("${}\r\n", bytes.len()).into_bytes();
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    fn int(n: i64) -> Vec<u8> {
+        format!(":{n}\r\n").into_bytes()
+    }
+
+    /// 缓冲区开头若是一条完整命令，返回参数与占用字节数；不完整返回 None 等下次读。
+    fn parse_command(buf: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
+        if buf.first() != Some(&b'*') {
+            return None;
+        }
+        let (n, mut pos) = read_line_number(buf, 1)?;
+        let mut args = Vec::with_capacity(n);
+        for _ in 0..n {
+            if buf.get(pos) != Some(&b'$') {
+                return None;
+            }
+            let (len, next) = read_line_number(buf, pos + 1)?;
+            if buf.len() < next + len + 2 {
+                return None;
+            }
+            args.push(buf[next..next + len].to_vec());
+            pos = next + len + 2;
+        }
+        Some((args, pos))
+    }
+
+    /// 从 `from` 起读一行十进制数，返回数值与行尾之后的位置。
+    fn read_line_number(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+        let end = from + buf[from..].windows(2).position(|w| w == b"\r\n")?;
+        let n: usize = std::str::from_utf8(&buf[from..end]).ok()?.parse().ok()?;
+        Some((n, end + 2))
+    }
+
+    #[test]
+    fn string_under_threshold_arrives_whole() {
+        // 用户报的那个尺寸：两万像素的 JSON 配置，旧代码只给前 1000 字节
+        let raw: Vec<u8> = (0..20445usize).map(|i| b'a' + (i % 26) as u8).collect();
+        let (port, _) = serve(vec![b"BXConfig".to_vec()], raw.clone());
+        let p = Params {
+            host: "127.0.0.1".into(),
+            port,
+            user: String::new(),
+            password: String::new(),
+        };
+        let v = read_value("verify-whole", &p, 0, b"BXConfig", 0, VALUE_LIMIT).unwrap();
+        assert_eq!(v.total, Some(raw.len() as i64));
+        assert!(!v.truncated, "取全阈值内的值不该再被截断");
+        assert_eq!(v.rows[0].value, raw);
+        assert_eq!(v.ttl, 3600);
+        // 存储细节跟着值一起回，列表页就不用替每个键问了
+        assert_eq!(v.encoding, "raw");
+        assert_eq!(v.size, raw.len() as i64);
+    }
+
+    #[test]
+    fn huge_string_pages_from_offset_until_whole() {
+        let raw: Vec<u8> = (0..STRING_FULL_LIMIT + 70_000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (port, _) = serve(vec![b"big".to_vec()], raw.clone());
+        let p = Params {
+            host: "127.0.0.1".into(),
+            port,
+            user: String::new(),
+            password: String::new(),
+        };
+        let first = read_value("verify-page", &p, 0, b"big", 0, VALUE_LIMIT).unwrap();
+        assert_eq!(first.rows[0].value.len(), STRING_FULL_LIMIT);
+        assert!(first.truncated, "超过阈值只给到阈值，剩下靠载入更多");
+        let mut got = first.rows[0].value.clone();
+        while got.len() < raw.len() {
+            let next =
+                read_value("verify-page", &p, 0, b"big", got.len(), VALUE_LIMIT).unwrap();
+            assert!(next.rows[0].value.len() <= STRING_PREVIEW);
+            got.extend_from_slice(&next.rows[0].value);
+            assert_eq!(next.truncated, got.len() < raw.len());
+        }
+        assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn save_writes_the_payload_back_byte_for_byte() {
+        let (port, _) = serve(vec![b"cfg".to_vec()], vec![b'x'; 5000]);
+        let p = Params {
+            host: "127.0.0.1".into(),
+            port,
+            user: String::new(),
+            password: String::new(),
+        };
+        // 界面压成紧凑 JSON 后交下来：超 i64 的整数与键序都得原样落库
+        let payload = br#"{"a":1,"list":[1,2,3],"big":99999999999999999999}"#;
+        set_string("verify-save", &p, 0, b"cfg", payload, None).unwrap();
+        let v = read_value("verify-save", &p, 0, b"cfg", 0, VALUE_LIMIT).unwrap();
+        assert_eq!(v.rows[0].value, payload.to_vec());
+        assert!(!v.truncated);
+    }
+
+    #[test]
+    fn key_page_costs_two_round_trips() {
+        let keys: Vec<Vec<u8>> = (0..200).map(|i| format!("20261114_{i:04}").into_bytes()).collect();
+        let (port, batches) = serve(keys.clone(), vec![b'x'; 10]);
+        let p = Params {
+            host: "127.0.0.1".into(),
+            port,
+            user: String::new(),
+            password: String::new(),
+        };
+        let page = scan("verify-scan", &p, 0, 0, "", "", 200).unwrap();
+        assert_eq!(page.keys.len(), 200);
+        assert_eq!(page.next, None, "游标回 0 就是遍历完");
+        assert!(
+            page.keys.iter().all(|m| m.rtype == "string" && m.ttl == 3600),
+            "整页类型/TTL 都得填上"
+        );
+        // 一页只该花两次往返：SCAN 一次、元数据流水线一次。逐键串问会是 401 次，
+        // 杭州那台库上按 30ms 一个来回算就是十几秒。
+        let got = batches.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(got <= 4, "往返批次 = {got}，元数据没走流水线？");
     }
 }
