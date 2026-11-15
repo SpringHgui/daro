@@ -280,7 +280,7 @@ fn paragraph(text: &str, dark: bool) -> AnyElement {
 }
 
 /// 块级 Markdown：逐个消费行，铺成纵向流。
-fn markdown(notes: &str, dark: bool) -> Div {
+pub(crate) fn markdown(notes: &str, dark: bool) -> Div {
     let p = Palette::of(dark);
     let muted = to_hsla(p.muted_foreground);
     let lines: Vec<&str> = notes.lines().collect();

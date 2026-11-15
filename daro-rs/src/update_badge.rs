@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::release_notes::ReleaseNotes;
@@ -327,11 +328,23 @@ impl DaroApp {
             Phase::Installing => "安装中…".into(),
             Phase::Failed => "重试更新".into(),
         };
-        let tip: SharedString = match badge.phase {
+        let hint: SharedString = match badge.phase {
+            Phase::Idle => "点击「更新」查看完整说明与下载选项".into(),
+            Phase::Downloading => "正在下载更新，点开查看进度".into(),
+            Phase::Ready => "更新已下载，点开即可重启安装".into(),
+            Phase::Installing => "正在安装更新".into(),
             Phase::Failed => "下载失败，点开查看并重试".into(),
-            Phase::Ready => "更新已下载，重启后安装".into(),
-            _ => format!("发现新版本 v{}", badge.latest.version).into(),
         };
+        let notes = badge.latest.notes.clone();
+        let version = badge.latest.version.clone();
+        let date = badge
+            .latest
+            .published_at
+            .as_deref()
+            .and_then(|value| value.get(..10))
+            .unwrap_or_default()
+            .to_string();
+        let dark = self.dark;
         h_flex()
             .id("update-button")
             .test_support()
@@ -345,7 +358,15 @@ impl DaroApp {
             .cursor_pointer()
             .hover(move |s| s.opacity(0.86))
             .tooltip(move |window, cx| {
-                gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                let version = version.clone();
+                let notes = notes.clone();
+                let date = date.clone();
+                let hint = hint.clone();
+                gpui_kit::component::tooltip::Tooltip::element(move |_, _| {
+                    update_hover_card(&version, &notes, &date, &hint, dark)
+                })
+                .p(px(10.))
+                .build(window, cx)
             })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_update_popover(cx)))
             .child(
@@ -527,6 +548,100 @@ impl DaroApp {
     }
 }
 
+/// 悬浮在更新按钮上时展示的更新内容：版本、日期与发布说明预览。
+fn update_hover_card(
+    version: &str,
+    notes: &str,
+    date: &str,
+    hint: &str,
+    dark: bool,
+) -> AnyElement {
+    let p = crate::palette::Palette::of(dark);
+    let fg = to_hsla(p.foreground);
+    let muted = to_hsla(p.muted_foreground);
+    let preview = notes_preview(notes);
+
+    let mut card = v_flex()
+        .id("update-hover-card")
+        .test_support()
+        .w(px(360.))
+        .gap(px(8.))
+        .child(
+            h_flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(format!("daro {version}")),
+                )
+                .when(!date.is_empty(), |s| {
+                    s.child(div().text_size(px(11.)).text_color(muted).child(date.to_string()))
+                }),
+        );
+    if preview.trim().is_empty() {
+        card = card.child(
+            div()
+                .text_size(px(12.))
+                .text_color(muted)
+                .child("此版本没有发布说明。"),
+        );
+    } else {
+        card = card
+            .child(div().h(px(1.)).w_full().bg(to_hsla(p.border)))
+            .child(crate::release_notes::markdown(&preview, dark));
+    }
+    card.child(
+        div()
+            .text_size(px(11.))
+            .text_color(muted)
+            .child(hint.to_string()),
+    )
+    .into_any_element()
+}
+
+/// 发布说明预览：跳过 HTML 注释，最多保留 14 行、每行 160 字。
+/// 超出时末尾补省略号；代码块被截断也能交给 Markdown 铺完。
+fn notes_preview(notes: &str) -> String {
+    const MAX_LINES: usize = 14;
+    const MAX_LINE_CHARS: usize = 160;
+    let mut out = String::new();
+    let mut taken = 0usize;
+    let mut in_comment = false;
+    for raw in notes.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        if in_comment {
+            if line.contains("-->") {
+                in_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("<!--") {
+            in_comment = !line.contains("-->");
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if taken == MAX_LINES {
+            out.push('…');
+            break;
+        }
+        if line.chars().count() > MAX_LINE_CHARS {
+            out.extend(line.chars().take(MAX_LINE_CHARS));
+            out.push('…');
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+        taken += 1;
+    }
+    out
+}
+
 fn kv_row(label: &'static str, value: &str, muted: Hsla, fg: Hsla) -> AnyElement {
     h_flex()
         .gap(px(8.))
@@ -559,5 +674,31 @@ fn human_size(bytes: f64) -> String {
         format!("{value:.0} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod hover_preview_tests {
+    use super::notes_preview;
+
+    #[test]
+    fn notes_preview_skips_comments_and_caps_size() {
+        let notes = "<!-- 隐藏 -->\n# 更新说明\n\n- 支持 Markdown\n- 修复问题";
+        let preview = notes_preview(notes);
+        assert!(!preview.contains("隐藏"), "HTML 注释不该出现在预览里");
+        assert!(preview.contains("# 更新说明"));
+        assert!(preview.contains("- 修复问题"));
+
+        let long: String = (0..20).map(|i| format!("第{i}行\n")).collect();
+        let preview = notes_preview(&long);
+        assert_eq!(preview.lines().count(), 15, "14 行正文 + 省略号行");
+        assert!(preview.ends_with('…'));
+
+        let wide = "字".repeat(200);
+        assert_eq!(
+            notes_preview(&wide),
+            format!("{}…\n", "字".repeat(160)),
+            "超长单行要截到 160 字"
+        );
     }
 }
