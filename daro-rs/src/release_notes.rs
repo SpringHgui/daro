@@ -232,24 +232,31 @@ fn inline(text: &str, dark: bool) -> (StyledText, Option<String>) {
                     let url = tail[mid + 2..mid + 2 + close].trim().to_string();
                     let start = out.len();
                     push(&mut out, label);
-                    spans.push((
-                        start..out.len(),
-                        HighlightStyle {
-                            color: Some(to_hsla(p.accent)),
-                            underline: Some(gpui::UnderlineStyle {
-                                thickness: px(1.),
-                                color: Some(to_hsla(p.accent)),
-                                wavy: false,
-                            }),
-                            ..Default::default()
-                        },
-                    ));
+                    spans.push((start..out.len(), link_style(&p)));
                     if link.is_none() {
                         link = Some(url);
                     }
                     i += mid + 2 + close + 1;
                     continue;
                 }
+            }
+        }
+        // 裸链接：CI 生成的发布说明末尾是「**发布地址**：<Release 页地址>」
+        //（旧版正文是 compare 地址），没有 Markdown 链接语法，得自己认出来才点得动。
+        if tail.starts_with("http://") || tail.starts_with("https://") {
+            let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+            let url = tail[..end].trim_end_matches(|c: char| {
+                "。，、；：！？）】》」,.;:!?)]}".contains(c)
+            });
+            if !url.is_empty() {
+                let start = out.len();
+                push(&mut out, url);
+                spans.push((start..out.len(), link_style(&p)));
+                if link.is_none() {
+                    link = Some(url.to_string());
+                }
+                i += url.len();
+                continue;
             }
         }
         let ch = tail.chars().next().unwrap_or(' ');
@@ -260,11 +267,26 @@ fn inline(text: &str, dark: bool) -> (StyledText, Option<String>) {
     (StyledText::new(out).with_highlights(spans), link)
 }
 
+/// 行内链接的样式：强调色 + 下划线。
+fn link_style(p: &Palette) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(to_hsla(p.accent)),
+        underline: Some(gpui::UnderlineStyle {
+            thickness: px(1.),
+            color: Some(to_hsla(p.accent)),
+            wavy: false,
+        }),
+        ..Default::default()
+    }
+}
+
 /// 段落：有链接时整块可点（发布说明里的链接通常一句话一个）。
 fn paragraph(text: &str, dark: bool) -> AnyElement {
     let p = Palette::of(dark);
     let (styled, link) = inline(text, dark);
     let el = div()
+        .w_full()
+        .min_w_0()
         .text_size(px(13.))
         .line_height(px(21.))
         .text_color(to_hsla(p.foreground))
@@ -453,6 +475,9 @@ fn list_row(marker: &str, text: &str, indent: usize, dark: bool) -> AnyElement {
         .child(
             div()
                 .flex_1()
+                // 不给 min-width:0 的话，flex 子项的自动最小尺寸是整段文字的
+                // 宽度，长句子会把这一行顶出容器（更新浮层里就见过）。
+                .min_w_0()
                 .text_size(px(13.))
                 .line_height(px(21.))
                 .text_color(to_hsla(p.foreground))

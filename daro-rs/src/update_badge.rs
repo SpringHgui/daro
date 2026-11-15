@@ -1,9 +1,10 @@
 //! 标题栏右上角的更新入口（照 VS Code 的更新提示做的）。
 //!
 //! 查到比当前新的版本后，`DaroApp::update` 存一份状态，标题栏出蓝色「更新」
-//! 按钮；点一下弹出详情浮层并开始后台下载（浮层关掉下载也继续）。「发布说明」
-//! 把该版本的 GitHub 正文按 Markdown 开成主窗口页签；下载完成后浮层给
-//! 「重启并更新」，走 [update::install] 拉起安装程序。
+//! 按钮；悬浮按钮即展开详情面板并开始后台下载（面板关掉下载也继续）。面板里
+//! 能直接点「发布地址」跳到该版本的 GitHub Release 页，「发布说明」把正文按
+//! Markdown 开成主窗口页签；下载完成后面板给「重启并更新」，走 [update::install]
+//! 拉起安装程序。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,6 +20,15 @@ use crate::release_notes::ReleaseNotes;
 use crate::update::{self, DownloadProgress, Latest};
 use crate::zed_icons::ZedIcon;
 use crate::{DaroApp, TITLE_H, WIN_BTN_W, db_icons, to_hsla, ui};
+
+/// 详情面板的宽度。
+const PANEL_W: f32 = 380.;
+/// 悬浮展开面板的延时：鼠标只是路过按钮时别急着弹。
+const HOVER_OPEN_DELAY: Duration = Duration::from_millis(220);
+/// 鼠标从按钮挪向面板的宽限：这段时间里先别收面板。
+const HOVER_BRIDGE_DELAY: Duration = Duration::from_millis(320);
+/// 指针彻底离开面板后的收起延时。
+const HOVER_CLOSE_DELAY: Duration = Duration::from_millis(180);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -46,8 +56,16 @@ pub struct UpdateBadge {
     status: SharedString,
     cancel: Arc<AtomicBool>,
     task: Option<Task<()>>,
-    /// 详情浮层是否展开（关掉浮层不影响后台下载）
+    /// 详情面板是否展开
     popover: bool,
+    /// 面板是否由点击打开：点开的面板钉住，鼠标移开也不收
+    sticky: bool,
+    /// 指针是否在「更新」按钮上
+    hover_button: bool,
+    /// 指针是否在面板上
+    hover_panel: bool,
+    /// 悬停开合的延时任务；换任务即取消上一个
+    hover_task: Option<Task<()>>,
 }
 
 impl Drop for UpdateBadge {
@@ -106,30 +124,123 @@ impl DaroApp {
             cancel: Default::default(),
             task: None,
             popover: false,
+            sticky: false,
+            hover_button: false,
+            hover_panel: false,
+            hover_task: None,
         });
         cx.notify();
     }
 
+    /// 详情面板是否展开（悬浮或点击打开都算）。
     pub fn update_popover_open(&self) -> bool {
         self.update.as_ref().is_some_and(|badge| badge.popover)
+    }
+
+    /// 面板是否由点击打开：只有这种才铺遮罩挡外部点击。
+    ///
+    /// 悬浮打开的面板不能铺遮罩——那会把整窗的交互都吃掉，用户只是想看一眼
+    /// 更新内容。
+    pub fn update_popover_sticky(&self) -> bool {
+        self.update
+            .as_ref()
+            .is_some_and(|badge| badge.popover && badge.sticky)
+    }
+
+    /// 更新是不是已经在下载（悬浮只预览，不动下载）。
+    #[cfg(test)]
+    pub fn update_downloading(&self) -> bool {
+        self.update
+            .as_ref()
+            .is_some_and(|badge| badge.phase == Phase::Downloading)
     }
 
     pub fn close_update_popover(&mut self) {
         if let Some(badge) = self.update.as_mut() {
             badge.popover = false;
+            badge.sticky = false;
         }
     }
 
-    /// 点更新按钮：开 / 关详情浮层；第一次打开时顺带开始后台下载。
+    /// 点更新按钮：面板钉住展开（不随鼠标移开收起），再点一下收起。
+    /// 第一次点开时顺带开始后台下载。
     pub fn toggle_update_popover(&mut self, cx: &mut Context<Self>) {
         let Some(badge) = self.update.as_mut() else {
             return;
         };
-        badge.popover = !badge.popover;
+        let was_sticky = badge.popover && badge.sticky;
+        badge.popover = !was_sticky;
+        badge.sticky = badge.popover;
+        badge.hover_task = None;
         let start = badge.popover && badge.phase == Phase::Idle;
         cx.notify();
         if start {
             self.start_update_download(cx);
+        }
+    }
+
+    /// 指针进出「更新」按钮：悬浮展开面板，指针移开先宽限再收。
+    fn update_button_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        let Some(badge) = self.update.as_mut() else {
+            return;
+        };
+        badge.hover_button = hovered;
+        if hovered {
+            self.schedule_update_panel(true, HOVER_OPEN_DELAY, cx);
+        } else if !badge.hover_panel {
+            // 指针正从按钮挪向面板：给一段宽限，别在路上就把面板收了。
+            self.schedule_update_panel(false, HOVER_BRIDGE_DELAY, cx);
+        }
+    }
+
+    /// 指针进出面板：进来就取消待收起的任务，出去且不在按钮上才收。
+    fn update_panel_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        let Some(badge) = self.update.as_mut() else {
+            return;
+        };
+        badge.hover_panel = hovered;
+        if hovered {
+            // 掉任务即取消：待收起的延时任务在这里作废。
+            if let Some(badge) = self.update.as_mut() {
+                badge.hover_task = None;
+            }
+        } else if !badge.hover_button {
+            self.schedule_update_panel(false, HOVER_CLOSE_DELAY, cx);
+        }
+    }
+
+    /// 面板的开合都走延时任务：换任务即取消上一个，避免鼠标快速来回时闪。
+    fn schedule_update_panel(&mut self, open: bool, delay: Duration, cx: &mut Context<Self>) {
+        let Some(badge) = self.update.as_mut() else {
+            return;
+        };
+        let already = badge.popover == open;
+        // 丢掉旧任务即取消它；顺带把「已经到位」的情况挡在任务之外。
+        badge.hover_task = None;
+        if already {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |app, cx| {
+                let Some(badge) = app.update.as_mut() else {
+                    return;
+                };
+                if badge.popover == open {
+                    return;
+                }
+                if !open && (badge.sticky || badge.hover_button || badge.hover_panel) {
+                    return;
+                }
+                badge.popover = open;
+                if !open {
+                    badge.sticky = false;
+                }
+                cx.notify();
+            });
+        });
+        if let Some(badge) = self.update.as_mut() {
+            badge.hover_task = Some(task);
         }
     }
 
@@ -312,6 +423,9 @@ impl DaroApp {
     }
 
     /// 标题栏右侧的蓝色小按钮（有更新才渲染）。
+    ///
+    /// 悬浮即展开详情面板：面板是窗口里的真元素，鼠标能挪进去点「发布地址」
+    /// 的链接，移出按钮也不会立刻消失。
     pub fn update_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(badge) = self.update.as_ref() else {
             return div().into_any_element();
@@ -328,23 +442,6 @@ impl DaroApp {
             Phase::Installing => "安装中…".into(),
             Phase::Failed => "重试更新".into(),
         };
-        let hint: SharedString = match badge.phase {
-            Phase::Idle => "点击「更新」查看完整说明与下载选项".into(),
-            Phase::Downloading => "正在下载更新，点开查看进度".into(),
-            Phase::Ready => "更新已下载，点开即可重启安装".into(),
-            Phase::Installing => "正在安装更新".into(),
-            Phase::Failed => "下载失败，点开查看并重试".into(),
-        };
-        let notes = badge.latest.notes.clone();
-        let version = badge.latest.version.clone();
-        let date = badge
-            .latest
-            .published_at
-            .as_deref()
-            .and_then(|value| value.get(..10))
-            .unwrap_or_default()
-            .to_string();
-        let dark = self.dark;
         h_flex()
             .id("update-button")
             .test_support()
@@ -357,17 +454,9 @@ impl DaroApp {
             .bg(bg)
             .cursor_pointer()
             .hover(move |s| s.opacity(0.86))
-            .tooltip(move |window, cx| {
-                let version = version.clone();
-                let notes = notes.clone();
-                let date = date.clone();
-                let hint = hint.clone();
-                gpui_kit::component::tooltip::Tooltip::element(move |_, _| {
-                    update_hover_card(&version, &notes, &date, &hint, dark)
-                })
-                .p(px(10.))
-                .build(window, cx)
-            })
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.update_button_hover(*hovered, cx)
+            }))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_update_popover(cx)))
             .child(
                 Icon::new(ZedIcon::Download)
@@ -383,7 +472,10 @@ impl DaroApp {
             .into_any_element()
     }
 
-    /// 按钮下方的详情浮层：版本信息、下载进度、发布说明与主动作。
+    /// 按钮下方的详情面板：版本信息、发布说明、下载进度与主动作。
+    ///
+    /// 面板是窗口里的普通元素（不是 tooltip），所以鼠标能挪进来点链接；
+    /// 悬浮打开的会随指针离开收起，点按钮打开的钉住，外部点击才收。
     pub fn update_popover(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(badge) = self.update.as_ref() else {
             return div().into_any_element();
@@ -414,6 +506,11 @@ impl DaroApp {
             .and_then(|value| value.get(..10))
             .unwrap_or_default()
             .to_string();
+        let notes = badge.latest.notes.clone();
+        // 「发布地址」用 API 返回的 Release 页链接，单拎一行：正文里的链接行
+        // 在长说明里会被截掉，而它恰恰是用户最想点开的地方。
+        let release_url = (!badge.latest.url.trim().is_empty()).then(|| badge.latest.url.clone());
+        let preview = notes_preview(&notes);
 
         let mut info = v_flex().gap(px(2.)).child(
             div()
@@ -435,7 +532,7 @@ impl DaroApp {
             .absolute()
             .top(px(TITLE_H + 4.))
             .right(px(right))
-            .w(px(340.))
+            .w(px(PANEL_W))
             .p(px(14.))
             .gap(px(10.))
             .bg(to_hsla(p.background))
@@ -445,6 +542,9 @@ impl DaroApp {
             .shadow_lg()
             .text_color(fg)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.update_panel_hover(*hovered, cx)
+            }))
             .child(
                 h_flex()
                     .items_center()
@@ -484,6 +584,48 @@ impl DaroApp {
                     .child(db_icons::logo(38.))
                     .child(info),
             );
+
+        // 发布说明预览：正文里的链接（含裸 URL）点了就开浏览器。
+        if !preview.trim().is_empty() {
+            card = card.child(
+                div()
+                    .id("update-notes")
+                    .test_support()
+                    .w_full()
+                    .min_w_0()
+                    .child(crate::release_notes::markdown(&preview, self.dark)),
+            );
+        }
+        if let Some(url) = release_url {
+            let link = url.clone();
+            card = card.child(
+                h_flex()
+                    .id("update-release")
+                    .test_support()
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .items_start()
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| cx.open_url(&link))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child("发布地址"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(11.))
+                            .line_height(px(16.))
+                            .text_color(to_hsla(p.accent))
+                            .child(url),
+                    ),
+            );
+        }
 
         card = card.child(
             div()
@@ -548,62 +690,11 @@ impl DaroApp {
     }
 }
 
-/// 悬浮在更新按钮上时展示的更新内容：版本、日期与发布说明预览。
-fn update_hover_card(
-    version: &str,
-    notes: &str,
-    date: &str,
-    hint: &str,
-    dark: bool,
-) -> AnyElement {
-    let p = crate::palette::Palette::of(dark);
-    let fg = to_hsla(p.foreground);
-    let muted = to_hsla(p.muted_foreground);
-    let preview = notes_preview(notes);
-
-    let mut card = v_flex()
-        .id("update-hover-card")
-        .test_support()
-        .w(px(360.))
-        .gap(px(8.))
-        .child(
-            h_flex()
-                .items_center()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(fg)
-                        .child(format!("daro {version}")),
-                )
-                .when(!date.is_empty(), |s| {
-                    s.child(div().text_size(px(11.)).text_color(muted).child(date.to_string()))
-                }),
-        );
-    if preview.trim().is_empty() {
-        card = card.child(
-            div()
-                .text_size(px(12.))
-                .text_color(muted)
-                .child("此版本没有发布说明。"),
-        );
-    } else {
-        card = card
-            .child(div().h(px(1.)).w_full().bg(to_hsla(p.border)))
-            .child(crate::release_notes::markdown(&preview, dark));
-    }
-    card.child(
-        div()
-            .text_size(px(11.))
-            .text_color(muted)
-            .child(hint.to_string()),
-    )
-    .into_any_element()
-}
-
 /// 发布说明预览：跳过 HTML 注释，最多保留 14 行、每行 160 字。
 /// 超出时末尾补省略号；代码块被截断也能交给 Markdown 铺完。
+///
+/// 「完整变更」旧格式（compare 地址）和「发布地址」那行都不收进来：面板底部
+/// 单独给一行 Release 页链接，保证看得到、点得到。
 fn notes_preview(notes: &str) -> String {
     const MAX_LINES: usize = 14;
     const MAX_LINE_CHARS: usize = 160;
@@ -624,6 +715,9 @@ fn notes_preview(notes: &str) -> String {
             continue;
         }
         if trimmed.is_empty() {
+            continue;
+        }
+        if line.contains("/compare/") || line.contains("/releases/tag/") {
             continue;
         }
         if taken == MAX_LINES {
@@ -683,11 +777,15 @@ mod hover_preview_tests {
 
     #[test]
     fn notes_preview_skips_comments_and_caps_size() {
-        let notes = "<!-- 隐藏 -->\n# 更新说明\n\n- 支持 Markdown\n- 修复问题";
+        let notes = "<!-- 隐藏 -->\n# 更新说明\n\n- 支持 Markdown\n- 修复问题\n\n**发布地址**：https://github.com/SpringHgui/daro/releases/tag/daro-rs-v1.0.9\n**完整变更**：https://github.com/SpringHgui/daro/compare/daro-rs-v1.0.8...daro-rs-v1.0.9";
         let preview = notes_preview(notes);
         assert!(!preview.contains("隐藏"), "HTML 注释不该出现在预览里");
         assert!(preview.contains("# 更新说明"));
         assert!(preview.contains("- 修复问题"));
+        assert!(
+            !preview.contains("releases/tag") && !preview.contains("/compare/"),
+            "链接行由面板底部单独一行给出，预览里不该重复：{preview}"
+        );
 
         let long: String = (0..20).map(|i| format!("第{i}行\n")).collect();
         let preview = notes_preview(&long);

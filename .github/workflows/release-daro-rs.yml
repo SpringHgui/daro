@@ -247,9 +247,7 @@ jobs:
                 echo
               fi
             done
-            if [[ -n "$prev" ]]; then
-              echo "**完整变更**：https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${tag}"
-            fi
+            echo "**发布地址**：https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}"
           } > release-notes.md
           cat release-notes.md
 

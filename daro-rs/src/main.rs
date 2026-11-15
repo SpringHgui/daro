@@ -33567,8 +33567,9 @@ impl Render for DaroApp {
                 )
                 .child(self.other_popup(cx));
         }
-        // 标题栏「更新」浮层：透明背板接外部点击，浮层对在按钮下方。
-        if self.update_popover_open() {
+        // 标题栏「更新」面板：点击打开时铺透明背板接外部点击；悬浮打开的不铺，
+        // 免得整窗的交互都被背板吃掉。
+        if self.update_popover_sticky() {
             root = root
                 .child(
                     div()
@@ -33587,6 +33588,8 @@ impl Render for DaroApp {
                         ),
                 )
                 .child(self.update_popover(window, cx));
+        } else if self.update_popover_open() {
+            root = root.child(self.update_popover(window, cx));
         }
         if let Some(t0) = t0 {
             std::hint::black_box(&root);
@@ -60801,9 +60804,10 @@ mod ui_flows {
         .unwrap();
     }
 
-    /// 悬浮更新按钮时先展示本次更新内容，不展开详情浮层、也不开始下载。
+    /// 悬浮更新按钮就展开详情面板：面板能一直开着等鼠标挪进去，「发布地址」
+    /// 的链接点得到；但悬浮只是预览，不开始下载。
     #[gpui_kit::test]
-    fn update_badge_hover_previews_release_notes(cx: &mut TestAppContext) {
+    fn update_badge_hover_opens_panel_without_downloading(cx: &mut TestAppContext) {
         use gpui_kit::test::TestQueryExt as _;
 
         isolate_store("update-hover");
@@ -60812,7 +60816,7 @@ mod ui_flows {
             version: "9.9.9".to_string(),
             url: "https://example.invalid/release".to_string(),
             asset: "not-a-url".to_string(),
-            notes: "# 更新说明\n\n- 支持 **Markdown** 与 `代码`".to_string(),
+            notes: "# 更新说明\n\n- 支持 **Markdown** 与 `代码`\n\n**完整变更**：https://github.com/SpringHgui/daro/compare/daro-rs-v1.0.8...daro-rs-v1.0.9".to_string(),
             published_at: Some("2026-11-10T08:00:00Z".to_string()),
         };
         app.update(cx, |app, cx| app.set_available_update(latest, cx));
@@ -60823,17 +60827,59 @@ mod ui_flows {
         })
         .unwrap();
         cx.executor()
-            .advance_clock(std::time::Duration::from_millis(700));
+            .advance_clock(std::time::Duration::from_millis(400));
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             assert!(
-                window.try_find("update-hover-card").is_some(),
-                "悬浮更新按钮要弹出更新内容"
+                window.try_find("update-popover").is_some(),
+                "悬浮更新按钮要展开详情面板"
             );
             assert!(
+                window.try_find("update-release").is_some(),
+                "面板里要给「发布地址」留一个可点的入口"
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(
+                !app.read(cx).update_downloading(),
+                "悬浮只是预览，不该开始下载"
+            );
+        });
+
+        // 鼠标挪进面板：面板不能被收掉，否则链接永远点不到。
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover("update-popover", cx);
+        })
+        .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("update-popover").is_some(),
+                "鼠标挪进面板后，面板要留着"
+            );
+        })
+        .unwrap();
+
+        // 指针彻底离开：面板收起。
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover("win-min", cx);
+        })
+        .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
                 window.try_find("update-popover").is_none(),
-                "仅悬浮不应展开下载浮层"
+                "指针离开按钮和面板后，面板要收起"
             );
         })
         .unwrap();
