@@ -730,25 +730,46 @@ pub fn apply_changes(key: &str, db: &str, ch: &GridChanges<'_>) -> Result<String
         let alias = alias.unwrap_or_else(|| "rowid".to_string());
         let tx = raw.unchecked_transaction().map_err(|e| e.to_string())?;
         let mut touched = 0usize;
-        for (key, col, val) in ch.updates {
+        for (key, cells) in ch.updates {
             let Some(rid) = rowid_of(key) else {
                 return Err("该表无 rowid，不支持编辑写回".to_string());
             };
-            let Some(meta) = ch.columns.get(*col) else {
-                continue;
-            };
-            if !writable.get(&meta.name).copied().unwrap_or(true) {
-                return Err(format!("列「{}」是生成列 / 隐藏列，不能写回", meta.name));
+            // 一行一条 UPDATE：逐格发多条时，只要 rowid 本身也在改动里，第一条
+            // 就把旧 rowid 写没了，后面按旧 rowid 定位必然 0 行命中并整批回滚
+            let mut sets: Vec<&ColMeta> = Vec::with_capacity(cells.len());
+            for (col, _) in cells {
+                let Some(meta) = ch.columns.get(*col) else {
+                    continue;
+                };
+                if !writable.get(&meta.name).copied().unwrap_or(true) {
+                    return Err(format!("列「{}」是生成列 / 隐藏列，不能写回", meta.name));
+                }
+                sets.push(meta);
             }
+            if sets.is_empty() {
+                continue;
+            }
+            let set_part = sets
+                .iter()
+                .enumerate()
+                .map(|(n, m)| format!("{} = ?{}", quote_ident(&m.name), n + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!(
-                "UPDATE {} SET {} = ?1 WHERE {} = ?2",
+                "UPDATE {} SET {set_part} WHERE {} = ?{}",
                 qualify(db, ch.table),
-                quote_ident(&meta.name),
-                alias
+                alias,
+                sets.len() + 1
             );
-            tx.execute(&sql, params![value_for(meta, val)?, rid])
+            let mut args: Vec<Value> = sets
+                .iter()
+                .zip(cells)
+                .map(|(m, (_, v))| value_for(m, v))
+                .collect::<Result<_, _>>()?;
+            args.push(Value::Integer(rid));
+            touched += tx
+                .execute(&sql, rusqlite::params_from_iter(args.iter()))
                 .map_err(|e| e.to_string())?;
-            touched += 1;
         }
         for key in ch.deletes {
             let Some(rid) = rowid_of(key) else {
@@ -1049,7 +1070,10 @@ mod tests {
         let ch = GridChanges {
             table: "member",
             columns: &cols,
-            updates: &[(k(1), 1, "阿离改".to_string()), (k(2), 2, "60.5".to_string())],
+            updates: &[(
+                k(1),
+                vec![(1, "阿离改".to_string())]
+            ), (k(2), vec![(2, "60.5".to_string())])],
             deletes: &[k(3)],
             inserts: &[vec![
                 "4".to_string(),
@@ -1068,14 +1092,37 @@ mod tests {
         close(K);
     }
 
+    /// 同一行的主键格和其它格一起改：必须并成一条 UPDATE。逐格发多条时，
+    /// 第一条就把旧 rowid 写没了，第二条按旧 rowid 定位 0 行、整批回滚。
     #[test]
-    fn apply_rejects_views_and_rowidless_tables() {
+    fn apply_changes_merges_cells_of_one_row() {
         let _guard = setup();
+        let cols = table_columns(K, "main", "member");
+        let ch = GridChanges {
+            table: "member",
+            columns: &cols,
+            updates: &[(k(1), vec![(0, "11".to_string()), (1, "改名又改值".to_string())])],
+            deletes: &[],
+            inserts: &[],
+        };
+        apply_changes(K, "main", &ch).unwrap();
+        let page = select_table(K, "main", "member", None, &[], 0, 100).unwrap();
+        assert!(
+            page.rows
+                .iter()
+                .any(|r| r[0] == "11" && r[1] == "改名又改值"),
+            "改 rowid 与改值应同批落库"
+        );
+        close(K);
+    }
+
+    #[test]
+    fn apply_rejects_views_and_rowidless_tables() {        let _guard = setup();
         let cols = table_columns(K, "main", "norowid");
         let ch = GridChanges {
             table: "norowid",
             columns: &cols,
-            updates: &[(Vec::new(), 0, "z".to_string())],
+            updates: &[(Vec::new(), vec![(0, "z".to_string())])],
             deletes: &[],
             inserts: &[],
         };

@@ -110,15 +110,16 @@ pub struct ScriptRun {
 /// 把网格工作集写回真库。调用方给：
 /// - `table` 目标表
 /// - `columns` 当前列清单（对取数结果的顺序）
-/// - `updates` (行身份, 列下标, 新值) 列表——行身份按驱动口径（SQLite 是
-///   单元素 rowid，PG 是主键列值）
+/// - `updates` (行身份, 该行改动的 [(列下标, 新值)…]) 列表，一行一条——行身份
+///   按驱动口径（SQLite 是单元素 rowid，PG 是主键列值）。改动格必须并到同一行
+///   的一条 UPDATE 里：主键本身被改过时，逐格发多条会让第二条按旧主键定位不到行。
 /// - `deletes` 行身份列表
 /// - `inserts` 行值列表
 /// 全部包在一个事务里；任何一条失败整体回滚。
 pub struct GridChanges<'a> {
     pub table: &'a str,
     pub columns: &'a [ColMeta],
-    pub updates: &'a [(RowKey, usize, String)],
+    pub updates: &'a [(RowKey, Vec<(usize, String)>)],
     pub deletes: &'a [RowKey],
     pub inserts: &'a [Vec<String>],
 }

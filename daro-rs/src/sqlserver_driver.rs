@@ -950,17 +950,29 @@ pub fn apply_changes(
         let mut touched = 0usize;
         run_affected(c, "BEGIN TRANSACTION")?;
         let result = (|| -> Result<(), String> {
-            for (key_vals, col, val) in ch.updates {
-                let Some(meta) = ch.columns.get(*col) else {
+            for (key_vals, cells) in ch.updates {
+                // 一行一条 UPDATE：逐格发多条时，只要主键本身也在改动里，第一条
+                // 就把旧主键写没了，后面按旧主键定位必然 0 行命中并整批回滚
+                let mut sets: Vec<String> = Vec::with_capacity(cells.len());
+                for (col, val) in cells {
+                    let Some(meta) = ch.columns.get(*col) else {
+                        continue;
+                    };
+                    if !meta.writable {
+                        return Err(format!("列「{}」不能写回", meta.name));
+                    }
+                    sets.push(format!(
+                        "{} = {}",
+                        quote_ident(&meta.name),
+                        literal(meta, val)
+                    ));
+                }
+                if sets.is_empty() {
                     continue;
-                };
-                if !meta.writable {
-                    return Err(format!("列「{}」不能写回", meta.name));
                 }
                 let sql = format!(
-                    "UPDATE {table} SET {} = {} WHERE {}",
-                    quote_ident(&meta.name),
-                    literal(meta, val),
+                    "UPDATE {table} SET {} WHERE {}",
+                    sets.join(", "),
                     where_part(key_vals)?
                 );
                 let n = run_affected(c, &sql)?;

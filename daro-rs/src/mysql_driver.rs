@@ -943,26 +943,39 @@ pub fn apply_changes(key: &str, db: &str, ch: &GridChanges<'_>) -> Result<String
         if (!ch.updates.is_empty() || !ch.deletes.is_empty()) && pk.is_empty() {
             return Err("该表没有主键，不支持编辑和删除写回".to_string());
         }
-        let update_where = pk_where(&pk);
-        let delete_where = pk_where(&pk);
+        let where_pk = pk_where(&pk);
         let mut tx = conn.start_transaction(TxOpts::default()).map_err(|e| err_text(&e))?;
         let mut touched = 0usize;
-        for (key_vals, col, val) in ch.updates {
-            let Some(meta) = ch.columns.get(*col) else {
-                continue;
-            };
-            if !meta.writable {
-                return Err(format!("列「{}」是生成列 / 自增列，不能写回", meta.name));
-            }
+        for (key_vals, cells) in ch.updates {
             if key_vals.len() != pk.len() {
                 return Err("行标识与当前主键不匹配，请刷新页签".to_string());
             }
+            // 一行一条 UPDATE：逐格发多条时，只要主键本身也在改动里，第一条
+            // 就把旧主键写没了，后面按旧主键定位必然 0 行命中并整批回滚
+            let mut sets: Vec<&ColMeta> = Vec::with_capacity(cells.len());
+            for (col, _) in cells {
+                let Some(meta) = ch.columns.get(*col) else {
+                    continue;
+                };
+                if !meta.writable {
+                    return Err(format!("列「{}」是生成列 / 自增列，不能写回", meta.name));
+                }
+                sets.push(meta);
+            }
+            if sets.is_empty() {
+                continue;
+            }
+            let set_part = sets
+                .iter()
+                .map(|m| format!("{} = ?", quote_ident(&m.name)))
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!(
-                "UPDATE {} SET {} = ? WHERE {update_where}",
-                qualify(db, ch.table),
-                quote_ident(&meta.name)
+                "UPDATE {} SET {set_part} WHERE {where_pk}",
+                qualify(db, ch.table)
             );
-            let mut args: Vec<Value> = vec![bind(meta, val)];
+            let mut args: Vec<Value> =
+                sets.iter().zip(cells).map(|(m, (_, v))| bind(m, v)).collect();
             args.extend(key_vals.iter().map(|v| Value::from(v.clone())));
             let n = tx
                 .exec_iter(sql, MParams::Positional(args))
@@ -977,7 +990,7 @@ pub fn apply_changes(key: &str, db: &str, ch: &GridChanges<'_>) -> Result<String
             if key_vals.len() != pk.len() {
                 return Err("行标识与当前主键不匹配，请刷新页签".to_string());
             }
-            let sql = format!("DELETE FROM {} WHERE {delete_where}", qualify(db, ch.table));
+            let sql = format!("DELETE FROM {} WHERE {where_pk}", qualify(db, ch.table));
             let args: Vec<Value> = key_vals.iter().map(|v| Value::from(v.clone())).collect();
             let n = tx
                 .exec_iter(sql, MParams::Positional(args))
@@ -1360,7 +1373,7 @@ mod live_tests {
         let ch = GridChanges {
             table: "member",
             columns: &cols,
-            updates: &[(target.clone(), 1, "阿离改".to_string())],
+            updates: &[(target.clone(), vec![(1, "阿离改".to_string())])],
             deletes: &[],
             inserts: &[],
         };

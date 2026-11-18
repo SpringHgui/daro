@@ -30056,7 +30056,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 cx.notify();
                 return;
             }
-            let mut updates: Vec<(db_types::RowKey, usize, String)> = Vec::new();
+            let mut updates: Vec<(db_types::RowKey, Vec<(usize, String)>)> = Vec::new();
             for (i, row) in tab.data.iter().enumerate() {
                 let Some(key) = tab.row_keys.get(i) else {
                     continue;
@@ -30073,10 +30073,16 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 if base_row == row {
                     continue;
                 }
-                for (c, val) in row.iter().enumerate() {
-                    if base_row.get(c) != Some(val) {
-                        updates.push((key.clone(), c, val.clone()));
-                    }
+                // 一行的改动格并成一条：主键也被改过时，逐格发多条 UPDATE，
+                // 第一条就把旧主键写没了，后面的按旧主键定位必然 0 行命中
+                let cells: Vec<(usize, String)> = row
+                    .iter()
+                    .enumerate()
+                    .filter(|(c, val)| base_row.get(*c) != Some(*val))
+                    .map(|(c, val)| (c, val.clone()))
+                    .collect();
+                if !cells.is_empty() {
+                    updates.push((key.clone(), cells));
                 }
             }
             let deletes: Vec<db_types::RowKey> = tab
@@ -61084,6 +61090,88 @@ mod ui_flows {
                 )
                 .unwrap();
                 assert_eq!(page.rows[0][1], "阿离改", "真库已更新");
+            });
+        });
+        crate::sqlite_driver::close(&conn_name);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 删行后点「应用」：待应用统计只能是「删除 1 行」，写回只发 DELETE。
+    /// 若把别的行算成改动，UPDATE 会先跑并可能 0 行命中，用户看到的就是
+    /// 「按主键没找到该行」。
+    #[gpui_kit::test]
+    fn sqlite_delete_row_and_apply_through_ui(cx: &mut TestAppContext) {
+        isolate_store("flowdel");
+        let (conn, path) = sqlite_fixture(
+            "flowdel",
+            &[
+                "CREATE TABLE member (id INTEGER PRIMARY KEY, name TEXT, score REAL)",
+                "INSERT INTO member (id, name, score) VALUES (1,'阿离',88.5),(2,'老张',60),(3,'小李',70)",
+            ],
+        );
+        let conn_name = conn.name.clone();
+        let (handle, app) = open_app(cx);
+        with_failure_dump(cx, handle, |cx| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                app.update(cx, |a, cx| {
+                    a.conns = vec![conn];
+                    a.groups.clear();
+                    a.sel = Act::Conn(0);
+                    a.open_connection(0, cx);
+                });
+            })
+            .unwrap();
+            settle(cx, handle);
+            app.update(cx, |a, _| {
+                let _ = catalog::objects(&a.conns[0], "main", "", 0);
+            });
+            settle(cx, handle);
+            cx.update_window(handle, |_, window, cx| {
+                window.click("db/0/0", cx);
+            })
+            .unwrap();
+            settle(cx, handle);
+            cx.update_window(handle, |_, window, cx| {
+                window.click(("obj", 0usize), cx);
+                window.click(("obj", 0usize), cx);
+            })
+            .unwrap();
+            settle(cx, handle);
+            cx.update_window(handle, |_, window, _| {
+                assert!(window.try_find("cell/0/1").is_some(), "表已打开并渲染格子");
+            })
+            .unwrap();
+
+            // 行首「−」删掉中间那行
+            app.update(cx, |a, cx| {
+                a.opened[0].cell = (1, 0);
+                a.grid_delete_row(cx);
+            });
+            settle(cx, handle);
+            app.update(cx, |a, _| {
+                assert_eq!(a.opened[0].grid_pending(), (0, 0, 1), "只该有 1 行待删");
+            });
+
+            cx.update_window(handle, |_, window, cx| {
+                window.click("nav/ok", cx);
+            })
+            .unwrap();
+            settle(cx, handle);
+            app.update(cx, |a, _| {
+                assert_eq!(a.opened[0].data.len(), 2, "网格剩 2 行");
+                let page = crate::sqlite_driver::select_table(
+                    &conn_name,
+                    "main",
+                    "member",
+                    None,
+                    &[],
+                    0,
+                    10,
+                )
+                .unwrap();
+                assert_eq!(page.rows.len(), 2, "真库少了一行");
+                assert!(page.rows.iter().all(|r| r[1] != "老张"), "删掉的是老张");
             });
         });
         crate::sqlite_driver::close(&conn_name);

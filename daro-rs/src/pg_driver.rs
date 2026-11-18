@@ -1105,32 +1105,47 @@ pub fn apply_changes(key: &str, schema: &str, ch: &GridChanges<'_>) -> Result<St
         if (!ch.updates.is_empty() || !ch.deletes.is_empty()) && pk.is_empty() {
             return Err("该表没有主键，不支持编辑和删除写回".to_string());
         }
-        // UPDATE 的 $1 是列值，主键从 $2 起；DELETE 没有列值，主键从 $1 起
-        let update_where = pk_where(&pk, 2);
+        // UPDATE 的 $1..$n 是各改动格的值，主键从 n+1 起；DELETE 没有列值，主键从 $1 起
         let delete_where = pk_where(&pk, 1);
         let mut tx = client.transaction().map_err(|e| err_text(&e))?;
         let mut touched = 0usize;
-        for (key_vals, col, val) in ch.updates {
-            let Some(meta) = ch.columns.get(*col) else {
-                continue;
-            };
-            if !meta.writable {
-                return Err(format!(
-                    "列「{}」是生成列 / 标识列，不能写回",
-                    meta.name
-                ));
-            }
+        for (key_vals, cells) in ch.updates {
             if key_vals.len() != pk.len() {
                 return Err("行标识与当前主键不匹配，请刷新页签".to_string());
             }
-            let sql = format!(
-                "UPDATE {} SET {} = {} WHERE {update_where}",
-                qualify(schema, ch.table),
-                quote_ident(&meta.name),
-                cast_expr(1, &meta.ty)
-            );
-            let mut args: Vec<Option<String>> = vec![value_for(meta, val)];
+            // 一行一条 UPDATE：逐格发多条时，只要主键本身也在改动里，第一条
+            // 就把旧主键写没了，后面按旧主键定位必然 0 行命中并整批回滚
+            let mut sets: Vec<(&ColMeta, &String)> = Vec::with_capacity(cells.len());
+            for (col, val) in cells {
+                let Some(meta) = ch.columns.get(*col) else {
+                    continue;
+                };
+                if !meta.writable {
+                    return Err(format!(
+                        "列「{}」是生成列 / 标识列，不能写回",
+                        meta.name
+                    ));
+                }
+                sets.push((meta, val));
+            }
+            if sets.is_empty() {
+                continue;
+            }
+            let where_from = sets.len() + 1;
+            let set_part = sets
+                .iter()
+                .enumerate()
+                .map(|(n, (m, _))| format!("{} = {}", quote_ident(&m.name), cast_expr(n + 1, &m.ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut args: Vec<Option<String>> =
+                sets.iter().map(|(m, v)| value_for(m, v)).collect();
             args.extend(key_vals.iter().map(|v| Some(v.clone())));
+            let sql = format!(
+                "UPDATE {} SET {set_part} WHERE {}",
+                qualify(schema, ch.table),
+                pk_where(&pk, where_from)
+            );
             let n = exec_bound(&mut tx, &sql, &args)?;
             if n == 0 {
                 return Err("按主键没找到该行（可能已被其它客户端改动或删除），请刷新".to_string());
@@ -1678,7 +1693,10 @@ pub(crate) mod tests {
         let ch = GridChanges {
             table: "member",
             columns: &cols,
-            updates: &[(first.clone(), 1, "阿离改".to_string()), (first.clone(), 2, "88.25".to_string())],
+            updates: &[(
+                first.clone(),
+                vec![(1, "阿离改".to_string()), (2, "88.25".to_string())]
+            )],
             deletes: vec![page.keys[2].clone()].leak(),
             inserts: &[vec![
                 "0".to_string(), // 标识列，驱动应跳过
@@ -1707,7 +1725,7 @@ pub(crate) mod tests {
             &GridChanges {
                 table: "gen",
                 columns: &gen_cols,
-                updates: &[(gen_page.keys[0].clone(), 2, "999".to_string())],
+                updates: &[(gen_page.keys[0].clone(), vec![(2, "999".to_string())])],
                 deletes: &[],
                 inserts: &[],
             },
@@ -1723,7 +1741,10 @@ pub(crate) mod tests {
             &GridChanges {
                 table: "pair",
                 columns: &pair,
-                updates: &[(vec!["1".to_string(), "2".to_string()], 2, "改中".to_string())],
+                updates: &[(
+                    vec!["1".to_string(), "2".to_string()],
+                    vec![(2, "改中".to_string())]
+                )],
                 deletes: &[],
                 inserts: &[],
             },
@@ -1733,6 +1754,30 @@ pub(crate) mod tests {
         assert_eq!(after.rows[0][2], "甲");
         assert_eq!(after.rows[1][2], "改中");
 
+        // 主键格和其它格一起改：必须并成一行的一条 UPDATE。逐格发多条时第一条
+        // 就把旧主键写没了，第二条按旧主键定位 0 行命中，整批回滚（用户实测：
+        // 选中整行按 Delete 清空后点 ✓ 报「按主键没找到该行」）
+        apply_changes(
+            &k,
+            "public",
+            &GridChanges {
+                table: "pair",
+                columns: &pair,
+                updates: &[(
+                    vec!["1".to_string(), "2".to_string()],
+                    vec![(0, "9".to_string()), (2, "改完".to_string())]
+                )],
+                deletes: &[],
+                inserts: &[],
+            },
+        )
+        .unwrap();
+        let after = select_table(&k, "public", "pair", None, &[], 0, 10).unwrap();
+        assert!(
+            after.rows.iter().any(|r| r[0] == "9" && r[2] == "改完"),
+            "改主键与改值应同批落库"
+        );
+
         // 无主键表：改 / 删整体拒绝；纯新增仍可
         let nopath = try_table_columns(&k, "public", "nopath").unwrap();
         let err = apply_changes(
@@ -1741,7 +1786,7 @@ pub(crate) mod tests {
             &GridChanges {
                 table: "nopath",
                 columns: &nopath,
-                updates: &[(vec![], 0, "z".to_string())],
+                updates: &[(vec![], vec![(0, "z".to_string())])],
                 deletes: &[],
                 inserts: &[],
             },
@@ -1796,8 +1841,8 @@ pub(crate) mod tests {
                 table: "member",
                 columns: &cols,
                 updates: &[
-                    (page.keys[0].clone(), 1, "跟着一起回滚".to_string()),
-                    (page.keys[1].clone(), 1, "没人".to_string()),
+                    (page.keys[0].clone(), vec![(1, "跟着一起回滚".to_string())]),
+                    (page.keys[1].clone(), vec![(1, "没人".to_string())]),
                 ],
                 deletes: &[],
                 inserts: &[],
