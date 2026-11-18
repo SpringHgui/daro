@@ -132,12 +132,21 @@ pub fn is_open(key: &str) -> bool {
     CONNS.lock().unwrap().contains_key(key)
 }
 
-/// 惰性建连：树上展开到某个库才为该库开连接。
+/// 惰性建连：树上展开到某个库才为该库开连接。断掉的句柄由 `with_conn` /
+/// `catalog_query` 在失败时摘掉，所以这里只需要看注册表在不在。
 pub fn ensure(key: &str, p: &Params) -> Result<(), String> {
     if is_open(key) {
         return Ok(());
     }
     open(key, p)
+}
+
+/// 摘掉某条句柄：期间可能已被「断开 + 重开」换成了新的，那种情况不动它。
+fn evict(key: &str, arc: &Arc<Mutex<Client>>) {
+    let mut map = CONNS.lock().unwrap();
+    if map.get(key).is_some_and(|c| Arc::ptr_eq(c, arc)) {
+        map.remove(key);
+    }
 }
 
 /// 关一条库连接（树上收起某个库时）。只从注册表摘句柄，不等在飞的查询：
@@ -203,11 +212,29 @@ pub fn probe(p: &Params) -> Result<(), String> {
         .map_err(|e| err_text(&e))
 }
 
+/// 服务端把这条连接判死了的错误码：连接异常类 `08xxx`、管理员中断 `57P0x`
+/// （被 kill / 实例关停）。收到这两种之后同一条句柄不可能再用，而
+/// `is_closed` 可能还慢半拍（连接任务刚把错误递上来、还没读到 EOF）。
+fn is_conn_dead(msg: &str) -> bool {
+    msg.contains("SQLSTATE 08") || msg.contains("SQLSTATE 57P0")
+}
+
 /// 注册表里取出句柄、锁住这条连接执行 `f`；注册表锁不跨 I/O。
+/// 失败且这条连接已经断了，就把句柄摘掉：留着它，这个库之后每次取数 / 写回
+/// 都连带报「connection closed」，用户只能手动断开再连。
 fn with_conn<T>(key: &str, f: impl FnOnce(&mut Client) -> Result<T, String>) -> Result<T, String> {
-    let client = handle(key)?;
-    let mut client = client.lock().unwrap();
-    f(&mut client)
+    let arc = handle(key)?;
+    let mut client = arc.lock().unwrap();
+    let r = f(&mut client);
+    let dead = match &r {
+        Ok(_) => false,
+        Err(msg) => client.is_closed() || is_conn_dead(msg),
+    };
+    drop(client);
+    if dead {
+        evict(key, &arc);
+    }
+    r
 }
 
 /// 把一条只读语句包成「事务 + `SET LOCAL statement_timeout`」的一批语句：
@@ -235,12 +262,9 @@ fn catalog_query(key: &str, sql: &str) -> Result<Vec<SimpleQueryMessage>, String
         }
     };
     let text = err_text(&err);
-    if is_transport(&err) {
+    if is_transport(&err) || is_conn_dead(&text) {
         // 只摘掉自己这条：期间可能已被「断开 + 重开」换成了新句柄
-        let mut map = CONNS.lock().unwrap();
-        if map.get(key).is_some_and(|c| Arc::ptr_eq(c, &client)) {
-            map.remove(key);
-        }
+        evict(key, &client);
     }
     Err(text)
 }
@@ -1539,13 +1563,75 @@ pub(crate) mod tests {
 
         let e = try_list_schemas(&k).expect_err("被踢掉的句柄该报错");
         assert!(
-            e.contains("error communicating with the server") || e.contains("connection closed"),
+            e.contains("error communicating with the server")
+                || e.contains("connection closed")
+                || is_conn_dead(&e),
             "传输层错误要能读懂：{e}"
         );
         assert!(!is_open(&k), "坏句柄必须出局：留在注册表里这个库之后每次都失败");
 
         ensure(&k, &p).expect("下次用的时候应该重连上");
         assert!(try_list_schemas(&k).unwrap().contains(&"public".to_string()));
+    }
+
+    /// 取数路径（`with_conn`）同样要出局：界面「刷新」走的是这条，不是目录查询。
+    /// 断掉的句柄留在注册表里，`ensure` 只看「登记没登记」就会一路报错到底。
+    #[test]
+    #[ignore = "打 datawalk 开发库，需要网络可达"]
+    fn dead_handle_is_evicted_by_a_failed_fetch_and_reconnects_after() {
+        let (_g, p, k) = pg_setup();
+        let fetch = || select_table(&k, "public", "member", None, &[], 0, 10);
+        fetch().expect("开场取数应该是活的");
+
+        let kicker = key("pg-kicker-fetch", "postgres");
+        ensure(&kicker, &p.for_db("postgres")).expect("连 postgres 库失败");
+        let kick = format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{TEST_DB}' AND pid <> pg_backend_pid()"
+        );
+        catalog_list(&kicker, &kick).expect("踢不掉占用测试库的会话");
+        close(&kicker);
+
+        let e = fetch().expect_err("被踢掉的会话该报错");
+        assert!(
+            e.contains("connection closed")
+                || e.contains("error communicating with the server")
+                || is_conn_dead(&e),
+            "传输层错误要能读懂：{e}"
+        );
+        assert!(!is_open(&k), "坏句柄必须出局：留着它之后每次刷新都只会重复这个错");
+
+        // 坏句柄已出局，下一次 ensure 直接重开，界面不需要先断开再连
+        ensure(&k, &p).expect("应该自动重连");
+        fetch().expect("重连后取数要能成");
+        close(&k);
+    }
+
+    /// 空闲期被服务端掐掉、中间没有任何会失败的调用：第一次取数注定报错，
+    /// 但报错会把句柄摘掉，`Target` 的取数入口在同一击里发现句柄没了就重连
+    /// 再取一次，用户看到的就是刷新直接成功（写回不重试）。
+    #[test]
+    #[ignore = "打 datawalk 开发库，需要网络可达"]
+    fn idle_drop_leaves_a_missing_handle_for_the_fetch_retry() {
+        let (_g, p, k) = pg_setup();
+        select_table(&k, "public", "member", None, &[], 0, 10).expect("开场取数应该是活的");
+
+        let kicker = key("pg-kicker-idle", "postgres");
+        ensure(&kicker, &p.for_db("postgres")).expect("连 postgres 库失败");
+        let kick = format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{TEST_DB}' AND pid <> pg_backend_pid()"
+        );
+        catalog_list(&kicker, &kick).expect("踢不掉占用测试库的会话");
+        close(&kicker);
+
+        let first = select_table(&k, "public", "member", None, &[], 0, 10);
+        assert!(first.is_err(), "被掐掉的连接第一次取数该报错：{first:?}");
+        assert!(!is_open(&k), "报错该把坏句柄摘掉，重试才有依据");
+
+        ensure(&k, &p).expect("该自动重连");
+        select_table(&k, "public", "member", None, &[], 0, 10).expect("重连后取数要能成");
+        close(&k);
     }
 
     #[test]

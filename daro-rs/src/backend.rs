@@ -361,6 +361,34 @@ impl Target {
         }
     }
 
+    /// 驱动此刻还留着这条连接吗。服务端判死一条连接时，驱动是在失败那一步
+    /// 才把句柄摘掉的（空闲期没人去探测），所以这里读的是「摘完之后的状态」：
+    /// 没了＝上一条是因为连接断了才失败，值得当场上重连再试一次。
+    fn is_live(&self) -> bool {
+        match self {
+            Target::Sqlite { conn, .. } => sqlite_driver::is_open(conn),
+            Target::Access { conn, .. } => access_driver::is_open(conn),
+            Target::Pg { .. } => pg_driver::is_open(&self.keyed()),
+            Target::MySql { .. } => mysql_driver::is_open(&self.keyed()),
+            Target::SqlServer { .. } => sqlserver_driver::is_open(&self.keyed()),
+            Target::Mongo { .. } => mongo_driver::is_open(&self.keyed()),
+        }
+    }
+
+    /// 只读操作跑这一层：失败且句柄已被驱动摘掉（说明是连接断了，不是这条 SQL
+    /// 或数据本身的问题），就当场上重连再跑一次，用户点一下刷新即恢复，不用
+    /// 先失败一次再刷第二遍。重连也失败就把连接错误报出去。
+    /// 写回不走这里——重放一条可能已经到达服务端的写，风险比多取一次数大得多。
+    fn read_retry<T>(&self, f: impl Fn() -> Result<T, String>) -> Result<T, String> {
+        match f() {
+            Err(_) if !self.is_live() => match self.ensure() {
+                Ok(()) => f(),
+                Err(reconnect) => Err(reconnect),
+            },
+            r => r,
+        }
+    }
+
     /// 一次取回的最大行数（各驱动里定，这里只转发）。
     pub fn row_limit(&self) -> usize {
         match self {
@@ -375,6 +403,17 @@ impl Target {
 
     /// 表页取数（WHERE / ORDER BY / LIMIT / OFFSET 全部下推）。
     pub fn select_table(
+        &self,
+        table: &str,
+        where_sql: Option<&str>,
+        orders: &[(String, bool)],
+        offset: usize,
+        limit: usize,
+    ) -> Result<SelectPage, String> {
+        self.read_retry(|| self.select_page_run(table, where_sql, orders, offset, limit))
+    }
+
+    fn select_page_run(
         &self,
         table: &str,
         where_sql: Option<&str>,
@@ -443,6 +482,10 @@ impl Target {
 
     /// 当前筛选条件下的总行数。
     pub fn count_table(&self, table: &str, where_sql: Option<&str>) -> Result<usize, String> {
+        self.read_retry(|| self.count_run(table, where_sql))
+    }
+
+    fn count_run(&self, table: &str, where_sql: Option<&str>) -> Result<usize, String> {
         self.ensure()?;
         match self {
             Target::Sqlite { conn, .. } => {
@@ -1069,5 +1112,48 @@ pub fn probe(conn: &Connection) -> Result<(), String> {
         DbKind::SqlServer => sqlserver_driver::probe(&sqlserver_params(conn, &conn.database)),
         DbKind::MongoDb => mongo_driver::probe(&mongo_params(conn)),
         DbKind::Redis => redis_driver::probe(&redis_params(conn)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 空闲期被服务端掐掉（防火墙超时、实例重启、连接被 DBA kill）：点一次
+    /// 刷新就该自己重连上取到数，而不是先报一次「取数失败」再等第二下。
+    #[test]
+    #[ignore = "打 datawalk 开发库，需要网络可达"]
+    fn one_refresh_recovers_after_the_server_drops_the_idle_conn() {
+        let Some((_guard, params)) = pg_driver::tests::pg_fixture() else {
+            eprintln!("[backend] skip：读不到 datawalk 连接串");
+            return;
+        };
+        let target = Target::Pg {
+            conn: "真机测试-重连".to_string(),
+            db: pg_driver::tests::TEST_DB.to_string(),
+            schema: "public".to_string(),
+            params: params.clone(),
+        };
+        let fetch = || target.select_table("member", None, &[], 0, 10);
+        fetch().expect("开场取数应该是活的");
+
+        // 另开一条到 postgres 库的连接，把测试库上的会话全部踢掉
+        let kicker = pg_driver::key("pg-kicker-backend", "postgres");
+        pg_driver::ensure(&kicker, &params.for_db("postgres")).expect("连 postgres 库失败");
+        pg_driver::execute_stmt(
+            &kicker,
+            &format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = '{db}' AND pid <> pg_backend_pid()",
+                db = pg_driver::tests::TEST_DB
+            ),
+            1,
+        )
+        .expect("踢不掉占用测试库的会话");
+        pg_driver::close(&kicker);
+
+        let r = fetch();
+        assert!(r.is_ok(), "连接被掐后一次刷新就该取到数：{:?}", r.err());
+        pg_driver::close(&pg_driver::key("真机测试-重连", pg_driver::tests::TEST_DB));
     }
 }

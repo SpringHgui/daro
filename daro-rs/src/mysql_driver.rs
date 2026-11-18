@@ -159,10 +159,23 @@ pub fn probe(p: &Params) -> Result<(), String> {
 }
 
 /// 注册表里取出句柄、锁住这条连接执行 `f`；注册表锁不跨 I/O。
+/// 失败了先问一句服务端还认不认这条连接（COM_PING）：不认就摘掉句柄，
+/// 下一次 ensure 自然重连。留着断掉的句柄，这个连接之后每次刷新都只会
+/// 重复报同一个连接已断的错误，用户只能手动断开再连。
 fn with_conn<T>(key: &str, f: impl FnOnce(&mut Conn) -> Result<T, String>) -> Result<T, String> {
-    let conn = handle(key)?;
-    let mut conn = conn.lock().unwrap();
-    f(&mut conn)
+    let arc = handle(key)?;
+    let mut conn = arc.lock().unwrap();
+    let r = f(&mut conn);
+    let dead = r.is_err() && conn.ping().is_err();
+    drop(conn);
+    if dead {
+        // 只摘自己这条：期间可能已被「断开 + 重开」换成了新句柄
+        let mut map = CONNS.lock().unwrap();
+        if map.get(key).is_some_and(|c| Arc::ptr_eq(c, &arc)) {
+            map.remove(key);
+        }
+    }
+    r
 }
 
 // ── SQL 片段 ─────────────────────────────────────────────────────
