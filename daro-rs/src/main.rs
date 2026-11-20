@@ -16594,13 +16594,13 @@ impl DaroApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let content = match std::fs::read_to_string(&path) {
+        let content = match sql_assoc::read_sql_text(&path) {
             Ok(c) => c,
             Err(e) => {
                 prompt_dialog::open_notice(
                     self.dark,
                     "打开 SQL 文件",
-                    format!("无法读取 {}：{e}", path.display()),
+                    e,
                     cx,
                 );
                 return;
