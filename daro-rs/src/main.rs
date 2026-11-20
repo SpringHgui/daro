@@ -2477,11 +2477,20 @@ fn design_index_sql_at(
                 .unwrap_or_default(),
         )
     };
-    let mut sql = format!(
-        "CREATE {unique}{prefix}INDEX {concurrently}{} ON {qual}{using} ({})",
-        q(name),
-        list.join(", ")
-    );
+    // PG 的 USING 在列表前，MySQL 的 USING 在列表后（放前面会报 1064）。
+    let mut sql = if is_mysql {
+        format!(
+            "CREATE {unique}{prefix}INDEX {} ON {qual} ({}){using}",
+            q(name),
+            list.join(", ")
+        )
+    } else {
+        format!(
+            "CREATE {unique}{prefix}INDEX {concurrently}{} ON {qual}{using} ({})",
+            q(name),
+            list.join(", ")
+        )
+    };
     if !is_mysql {
         let mut opts: Vec<String> = Vec::new();
         let ff = idx.fillfactor.trim();
@@ -50838,12 +50847,12 @@ mod designer_tests {
         };
         assert_eq!(
             sql_of(&prefix),
-            "CREATE INDEX `idx_name` ON `users` USING BTREE (`name`(10));"
+            "CREATE INDEX `idx_name` ON `users` (`name`(10)) USING BTREE;"
         );
         assert_eq!(prefix.fields[0].summary_mysql(), "`name`(10)");
         for junk in ["0", "", "abc"] {
             let idx = DesignIndex { fields: vec![field(junk)], ..prefix.clone() };
-            assert!(sql_of(&idx).contains("(`name`);"), "{junk:?} → {}", sql_of(&idx));
+            assert!(sql_of(&idx).contains("(`name`)"), "{junk:?} → {}", sql_of(&idx));
             assert_eq!(idx.fields[0].summary_mysql(), "`name`");
         }
         // 索引类型：FULLTEXT / SPATIAL 顶在 INDEX 前，且不带 USING
@@ -50865,7 +50874,7 @@ mod designer_tests {
         let uq = DesignIndex { kind: "UNIQUE".into(), unique: true, ..prefix.clone() };
         assert_eq!(
             sql_of(&uq),
-            "CREATE UNIQUE INDEX `idx_name` ON `users` USING BTREE (`name`(10));"
+            "CREATE UNIQUE INDEX `idx_name` ON `users` (`name`(10)) USING BTREE;"
         );
         let ha = DesignIndex {
             kind: "NORMAL".into(),
@@ -50873,7 +50882,7 @@ mod designer_tests {
             method: "HASH".into(),
             ..prefix.clone()
         };
-        assert_eq!(sql_of(&ha), "CREATE INDEX `idx_name` ON `users` USING HASH (`name`(10));");
+        assert_eq!(sql_of(&ha), "CREATE INDEX `idx_name` ON `users` (`name`(10)) USING HASH;");
         // 老存档没填 kind：仍按勾选唯一 / 方法里的 FULLTEXT 推断
         let legacy = DesignIndex { kind: String::new(), method: "FULLTEXT".into(), ..prefix };
         assert!(sql_of(&legacy).starts_with("CREATE FULLTEXT INDEX `idx_name`"));
@@ -50983,7 +50992,7 @@ mod designer_tests {
             &[],
             &[],
         );
-        assert!(sql.contains(" USING BTREE ("));
+        assert!(sql.contains(") USING BTREE;"), "{sql}");
 
         // 校验：名称可以留空（数据库默认起名），字段为空、名称重复才拦
         let empty_name = vec![DesignIndex {
