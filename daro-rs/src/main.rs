@@ -59968,6 +59968,37 @@ mod tree_menu_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 回归 issue #15：右键选中一条没连上的实例，状态栏会按「连接」节点数库，
+    /// 目录层不该因此排队——排队既把连接行点成转圈，又会真把实例连上去。
+    #[gpui_kit::test]
+    fn right_click_on_offline_instance_does_not_start_loading(cx: &mut TestAppContext) {
+        isolate_store("rightclickload");
+        let (mut conn, path) = sqlite_fixture("rightclickload-seed", &["CREATE TABLE t(a INTEGER)"]);
+        let name = "右键载入测试";
+        conn.name = name.to_string();
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, _| {
+                a.conns = vec![conn];
+                a.groups.clear();
+            });
+            window.right_click("conn-0~", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.read_with(cx, |a, _| {
+            assert!(matches!(a.sel, Act::Conn(0)), "右键应先选中这条实例");
+            assert!(a.loading.is_empty(), "右键不该把未连接的实例排成载入中：{:?}", a.loading);
+        });
+        settle(cx, handle);
+        app.read_with(cx, |a, _| {
+            assert!(!a.conns[0].connected, "光是右键选中不该真的建连");
+            assert!(a.loading.is_empty(), "收尾后不该残留载入中：{:?}", a.loading);
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 树右键「刷新」重查真库目录：外部往库里加表后，不刷看不见、刷了看得见。
     #[gpui_kit::test]
     fn refresh_catalog_rereads_real_db(cx: &mut TestAppContext) {

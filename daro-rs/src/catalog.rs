@@ -375,6 +375,12 @@ pub fn databases(conn: &Connection) -> &'static [&'static str] {
     if !backend::is_real_conn(conn) {
         return mock::databases(conn.kind);
     }
+    // 没连上的实例不排队：排队会经 `fill_databases` 的 `ensure` 把这条连接
+    // 真连上去，还会把连接行点成「载入中」转圈——状态栏按选中节点数库时，
+    // 光是右键选中就会触发（issue #15）。
+    if !conn.connected {
+        return &[];
+    }
     get(&DATABASES_CACHE, &databases_key(&conn.name)).unwrap_or_else(|| {
         schedule(Pending::Databases(conn.clone()));
         &[]
