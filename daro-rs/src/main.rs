@@ -6633,6 +6633,13 @@ pub(crate) fn split_sql_statements(script: &str) -> Vec<String> {
             i = end;
             continue;
         }
+        // MySQL 的 `#` 行注释同样不能拆语句；只在行首认，避免吃掉 PG 的 `#>` 运算符
+        if script[i..].starts_with('#') && sql_format::at_line_start(script, i) {
+            let end = script[i..].find('\n').map(|p| i + p).unwrap_or(script.len());
+            buf.push_str(&script[i..end]);
+            i = end;
+            continue;
+        }
         if script[i..].starts_with("/*") {
             block_depth = 1;
             buf.push_str("/*");

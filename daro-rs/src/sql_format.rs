@@ -17,6 +17,22 @@ enum Tok {
     Atom(String),
 }
 
+/// `i` 处是否是本行第一个非空白字符（行首）。
+pub(crate) fn at_line_start(s: &str, i: usize) -> bool {
+    let mut j = i;
+    while j > 0 {
+        let ch = s[..j].chars().next_back().unwrap();
+        if ch == '\n' {
+            return true;
+        }
+        if !(ch == ' ' || ch == '\t') {
+            return false;
+        }
+        j -= ch.len_utf8();
+    }
+    true
+}
+
 fn lex(s: &str) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -27,6 +43,14 @@ fn lex(s: &str) -> Vec<Tok> {
             continue;
         }
         if s[i..].starts_with("--") {
+            let end = s[i..].find('\n').map(|p| i + p).unwrap_or(s.len());
+            out.push(Tok::Atom(s[i..end].to_string()));
+            i = end;
+            continue;
+        }
+        // MySQL 的 `#` 行注释只在行首认：PG 的 `#>` / `#` 运算符都是行内的，
+        // 若在任意位置当注释吃掉会把表达式截断。
+        if c == '#' && at_line_start(s, i) {
             let end = s[i..].find('\n').map(|p| i + p).unwrap_or(s.len());
             out.push(Tok::Atom(s[i..end].to_string()));
             i = end;
@@ -325,6 +349,10 @@ pub fn pretty_statement(stmt: &str) -> String {
     let mut in_body = false;
     // 上一个 token 是 `::` / `->` 之类贴右运算符：下一个 token 不许补空格
     let mut tight_next = false;
+    // INSERT 目标表 → 列清单的 `(` 要带空格（`INSERT INTO t (a, b)`），
+    // 而函数调用的 `(` 紧贴。`after_insert` 等目标表，`insert_cols` 等那个括号。
+    let mut after_insert = false;
+    let mut insert_cols = false;
     for tok in toks {
         let tight = std::mem::take(&mut tight_next);
         match tok {
@@ -342,11 +370,12 @@ pub fn pretty_statement(stmt: &str) -> String {
                         cur = indent(base_indent);
                     }
                     cur.push('(');
-                } else if is_keyword(&prev_word) {
+                } else if is_keyword(&prev_word) || insert_cols {
                     cur.push_str(" (");
                 } else {
                     cur.push('(');
                 }
+                insert_cols = false;
                 depth += 1;
             }
             Tok::Sym(')') => {
@@ -381,7 +410,7 @@ pub fn pretty_statement(stmt: &str) -> String {
                 }
             }
             Tok::Atom(a) => {
-                let line_comment = a.starts_with("--");
+                let line_comment = a.starts_with("--") || a.starts_with('#');
                 let lead = leading_spaces(&cur);
                 push_tok(&mut cur, &a, tight);
                 if line_comment {
@@ -415,11 +444,21 @@ pub fn pretty_statement(stmt: &str) -> String {
                     flush(&mut lines, &mut cur);
                     let extra = usize::from(up == "AND" || up == "OR");
                     cur = format!("{}{}", indent(base_indent + extra), upper_keyword(&w));
+                    insert_cols = false;
+                    after_insert = false;
                 } else {
                     if up == "TRIGGER" {
                         saw_trigger = true;
                     }
                     push_tok(&mut cur, &upper_keyword(&w), tight);
+                    if matches!(up.as_str(), "INSERT" | "INTO" | "OVERWRITE") {
+                        after_insert = true;
+                    } else if after_insert && !is_keyword(&w) {
+                        insert_cols = true;
+                        after_insert = false;
+                    } else if is_keyword(&w) {
+                        after_insert = false;
+                    }
                 }
                 prev_word = up;
             }
@@ -620,6 +659,29 @@ mod tests {
             assert!(out.contains(want), "{src} => {out}");
             assert_eq!(pretty(&out), out, "{src} 美化两次结果一致");
         }
+    }
+
+    /// 回归 issue #16：MySQL 的 `#` 行注释不被识别，整段挤成一行且首行
+    /// 变成注释；`INSERT INTO 表(列…)` 的括号还紧贴表名。
+    #[test]
+    fn mysql_hash_comment_and_insert_column_list() {
+        let src = "##OTA渠道\nINSERT INTO bxreport.rpt_general_hour(rpt_id, rpt_time, rpt_key)\n  \
+                   SELECT 'GanZiWenLv', DATE_FORMAT(NOW(),'%Y%m%d%H'), CONCAT(ota_type,'-',`status`) \
+                   FROM bxtour.jq_card_ota_order_details WHERE dealer_id=550146 GROUP BY ota_type, `status`";
+        let out = pretty(src);
+        assert_eq!(
+            out,
+            "##OTA渠道\n\
+             INSERT INTO bxreport.rpt_general_hour (rpt_id, rpt_time, rpt_key)\n\
+             SELECT 'GanZiWenLv',\n  DATE_FORMAT(NOW(), '%Y%m%d%H'),\n  \
+             CONCAT(ota_type, '-', `status`)\n\
+             FROM bxtour.jq_card_ota_order_details\n\
+             WHERE dealer_id = 550146\n\
+             GROUP BY ota_type,\n  `status`"
+        );
+        assert_eq!(pretty(&out), out, "美化两次结果一致");
+        // 行内的 `#` 不当注释：PG 的 `#>` / 位或 XOR 不能被吃掉
+        assert!(pretty("select a #> '{x}' from t").contains("#>"), "{out}");
     }
 }
 
