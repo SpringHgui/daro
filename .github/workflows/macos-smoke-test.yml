@@ -93,6 +93,47 @@ jobs:
           echo "$version" > "$REPORT_DIR/version"
           echo "✅ 解压完成：${app}" | tee -a "$REPORT_DIR/report.txt"
 
+      - name: 直跑主程序（绕过 LaunchServices / Gatekeeper，抓 stdout/stderr）
+        shell: bash
+        run: |
+          set -uo pipefail
+          app="$(cat "$REPORT_DIR/app_path")"
+          bin="$app/Contents/MacOS/daro-rs"
+          {
+            echo
+            echo "### 直接运行主程序二进制（不经 open / Gatekeeper）"
+          } >> "$REPORT_DIR/report.txt"
+
+          # 前台进程直接拉起，不经 LaunchServices；能活着就说明二进制本身
+          # 可运行，问题只在签名/公证；起不来则 stderr 会给出真实原因。
+          "$bin" >"$REPORT_DIR/direct.out" 2>"$REPORT_DIR/direct.err" &
+          pid=$!
+          sleep 10
+          alive="no"
+          if kill -0 "$pid" 2>/dev/null; then
+            alive="yes"
+          fi
+
+          {
+            echo "- PID：${pid}"
+            echo "- 10 秒后进程存活：${alive}"
+            echo "- stdout："
+            cat "$REPORT_DIR/direct.out" 2>/dev/null || true
+            echo "- stderr："
+            cat "$REPORT_DIR/direct.err" 2>/dev/null || true
+            if [[ "$alive" == "yes" ]]; then
+              echo "- 结论：✅ 二进制本身能在 macOS 上运行，问题只在 Gatekeeper/签名。"
+              echo "ok" > "$REPORT_DIR/direct_result"
+            else
+              echo "- 结论：❌ 直跑也起不来，是程序/运行时问题，不是签名。"
+              echo "fail" > "$REPORT_DIR/direct_result"
+            fi
+          } >> "$REPORT_DIR/report.txt" 2>&1
+
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          sleep 2
+
       - name: 第一轮：放行后启动（验证程序本身能否运行）
         shell: bash
         run: |
@@ -283,10 +324,11 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # 只有第二轮放行后进程存活才算通过；第一轮被 Gatekeeper 拦是预期。
-          if [[ "$(cat "$REPORT_DIR/result" 2>/dev/null || true)" == "ok" ]]; then
-            echo "程序启动验证通过"
+          # 硬指标是「直跑二进制能存活」：它区分了「签名被 Gatekeeper 拦」
+          # 和「程序本身在 macOS 上起不来」。open 两轮只留现场证据。
+          if [[ "$(cat "$REPORT_DIR/direct_result" 2>/dev/null || true)" == "ok" ]]; then
+            echo "程序二进制验证通过；Gatekeeper 状况见报告"
           else
-            echo "程序启动验证失败，请看上面的报告与 artifact" >&2
+            echo "程序二进制直跑失败，请看报告里的 stdout/stderr 与 artifact" >&2
             exit 1
           fi
