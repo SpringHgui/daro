@@ -36,7 +36,6 @@ jobs:
   smoke:
     name: macOS ${{ matrix.arch }} 冒烟
     runs-on: ${{ matrix.runner }}
-    if: inputs.arch == 'both' || inputs.arch == matrix.arch
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
@@ -45,12 +44,11 @@ jobs:
       REPORT_DIR: ${{ github.workspace }}/daro-smoke-report
     strategy:
       fail-fast: false
+      # job 级 if 同样不能用 matrix 上下文，改为按 inputs.arch 动态生成
+      # matrix：只选一个架构时就只起一个 runner，both 才起两个。
       matrix:
-        include:
-          - arch: arm64
-            runner: macos-latest
-          - arch: x64
-            runner: macos-15-intel
+        include: >-
+          ${{ fromJSON(inputs.arch == 'x64' && '[{"arch":"x64","runner":"macos-15-intel"}]' || inputs.arch == 'arm64' && '[{"arch":"arm64","runner":"macos-latest"}]' || '[{"arch":"arm64","runner":"macos-latest"},{"arch":"x64","runner":"macos-15-intel"}]') }}
 
     steps:
       - name: 下载并解压指定版本
