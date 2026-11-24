@@ -58,8 +58,29 @@ trap 'rm -rf "$tmpdir"' EXIT
 iconset="$tmpdir/daro.iconset"
 mkdir -p "$iconset" "$app/Contents/Resources"
 logo="assets/icons/ui/logo.png"
+
+# 先做一张 1024×1024 母版：logo 原图只有 256×256，直接从它放大到各档
+# 在部分 macOS 上会产出尺寸不符的 png，iconutil 报 "Failed to generate ICNS"。
+# 统一从母版「缩小」更可靠；母版本身也校验，放大失败就明确报错。
+master="$tmpdir/daro-master-1024.png"
+if ! sips -z 1024 1024 "$logo" --out "$master" > /dev/null 2>&1; then
+  echo "生成 1024 图标母版失败" >&2
+  exit 1
+fi
+
 while read -r icon_name size; do
-  sips -z "$size" "$size" "$logo" --out "$iconset/$icon_name.png" > /dev/null
+  out="$iconset/$icon_name.png"
+  if ! sips -z "$size" "$size" "$master" --out "$out" > /dev/null 2>&1; then
+    echo "生成图标 $icon_name ($size×$size) 失败" >&2
+    exit 1
+  fi
+  # iconutil 要求实际像素必须与文件名标称一致，不符会让整包生成失败。
+  w="$(sips -g pixelWidth "$out" | awk '/pixelWidth/{print $2}')"
+  h="$(sips -g pixelHeight "$out" | awk '/pixelHeight/{print $2}')"
+  if [[ "$w" != "$size" || "$h" != "$size" ]]; then
+    echo "图标 $icon_name 实际 ${w}×${h}，应为 ${size}×${size}" >&2
+    exit 1
+  fi
 done <<'ICONSET'
 icon_16x16.png 16
 icon_16x16@2x.png 32
@@ -72,7 +93,10 @@ icon_256x256@2x.png 512
 icon_512x512.png 512
 icon_512x512@2x.png 1024
 ICONSET
-iconutil -c icns "$iconset" -o "$app/Contents/Resources/daro.icns"
+if ! iconutil -c icns "$iconset" -o "$app/Contents/Resources/daro.icns"; then
+  echo "iconutil 生成 .icns 失败" >&2
+  exit 1
+fi
 
 # 有 Developer ID 证书就正式签名 + 公证，Gatekeeper 不再拦首次启动；
 # 没有则保持 ad-hoc 签名，并在包内附打开说明（见下方 zip 之前）。
