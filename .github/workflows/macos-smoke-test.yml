@@ -93,14 +93,79 @@ jobs:
           echo "$version" > "$REPORT_DIR/version"
           echo "✅ 解压完成：${app}" | tee -a "$REPORT_DIR/report.txt"
 
-      - name: 第一轮：模拟用户下载后首次打开（带隔离属性）
+      - name: 第一轮：放行后启动（验证程序本身能否运行）
         shell: bash
         run: |
           set -uo pipefail
           app="$(cat "$REPORT_DIR/app_path")"
 
-          # open 遇到 Gatekeeper 对话框会一直等，CI 里没人点，必须限时。
-          # 124 = 超时被杀，视为「没能启动」。
+          # open 遇到系统对话框会一直等，CI 里没人点，必须限时；124 = 超时。
+          # 进程检测必须用 -x 精确匹配进程名：之前用 -f 全命令行会匹配到
+          # open 命令自身（命令行里含完整路径），造出「进程存活」的假阳性。
+          timed() {
+            local secs="$1"; shift
+            "$@" &
+            local pid=$! i=0
+            while [[ $i -lt $secs ]] && kill -0 "$pid" 2>/dev/null; do
+              sleep 1
+              i=$((i + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+              return 124
+            fi
+            wait "$pid"
+          }
+
+          # 放行轮放前面：此时没有残留的 Gatekeeper 对话框，判定最干净。
+          # 反过来先跑带 quarantine 那轮的话，对话框会留在屏幕上，
+          # 后续 open 直接复用它，清了 quarantine 也开不起来。
+          xattr -cr "$app"
+          {
+            echo
+            echo "### 第一轮：清除隔离属性后启动（程序本身能否跑）"
+          } >> "$REPORT_DIR/report.txt"
+
+          set +e
+          timed 15 open "$app" >"$REPORT_DIR/open-clean.out" 2>"$REPORT_DIR/open-clean.err"
+          open_rc=$?
+          set -e
+
+          # 启动需要时间；等 8 秒再看进程，避免把启动慢误判成崩溃。
+          sleep 8
+          alive="no"
+          if pgrep -x daro-rs >/dev/null; then
+            alive="yes"
+          fi
+          timed 15 screencapture -x "$REPORT_DIR/01-opened.png" || true
+
+          {
+            echo "- open 退出码：${open_rc}$([[ "$open_rc" == 124 ]] && echo '（15 秒未返回）')"
+            echo "- stderr：$(cat "$REPORT_DIR/open-clean.err")"
+            echo "- 进程列表："
+            pgrep -ax daro-rs || echo "  (无)"
+            echo "- 进程存活：${alive}"
+          } >> "$REPORT_DIR/report.txt"
+
+          if [[ "$alive" == "yes" ]]; then
+            echo "- 结论：✅ 程序能在这台 macOS 上启动并保持运行。" >> "$REPORT_DIR/report.txt"
+            echo "ok" > "$REPORT_DIR/result"
+          else
+            echo "- 结论：❌ 放行后进程仍未存活，程序本身可能启动即崩溃。见下方崩溃报告。" >> "$REPORT_DIR/report.txt"
+            echo "fail" > "$REPORT_DIR/result"
+          fi
+
+          # 清干净再进第二轮，否则已运行实例会让 open 复用，测不到拦截。
+          pkill -x daro-rs 2>/dev/null || true
+          sleep 3
+
+      - name: 第二轮：模拟用户下载后首次打开（带隔离属性）
+        shell: bash
+        run: |
+          set -uo pipefail
+          app="$(cat "$REPORT_DIR/app_path")"
+
           timed() {
             local secs="$1"; shift
             "$@" &
@@ -123,7 +188,7 @@ jobs:
 
           {
             echo
-            echo "### 第一轮：带 quarantine 打开（Gatekeeper 拦截属预期）"
+            echo "### 第二轮：带 quarantine 打开（Gatekeeper 拦截留证）"
           } >> "$REPORT_DIR/report.txt"
 
           set +e
@@ -133,83 +198,23 @@ jobs:
           sleep 3
 
           alive="no"
-          if pgrep -f 'daro-rs.app/Contents/MacOS/daro-rs' >/dev/null; then
+          if pgrep -x daro-rs >/dev/null; then
             alive="yes"
           fi
-          timed 15 screencapture -x "$REPORT_DIR/01-quarantine.png" || true
+          timed 15 screencapture -x "$REPORT_DIR/02-quarantine.png" || true
 
           {
-            echo "- open 退出码：${open_rc}$([[ "$open_rc" == 124 ]] && echo '（12 秒未返回，疑似 Gatekeeper 对话框在等人工点击）')"
+            echo "- open 退出码：${open_rc}$([[ "$open_rc" == 124 ]] && echo '（12 秒未返回，Gatekeeper 对话框在等人工点击）')"
             echo "- stderr：$(cat "$REPORT_DIR/open-quarantine.err")"
             echo "- 进程存活：${alive}"
             if [[ "$alive" == "no" ]]; then
-              echo "- 结论：首次打开没能启动（系统拦下 / 对话框无人确认）。这是预期现象，不代表程序坏；见截图。"
+              echo "- 结论：首次打开被系统拦下（见截图的 Gatekeeper 提示）。这是预期现象，不代表程序坏。"
             else
-              echo "- 结论：带隔离属性也直接启动了（runner 的 Gatekeeper 策略较宽松）。"
+              echo "- 结论：这次带隔离属性也启动了。"
             fi
           } >> "$REPORT_DIR/report.txt"
 
-          pkill -f 'daro-rs.app/Contents/MacOS/daro-rs' 2>/dev/null || true
-          sleep 1
-
-      - name: 第二轮：放行后启动（验证程序本身能否运行）
-        shell: bash
-        run: |
-          set -uo pipefail
-          app="$(cat "$REPORT_DIR/app_path")"
-          xattr -cr "$app"
-
-          timed() {
-            local secs="$1"; shift
-            "$@" &
-            local pid=$! i=0
-            while [[ $i -lt $secs ]] && kill -0 "$pid" 2>/dev/null; do
-              sleep 1
-              i=$((i + 1))
-            done
-            if kill -0 "$pid" 2>/dev/null; then
-              kill "$pid" 2>/dev/null || true
-              wait "$pid" 2>/dev/null || true
-              return 124
-            fi
-            wait "$pid"
-          }
-
-          {
-            echo
-            echo "### 第二轮：清除隔离属性后启动"
-          } >> "$REPORT_DIR/report.txt"
-
-          set +e
-          timed 15 open "$app" >"$REPORT_DIR/open-clean.out" 2>"$REPORT_DIR/open-clean.err"
-          open_rc=$?
-          set -e
-
-          # 启动需要时间；等 8 秒再看进程，避免把启动慢误判成崩溃。
-          sleep 8
-          alive="no"
-          if pgrep -f 'daro-rs.app/Contents/MacOS/daro-rs' >/dev/null; then
-            alive="yes"
-          fi
-          timed 15 screencapture -x "$REPORT_DIR/02-opened.png" || true
-
-          {
-            echo "- open 退出码：${open_rc}$([[ "$open_rc" == 124 ]] && echo '（15 秒未返回）')"
-            echo "- stderr：$(cat "$REPORT_DIR/open-clean.err")"
-            echo "- 进程列表："
-            pgrep -fl 'daro-rs.app/Contents/MacOS/daro-rs' || echo "  (无)"
-            echo "- 进程存活：${alive}"
-          } >> "$REPORT_DIR/report.txt"
-
-          if [[ "$alive" == "yes" ]]; then
-            echo "- 结论：✅ 程序能在这台 macOS 上启动并保持运行。" >> "$REPORT_DIR/report.txt"
-            echo "ok" > "$REPORT_DIR/result"
-          else
-            echo "- 结论：❌ 放行后进程仍未存活，程序本身可能启动即崩溃。见下方崩溃报告。" >> "$REPORT_DIR/report.txt"
-            echo "fail" > "$REPORT_DIR/result"
-          fi
-
-          pkill -f 'daro-rs.app/Contents/MacOS/daro-rs' 2>/dev/null || true
+          pkill -x daro-rs 2>/dev/null || true
 
       - name: 收集系统诊断
         if: always()
@@ -248,7 +253,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: daro-smoke-${{ matrix.arch }}
-          path: ${{ github.workspace }}/daro-smoke-report/
+          # 只传报告本身，别把 30MB 下载包和 80MB 解压目录一起塞进 artifact。
+          path: |
+            ${{ github.workspace }}/daro-smoke-report/*.txt
+            ${{ github.workspace }}/daro-smoke-report/*.png
+            ${{ github.workspace }}/daro-smoke-report/*.out
+            ${{ github.workspace }}/daro-smoke-report/*.err
+            ${{ github.workspace }}/daro-smoke-report/result
           if-no-files-found: warn
           retention-days: 14
 
