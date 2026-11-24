@@ -1,5 +1,5 @@
-﻿//! 单行文本输入小窗（新建组 / 复制连接）。参考界面里这类确认框都是独立窗口，
-//! 这里同样开顶层窗口，避免在主窗口里叠遮罩。
+﻿//! 单行文本输入小窗（新建组 / 复制连接 / 输入密码）。参考界面里这类确认框都是
+//! 独立窗口，这里同样开顶层窗口，避免在主窗口里叠遮罩。
 
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::*;
@@ -23,18 +23,59 @@ pub fn open_text_prompt(
     on_submit: impl Fn(&mut DaroApp, &mut Context<DaroApp>, String) + 'static,
     cx: &mut App,
 ) {
-    let mut options = ui::dialog_options();
-    options.window_min_size = Some(size(px(360.), px(150.)));
-    options.window_bounds = Some(WindowBounds::centered(size(px(420.), px(180.)), cx));
-    if let Some(titlebar) = options.titlebar.as_mut() {
-        titlebar.title = Some(title.into());
+    let on_submit: Submit = Box::new(on_submit);
+    TextPrompt::builder(parent, dark, title, label, initial, on_submit, cx).open();
+}
+
+/// 掩码单行输入小窗（输入密码）。不预填：口令本就不可读。
+pub fn open_password_prompt(
+    parent: Entity<DaroApp>,
+    dark: bool,
+    title: &'static str,
+    label: &'static str,
+    on_submit: impl Fn(&mut DaroApp, &mut Context<DaroApp>, String) + 'static,
+    cx: &mut App,
+) {
+    let on_submit: Submit = Box::new(on_submit);
+    TextPrompt::builder(parent, dark, title, label, String::new(), on_submit, cx)
+        .masked()
+        .open();
+}
+
+pub struct TextPromptBuilder<'a> {
+    parent: Entity<DaroApp>,
+    dark: bool,
+    title: &'static str,
+    label: &'static str,
+    initial: String,
+    on_submit: Submit,
+    masked: bool,
+    cx: &'a mut App,
+}
+
+impl TextPromptBuilder<'_> {
+    /// 输入内容以圆点显示，且不预选已有文本（预填恒为空）。
+    pub fn masked(mut self) -> Self {
+        self.masked = true;
+        self
     }
-    let opened = gpui_kit::open_window(options, cx, move |window, cx| {
-        let on_submit: Submit = Box::new(on_submit);
-        cx.new(|cx| TextPrompt::new(parent, dark, title, label, initial, on_submit, window, cx))
-    });
-    if opened.is_err() {
-        eprintln!("failed to open prompt window");
+
+    pub fn open(self) {
+        let Self { parent, dark, title, label, initial, on_submit, masked, cx } = self;
+        let mut options = ui::dialog_options();
+        options.window_min_size = Some(size(px(360.), px(150.)));
+        options.window_bounds = Some(WindowBounds::centered(size(px(420.), px(180.)), cx));
+        if let Some(titlebar) = options.titlebar.as_mut() {
+            titlebar.title = Some(title.into());
+        }
+        let opened = gpui_kit::open_window(options, cx, move |window, cx| {
+            cx.new(|cx| {
+                TextPrompt::new_with(parent, dark, title, label, initial, on_submit, masked, window, cx)
+            })
+        });
+        if opened.is_err() {
+            eprintln!("failed to open prompt window");
+        }
     }
 }
 
@@ -51,18 +92,38 @@ struct TextPrompt {
 }
 
 impl TextPrompt {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
+    fn builder<'a>(
         parent: Entity<DaroApp>,
         dark: bool,
         title: &'static str,
         label: &'static str,
         initial: String,
         on_submit: Submit,
+        cx: &'a mut App,
+    ) -> TextPromptBuilder<'a> {
+        TextPromptBuilder { parent, dark, title, label, initial, on_submit, masked: false, cx }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with(
+        parent: Entity<DaroApp>,
+        dark: bool,
+        title: &'static str,
+        label: &'static str,
+        initial: String,
+        on_submit: Submit,
+        masked: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
+        let input = cx.new(|cx| {
+            let s = InputState::new(window, cx).default_value(initial);
+            if masked {
+                s.masked(true)
+            } else {
+                s
+            }
+        });
         let window_handle = window.window_handle();
         cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -75,11 +136,13 @@ impl TextPrompt {
             }
         })
         .detach();
-        cx.defer_in(window, |this, window, cx| {
+        cx.defer_in(window, move |this, window, cx| {
             this.input.update(cx, |state, cx| {
                 state.focus(window, cx);
                 // 参考界面的预填框打开时是全选态：直接打字即替换，不用先退格
-                state.select_all(window, cx);
+                if !masked {
+                    state.select_all(window, cx);
+                }
             });
         });
         let esc = ui::close_on_escape(window, cx);
@@ -150,6 +213,7 @@ impl Render for TextPrompt {
 
         v_flex()
             .id("prompt-root")
+            .test_support()
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(fg)
@@ -171,6 +235,8 @@ impl Render for TextPrompt {
                     .child(div().w(px(56.)).text_xs().text_color(fg).child(self.label))
                     .child(
                         div()
+                            .id("prompt-input")
+                            .test_support()
                             .flex_1()
                             .child(ui::field_input(&self.input, self.dark, window, cx)),
                     ),
