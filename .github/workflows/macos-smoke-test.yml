@@ -99,6 +99,24 @@ jobs:
           set -uo pipefail
           app="$(cat "$REPORT_DIR/app_path")"
 
+          # open 遇到 Gatekeeper 对话框会一直等，CI 里没人点，必须限时。
+          # 124 = 超时被杀，视为「没能启动」。
+          timed() {
+            local secs="$1"; shift
+            "$@" &
+            local pid=$! i=0
+            while [[ $i -lt $secs ]] && kill -0 "$pid" 2>/dev/null; do
+              sleep 1
+              i=$((i + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+              return 124
+            fi
+            wait "$pid"
+          }
+
           # 真实模拟浏览器下载留下的隔离属性；gh 在 CI 里下载不会自动打。
           xattr -w com.apple.quarantine \
             "0081;$(date +%s);Safari;00000000-0000-0000-0000-000000000000" "$app"
@@ -109,23 +127,23 @@ jobs:
           } >> "$REPORT_DIR/report.txt"
 
           set +e
-          open "$app" >"$REPORT_DIR/open-quarantine.out" 2>"$REPORT_DIR/open-quarantine.err"
+          timed 12 open "$app" >"$REPORT_DIR/open-quarantine.out" 2>"$REPORT_DIR/open-quarantine.err"
           open_rc=$?
           set -e
-          sleep 4
+          sleep 3
 
           alive="no"
           if pgrep -f 'daro-rs.app/Contents/MacOS/daro-rs' >/dev/null; then
             alive="yes"
           fi
-          screencapture -x "$REPORT_DIR/01-quarantine.png" || true
+          timed 15 screencapture -x "$REPORT_DIR/01-quarantine.png" || true
 
           {
-            echo "- open 退出码：${open_rc}"
+            echo "- open 退出码：${open_rc}$([[ "$open_rc" == 124 ]] && echo '（12 秒未返回，疑似 Gatekeeper 对话框在等人工点击）')"
             echo "- stderr：$(cat "$REPORT_DIR/open-quarantine.err")"
             echo "- 进程存活：${alive}"
             if [[ "$alive" == "no" ]]; then
-              echo "- 结论：首次打开被系统拦下（未放行）。这是预期现象，不代表程序坏。"
+              echo "- 结论：首次打开没能启动（系统拦下 / 对话框无人确认）。这是预期现象，不代表程序坏；见截图。"
             else
               echo "- 结论：带隔离属性也直接启动了（runner 的 Gatekeeper 策略较宽松）。"
             fi
@@ -141,13 +159,29 @@ jobs:
           app="$(cat "$REPORT_DIR/app_path")"
           xattr -cr "$app"
 
+          timed() {
+            local secs="$1"; shift
+            "$@" &
+            local pid=$! i=0
+            while [[ $i -lt $secs ]] && kill -0 "$pid" 2>/dev/null; do
+              sleep 1
+              i=$((i + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+              return 124
+            fi
+            wait "$pid"
+          }
+
           {
             echo
             echo "### 第二轮：清除隔离属性后启动"
           } >> "$REPORT_DIR/report.txt"
 
           set +e
-          open "$app" >"$REPORT_DIR/open-clean.out" 2>"$REPORT_DIR/open-clean.err"
+          timed 15 open "$app" >"$REPORT_DIR/open-clean.out" 2>"$REPORT_DIR/open-clean.err"
           open_rc=$?
           set -e
 
@@ -157,10 +191,10 @@ jobs:
           if pgrep -f 'daro-rs.app/Contents/MacOS/daro-rs' >/dev/null; then
             alive="yes"
           fi
-          screencapture -x "$REPORT_DIR/02-opened.png" || true
+          timed 15 screencapture -x "$REPORT_DIR/02-opened.png" || true
 
           {
-            echo "- open 退出码：${open_rc}"
+            echo "- open 退出码：${open_rc}$([[ "$open_rc" == 124 ]] && echo '（15 秒未返回）')"
             echo "- stderr：$(cat "$REPORT_DIR/open-clean.err")"
             echo "- 进程列表："
             pgrep -fl 'daro-rs.app/Contents/MacOS/daro-rs' || echo "  (无)"
