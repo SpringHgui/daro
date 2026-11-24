@@ -68,14 +68,20 @@
 
 ---
 
-## macOS 首次打开说明
+## macOS 打开说明
 
-`daro-rs-*-macos-*.zip` 解压后是 `daro-rs.app`。当前版本使用临时签名、尚未加入 Apple 公证计划，从浏览器下载后首次启动会被 Gatekeeper 拦一下：
+当前发布的 macOS 包使用 **ad-hoc 临时签名**，未加入 Apple 开发者计划，也未做公证。在 macOS 26（arm64）上实测：从浏览器下载解压后双击，会被 Gatekeeper 直接拦下，弹窗是：
 
-- 在 Finder 里按住 **Control** 点击 `daro-rs`（或右键），选「打开」，弹窗里再点一次「打开」；之后就能正常双击。
-- 若仍被拦，在终端执行 `xattr -cr daro-rs.app` 后再双击。
+> **"daro-rs" Not Opened** — Apple could not verify "daro-rs" is free of malware that may harm your Mac or compromise your privacy.
 
-发布包内也附了同样的「首次打开说明.txt」。校验下载完整性可用发布页的 `SHA256SUMS.txt`。
+只有 `Move to Trash` 和 `Done` 两个按钮，**没有「仍要打开」**，所以点不进去。这不是文件损坏，是签名问题。目前可行的只有两条路：
+
+1. **等正式签名版**：配置 Developer ID 证书并做公证后双击即可打开。这是唯一能让我们发布的 zip 直接运行的办法，需要 Apple 开发者账号与公证凭据。
+2. **从源码自行构建**：本地构建出来的可执行文件不带浏览器的隔离属性，不会被拦。在 `daro-rs/` 目录执行 `cargo build --release --bin daro-rs`，然后运行 `target/release/daro-rs`（需已安装 Rust 工具链）。
+
+`xattr -cr daro-rs.app` 这类命令行放行在新版 macOS 上**不保证有效**——CI 实机测试中，清除隔离属性后 `open` 虽返回成功，应用仍没有启动。如果你的机器也是这样，请改用上面的源码构建方式。
+
+发布包内附同样的「打开说明.txt」。校验下载完整性可用发布页的 `SHA256SUMS.txt`。
 
 ---
 

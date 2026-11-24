@@ -75,7 +75,7 @@ ICONSET
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/daro.icns"
 
 # 有 Developer ID 证书就正式签名 + 公证，Gatekeeper 不再拦首次启动；
-# 没有则保持 ad-hoc 签名，并在包内附首次打开说明（见下方 zip 之前）。
+# 没有则保持 ad-hoc 签名，并在包内附打开说明（见下方 zip 之前）。
 sign_identity="${MACOS_SIGN_IDENTITY:-}"
 
 # 由内向外签：先签嵌套可执行文件，再签 bundle。
@@ -136,27 +136,40 @@ if [[ "$fail" != 0 ]]; then
   exit 1
 fi
 
-# ad-hoc 签名的包从浏览器下载后会被 macOS 打上隔离属性，首次启动被
-# Gatekeeper 拦下（issue #21「无法打开」）。把放行步骤放进包里。
+# ad-hoc 签名的包从浏览器下载后会被 macOS 打上隔离属性，被 Gatekeeper 拦下
+# （issue #21）。实测 macOS 26 上弹窗没有「仍要打开」，xattr 放行也不保证
+# 有效，所以不再给虚假的放行步骤，只如实说明现状与可行路径。
 if [[ -z "$sign_identity" ]]; then
-  cat > "dist/${name}/首次打开说明.txt" <<'TXT'
-daro-rs macOS 版 · 首次打开说明
-================================
+  cat > "dist/${name}/打开说明.txt" <<'TXT'
+daro-rs macOS 版 · 打开说明
+============================
 
-本版本使用临时签名，尚未加入 Apple 开发者公证计划。从 GitHub 下载后，
-macOS 会因为「来自互联网」而拦截首次启动，这是系统提示，不是应用损坏。
+当前安装包使用 ad-hoc 临时签名，未加入 Apple 开发者计划，也未做公证。
+在 macOS 26 (arm64) 实测：从浏览器下载解压后双击，Gatekeeper 会直接拦下，
+弹窗是：
 
-方法一（推荐）：在 Finder 里按住 Control 点击 daro-rs（或右键点击），
-选择「打开」，在弹出的提示里再点一次「打开」。之后就可以正常双击启动。
+    "daro-rs" Not Opened
+    Apple could not verify "daro-rs" is free of malware that may harm your
+    Mac or compromise your privacy.
 
-方法二：打开「终端」，cd 到本文件夹后执行：
+按钮只有 Move to Trash / Done，没有「仍要打开」，点不进去。这不是文件损坏，
+是签名问题。目前可行的只有两条路：
 
-    xattr -cr daro-rs.app
+1. 等正式签名版：项目配置 Developer ID 证书并做公证后双击即可打开。
+   这是唯一能让官方 zip 直接运行的办法。
 
-然后双击 daro-rs 即可。
+2. 从源码自行构建：本地构建的可执行文件不带浏览器的隔离属性，不会被拦。
+   在 daro-rs/ 目录执行：
 
-若提示的不是「无法验证开发者」而是「已损坏 / 无法识别」，请先用发布页的
-SHA256SUMS.txt 校验下载包完整性，重新下载后再执行方法二。
+       cargo build --release --bin daro-rs
+
+   然后运行 target/release/daro-rs（需已安装 Rust 工具链）。
+
+xattr -cr daro-rs.app 这类命令行放行在新版 macOS 上不保证有效：CI 实机
+测试中清除隔离属性后 open 虽返回成功，应用仍没有启动。若你的机器也是这样，
+请改用上面的源码构建方式。
+
+下载完整性可用发布页的 SHA256SUMS.txt 校验。
 TXT
 fi
 
