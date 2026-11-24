@@ -28,6 +28,14 @@ on:
           - both
           - arm64
           - x64
+      source:
+        description: '测已发布版，还是当前分支源码现编（验修复用）'
+        required: true
+        type: choice
+        default: release
+        options:
+          - release
+          - source
 
 permissions:
   contents: read
@@ -36,7 +44,7 @@ jobs:
   smoke:
     name: macOS ${{ matrix.arch }} 冒烟
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
       # job 级 env 不能用 runner 上下文（GitHub Actions 语法限制），
@@ -51,8 +59,11 @@ jobs:
           ${{ fromJSON(inputs.arch == 'x64' && '[{"arch":"x64","runner":"macos-15-intel"}]' || inputs.arch == 'arm64' && '[{"arch":"arm64","runner":"macos-latest"}]' || '[{"arch":"arm64","runner":"macos-latest"},{"arch":"x64","runner":"macos-15-intel"}]') }}
 
     steps:
-      - name: 下载并解压指定版本
+      - uses: actions/checkout@v4
+
+      - name: 准备被测程序（下载发布版 / 当前源码现编）
         shell: bash
+        working-directory: daro-rs
         run: |
           set -euo pipefail
           mkdir -p "$REPORT_DIR/download" "$REPORT_DIR/extracted"
@@ -60,38 +71,48 @@ jobs:
 
           arch="${{ matrix.arch }}"
           repo="SpringHgui/daro"
+          source_mode="${{ inputs.source }}"
           version="${{ inputs.version }}"
           version="${version#v}"
-
-          if [[ -n "$version" ]]; then
-            tag="daro-rs-v${version}"
-          else
-            tag="$(gh release view --repo "$repo" --json tagName --jq .tagName)"
-            version="${tag#daro-rs-v}"
-          fi
-          pattern="daro-rs-${version}-macos-${arch}.zip"
 
           {
             echo "## macOS ${arch} 冒烟报告"
             echo
             echo "- 时间：$(date '+%Y-%m-%d %H:%M:%S %Z')"
             echo "- runner：${{ matrix.runner }}（$(uname -m) / $(sw_vers -productVersion)）"
-            echo "- release tag：${tag}"
-            echo "- 下载资产：${pattern}"
+            echo "- 被测来源：${source_mode}"
           } | tee -a "$REPORT_DIR/report.txt"
 
-          gh release download "$tag" --repo "$repo" \
-            --pattern "$pattern" --dir "$REPORT_DIR/download" --clobber
+          if [[ "$source_mode" == "source" ]]; then
+            version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)-dev"
+            cargo build --release --locked --bin daro-rs --bin daro-mcpd
+            bash packaging/macos/bundle-app.sh --skip-build
+            zip="$(find dist -maxdepth 1 -name 'daro-rs-*-macos-*.zip' | head -1)"
+            echo "- 构建产物：${zip}" | tee -a "$REPORT_DIR/report.txt"
+            unzip -q "$zip" -d "$REPORT_DIR/extracted"
+          else
+            if [[ -n "$version" ]]; then
+              tag="daro-rs-v${version}"
+            else
+              tag="$(gh release view --repo "$repo" --json tagName --jq .tagName)"
+              version="${tag#daro-rs-v}"
+            fi
+            pattern="daro-rs-${version}-macos-${arch}.zip"
+            echo "- release tag：${tag}" | tee -a "$REPORT_DIR/report.txt"
+            echo "- 下载资产：${pattern}" | tee -a "$REPORT_DIR/report.txt"
+            gh release download "$tag" --repo "$repo" \
+              --pattern "$pattern" --dir "$REPORT_DIR/download" --clobber
+            unzip -q "$REPORT_DIR/download/$pattern" -d "$REPORT_DIR/extracted"
+          fi
 
-          unzip -q "$REPORT_DIR/download/$pattern" -d "$REPORT_DIR/extracted"
           app="$(find "$REPORT_DIR/extracted" -type d -name 'daro-rs.app' | head -1)"
           if [[ -z "$app" ]]; then
-            echo "❌ zip 里找不到 daro-rs.app" | tee -a "$REPORT_DIR/report.txt"
+            echo "❌ 找不到 daro-rs.app" | tee -a "$REPORT_DIR/report.txt"
             exit 1
           fi
           echo "$app" > "$REPORT_DIR/app_path"
           echo "$version" > "$REPORT_DIR/version"
-          echo "✅ 解压完成：${app}" | tee -a "$REPORT_DIR/report.txt"
+          echo "✅ 被测程序就位：${app}" | tee -a "$REPORT_DIR/report.txt"
 
       - name: 直跑主程序（绕过 LaunchServices / Gatekeeper，抓 stdout/stderr）
         shell: bash

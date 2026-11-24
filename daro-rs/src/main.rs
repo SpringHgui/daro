@@ -1423,15 +1423,27 @@ fn wire_global_keys(root: Entity<DaroApp>, win: AnyWindowHandle, cx: &mut App) {
 }
 
 fn main() {
-    // 设计器整页 + 下拉浮层的渲染栈很深，Windows 主线程默认 1MB 栈会 overflow；
-    // 把 UI 跑在一个 16MB 栈的线程上（消息循环跟着这个线程走）。
-    std::thread::Builder::new()
-        .name("daro-ui".into())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(ui_main)
-        .expect("spawn ui thread")
-        .join()
-        .expect("ui thread");
+    #[cfg(target_os = "windows")]
+    {
+        // 设计器整页 + 下拉浮层的渲染栈很深，Windows 主线程默认 1MB 栈会 overflow；
+        // 把 UI 跑在一个 16MB 栈的线程上（消息循环跟着这个线程走）。
+        std::thread::Builder::new()
+            .name("daro-ui".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(ui_main)
+            .expect("spawn ui thread")
+            .join()
+            .expect("ui thread");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // gpui 的 macOS 平台强制要求在主线程创建（platform.rs 报
+        // "Mac platform not created on main thread"），Linux 同理。放到具名
+        // 线程会在启动瞬间 panic，GUI 程序的 stderr 又被吞掉，表现出来就是
+        // 双击没有任何反应。只有 Windows 需要大栈线程。
+        ui_main();
+    }
 }
 
 fn ui_main() {
