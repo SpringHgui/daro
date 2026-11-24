@@ -5,6 +5,25 @@ on:
     tags:
       - 'daro-rs-v*'
   workflow_dispatch:
+    inputs:
+      target:
+        description: '只构建指定平台（验修复时可只跑 macOS，省时间）'
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - macos
+          - macos-arm64
+          - macos-x64
+      source:
+        description: 'source = 构建后在 macOS 上直跑验证（不发版）；release = 只构建'
+        required: true
+        type: choice
+        default: source
+        options:
+          - release
+          - source
 
 permissions:
   contents: write
@@ -18,16 +37,14 @@ jobs:
     name: build (${{ matrix.name }})
     strategy:
       fail-fast: false
+      # tag 推送时 inputs.target 为空 → 跑全部四个平台；
+      # 手动触发时按 target 只起需要的 runner（验修复时只跑 macOS 省时间）。
       matrix:
-        include:
-          - os: windows-latest
-            name: windows-x64
-          - os: macos-15-intel
-            name: macos-x64
-          - os: macos-latest
-            name: macos-arm64
-          - os: ubuntu-22.04
-            name: linux-x64
+        include: >-
+          ${{ (inputs.target || 'all') == 'macos-arm64' && '[{"os":"macos-latest","name":"macos-arm64"}]'
+           || (inputs.target || 'all') == 'macos-x64' && '[{"os":"macos-15-intel","name":"macos-x64"}]'
+           || (inputs.target || 'all') == 'macos' && '[{"os":"macos-latest","name":"macos-arm64"},{"os":"macos-15-intel","name":"macos-x64"}]'
+           || '[{"os":"windows-latest","name":"windows-x64"},{"os":"macos-15-intel","name":"macos-x64"},{"os":"macos-latest","name":"macos-arm64"},{"os":"ubuntu-22.04","name":"linux-x64"}]' }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -148,6 +165,48 @@ jobs:
               line="${line//'%'/'%25'}"
               echo "::error file=daro-rs/packaging/macos/bundle-app.sh::${line}"
             done
+            exit 1
+          fi
+
+      # 只在手动 source 模式的 macOS 分支跑：解开刚打好的 zip，绕过
+      # LaunchServices/Gatekeeper 直接拉起二进制，抓 stdout/stderr。
+      # 这是「程序本身在 mac 上能不能跑」的硬指标，与签名无关。
+      - name: 直跑验证（macOS / source 模式）
+        if: runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && inputs.source == 'source'
+        shell: bash
+        run: |
+          set -uo pipefail
+          zip="$(find dist -maxdepth 1 -name 'daro-rs-*-macos-*.zip' | head -1)"
+          if [[ -z "$zip" ]]; then
+            echo "::error::找不到 macOS 产物 zip，无法直跑验证"
+            exit 1
+          fi
+          tmp="$(mktemp -d)"
+          unzip -q "$zip" -d "$tmp"
+          app="$(find "$tmp" -type d -name 'daro-rs.app' | head -1)"
+          bin="$app/Contents/MacOS/daro-rs"
+          echo "直跑：$bin"
+
+          "$bin" >"$tmp/stdout.log" 2>"$tmp/stderr.log" &
+          pid=$!
+          sleep 12
+          alive="no"
+          if kill -0 "$pid" 2>/dev/null; then
+            alive="yes"
+          fi
+
+          echo "--- stdout ---"; cat "$tmp/stdout.log" 2>/dev/null || true
+          echo "--- stderr ---"; cat "$tmp/stderr.log" 2>/dev/null || true
+          echo "--- 12 秒后进程存活：$alive ---"
+
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          rm -rf "$tmp"
+
+          if [[ "$alive" == "yes" ]]; then
+            echo "✅ 二进制能在 macOS 上保持运行，主线程修复生效"
+          else
+            echo "::error::macOS 二进制直跑未存活，见上方 stdout/stderr"
             exit 1
           fi
 
