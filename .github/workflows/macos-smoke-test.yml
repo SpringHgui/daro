@@ -40,7 +40,9 @@ jobs:
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
-      REPORT_DIR: ${{ runner.temp }}/daro-smoke
+      # job 级 env 不能用 runner 上下文（GitHub Actions 语法限制），
+      # github.workspace 在这里可用，mkdir -p 会保证目录存在。
+      REPORT_DIR: ${{ github.workspace }}/daro-smoke-report
     strategy:
       fail-fast: false
       matrix:
@@ -214,7 +216,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: daro-smoke-${{ matrix.arch }}
-          path: ${{ runner.temp }}/daro-smoke/
+          path: ${{ github.workspace }}/daro-smoke-report/
           if-no-files-found: warn
           retention-days: 14
 
