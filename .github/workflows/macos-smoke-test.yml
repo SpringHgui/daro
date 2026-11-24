@@ -1,0 +1,247 @@
+name: macOS 冒烟测试（手动）
+
+# 目的：回答「这个程序到底能不能在 mac 上跑起来」。
+# 从 GitHub Releases 下载已发布的 zip（macOS 没有安装步骤，解压即 .app），
+# 跑两轮：
+#   1) 给 .app 打上 com.apple.quarantine，模拟用户从浏览器下载后双击 ——
+#      预期被 Gatekeeper 拦，截图留证；这一步被拦不算失败。
+#   2) xattr -cr 放行后再开一次 —— 进程活下来才算程序本身没问题。
+# 不推 tag、不发版；只上传截图/日志/崩溃报告到 artifact，并写进 job summary。
+#
+# 注意：GitHub-hosted macOS runner 的 screencapture 偶尔拍到黑屏或桌面，
+# 这是 runner 的 GUI 会话限制，不代表应用有问题；进程存活判定才是硬指标。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要测的版本号（如 1.0.11；留空 = 最新发布版）'
+        required: false
+        type: string
+        default: ''
+      arch:
+        description: '测试架构（both = 同时跑 arm64 和 x64）'
+        required: true
+        type: choice
+        default: both
+        options:
+          - both
+          - arm64
+          - x64
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: macOS ${{ matrix.arch }} 冒烟
+    runs-on: ${{ matrix.runner }}
+    if: inputs.arch == 'both' || inputs.arch == matrix.arch
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPORT_DIR: ${{ runner.temp }}/daro-smoke
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+          - arch: x64
+            runner: macos-15-intel
+
+    steps:
+      - name: 下载并解压指定版本
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR/download" "$REPORT_DIR/extracted"
+          : > "$REPORT_DIR/report.txt"
+
+          arch="${{ matrix.arch }}"
+          repo="SpringHgui/daro"
+          version="${{ inputs.version }}"
+          version="${version#v}"
+
+          if [[ -n "$version" ]]; then
+            tag="daro-rs-v${version}"
+          else
+            tag="$(gh release view --repo "$repo" --json tagName --jq .tagName)"
+            version="${tag#daro-rs-v}"
+          fi
+          pattern="daro-rs-${version}-macos-${arch}.zip"
+
+          {
+            echo "## macOS ${arch} 冒烟报告"
+            echo
+            echo "- 时间：$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "- runner：${{ matrix.runner }}（$(uname -m) / $(sw_vers -productVersion)）"
+            echo "- release tag：${tag}"
+            echo "- 下载资产：${pattern}"
+          } | tee -a "$REPORT_DIR/report.txt"
+
+          gh release download "$tag" --repo "$repo" \
+            --pattern "$pattern" --dir "$REPORT_DIR/download" --clobber
+
+          unzip -q "$REPORT_DIR/download/$pattern" -d "$REPORT_DIR/extracted"
+          app="$(find "$REPORT_DIR/extracted" -type d -name 'daro-rs.app' | head -1)"
+          if [[ -z "$app" ]]; then
+            echo "❌ zip 里找不到 daro-rs.app" | tee -a "$REPORT_DIR/report.txt"
+            exit 1
+          fi
+          echo "$app" > "$REPORT_DIR/app_path"
+          echo "$version" > "$REPORT_DIR/version"
+          echo "✅ 解压完成：${app}" | tee -a "$REPORT_DIR/report.txt"
+
+      - name: 第一轮：模拟用户下载后首次打开（带隔离属性）
+        shell: bash
+        run: |
+          set -uo pipefail
+          app="$(cat "$REPORT_DIR/app_path")"
+
+          # 真实模拟浏览器下载留下的隔离属性；gh 在 CI 里下载不会自动打。
+          xattr -w com.apple.quarantine \
+            "0081;$(date +%s);Safari;00000000-0000-0000-0000-000000000000" "$app"
+
+          {
+            echo
+            echo "### 第一轮：带 quarantine 打开（Gatekeeper 拦截属预期）"
+          } >> "$REPORT_DIR/report.txt"
+
+          set +e
+          open "$app" >"$REPORT_DIR/open-quarantine.out" 2>"$REPORT_DIR/open-quarantine.err"
+          open_rc=$?
+          set -e
+          sleep 4
+
+          alive="no"
+          if pgrep -f 'daro-rs.app/Contents/MacOS/daro-rs' >/dev/null; then
+            alive="yes"
+          fi
+          screencapture -x "$REPORT_DIR/01-quarantine.png" || true
+
+          {
+            echo "- open 退出码：${open_rc}"
+            echo "- stderr：$(cat "$REPORT_DIR/open-quarantine.err")"
+            echo "- 进程存活：${alive}"
+            if [[ "$alive" == "no" ]]; then
+              echo "- 结论：首次打开被系统拦下（未放行）。这是预期现象，不代表程序坏。"
+            else
+              echo "- 结论：带隔离属性也直接启动了（runner 的 Gatekeeper 策略较宽松）。"
+            fi
+          } >> "$REPORT_DIR/report.txt"
+
+          pkill -f 'daro-rs.app/Contents/MacOS/daro-rs' 2>/dev/null || true
+          sleep 1
+
+      - name: 第二轮：放行后启动（验证程序本身能否运行）
+        shell: bash
+        run: |
+          set -uo pipefail
+          app="$(cat "$REPORT_DIR/app_path")"
+          xattr -cr "$app"
+
+          {
+            echo
+            echo "### 第二轮：清除隔离属性后启动"
+          } >> "$REPORT_DIR/report.txt"
+
+          set +e
+          open "$app" >"$REPORT_DIR/open-clean.out" 2>"$REPORT_DIR/open-clean.err"
+          open_rc=$?
+          set -e
+
+          # 启动需要时间；等 8 秒再看进程，避免把启动慢误判成崩溃。
+          sleep 8
+          alive="no"
+          if pgrep -f 'daro-rs.app/Contents/MacOS/daro-rs' >/dev/null; then
+            alive="yes"
+          fi
+          screencapture -x "$REPORT_DIR/02-opened.png" || true
+
+          {
+            echo "- open 退出码：${open_rc}"
+            echo "- stderr：$(cat "$REPORT_DIR/open-clean.err")"
+            echo "- 进程列表："
+            pgrep -fl 'daro-rs.app/Contents/MacOS/daro-rs' || echo "  (无)"
+            echo "- 进程存活：${alive}"
+          } >> "$REPORT_DIR/report.txt"
+
+          if [[ "$alive" == "yes" ]]; then
+            echo "- 结论：✅ 程序能在这台 macOS 上启动并保持运行。" >> "$REPORT_DIR/report.txt"
+            echo "ok" > "$REPORT_DIR/result"
+          else
+            echo "- 结论：❌ 放行后进程仍未存活，程序本身可能启动即崩溃。见下方崩溃报告。" >> "$REPORT_DIR/report.txt"
+            echo "fail" > "$REPORT_DIR/result"
+          fi
+
+          pkill -f 'daro-rs.app/Contents/MacOS/daro-rs' 2>/dev/null || true
+
+      - name: 收集系统诊断
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          app="$(cat "$REPORT_DIR/app_path" 2>/dev/null || true)"
+          {
+            echo
+            echo "### 签名与 Gatekeeper 评估"
+            if [[ -n "$app" ]]; then
+              echo "-- spctl --"
+              spctl -a -vvv -t exec "$app" 2>&1 || true
+              echo "-- codesign --verify --"
+              codesign --verify --strict --verbose=2 "$app" 2>&1 || true
+              echo "-- codesign -dv --"
+              codesign -dv --verbose=4 "$app" 2>&1 || true
+              echo "-- bundle 内文件 --"
+              find "$app" -type f | head -40
+            fi
+
+            echo
+            echo "### 崩溃报告（daro-rs 相关）"
+            found=0
+            for f in "$HOME"/Library/Logs/DiagnosticReports/daro-rs*.crash; do
+              [[ -f "$f" ]] || continue
+              found=1
+              echo "-- $f --"
+              head -60 "$f"
+            done
+            [[ "$found" == 1 ]] || echo "(无崩溃报告)"
+          } >> "$REPORT_DIR/report.txt" 2>&1
+
+      - name: 上传截图与日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daro-smoke-${{ matrix.arch }}
+          path: ${{ runner.temp }}/daro-smoke/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 写入 Job Summary
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "## macOS ${{ matrix.arch }} 冒烟测试"
+            echo
+            echo '```text'
+            cat "$REPORT_DIR/report.txt" 2>/dev/null || echo "(无报告)"
+            echo '```'
+            echo
+            echo "截图与完整日志见本 run 的 Artifacts：**daro-smoke-${{ matrix.arch }}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 判定结果
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          # 只有第二轮放行后进程存活才算通过；第一轮被 Gatekeeper 拦是预期。
+          if [[ "$(cat "$REPORT_DIR/result" 2>/dev/null || true)" == "ok" ]]; then
+            echo "程序启动验证通过"
+          else
+            echo "程序启动验证失败，请看上面的报告与 artifact" >&2
+            exit 1
+          fi
