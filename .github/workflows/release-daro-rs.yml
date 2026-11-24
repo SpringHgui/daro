@@ -91,8 +91,10 @@ jobs:
           workspaces: daro-rs
           key: ${{ matrix.name }}
 
+      # source 手动验证模式的目的是「构建 → 打包 → 直跑」，跳过测试省时间；
+      # 正式发版（tag 推送）和手动 release 模式照常全量测。
       - name: 测试（Windows 全量）
-        if: runner.os == 'Windows'
+        if: ${{ runner.os == 'Windows' && !(github.event_name == 'workflow_dispatch' && inputs.source == 'source') }}
         shell: bash
         env:
           RUST_BACKTRACE: '1'
@@ -102,15 +104,12 @@ jobs:
           if cargo test --release --locked --bin daro-rs -- --test-threads=1 >"$log" 2>&1; then
             tail -n 15 "$log"
           else
-            tail -n 40 "$log"
-            grep -v '^[[:space:]]*$' "$log" | tail -n 8 | while IFS= read -r line; do
-              line="${line//'%'/'%25'}"
-              echo "::error file=daro-rs/src/main.rs::${line}"
-            done
+            grep -n -A10 -B2 -E '^error(\[|:)' "$log" | head -80 || tail -n 40 "$log"
             exit 1
           fi
 
       - name: 测试（MCP 集成，各平台）
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.source == 'source') }}
         shell: bash
         env:
           RUST_BACKTRACE: '1'
@@ -120,11 +119,7 @@ jobs:
           if cargo test --release --locked --test mcp -- --test-threads=1 >"$log" 2>&1; then
             tail -n 15 "$log"
           else
-            tail -n 40 "$log"
-            grep -v '^[[:space:]]*$' "$log" | tail -n 8 | while IFS= read -r line; do
-              line="${line//'%'/'%25'}"
-              echo "::error file=daro-rs/tests/mcp.rs::${line}"
-            done
+            grep -n -A10 -B2 -E '^error(\[|:)' "$log" | head -80 || tail -n 40 "$log"
             exit 1
           fi
 
