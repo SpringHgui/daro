@@ -323,6 +323,53 @@ fn schedule(p: Pending) {
     });
 }
 
+/// 右键「刷新」用：不删缓存，强制把这一层重查一遍。旧清单继续渲染、
+/// 新结果回来原子替换，展开的树不会在回执前塌成空行——否则滚动位置会被
+/// 布局 clamp 到顶（issue #20）。重复点刷新时已有同类活儿在队列里就不重排。
+fn force_schedule(p: Pending) {
+    if is_closed(&p.conn().name) {
+        return;
+    }
+    #[cfg(test)]
+    TEST_CONNS.with(|names| {
+        names.borrow_mut().insert(p.conn().name.clone());
+    });
+    let marks = p.marks();
+    with_pending(|queue| {
+        if queue.iter().any(|q| marks.iter().all(|m| q.marks().contains(m))) {
+            return;
+        }
+        queue.push(p);
+    });
+}
+
+/// 下面几个 `refresh_*` 和 `*_cache` 的读取口径相反：只排队重查，不清旧值。
+pub fn refresh_databases(conn: &Connection) {
+    force_schedule(Pending::Databases(conn.clone()));
+}
+
+pub fn refresh_schemas(conn: &Connection, db: &str) {
+    force_schedule(Pending::Schemas(conn.clone(), db.to_string()));
+}
+
+pub fn refresh_objects(conn: &Connection, db: &str, schema: &str, cat: usize) {
+    force_schedule(Pending::Objects(
+        conn.clone(),
+        db.to_string(),
+        schema.to_string(),
+        cat,
+    ));
+}
+
+pub fn refresh_columns(conn: &Connection, db: &str, schema: &str, table: &str) {
+    force_schedule(Pending::Columns(
+        conn.clone(),
+        db.to_string(),
+        schema.to_string(),
+        table.to_string(),
+    ));
+}
+
 /// 用户点「打开连接」：直接排一条建连任务（顺带列库），不等渲染碰到缓存才排。
 /// 返回标记键，界面层拿去插进 `loading`。
 pub fn request_open(conn: &Connection) -> String {

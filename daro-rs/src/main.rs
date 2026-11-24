@@ -144,7 +144,7 @@ use conn_dialog::{ConnDialogMode, open_connection_dialog, open_new_connection};
 use crate::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use mock::{Connection, DbKind};
 use palette::Palette;
-use prompt_dialog::{open_confirm, open_notice, open_text_prompt};
+use prompt_dialog::{open_confirm, open_notice, open_password_prompt, open_text_prompt};
 
 /// 行高：参考界面里左侧树是 20px，中部对象列表更密（约 16.5px），分别取值
 /// 树行高。参考界面实测：行距 40 物理像素 @200% = 20 逻辑像素
@@ -552,6 +552,9 @@ pub struct ImportItem {
 /// 一次导入的结果，供向导回显汇总文案。
 pub struct ImportOutcome {
     pub imported: usize,
+    /// 同名同类型、就地覆盖的条数
+    pub overwritten: usize,
+    /// 同名不同类型、自动加序号改名的条数
     pub renamed: usize,
     pub new_groups: Vec<String>,
 }
@@ -9359,12 +9362,26 @@ impl DaroApp {
         if !conn.connected {
             return &[];
         }
-        let schema = self
-            .sel
-            .schema()
-            .and_then(|s| catalog::schemas(conn, db).get(s).copied())
-            .unwrap_or("");
-        self.objects_of(conn, db, schema, cat)
+        // 库没「打开」就不列对象，和连接未打开时一个口径（issue #19）。
+        // 演示连接是种子假数据，没有真实库要加载，点开就看，豁免这道门。
+        if backend::is_real_conn(conn) && !self.visited_dbs.contains(&node_key(&conn.name, db)) {
+            return &[];
+        }
+        self.objects_of(conn, db, self.pane_schema(conn, db), cat)
+    }
+
+    /// 面板当前用的模式名。口径必须和 pane_path() 的索引一致：有模式层的
+    /// 引擎上「没显式选模式」= 第一个模式。若落到 ""，单击对象行把它变成
+    /// Act::Obj(c,d,0,...) 后下一帧会去查另一个 key（obj|conn|db|public|...），
+    /// 缓存未命中触发重载、列表短暂清空、滚动被 clamp 到顶（issue #18）。
+    fn pane_schema(&self, conn: &mock::Connection, db: &str) -> &'static str {
+        match self.sel.schema() {
+            Some(s) => catalog::schemas(conn, db).get(s).copied().unwrap_or(""),
+            None if catalog::has_schemas(conn.kind) => {
+                catalog::schemas(conn, db).first().copied().unwrap_or("")
+            }
+            None => "",
+        }
     }
 
     /// 某库某模式某分类的对象清单。「查询」分类在真连接上没有系统表可查，
@@ -9878,6 +9895,110 @@ impl DaroApp {
             }
             Err(e) => {
                 open_confirm(cx.entity(), dark, "新建数据库失败", e, |_| {}, cx);
+            }
+        }
+    }
+
+    /// 右键「刷新」：只重查当前节点那一支。缓存不清空，旧清单一直渲染到
+    /// 新结果回来，展开的树不会塌成空行，滚动位置也就不会被布局 clamp（issue #20）。
+    fn refresh_node(&mut self, target: RefreshTarget, cx: &mut Context<Self>) {
+        match target {
+            RefreshTarget::All => {
+                self.refresh_catalog(cx);
+                return;
+            }
+            RefreshTarget::Conn(ix) => {
+                let Some(conn) = self.conns.get(ix).cloned() else { return };
+                if !conn.connected || !backend::is_real_conn(&conn) {
+                    return;
+                }
+                catalog::refresh_databases(&conn);
+                // 只跟着重查这条连接下已经展开的库
+                for db in catalog::databases(&conn).iter().copied().collect::<Vec<_>>() {
+                    if self.expanded.contains(&node_key(&conn.name, db)) {
+                        Self::refresh_db_catalog(&conn, db, None);
+                    }
+                }
+            }
+            RefreshTarget::Group(gix) => {
+                let Some(group) = self.groups.get(gix).cloned() else { return };
+                for conn in self.conns.iter().filter(|c| c.group == group).cloned() {
+                    if conn.connected && backend::is_real_conn(&conn) {
+                        catalog::refresh_databases(&conn);
+                    }
+                }
+            }
+            RefreshTarget::Db(c, d) => {
+                let Some((conn, db)) = self.refresh_conn_db(c, d) else { return };
+                catalog::refresh_databases(&conn);
+                Self::refresh_db_catalog(&conn, db, None);
+            }
+            RefreshTarget::Schema(c, d, s) => {
+                let Some((conn, db)) = self.refresh_conn_db(c, d) else { return };
+                let schema = Self::refresh_schema_name(&conn, db, s);
+                catalog::refresh_schemas(&conn, db);
+                Self::refresh_db_catalog(&conn, db, Some(schema));
+            }
+            RefreshTarget::Cat(c, d, s, k) => {
+                let Some((conn, db)) = self.refresh_conn_db(c, d) else { return };
+                let schema = Self::refresh_schema_name(&conn, db, s);
+                catalog::refresh_objects(&conn, db, schema, k);
+            }
+            RefreshTarget::Obj(c, d, s, k, o) => {
+                let Some((conn, db)) = self.refresh_conn_db(c, d) else { return };
+                let schema = Self::refresh_schema_name(&conn, db, s);
+                catalog::refresh_objects(&conn, db, schema, k);
+                if let Some(table) = catalog::objects(&conn, db, schema, k).get(o).copied() {
+                    catalog::refresh_columns(&conn, db, schema, table);
+                }
+            }
+            RefreshTarget::Objects => {
+                // 对象面板空白右键：只重查面板当前所在的分类
+                let Some(c) = self.sel_conn_ix() else { return };
+                let Some(db) = self.sel_db_name() else { return };
+                let Some(cat) = self.pane_cat() else { return };
+                let conn = self.conns[c].clone();
+                if !conn.connected || !backend::is_real_conn(&conn) {
+                    return;
+                }
+                let schema = self.pane_schema(&conn, db);
+                catalog::refresh_objects(&conn, db, schema, cat);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 刷新目标定位到真连接 + 库；演示连接没有目录可重查。
+    fn refresh_conn_db(&self, c: usize, d: usize) -> Option<(mock::Connection, &'static str)> {
+        let conn = self.conns.get(c)?.clone();
+        if !conn.connected || !backend::is_real_conn(&conn) {
+            return None;
+        }
+        let db = catalog::databases(&conn).get(d).copied()?;
+        Some((conn, db))
+    }
+
+    /// Act 里的模式下标 → 目录缓存用的模式名；无模式层引擎保持空串。
+    fn refresh_schema_name(conn: &mock::Connection, db: &str, s: usize) -> &'static str {
+        if s == NO_SCHEMA {
+            ""
+        } else {
+            catalog::schemas(conn, db).get(s).copied().unwrap_or("")
+        }
+    }
+
+    /// 库 / 模式级刷新：重查该库的模式清单，以及各模式下的对象分类。
+    /// `schema` 为 None 时覆盖库下所有模式（无模式层引擎用空串那一份）。
+    fn refresh_db_catalog(conn: &mock::Connection, db: &str, schema: Option<&str>) {
+        catalog::refresh_schemas(conn, db);
+        let schemas: Vec<&str> = match schema {
+            Some(s) => vec![s],
+            None if catalog::has_schemas(conn.kind) => catalog::schemas(conn, db).to_vec(),
+            None => vec![""],
+        };
+        for s in schemas {
+            for cat in 0..CATEGORIES.len() {
+                catalog::refresh_objects(conn, db, s, cat);
             }
         }
     }
@@ -11358,6 +11479,7 @@ impl DaroApp {
 
     /// 打开连接：建连（TCP 握手 / 开库文件）连同库清单一起进 catalog 队列，
     /// 由 pump_catalog 投到后台线程；期间连接行图标转圈，界面不冻。
+    /// 密码没填（且不是免密场景）先弹密码框，确定后再连——参考界面同口径。
     fn open_connection(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(conn) = self.conns.get(ix).cloned() else {
             return;
@@ -11366,7 +11488,41 @@ impl DaroApp {
             self.apply_connected(&conn.name, cx);
             return;
         }
-        catalog::request_open(&conn);
+        // SQLite / Access 开文件、无口令概念（Access 加密库的空密码即不加密）；
+        // SQL Server 空用户名 = Windows 集成认证，密码留空是正常态。
+        // 以上或已存口令的直接连，其余先问密码。
+        let direct_connect = !conn.password.is_empty()
+            || matches!(conn.kind, DbKind::SQLite | DbKind::Access)
+            || (conn.kind == DbKind::SqlServer && conn.user.is_empty());
+        if direct_connect {
+            self.schedule_open(&conn, cx);
+            return;
+        }
+        let dark = self.dark;
+        let name = conn.name.clone();
+        open_password_prompt(
+            cx.entity(),
+            dark,
+            "密码",
+            "密码",
+            move |app, cx, pw| {
+                // 中途删了 / 改了这条连接：这次口令作废，不落到别人身上
+                let Some(c) = app.conns.iter_mut().find(|c| c.name == name) else {
+                    return;
+                };
+                // 写回配置：后续「列库 / 列表」的目录任务从 self.conns 现取
+                // Connection 拼参数，缺口令会拿空密码把连接重新建回来
+                c.password = pw;
+                let c = c.clone();
+                app.schedule_open(&c, cx);
+            },
+            cx,
+        );
+    }
+
+    /// 口令就位后的真正排队：把这份 Connection（含密码）投进建连队列。
+    fn schedule_open(&mut self, conn: &mock::Connection, cx: &mut Context<Self>) {
+        catalog::request_open(conn);
         cx.notify();
     }
 
@@ -11428,14 +11584,15 @@ impl DaroApp {
         }
     }
 
-    /// 双击库节点：普通引擎照旧展开子树；Redis 的库是命名空间，
+    /// 双击库节点：普通引擎等同右键「打开」（标记已打开并自动展开），
+    /// 而不是折叠/展开——那是三角的职责（issue #19）。Redis 的库是命名空间，
     /// 双击直接开键浏览页。
     fn open_db_action(&mut self, c: usize, d: usize, window: &mut Window, cx: &mut Context<Self>) {
         let redis = self.conns.get(c).is_some_and(|x| x.kind == DbKind::Redis);
         if redis {
             self.open_kv_tab(c, d, window, cx);
         } else {
-            self.toggle_db(c, d, cx);
+            self.open_db(c, d, cx);
         }
     }
 
@@ -11472,6 +11629,11 @@ impl DaroApp {
         let key = node_key(&conn_name, db);
         self.visited_dbs.remove(&key);
         self.expanded.remove(&key);
+        // 选中项在这个库里：子树收掉了，回落到连接行，别让面板 / 信息卡
+        // 还挂着一个已经关掉的库（和 close_connection 同口径）
+        if self.sel.conn() == Some(c) && self.sel.db() == Some(d) {
+            self.sel = Act::Conn(c);
+        }
         // 关库时把这个库下打开的页签一并关掉（与关连接 / 删连接同口径）
         let gone: Vec<usize> = self
             .opened
@@ -32692,12 +32854,14 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
     }
 
     /// 导入一批连接（迁移自 Flutter `AppState` 的 `_uniqueNamed` 口径）：
-    /// - 重名追加 " (2)"、" (3)"… 直到不重名；
+    /// - 同名同类型就地覆盖（等价于在连接对话框里改一遍），断连 + 作废目录缓存；
+    /// - 同名不同类型追加 " (2)"、" (3)"… 直到不重名；
     /// - 文件里出现、本地没有的分组顺带登记（即「分组不存在则重建」）；
-    /// - 导入的连接一律是未打开态，和参考界面一致。
+    /// - 新导入的连接一律是未打开态，覆盖掉的则编辑后同样回到未打开态。
     fn import_connections(&mut self, items: Vec<ImportItem>) -> ImportOutcome {
         let mut outcome = ImportOutcome {
             imported: 0,
+            overwritten: 0,
             renamed: 0,
             new_groups: Vec::new(),
         };
@@ -32710,6 +32874,26 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
             let mut name = item.name.trim().to_string();
             if name.is_empty() {
                 name = "未命名连接".to_string();
+            }
+            let overwrite = self
+                .conns
+                .iter()
+                .position(|c| c.name == name && c.kind == item.kind);
+            if let Some(ix) = overwrite {
+                self.apply_connection_edit(
+                    ix,
+                    name.clone(),
+                    item.kind,
+                    item.host.clone(),
+                    item.port,
+                    item.database.clone(),
+                    item.user.clone(),
+                    item.password.clone(),
+                    false,
+                );
+                outcome.overwritten += 1;
+                outcome.imported += 1;
+                continue;
             }
             if self.conns.iter().any(|c| c.name == name) {
                 let base = name.clone();
@@ -35409,8 +35593,20 @@ impl DaroApp {
         let mut rows = Vec::new();
         for (dix, db) in catalog::databases(conn).iter().enumerate() {
             let db_key = node_key(&name, db);
-            let db_open = self.expanded.contains(&db_key);
-            rows.push(self.db_row_elem(ix, dix, db_base, Some(caret(db_open)), q, ink, cx));
+            // 库要先「打开」才有对象：没打开的库不画三角、不渲染子树（issue #19）。
+            // 「打开」和「展开」是两件事：visited_dbs 是开/关，expanded 是折叠。
+            // 演示连接没有真实库要加载，点开就能看，不受这道门约束。
+            let opened = !backend::is_real_conn(conn) || self.visited_dbs.contains(&db_key);
+            let db_open = opened && self.expanded.contains(&db_key);
+            rows.push(self.db_row_elem(
+                ix,
+                dix,
+                db_base,
+                opened.then(|| caret(db_open)),
+                q,
+                ink,
+                cx,
+            ));
             if !db_open {
                 continue;
             }
@@ -45877,7 +46073,7 @@ fn tree_blank_menu(
     } else {
         menu = menu.item(mi("粘贴").disabled(true));
     }
-    menu.separator().item(refresh_item(me.clone()))
+    menu.separator().item(refresh_item(me.clone(), RefreshTarget::All))
 }
 
 /// 表头类型行的小图标（参考界面同款灰度三态）：数值「#」、字符串「ABC」
@@ -47634,12 +47830,24 @@ fn spawn_db_terminal(conn: &mock::Connection) {
     }
 }
 
-/// 「刷新」：失效目录缓存并立即重查已打开的连接。真驱动下库内容可能被
-/// 外部改动，树只看缓存，不重查看不见；重查失败要弹窗，否则空树像空库。
-fn refresh_item(me: Entity<DaroApp>) -> PopupMenuItem {
+/// 右键「刷新」的目标层级：只重查这一支，不再无差别清空整棵目录树（issue #20）。
+#[derive(Clone, Copy)]
+enum RefreshTarget {
+    All, // 树空白处：全部
+    Conn(usize),
+    Group(usize),
+    Db(usize, usize),
+    Schema(usize, usize, usize),
+    Cat(usize, usize, usize, usize),
+    Obj(usize, usize, usize, usize, usize),
+    Objects, // 对象面板空白处：当前面板所在的分类
+}
+
+/// 「刷新」：重查右键所在节点那一支。旧缓存不清空，展开的树在回执前不塌，
+/// 滚动位置也就不会丢；真驱动下库内容可能被外部改动，不重查就看不见。
+fn refresh_item(me: Entity<DaroApp>, target: RefreshTarget) -> PopupMenuItem {
     PopupMenuItem::new("刷新").on_click(move |_, _, cx| {
-        let target = me.clone();
-        target.update(cx, |app, cx| app.refresh_catalog(cx));
+        me.update(cx, move |app, cx| app.refresh_node(target, cx));
     })
 }
 
@@ -47794,11 +48002,12 @@ fn db_menu(
         menu = menu.item(PopupMenuItem::new(db_item).on_click(move |_, _, cx| {
             target.update(cx, |app, cx| {
                 if opened {
+                    // close_db 自己会把选中项从该库回落到连接行
                     app.close_db(c, d);
                 } else {
+                    // open_db 自己会把 sel 切到这个库并展开
                     app.open_db(c, d, cx);
                 }
-                app.sel = Act::Db(c, d);
                 cx.notify();
             });
         }));
@@ -47923,7 +48132,7 @@ fn db_menu(
         })
     };
     menu = menu.separator().item(todo_item("共享..."));
-    menu.separator().item(refresh_item(me.clone()))
+    menu.separator().item(refresh_item(me.clone(), RefreshTarget::Db(c, d)))
 }
 
 /// 模式节点右键菜单（参考界面实测，PostgreSQL public）。
@@ -48035,7 +48244,7 @@ fn schema_menu(
     });
     menu = menu.item(ent_item(&me, "数据字典..."));
     menu = menu.separator().item(todo_item("共享..."));
-    menu.separator().item(refresh_item(me.clone()))
+    menu.separator().item(refresh_item(me.clone(), RefreshTarget::Schema(c, d, s)))
 }
 
 /// 分类节点（表 / 视图 / …）右键菜单，五个分类逐个按参考界面实测还原
@@ -48242,7 +48451,7 @@ fn cat_menu(
             .item(todo_item("打开所在的文件夹..."))
             .item(todo_item("打开外部查询..."));
     }
-    menu.separator().item(refresh_item(me.clone()))
+    menu.separator().item(refresh_item(me.clone(), RefreshTarget::Cat(c, d, s, k)))
 }
 
 /// 对象级「管理组」子菜单：参考界面是 新建组 / 移动到▸ / 从组中排除（不在组内时灰）。
@@ -48497,7 +48706,7 @@ fn obj_menu(
     } else {
         menu = menu.item(todo_item("重命名"));
     }
-    menu.separator().item(refresh_item(me.clone()))
+    menu.separator().item(refresh_item(me.clone(), RefreshTarget::Obj(c, d, s, k, o)))
 }
 
 /// 连接节点右键菜单，条目与分组顺序照参考界面实测结果。
@@ -48754,7 +48963,7 @@ fn conn_menu_body(
 
         menu.item(PopupMenuItem::new("共享...").disabled(true))
             // 参考界面里 共享 与 刷新 之间没有分隔线
-            .item(refresh_item(me.clone()))
+            .item(refresh_item(me.clone(), RefreshTarget::Conn(ix)))
 }
 
 /// 分组节点右键菜单（参考界面实测：新建连接... / 新建组 / 删除组 / 重命名 / 刷新）。
@@ -48807,7 +49016,7 @@ fn group_menu(
         });
     }));
     // 组内连接的目录同样要重查（真驱动下库内容可能被外部改）
-    menu.separator().item(refresh_item(me.clone()))
+    menu.separator().item(refresh_item(me.clone(), RefreshTarget::Group(gix)))
 }
 
 /// 数据页工具条 / 记录导航条的纯图标按钮。`enabled: false` 时是置灰占位
@@ -49551,6 +49760,108 @@ mod first_run_tests {
         app.update(cx, |a, _| {
             assert_eq!(a.conns.len(), 1);
             assert!(!a.conns[0].demo, "旧存档的 demo 标记必须失效");
+        });
+    }
+}
+
+/// 导入向导落库的判重口径：同名同类型覆盖，同名不同类型才让序号。
+#[cfg(test)]
+mod import_overwrite_tests {
+    use super::*;
+    use crate::ui_test_support::{isolate_store, open_app_raw};
+    use gpui_kit::TestAppContext;
+    // `use super::*` 会把 gpui 的同名 test 宏带进来，显式引回标准 test 宏
+    use core::prelude::v1::test;
+
+    fn item(name: &str, kind: DbKind, host: &str, port: u16, db: &str) -> ImportItem {
+        ImportItem {
+            name: name.into(),
+            kind,
+            host: host.into(),
+            port,
+            database: db.into(),
+            user: "root".into(),
+            password: "s3cret".into(),
+            group: String::new(),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn same_name_and_kind_overwrites_in_place(cx: &mut TestAppContext) {
+        isolate_store("importsame");
+        let (_handle, app) = open_app_raw(cx);
+        app.update(cx, |a, _| {
+            a.push_connection(Connection::new(
+                "仓库", DbKind::MySql, "127.0.0.1", 3306, "老库", "root", "", "", false,
+            ));
+            a.conns.last_mut().unwrap().connected = true;
+
+            let out = a.import_connections(vec![item("仓库", DbKind::MySql, "10.0.0.9", 3307, "新库")]);
+            assert_eq!((out.imported, out.overwritten, out.renamed), (1, 1, 0));
+            assert_eq!(a.conns.len(), 1, "同名同类型不该多出「仓库 (2)」");
+            let c = &a.conns[0];
+            assert_eq!((c.host.as_str(), c.port, c.database.as_str()), ("10.0.0.9", 3307, "新库"));
+            assert_eq!(c.password, "s3cret", "密码要跟着覆盖");
+            assert!(!c.connected, "覆盖后回到未打开态");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn same_name_other_kind_still_gets_suffix(cx: &mut TestAppContext) {
+        isolate_store("importdiff");
+        let (_handle, app) = open_app_raw(cx);
+        app.update(cx, |a, _| {
+            a.push_connection(Connection::new(
+                "仓库", DbKind::MySql, "127.0.0.1", 3306, "老库", "root", "", "", false,
+            ));
+
+            let out = a.import_connections(vec![item("仓库", DbKind::PostgreSql, "10.0.0.9", 5432, "新库")]);
+            assert_eq!((out.imported, out.overwritten, out.renamed), (1, 0, 1));
+            assert_eq!(a.conns.len(), 2, "类型不同是另一条连接，不能吃掉原来那条");
+            assert_eq!(a.conns[1].name, "仓库 (2)");
+            assert_eq!(a.conns[0].database, "老库");
+        });
+    }
+}
+
+/// 对象面板的模式口径必须和 pane_path() 一致：单击对象行把库节点变成
+/// Act::Obj(...,0,...) 时不能换缓存 key，否则列表重载、滚动归零（issue #18）。
+#[cfg(test)]
+mod pane_schema_tests {
+    use super::*;
+    use crate::ui_test_support::{isolate_store, open_app_raw};
+    use gpui_kit::TestAppContext;
+    // `use super::*` 会带进 gpui 的同名 test 宏，显式引回标准 test 宏
+    use core::prelude::v1::test;
+
+    #[gpui_kit::test]
+    fn pane_schema_stays_first_schema_on_object_click(cx: &mut TestAppContext) {
+        isolate_store("paneschema");
+        let (_handle, app) = open_app_raw(cx);
+        app.update(cx, |a, _| {
+            a.conns = vec![
+                Connection::new("PG", DbKind::PostgreSql, "127.0.0.1", 5432, "db", "u", "p", "", false)
+                    .as_demo(),
+                Connection::new("Lite", DbKind::SQLite, "", 0, "db", "", "", "", false).as_demo(),
+            ];
+            a.conns[0].connected = true;
+            a.conns[1].connected = true;
+
+            a.sel = Act::Db(0, 0);
+            assert_eq!(a.pane_path().2, 0, "库节点折成第一个模式索引");
+            assert_eq!(a.pane_schema(&a.conns[0], "db"), "public");
+            a.sel = Act::Obj(0, 0, 0, 0, 0);
+            assert_eq!(
+                a.pane_schema(&a.conns[0], "db"),
+                "public",
+                "单击对象行不该把模式换成空串"
+            );
+
+            // 无模式层的引擎两边都保持空串，行为不变
+            a.sel = Act::Db(1, 0);
+            assert_eq!(a.pane_schema(&a.conns[1], "db"), "");
+            a.sel = Act::Obj(1, 0, NO_SCHEMA, 0, 0);
+            assert_eq!(a.pane_schema(&a.conns[1], "db"), "");
         });
     }
 }
@@ -59170,6 +59481,8 @@ mod designer_tests {
         })
         .unwrap();
         settle(cx, handle);
+        // 真库要先「打开」才列对象（issue #19 的新口径）
+        app.update(cx, |a, cx| a.open_db(0, 0, cx));
 
         let dir = std::env::temp_dir().join(format!("daro_sql_paste_{}", std::process::id()));
         let other = dir.join("v2");
@@ -60034,6 +60347,8 @@ mod tree_menu_tests {
         .unwrap();
         // 先等目录进缓存，之后外部建表才谈得上「不刷新看不见」
         settle(cx, handle);
+        // 真库要先打开，渲染才会去排队取对象
+        app.update(cx, |a, cx| a.open_db(0, 0, cx));
         app.update(cx, |a, _| {
             let _ = catalog::objects(&a.conns[0], "main", "", 0);
         });
@@ -60064,6 +60379,107 @@ mod tree_menu_tests {
 
         crate::sqlite_driver::close("刷新测试");
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// 右键刷新只重查目标那一支，且旧清单留到新结果回来：树不塌、滚动不跳（#20）
+    #[gpui_kit::test]
+    fn refresh_node_is_scoped_and_keeps_old_rows(cx: &mut TestAppContext) {
+        isolate_store("refreshscope");
+        let (a, pa) = sqlite_fixture("scope-a", &["CREATE TABLE one(a INTEGER)"]);
+        let (b, pb) = sqlite_fixture("scope-b", &["CREATE TABLE two(a INTEGER)"]);
+        let (handle, app) = open_app(cx);
+        app.update(cx, |app, cx| {
+            app.conns = vec![a.clone(), b.clone()];
+            app.groups.clear();
+            app.sel = Act::Db(0, 0);
+            app.open_connection(0, cx);
+            app.open_connection(1, cx);
+        });
+        settle(cx, handle);
+        app.update(cx, |app, _| {
+            // 没有渲染帧就不会懒加载对象，显式触发一次再等回执
+            let _ = catalog::objects(&app.conns[0], "main", "", 0);
+            let _ = catalog::objects(&app.conns[1], "main", "", 0);
+        });
+        settle(cx, handle);
+        app.update(cx, |app, _| {
+            assert_eq!(catalog::objects(&app.conns[0], "main", "", 0), &["one"]);
+            assert_eq!(catalog::objects(&app.conns[1], "main", "", 0), &["two"]);
+        });
+
+        // 外部只往 A 加表
+        crate::sqlite_driver::open("scope-a2", &pa).unwrap();
+        crate::sqlite_driver::execute_stmt("scope-a2", "CREATE TABLE next(a INTEGER)", 1).unwrap();
+        crate::sqlite_driver::close("scope-a2");
+
+        app.update(cx, |app, cx| {
+            app.refresh_node(RefreshTarget::Cat(0, 0, NO_SCHEMA, 0), cx)
+        });
+        // 重查在后台：回执前旧行还在，B 更不该被波及
+        app.update(cx, |app, _| {
+            assert_eq!(
+                catalog::objects(&app.conns[0], "main", "", 0),
+                &["one"],
+                "旧行留到新结果回来"
+            );
+            assert_eq!(catalog::objects(&app.conns[1], "main", "", 0), &["two"]);
+        });
+        settle(cx, handle);
+        app.update(cx, |app, _| {
+            assert_eq!(catalog::objects(&app.conns[0], "main", "", 0), &["next", "one"]);
+            assert_eq!(catalog::objects(&app.conns[1], "main", "", 0), &["two"], "不刷 B");
+        });
+        crate::sqlite_driver::close(&a.name);
+        crate::sqlite_driver::close(&b.name);
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    /// 真库的「打开/关闭」按连接同口径：未打开不列对象，双击=打开且自动展开，
+    /// 关闭后卸载并把选中项回落（issue #19）。
+    #[gpui_kit::test]
+    fn db_open_close_semantics_follow_connection(cx: &mut TestAppContext) {
+        isolate_store("dbopenclose");
+        let (conn, path) = sqlite_fixture("dbopenclose", &["CREATE TABLE one(a INTEGER)"]);
+        let conn_name = conn.name.clone();
+        let (handle, app) = open_app(cx);
+        app.update(cx, |a, cx| {
+            a.conns = vec![conn];
+            a.groups.clear();
+            a.sel = Act::Conn(0);
+            a.open_connection(0, cx);
+        });
+        settle(cx, handle);
+
+        // 连接开了但库没打开：选中库也不该出对象
+        app.update(cx, |a, _| {
+            assert!(!a.visited_dbs.contains(&node_key(&a.conns[0].name, "main")));
+            a.sel = Act::Db(0, 0);
+            assert!(a.pane_objects().is_empty(), "未打开的库不列对象");
+        });
+        // 双击库 = 右键「打开」，不是折叠/展开
+        cx.update_window(handle, |_, window, cx| {
+            window.double_click("db/0/0", cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.update(cx, |a, _| {
+            let key = node_key(&a.conns[0].name, "main");
+            assert!(a.visited_dbs.contains(&key), "双击要打开库");
+            assert!(a.expanded.contains(&key), "打开后自动展开");
+            assert_eq!(a.pane_objects(), &["one"]);
+        });
+        // 关闭库：卸载、收起、选中项回落连接行
+        app.update(cx, |a, _| a.close_db(0, 0));
+        app.update(cx, |a, _| {
+            let key = node_key(&a.conns[0].name, "main");
+            assert!(!a.visited_dbs.contains(&key));
+            assert!(!a.expanded.contains(&key));
+            assert!(a.pane_objects().is_empty(), "关闭后不列对象");
+            assert!(matches!(a.sel, Act::Conn(0)), "选中项回落到连接");
+        });
+        crate::sqlite_driver::close(&conn_name);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 表右键菜单的 DDL 接线：真库上删除 / 改名走完整链路（拼语句 → 后台执行 →
@@ -60301,7 +60717,7 @@ mod tree_menu_tests {
             "表已进对象级剪贴板"
         );
         cx.update_window(handle, |_, window, cx| {
-            window.click("db/0/0", cx);
+            window.double_click("db/0/0", cx);
         })
         .unwrap();
         settle(cx, handle);
@@ -61074,7 +61490,7 @@ mod ui_flows {
 
             // 选中库节点，对象面板才挂上这条路径的清单
             cx.update_window(handle, |_, window, cx| {
-                window.click("db/0/0", cx);
+                window.double_click("db/0/0", cx);
             })
             .unwrap();
             settle(cx, handle);
@@ -61175,7 +61591,7 @@ mod ui_flows {
             });
             settle(cx, handle);
             cx.update_window(handle, |_, window, cx| {
-                window.click("db/0/0", cx);
+                window.double_click("db/0/0", cx);
             })
             .unwrap();
             settle(cx, handle);
@@ -61260,7 +61676,7 @@ mod ui_flows {
             });
             settle(cx, handle);
             cx.update_window(handle, |_, window, cx| {
-                window.click("db/0/0", cx);
+                window.double_click("db/0/0", cx);
             })
             .unwrap();
             settle(cx, handle);
@@ -61752,7 +62168,7 @@ mod ui_flows {
             });
             settle(cx, handle);
             cx.update_window(handle, |_, window, cx| {
-                window.click("db/0/0", cx);
+                window.double_click("db/0/0", cx);
             })
             .unwrap();
             settle(cx, handle);
@@ -61858,7 +62274,7 @@ mod ui_flows {
             });
             settle(cx, handle);
             cx.update_window(handle, |_, window, cx| {
-                window.click("db/0/0", cx);
+                window.double_click("db/0/0", cx);
             })
             .unwrap();
             settle(cx, handle);
@@ -62362,7 +62778,7 @@ mod ui_flows {
         settle(cx, handle);
         cx.update_window(handle, |_, window, cx| {
             app.update(cx, |a, cx| {
-                a.sel = Act::Db(0, 0);
+                a.open_db(0, 0, cx);
                 a.list_view = false;
                 cx.notify();
             });
@@ -62441,7 +62857,7 @@ mod ui_flows {
             });
             settle(cx, handle);
             cx.update_window(handle, |_, window, cx| {
-                window.click("db/0/0", cx);
+                window.double_click("db/0/0", cx);
             })
             .unwrap();
             settle(cx, handle);
@@ -62580,7 +62996,7 @@ mod ui_flows {
             });
             settle(cx, handle);
             cx.update_window(handle, |_, window, cx| {
-                window.click("db/0/0", cx);
+                window.double_click("db/0/0", cx);
             })
             .unwrap();
             settle(cx, handle);
@@ -64297,7 +64713,7 @@ mod ent_tests {
         });
         settle(cx, handle);
         cx.update_window(handle, |_, window, cx| {
-            window.click("db/0/0", cx);
+            window.double_click("db/0/0", cx);
         })
         .unwrap();
         settle(cx, handle);
@@ -65087,6 +65503,91 @@ mod explain_tests {
             let q = a.opened.last().unwrap().qstate.as_ref().unwrap();
             assert!(q.outcomes.is_empty(), "不生成假计划");
         });
+    }
+
+    /// 双击无口令的 TCP 连接：先弹「密码」小窗，取消只收窗、不建连；
+    /// 有口令照旧直连。免密场景（SQLite / Access / Windows 集成认证）不拦。
+    #[gpui_kit::test]
+    fn double_click_empty_password_opens_password_prompt(cx: &mut TestAppContext) {
+        isolate_store("pw-prompt");
+        let (handle, app) = open_app(cx);
+        app.update(cx, |a, _| {
+            a.conns = vec![
+                mock::Connection::new("口令缺失", DbKind::MySql, "127.0.0.1", 3306, "", "root", "", "", false),
+                mock::Connection::new("已存口令", DbKind::MySql, "127.0.0.1", 3306, "", "root", "pw", "", false),
+            ];
+            a.groups.clear();
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let base = cx.windows().len();
+        // 走双击的同一条入口（toggle_connection → open_connection）
+        app.update(cx, |a, cx| a.toggle_connection(0, cx));
+        settle(cx, handle);
+        assert_eq!(cx.windows().len(), base + 1, "空口令应弹出密码窗");
+        let dialog = *cx.windows().last().unwrap();
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("prompt-root").is_some()
+                    && window.try_find("prompt-input").is_some(),
+                "弹的必须是带输入框的密码窗，不是失败回执"
+            );
+        })
+        .unwrap();
+        // 取消：窗收回，连接不算连上、也没去建连（无失败窗，也仍无口令）
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("cancel", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        assert_eq!(cx.windows().len(), base, "取消只收回密码窗，不该有失败回执");
+        app.update(cx, |a, _| {
+            assert!(!a.conns[0].connected, "取消不算连上");
+            assert!(a.conns[0].password.is_empty(), "取消不写口令");
+        });
+        // 已存口令：不弹密码窗；真去建连（本机 3306 无人监听 → 连接失败回执窗）
+        app.update(cx, |a, cx| a.toggle_connection(1, cx));
+        settle(cx, handle);
+        let wins = cx.windows();
+        assert_eq!(wins.len(), base + 1, "有口令该直接建连并收到失败回执窗");
+        cx.update_window(*wins.last().unwrap(), |_, window, cx| {
+            window.render_frame(cx);
+            // 「ok」空点即关的是失败回执；密码窗的确定钮空值时是灰的，关不掉
+            window.click("ok", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        assert_eq!(cx.windows().len(), base, "失败回执确认后收窗");
+        // 免密场景：SQLite 开文件、SQL Server 空用户名 = Windows 集成认证，都不弹密码窗
+        for (kind, user) in [(DbKind::SQLite, ""), (DbKind::SqlServer, "")] {
+            app.update(cx, |a, cx| {
+                a.conns = vec![mock::Connection::new(
+                    "免密直连", kind, "127.0.0.1", 0, "no-such-file.mdb", user, "", "", false,
+                )];
+                a.groups.clear();
+                a.toggle_connection(0, cx);
+            });
+            settle(cx, handle);
+            assert!(
+                cx.windows().len() <= base + 1,
+                "{kind:?} user={user:?} 不该弹密码窗（至多一个失败回执）"
+            );
+            let wins = cx.windows();
+            for w in wins.iter().skip(base) {
+                cx.update_window(*w, |_, window, cx| {
+                    window.render_frame(cx);
+                    window.click("ok", cx);
+                })
+                .unwrap();
+            }
+            settle(cx, handle);
+        }
     }
 
     /// 视图设计器「预览」/「解释」：预览跑「定义」正文的 SELECT，底部出消息 /

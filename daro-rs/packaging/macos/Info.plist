@@ -7,6 +7,8 @@
   <string>zh_CN</string>
   <key>CFBundleExecutable</key>
   <string>daro-rs</string>
+  <key>CFBundleIconFile</key>
+  <string>daro.icns</string>
   <key>CFBundleIdentifier</key>
   <string>com.springh.daro</string>
   <key>CFBundleInfoDictionaryVersion</key>

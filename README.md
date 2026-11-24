@@ -67,7 +67,18 @@
 | Access（`.mdb` / `.accdb`） | 仅 Windows | ✅ |
 
 ---
- 
+
+## macOS 首次打开说明
+
+`daro-rs-*-macos-*.zip` 解压后是 `daro-rs.app`。当前版本使用临时签名、尚未加入 Apple 公证计划，从浏览器下载后首次启动会被 Gatekeeper 拦一下：
+
+- 在 Finder 里按住 **Control** 点击 `daro-rs`（或右键），选「打开」，弹窗里再点一次「打开」；之后就能正常双击。
+- 若仍被拦，在终端执行 `xattr -cr daro-rs.app` 后再双击。
+
+发布包内也附了同样的「首次打开说明.txt」。校验下载完整性可用发布页的 `SHA256SUMS.txt`。
+
+---
+
 ## 交流
 
 QQ 交流群：1132083886
