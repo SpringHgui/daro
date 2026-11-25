@@ -17567,6 +17567,19 @@ impl DaroApp {
         opened.iter_mut().find(|t| t.qid == qid)?.qstate.as_mut()
     }
 
+    /// 面板头只有一行：驱动报错会把整条语句塞进消息（rusqlite 是
+    /// `{msg} in {sql} at offset {n}`，语句原文里的换行也原样带回来），
+    /// 换行压平再截断——不压平的话整段文本会按几十行排下来、撑破面板头。
+    fn status_one_line(s: &str) -> String {
+        const MAX_CHARS: usize = 100;
+        let flat = s.replace(['\n', '\r'], " ");
+        let mut out: String = flat.chars().take(MAX_CHARS).collect();
+        if flat.chars().count() > MAX_CHARS {
+            out.push('…');
+        }
+        out
+    }
+
     /// 结果面板头的状态文案（同 Flutter 版口径：结果 + 耗时）。
     /// 只描述本轮执行：固定的旧结果不算在内。
     fn query_status_text(q: &QueryState) -> String {
@@ -17596,12 +17609,19 @@ impl DaroApp {
             let o = shown[0];
             return match &o.result {
                 Some(rows) => match &o.message {
-                    Some(m) => format!("{what} · {} 行 · {m} · {} ms", rows.len(), q.last_ms),
+                    Some(m) => format!(
+                        "{what} · {} 行 · {} · {} ms",
+                        rows.len(),
+                        Self::status_one_line(m),
+                        q.last_ms
+                    ),
                     None => format!("{what} · {} 行 · {} ms", rows.len(), q.last_ms),
                 },
                 None => format!(
                     "{} · {} ms",
-                    o.message.as_deref().unwrap_or("演示数据 · 写操作未执行"),
+                    Self::status_one_line(
+                        o.message.as_deref().unwrap_or("演示数据 · 写操作未执行")
+                    ),
                     q.last_ms
                 ),
             };
@@ -42009,6 +42029,8 @@ impl DaroApp {
             .border_color(border)
             .child(
                 div()
+                    .id("qhead-status")
+                    .test_support()
                     .min_w_0()
                     .truncate()
                     .text_size(px(12.))
@@ -42556,7 +42578,9 @@ impl DaroApp {
                     .border_color(soft)
                     .hover(move |s| s.bg(to_hsla(p.hover)))
                     .child(cell(None, fg, o.sql.replace(['\n', '\r'], " ")))
-                    .child(cell(Some(240.), fg, msg))
+                    // 报错消息里夹着语句原文（含换行），概览格只有一行高，
+                    // 不压平会按几十行排、被垂直裁成中段乱码。
+                    .child(cell(Some(240.), fg, msg.replace(['\n', '\r'], " ")))
                     .child(cell(Some(84.), fg, query_secs_text(o.elapsed_ms)))
                     .child(cell(Some(84.), fg, "—".to_string()))
                     .into_any_element()
@@ -53787,6 +53811,58 @@ mod designer_tests {
             });
             assert!(window.try_find("qtab/0").is_none(), "清掉结果页签条");
             assert!(window.try_find("qmsg").is_none());
+        })
+        .unwrap();
+    }
+
+    /// 失败语句的面板头只占一行：rusqlite 的报错会把整条语句原文（连同换行）
+    /// 拼进消息（`{msg} in {sql} at offset {n}`），不压平的话状态文本会按
+    /// 几十行排下来，溢出面板头把编辑区和摘要页一起盖住。
+    #[gpui_kit::test]
+    fn query_failed_status_keeps_panel_header_one_line(cx: &mut TestAppContext) {
+        isolate_store("qstatus");
+        let (handle, app) = open_app(cx);
+        let msg = "错误：unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT\n  i.id\n  CASE WHEN 1 THEN 2\n  ELSE {lastOffset} END\nORDER BY i.id ASC\nLIMIT 111 at offset 1367";
+        assert!(
+            DaroApp::status_one_line(msg).chars().count() <= 101,
+            "压平后截到 100 字加省略号"
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.open_query_tab(None, window, cx);
+            });
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                let q = a.opened[0].qstate.as_mut().unwrap();
+                q.outcomes = vec![QueryOutcome {
+                    sql: "EXPLAIN QUERY PLAN SELECT i.id".into(),
+                    result: None,
+                    columns: Vec::new(),
+                    message: Some(msg.into()),
+                    elapsed_ms: 0,
+                    cell: (0, 0),
+                    sel: None,
+                    explain: false,
+                    pinned: false,
+                    pin_seq: 0,
+                }];
+                q.pane = 1;
+                let status = DaroApp::query_status_text(q);
+                assert!(!status.contains('\n'), "面板头状态必须压成一行：{status}");
+                assert!(status.starts_with("错误：unrecognized token"), "{status}");
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let head = window.find("qhead").bounds();
+            let status = window.find("qhead-status").bounds();
+            assert!(
+                status.size.height <= head.size.height,
+                "状态文本高 {} 超过面板头 {}：多行文本会溢出到编辑区",
+                status.size.height,
+                head.size.height
+            );
+            assert!(window.try_find("qsummary").is_some(), "失败落摘要页");
         })
         .unwrap();
     }
