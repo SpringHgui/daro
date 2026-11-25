@@ -68,7 +68,7 @@ if ! sips -z 1024 1024 "$logo" --out "$master" > /dev/null 2>&1; then
 fi
 
 while read -r icon_name size; do
-  out="$iconset/$icon_name.png"
+  out="$iconset/$icon_name"
   if ! sips -z "$size" "$size" "$master" --out "$out" > /dev/null 2>&1; then
     echo "生成图标 $icon_name ($size×$size) 失败" >&2
     exit 1
@@ -92,10 +92,9 @@ icon_256x256@2x.png 512
 icon_512x512.png 512
 icon_512x512@2x.png 1024
 ICONSET
-# 不用 iconutil：macOS 26 runner 上它对同一份尺寸校验通过的合法 iconset
-# 反复报 "Failed to generate ICNS"，且匿名拿不到 runner 日志。.icns 本身
-# 只是「icns + 总长 + (类型 + 长度 + 数据)」的容器，PNG 负载是 10.7+ 的
-# 标准写法，直接写入既避开 runner 工具差异，产物也能在任意平台校验。
+# 不用 iconutil：它失败时只报一句 "Failed to generate ICNS"，不说是哪个
+# 文件有问题。.icns 只是「icns + 总长 + (类型 + 长度 + 数据)」的容器，
+# 直接按规范写入并在缺文件/非 PNG 时点名报错；PNG 负载是 10.7+ 的标准写法。
 python3 - "$iconset" "$app/Contents/Resources/daro.icns" <<'PY'
 import struct
 import sys
