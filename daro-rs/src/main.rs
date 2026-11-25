@@ -35884,13 +35884,14 @@ impl DaroApp {
         rows
     }
 
-    /// 库节点是否在「打开中」：模式清单（PG）或该库下任一分类的对象清单在飞。
+    /// 库节点自己这一层是否在取数：折叠着的库行没有子树要加载，一律不转圈；
+    /// 展开后只看模式清单（PG）这一层。选中一个开过的库时对象面板也会去要模式 /
+    /// 表清单，那是面板的加载，不该点亮树图标（issue #22 续）。
     fn db_is_loading(&self, conn: &Connection, db: &str) -> bool {
-        if self.loading.contains(&catalog::schemas_key(&conn.name, db)) {
-            return true;
+        if !self.expanded.contains(&node_key(&conn.name, db)) {
+            return false;
         }
-        let prefix = format!("obj|{}|{}|", conn.name, db);
-        self.loading.iter().any(|k| k.starts_with(&prefix))
+        self.loading.contains(&catalog::schemas_key(&conn.name, db))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -60883,6 +60884,68 @@ mod tree_menu_tests {
             a.visited_dbs.insert(key);
         });
         app.read_with(cx, |a, _| assert_eq!(a.sel_child_count(), (Some(2), "模式")));
+    }
+
+    /// 库行图标只在「这一行的子树正在渲染、且模式清单还在飞」时转圈。
+    /// 选中一个开过的库时对象面板会去要模式 / 表清单，键确实进了 loading，
+    /// 但折叠着的库行没有子树要加载，点亮它就像单击把库打开了（issue #22 续）。
+    #[gpui_kit::test]
+    fn collapsed_db_row_icon_does_not_spin(cx: &mut TestAppContext) {
+        isolate_store("dbicon23");
+        let name = "库行图标测试 PG";
+        let conn = mock::Connection::new(
+            name,
+            DbKind::PostgreSql,
+            "127.0.0.1",
+            5432,
+            "appdb",
+            "postgres",
+            "",
+            "",
+            true,
+        );
+        let (_handle, app) = open_app(cx);
+        app.update(cx, |a, _| {
+            a.conns = vec![conn];
+            a.groups.clear();
+        });
+        let db_key = node_key(name, "appdb");
+        let schemas = catalog::schemas_key(name, "appdb");
+        let objects = catalog::objects_key(name, "appdb", "public", 0);
+
+        // 折叠着选中：面板在取模式清单，库行不转圈
+        app.update(cx, |a, _| {
+            a.visited_dbs.insert(db_key.clone());
+            a.sel = Act::Db(0, 0);
+            a.loading.insert(schemas.clone());
+        });
+        app.read_with(cx, |a, _| {
+            assert!(
+                !a.db_is_loading(&a.conns[0], "appdb"),
+                "折叠着的库行不该点亮转圈"
+            );
+        });
+        // 展开后同一份在飞标记：这才是树在自己这一层取数，要转圈
+        app.update(cx, |a, _| {
+            a.expanded.insert(db_key.clone());
+        });
+        app.read_with(cx, |a, _| {
+            assert!(
+                a.db_is_loading(&a.conns[0], "appdb"),
+                "展开的库在等模式清单，图标该转圈"
+            );
+        });
+        // 分类对象清单在飞属于分类行，不该顺着点亮库行
+        app.update(cx, |a, _| {
+            a.loading.remove(&schemas);
+            a.loading.insert(objects);
+        });
+        app.read_with(cx, |a, _| {
+            assert!(
+                !a.db_is_loading(&a.conns[0], "appdb"),
+                "对象清单在飞不该让库行转圈"
+            );
+        });
     }
 
     /// 树右键「刷新」重查真库目录：外部往库里加表后，不刷看不见、刷了看得见。
