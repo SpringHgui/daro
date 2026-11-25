@@ -51,7 +51,6 @@ sed "s/__VERSION__/${version}/g" packaging/macos/Info.plist > "$app/Contents/Inf
 
 # 应用图标：由项目 logo 生成 .icns 放进 Contents/Resources/，Info.plist 的
 # CFBundleIconFile 指向它。没有图标时 Finder 显示空白通用图标（issue #21）。
-# sips / iconutil 都是 macOS 自带工具，CI runner 与本机都可用。
 # 必须在 codesign 之前放好：签完再动 bundle 内容会把签名打坏。
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -60,8 +59,8 @@ mkdir -p "$iconset" "$app/Contents/Resources"
 logo="assets/icons/ui/logo.png"
 
 # 先做一张 1024×1024 母版：logo 原图只有 256×256，直接从它放大到各档
-# 在部分 macOS 上会产出尺寸不符的 png，iconutil 报 "Failed to generate ICNS"。
-# 统一从母版「缩小」更可靠；母版本身也校验，放大失败就明确报错。
+# 在部分 macOS 上会产出尺寸不符的 png。统一从母版「缩小」更可靠；
+# 母版本身也校验，放大失败就明确报错。
 master="$tmpdir/daro-master-1024.png"
 if ! sips -z 1024 1024 "$logo" --out "$master" > /dev/null 2>&1; then
   echo "生成 1024 图标母版失败" >&2
@@ -74,7 +73,7 @@ while read -r icon_name size; do
     echo "生成图标 $icon_name ($size×$size) 失败" >&2
     exit 1
   fi
-  # iconutil 要求实际像素必须与文件名标称一致，不符会让整包生成失败。
+  # 名里的尺寸会被 Finder/系统当作实际像素使用，不符会显示错误图标。
   w="$(sips -g pixelWidth "$out" | awk '/pixelWidth/{print $2}')"
   h="$(sips -g pixelHeight "$out" | awk '/pixelHeight/{print $2}')"
   if [[ "$w" != "$size" || "$h" != "$size" ]]; then
@@ -93,10 +92,36 @@ icon_256x256@2x.png 512
 icon_512x512.png 512
 icon_512x512@2x.png 1024
 ICONSET
-if ! iconutil -c icns "$iconset" -o "$app/Contents/Resources/daro.icns"; then
-  echo "iconutil 生成 .icns 失败" >&2
-  exit 1
-fi
+# 不用 iconutil：macOS 26 runner 上它对同一份尺寸校验通过的合法 iconset
+# 反复报 "Failed to generate ICNS"，且匿名拿不到 runner 日志。.icns 本身
+# 只是「icns + 总长 + (类型 + 长度 + 数据)」的容器，PNG 负载是 10.7+ 的
+# 标准写法，直接写入既避开 runner 工具差异，产物也能在任意平台校验。
+python3 - "$iconset" "$app/Contents/Resources/daro.icns" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+iconset, out = Path(sys.argv[1]), Path(sys.argv[2])
+mapping = [
+    ("ic11", "icon_16x16@2x.png"),
+    ("ic12", "icon_32x32@2x.png"),
+    ("ic07", "icon_128x128.png"),
+    ("ic13", "icon_128x128@2x.png"),
+    ("ic08", "icon_256x256.png"),
+    ("ic14", "icon_256x256@2x.png"),
+    ("ic09", "icon_512x512.png"),
+    ("ic10", "icon_512x512@2x.png"),
+]
+entries = bytearray()
+for typ, name in mapping:
+    data = (iconset / name).read_bytes()
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        sys.exit(f"{name} 不是 PNG")
+    entries += typ.encode("ascii")
+    entries += struct.pack(">I", len(data) + 8)
+    entries += data
+out.write_bytes(b"icns" + struct.pack(">I", len(entries) + 8) + bytes(entries))
+PY
 
 # 有 Developer ID 证书就正式签名 + 公证，Gatekeeper 不再拦首次启动；
 # 没有则保持 ad-hoc 签名，并在包内附打开说明（见下方 zip 之前）。
