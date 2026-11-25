@@ -8107,6 +8107,13 @@ impl QPopup {
     }
 }
 
+/// 摘要页「…」详情浮层看哪一列：查询（SQL 原文）或消息（报错前半句）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SumDetailKind {
+    Sql,
+    Msg,
+}
+
 /// 查询页签工作状态，随页签存亡（放 [OpenTab] 里，关页签即弃）。
 #[derive(Clone)]
 struct QueryState {
@@ -8138,8 +8145,8 @@ struct QueryState {
     result_sub: usize,
     /// 摘要页查询清单的滚动
     summary_scroll: ScrollHandle,
-    /// 摘要页「详情」浮层的目标行（outcomes 下标）；None = 收起
-    sum_detail: Option<usize>,
+    /// 摘要页「详情」浮层的目标（outcomes 下标 + 列）；None = 收起
+    sum_detail: Option<(usize, SumDetailKind)>,
     /// 最近一次运行的总耗时（状态文案用）
     last_ms: u128,
     /// 运行前的提示（如「请输入 SQL 语句」），出结果后撤
@@ -42497,8 +42504,10 @@ impl DaroApp {
                         .text_color(fg)
                         .child(label),
                 )
-                .child(div().text_size(px(11.5)).text_color(fg).child(value))
+                .child(div().text_size(px(11.5)).text_color(color).child(value))
         };
+        // 参考界面口径：有报错时「错误: N」整条染红
+        let err_color = if failed > 0 { err } else { fg };
         let top = h_flex()
             .flex_none()
             .items_start()
@@ -42506,9 +42515,9 @@ impl DaroApp {
             .child(
                 v_flex()
                     .gap(px(2.))
-                    .child(stat("已处理的查询:", total.to_string()))
-                    .child(stat("成功:", ok.to_string()))
-                    .child(stat("错误:", failed.to_string())),
+                    .child(stat("已处理的查询:", total.to_string(), fg))
+                    .child(stat("成功:", ok.to_string(), fg))
+                    .child(stat("错误:", failed.to_string(), err_color)),
             )
             .child(
                 v_flex()
@@ -42516,12 +42525,14 @@ impl DaroApp {
                     .child(stat(
                         "开始时间:",
                         q.started_at.clone().unwrap_or_else(|| "—".to_string()),
+                        fg,
                     ))
                     .child(stat(
                         "结束时间:",
                         q.finished_at.clone().unwrap_or_else(|| "—".to_string()),
+                        fg,
                     ))
-                    .child(stat("运行时间:", query_secs_text(q.last_ms))),
+                    .child(stat("运行时间:", query_secs_text(q.last_ms), fg)),
             )
             .child(div().flex_1())
             .child(
@@ -42580,6 +42591,7 @@ impl DaroApp {
             .filter(|o| !o.pinned && (!q.only_errors || query_outcome_failed(o)))
             .enumerate()
             .map(|(i, o)| {
+                let failed = query_outcome_failed(o);
                 let msg = o
                     .message
                     .clone()
@@ -42590,6 +42602,14 @@ impl DaroApp {
                 // 单行预览要压平：消息里夹着整条语句（含换行），一行高不压平会被垂直裁成中段；
                 // 后半截的 `in {sql} at offset {n}` 与「查询」列重复，只留报错前半句
                 let preview = Self::error_head(&msg).replace(['\n', '\r'], " ");
+                // 参考界面口径：整行染红（SQL / 消息 / 两个时间列），成功行照常
+                let color = if failed { err } else { fg };
+                let mut acc = to_hsla(p.accent);
+                acc.a = 0.12;
+                let acc_face = acc;
+                let mut acc_h = to_hsla(p.accent);
+                acc_h.a = 0.24;
+                let acc_hover = acc_h;
                 h_flex()
                     .id(format!("qsum/row/{i}"))
                     .test_support()
@@ -42599,19 +42619,57 @@ impl DaroApp {
                     .border_b_1()
                     .border_color(soft)
                     .hover(move |s| s.bg(to_hsla(p.hover)))
-                    // SQL 按原样换行显示（最多 6 行），整句太长再点行尾「…」看全文
+                    // SQL 按原样换行显示（最多 6 行），整句太长再点格尾「…」看全文
                     .child(
-                        div()
-                            .id(format!("qsum/sql/{i}"))
-                            .test_support()
+                        h_flex()
                             .flex_1()
                             .min_w_0()
+                            .items_start()
+                            .gap(px(4.))
                             .px(px(6.))
                             .py(px(3.))
-                            .line_clamp(6)
-                            .text_size(px(11.5))
-                            .text_color(fg)
-                            .child(o.sql.clone()),
+                            .child(
+                                div()
+                                    .id(format!("qsum/sql/{i}"))
+                                    .test_support()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .line_clamp(6)
+                                    .text_size(px(11.5))
+                                    .text_color(color)
+                                    .child(o.sql.clone()),
+                            )
+                            // 「…」小方块（参考界面的蓝色三圆点）：展开 SQL 原文
+                            .child(
+                                div()
+                                    .id(format!("qsum/sql-detail/{i}"))
+                                    .w(px(14.))
+                                    .h(px(14.))
+                                    .flex_none()
+                                    .rounded(px(2.))
+                                    .bg(acc_face)
+                                    .hover(move |s| s.bg(acc_hover))
+                                    .text_size(px(11.))
+                                    .text_color(to_hsla(p.accent))
+                                    .items_center()
+                                    .justify_center()
+                                    .child("…")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let mut focus = None;
+                                        if let Some(q) =
+                                            Self::query_state_mut(&mut this.opened, qid)
+                                        {
+                                            q.sum_detail = Some((i, SumDetailKind::Sql));
+                                            focus = Some(q.popup_focus.clone());
+                                        }
+                                        // Esc 收起靠挡板收键，先占住焦点
+                                        if let Some(f) = focus {
+                                            window.focus(&f, cx);
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .test_support(),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -42627,30 +42685,44 @@ impl DaroApp {
                                     .min_w_0()
                                     .truncate()
                                     .text_size(px(11.5))
-                                    .text_color(fg)
+                                    .text_color(color)
                                     .child(preview),
                             )
-                            .child(
-                                ui::compact_button(format!("qsum/detail/{i}"), "…").on_click(
-                                    cx.listener(move |this, _, window, cx| {
-                                        let mut focus = None;
-                                        if let Some(q) =
-                                            Self::query_state_mut(&mut this.opened, qid)
-                                        {
-                                            q.sum_detail = Some(i);
-                                            focus = Some(q.popup_focus.clone());
-                                        }
-                                        // Esc 收起靠挡板收键，先占住焦点
-                                        if let Some(f) = focus {
-                                            window.focus(&f, cx);
-                                        }
-                                        cx.notify();
-                                    }),
-                                ),
-                            ),
+                            // 只有报错行需要消息详情：成功行的消息（OK 等）本身已完整
+                            .when(failed, |s| {
+                                s.child(
+                                    div()
+                                        .id(format!("qsum/msg-detail/{i}"))
+                                        .w(px(14.))
+                                        .h(px(14.))
+                                        .flex_none()
+                                        .rounded(px(2.))
+                                        .bg(acc_face)
+                                        .hover(move |s| s.bg(acc_hover))
+                                        .text_size(px(11.))
+                                        .text_color(to_hsla(p.accent))
+                                        .items_center()
+                                        .justify_center()
+                                        .child("…")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            let mut focus = None;
+                                            if let Some(q) =
+                                                Self::query_state_mut(&mut this.opened, qid)
+                                            {
+                                                q.sum_detail = Some((i, SumDetailKind::Msg));
+                                                focus = Some(q.popup_focus.clone());
+                                            }
+                                            if let Some(f) = focus {
+                                                window.focus(&f, cx);
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .test_support(),
+                                )
+                            }),
                     )
-                    .child(cell(Some(84.), fg, query_secs_text(o.elapsed_ms)))
-                    .child(cell(Some(84.), fg, "—".to_string()))
+                    .child(cell(Some(84.), color, query_secs_text(o.elapsed_ms)))
+                    .child(cell(Some(84.), color, "—".to_string()))
                     .into_any_element()
             })
             .collect();
@@ -42683,11 +42755,29 @@ impl DaroApp {
             )
             .vertical_scrollbar(&q.summary_scroll);
 
-        // 「详情」浮层：非模态，浮在摘要表上；点「确定」、点浮层外或 Esc 收起
-        let detail_sql = q
-            .sum_detail
-            .and_then(|i| q.outcomes.get(i))
-            .map(|o| o.sql.clone());
+        // 「详情」浮层：非模态，浮在摘要表上；点「确定」、点浮层外或 Esc 收起。
+        // 参考界面口径：白底小窗居中压在结果区上，宽度固定，高度吃到面板下沿。
+        let detail = q.sum_detail.and_then(|(i, kind)| {
+            q.outcomes.get(i).map(|o| {
+                let text = match kind {
+                    SumDetailKind::Sql => o.sql.clone(),
+                    SumDetailKind::Msg => {
+                        let msg = o.message.clone().unwrap_or_else(|| match o.result {
+                            Some(_) => "OK".to_string(),
+                            None => "演示数据：写操作未执行".to_string(),
+                        });
+                        Self::error_head(&msg).to_string()
+                    }
+                };
+                let color = if kind == SumDetailKind::Msg { err } else { fg };
+                (text, color)
+            })
+        });
+        // 中栏宽度 = 窗口宽 − 可见侧栏（左 250 / 右 315 起，可拖）；浮层固定宽 360 居中
+        let pane_w = self.viewport_w
+            - if self.show_tree { self.left_w } else { 0. }
+            - if self.show_info { self.right_w } else { 0. };
+        let detail_left = ((pane_w - 360.) / 2.).max(8.);
 
         v_flex()
             .id("qsummary")
@@ -42698,7 +42788,7 @@ impl DaroApp {
             .gap(px(8.))
             .child(top)
             .child(table_area)
-            .when_some(detail_sql, |s, sql| {
+            .when_some(detail, |s, (text, color)| {
                 s.child(
                     // 透明挡板：点浮层外收起（不压暗背景，也不开系统模态窗）
                     div()
@@ -42729,10 +42819,10 @@ impl DaroApp {
                         .id("qsum-detail")
                         .test_support()
                         .absolute()
-                        .right(px(24.))
-                        .top(px(36.))
-                        .bottom(px(12.))
-                        .w(px(480.))
+                        .left(px(detail_left))
+                        .top(px(60.))
+                        .bottom(px(16.))
+                        .w(px(360.))
                         .bg(to_hsla(p.background))
                         .border_1()
                         .border_color(to_hsla(p.border))
@@ -42750,8 +42840,8 @@ impl DaroApp {
                                 .p(px(6.))
                                 .font_family("Consolas")
                                 .text_size(px(12.))
-                                .text_color(fg)
-                                .child(sql),
+                                .text_color(color)
+                                .child(text),
                         )
                         .child(
                             h_flex().justify_end().child(
@@ -54062,10 +54152,15 @@ mod designer_tests {
                 row.size.height
             );
             assert!(
-                window.try_find("qsum/detail/0").is_some(),
-                "行尾要有「…」详情入口"
+                window.try_find("qsum/sql-detail/0").is_some(),
+                "查询格尾要有「…」"
             );
-            window.click("qsum/detail/0", cx);
+            assert!(
+                window.try_find("qsum/msg-detail/0").is_some(),
+                "报错行消息格尾要有「…」"
+            );
+            // 查询格「…」→ SQL 浮层
+            window.click("qsum/sql-detail/0", cx);
             window.render_frame(cx);
             assert!(
                 window.try_find("qsum-detail").is_some(),
@@ -54073,7 +54168,7 @@ mod designer_tests {
             );
             assert!(
                 window.try_find("qsum-detail-scroll").is_some(),
-                "浮层缺可滚动的 SQL 正文"
+                "浮层缺可滚动的正文"
             );
             window.click("qsum-detail-ok", cx);
             window.render_frame(cx);
@@ -54081,8 +54176,8 @@ mod designer_tests {
                 window.try_find("qsum-detail").is_none(),
                 "点「确定」收起浮层"
             );
-            // 再开一次，点浮层外的挡板也能收起
-            window.click("qsum/detail/0", cx);
+            // 消息格「…」→ 报错浮层，点浮层外的挡板也能收起
+            window.click("qsum/msg-detail/0", cx);
             window.render_frame(cx);
             assert!(window.try_find("qsum-detail").is_some());
             window.click("qsum-detail-backdrop", cx);
