@@ -1,6 +1,6 @@
 [package]
 name = "daro-rs"
-version = "1.0.13"
+version = "1.0.14"
 edition = "2024"
 
 # 无界面部分（驱动层 + MCP 服务）单独成库：`daro-mcpd` 只依赖这一半，
@@ -69,6 +69,11 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(unix)'.dependencies]
 tiberius = { version = "0.13", default-features = false, features = ["tds80", "rustls", "sql-browser-tokio"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 系统菜单栏：关掉 NSMenu 的自动启停（否则 gpui 烘的勾选 / 置灰会被
+# 「有没有处理器」覆盖），隐藏 / 隐藏其他 / 显示全部也走 NSApplication。
+objc2 = "0.6"
 
 [build-dependencies]
 embed-resource = "3"

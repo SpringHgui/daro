@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "daro-rs"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "aes",
  "anyhow",
@@ -1563,6 +1563,7 @@ dependencies = [
  "lsp-types",
  "mongodb",
  "mysql",
+ "objc2 0.6.5",
  "open",
  "postgres",
  "quick-xml 0.37.5",
