@@ -71,7 +71,6 @@ mod sql_assoc;
 mod save_query_dialog;
 mod palette;
 mod prompt_dialog;
-mod text_view_dialog;
 mod zed_icons;
 mod role_design;
 mod window_drag;
@@ -8139,6 +8138,8 @@ struct QueryState {
     result_sub: usize,
     /// 摘要页查询清单的滚动
     summary_scroll: ScrollHandle,
+    /// 摘要页「详情」浮层的目标行（outcomes 下标）；None = 收起
+    sum_detail: Option<usize>,
     /// 最近一次运行的总耗时（状态文案用）
     last_ms: u128,
     /// 运行前的提示（如「请输入 SQL 语句」），出结果后撤
@@ -14256,6 +14257,7 @@ impl DaroApp {
                 finished_at: None,
                 result_sub: 0,
                 summary_scroll: ScrollHandle::new(),
+                sum_detail: None,
                 last_ms: 0,
                 prompt: None,
                 job: None,
@@ -17568,6 +17570,18 @@ impl DaroApp {
         opened.iter_mut().find(|t| t.qid == qid)?.qstate.as_mut()
     }
 
+    /// 驱动报错原文只要前半句：rusqlite 的 Display 是
+    /// `{msg} in {sql} at offset {n}`，语句原文既长又和「查询」列重复，
+    /// 概览格与面板头都别把整条语句再抄一遍。
+    fn error_head(s: &str) -> &str {
+        if let Some(at) = s.rfind(" at offset ") {
+            if let Some(at_in) = s[..at].rfind(" in ") {
+                return s[..at_in].trim_end();
+            }
+        }
+        s
+    }
+
     /// 面板头只有一行：驱动报错会把整条语句塞进消息（rusqlite 是
     /// `{msg} in {sql} at offset {n}`，语句原文里的换行也原样带回来），
     /// 换行压平再截断——不压平的话整段文本会按几十行排下来、撑破面板头。
@@ -17613,16 +17627,16 @@ impl DaroApp {
                     Some(m) => format!(
                         "{what} · {} 行 · {} · {} ms",
                         rows.len(),
-                        Self::status_one_line(m),
+                        Self::status_one_line(Self::error_head(m)),
                         q.last_ms
                     ),
                     None => format!("{what} · {} 行 · {} ms", rows.len(), q.last_ms),
                 },
                 None => format!(
                     "{} · {} ms",
-                    Self::status_one_line(
+                    Self::status_one_line(Self::error_head(
                         o.message.as_deref().unwrap_or("演示数据 · 写操作未执行")
-                    ),
+                    )),
                     q.last_ms
                 ),
             };
@@ -42573,10 +42587,9 @@ impl DaroApp {
                         Some(_) => "OK".to_string(),
                         None => "演示数据：写操作未执行".to_string(),
                     });
-                // 单行预览要压平：消息里夹着整条语句（含换行），一行高不压平会被垂直裁成中段
-                let preview = msg.replace(['\n', '\r'], " ");
-                let (sql_full, msg_full) = (o.sql.clone(), msg.clone());
-                let dark = self.dark;
+                // 单行预览要压平：消息里夹着整条语句（含换行），一行高不压平会被垂直裁成中段；
+                // 后半截的 `in {sql} at offset {n}` 与「查询」列重复，只留报错前半句
+                let preview = Self::error_head(&msg).replace(['\n', '\r'], " ");
                 h_flex()
                     .id(format!("qsum/row/{i}"))
                     .test_support()
@@ -42619,16 +42632,19 @@ impl DaroApp {
                             )
                             .child(
                                 ui::compact_button(format!("qsum/detail/{i}"), "…").on_click(
-                                    cx.listener(move |_, _, _, cx| {
-                                        text_view_dialog::open_text_view(
-                                            dark,
-                                            "查询详情",
-                                            vec![
-                                                ("SQL", sql_full.clone()),
-                                                ("消息", msg_full.clone()),
-                                            ],
-                                            cx,
-                                        );
+                                    cx.listener(move |this, _, window, cx| {
+                                        let mut focus = None;
+                                        if let Some(q) =
+                                            Self::query_state_mut(&mut this.opened, qid)
+                                        {
+                                            q.sum_detail = Some(i);
+                                            focus = Some(q.popup_focus.clone());
+                                        }
+                                        // Esc 收起靠挡板收键，先占住焦点
+                                        if let Some(f) = focus {
+                                            window.focus(&f, cx);
+                                        }
+                                        cx.notify();
                                     }),
                                 ),
                             ),
@@ -42667,14 +42683,92 @@ impl DaroApp {
             )
             .vertical_scrollbar(&q.summary_scroll);
 
+        // 「详情」浮层：非模态，浮在摘要表上；点「确定」、点浮层外或 Esc 收起
+        let detail_sql = q
+            .sum_detail
+            .and_then(|i| q.outcomes.get(i))
+            .map(|o| o.sql.clone());
+
         v_flex()
             .id("qsummary")
             .test_support()
+            .relative()
             .size_full()
             .p(px(10.))
             .gap(px(8.))
             .child(top)
             .child(table_area)
+            .when_some(detail_sql, |s, sql| {
+                s.child(
+                    // 透明挡板：点浮层外收起（不压暗背景，也不开系统模态窗）
+                    div()
+                        .id("qsum-detail-backdrop")
+                        .test_support()
+                        .absolute()
+                        .size_full()
+                        .track_focus(&q.popup_focus)
+                        .occlude()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(q) = Self::query_state_mut(&mut this.opened, qid) {
+                                q.sum_detail = None;
+                            }
+                            cx.notify();
+                        }))
+                        .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                            if ev.keystroke.key == "escape" {
+                                if let Some(q) = Self::query_state_mut(&mut this.opened, qid) {
+                                    q.sum_detail = None;
+                                }
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                        })),
+                )
+                .child(
+                    v_flex()
+                        .id("qsum-detail")
+                        .test_support()
+                        .absolute()
+                        .right(px(24.))
+                        .top(px(36.))
+                        .bottom(px(12.))
+                        .w(px(480.))
+                        .bg(to_hsla(p.background))
+                        .border_1()
+                        .border_color(to_hsla(p.border))
+                        .rounded(px(4.))
+                        .shadow_lg()
+                        .p(px(8.))
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .id("qsum-detail-scroll")
+                                .test_support()
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .p(px(6.))
+                                .font_family("Consolas")
+                                .text_size(px(12.))
+                                .text_color(fg)
+                                .child(sql),
+                        )
+                        .child(
+                            h_flex().justify_end().child(
+                                ui::secondary_button("qsum-detail-ok", "确定").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        if let Some(q) =
+                                            Self::query_state_mut(&mut this.opened, qid)
+                                        {
+                                            q.sum_detail = None;
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -53919,14 +54013,19 @@ mod designer_tests {
         .unwrap();
     }
 
-    /// 摘要页每行不再把 SQL 压成一行：按原样换行显示，行尾「…」弹出详情窗，
-    /// SQL 与驱动报错原文都保留换行，整段可见、可复制。
+    /// 摘要页每行不再把 SQL 压成一行：按原样换行显示，行尾「…」在页内弹浮层看
+    /// 完整 SQL（不开系统窗、不压暗背景）；驱动报错只留前半句，不再回显语句原文。
     #[gpui_kit::test]
     fn query_summary_rows_wrap_sql_and_open_detail(cx: &mut TestAppContext) {
         isolate_store("qsum-detail");
         let (handle, app) = open_app(cx);
         let sql = "SELECT TOP {count}\n       RTRIM([buss_date])\n     + '|' + CAST([shift_no] AS VARCHAR(10)) AS TradeId\nFROM dbo.TRADE\nWHERE [pc_time] >= CASE\n  WHEN '{lastOffset}' = '0' THEN DATEADD(MINUTE, -10, GETDATE())\n  ELSE CONVERT(DATETIME, '{fallbackOffset}', 120)\nEND";
         let msg = "错误：unrecognized token: \"{\" in SELECT TOP {count}\n  RTRIM([buss_date])\n  + '|' AS TradeId at offset 1367";
+        assert_eq!(
+            DaroApp::error_head(msg),
+            "错误：unrecognized token: \"{\"",
+            "报错只留前半句，in 后面的语句原文与「查询」列重复"
+        );
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             app.update(cx, |a, cx| {
@@ -53948,6 +54047,11 @@ mod designer_tests {
                     pin_seq: 0,
                 }];
                 q.pane = 1;
+                let status = DaroApp::query_status_text(q);
+                assert!(
+                    !status.contains("SELECT TOP"),
+                    "面板头不该回显语句原文：{status}"
+                );
                 cx.notify();
             });
             window.render_frame(cx);
@@ -53963,22 +54067,33 @@ mod designer_tests {
             );
             window.click("qsum/detail/0", cx);
             window.render_frame(cx);
+            assert!(
+                window.try_find("qsum-detail").is_some(),
+                "「…」要在摘要页内弹浮层"
+            );
+            assert!(
+                window.try_find("qsum-detail-scroll").is_some(),
+                "浮层缺可滚动的 SQL 正文"
+            );
+            window.click("qsum-detail-ok", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("qsum-detail").is_none(),
+                "点「确定」收起浮层"
+            );
+            // 再开一次，点浮层外的挡板也能收起
+            window.click("qsum/detail/0", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("qsum-detail").is_some());
+            window.click("qsum-detail-backdrop", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("qsum-detail").is_none(),
+                "点浮层外收起"
+            );
         })
         .unwrap();
-        settle(cx, handle);
-        let windows = cx.windows();
-        assert_eq!(windows.len(), 2, "点「…」应弹出详情窗");
-        let dlg = *windows.last().unwrap();
-        cx.update_window(dlg, |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.try_find("textview-scroll").is_some(), "详情窗缺正文区");
-            assert!(window.try_find("tv-copy").is_some(), "详情窗缺复制");
-            window.click("tv-close", cx);
-            window.render_frame(cx);
-        })
-        .unwrap();
-        settle(cx, handle);
-        assert_eq!(cx.windows().len(), 1, "关闭后收回详情窗");
+        assert_eq!(cx.windows().len(), 1, "详情是页内浮层，不该开新窗口");
     }
 
     /// 非查询 / 失败的语句没有结果网格：页签条只列有网格的语句，页签号仍按
