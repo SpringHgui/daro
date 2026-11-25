@@ -1,0 +1,53 @@
+version: '1.0'
+name: gitee-publish
+displayName: Gitee 发行版（同步 GitHub 产物）
+
+# 这条流水线只负责「把最新一次 GitHub Release 搬到 Gitee」：构建仍在 GitHub
+# （Gitee Go 云端没有 Windows / macOS runner），这里不重新打包，而是从 GitHub
+# Release 下回产物、校验 sha256，再在 Gitee 建同 tag 的发行版把产物挂成附件。
+#
+# 触发方式只有两种，故意不配 triggers：
+#   1) GitHub 发完 Release 后经 go-api 触发
+#      （daro-rs/scripts/trigger_gitee_pipeline.py）；
+#   2) 在 Gitee Go 页面手动执行（补发 / 重跑）。
+# 千万别加 push 触发：Gitee 镜像仓每次从 GitHub 同步源码都会推分支，
+# 加了就是每同步一次跑一遍发布。
+#
+# 一次性配置（都在 Gitee 侧，不进仓库）：
+#   Gitee Go → 通用变量：DARO_GITEE_TOKEN（私人令牌，勾 projects 权限，要能推
+#   SpringHgui/daro 的 tag、调 v5 发行版接口）。名字不能用 GITEE_ 开头——
+#   那是系统级参数保留前缀。可选 DARO_GITEE_USER（令牌账号登录名，缺省反查）。
+#   建完变量必须在流水线里「引用」：variables.global 列表写上变量名
+#   （可视化界面的「编辑流水线 → 变量设置 → 引用变量」保存后写的就是这个）。
+#   没被引用的通用变量不会进构建环境（实测：env 里没有、${} 也不替换）。
+#   Gitee 镜像仓 main 分支要同步到含 .workflow/ 与 daro-rs/scripts/ 的提交，
+#   否则触发会报「流水线文件不存在」。
+#
+# 配额：Gitee 单附件 ≤100 MB（daro 最大产物 ~40 MB），每仓附件总量 ≤1 GB
+# （daro 一次发版约 150 MB，攒到十次左右要清老发行版的附件）。
+variables:
+  DARO_PROBE: probe-value
+  global:
+    - DARO_GITEE_TOKEN
+    - DARO_GITEE_USER
+stages:
+  - stage:
+    name: publish
+    displayName: 同步最新 Release 到 Gitee
+    strategy: naturally
+    trigger: auto
+    steps:
+      - step: build@python
+        name: publish_gitee
+        displayName: 建发行版 + 挂产物
+        # CentOS 8.3 基础镜像，自带 git；脚本只用标准库，不需要 pip
+        pythonVersion: 3.9
+        commands:
+          - python3 -V
+          # 只打印长度不打印值：检测 ${} 替换是否生效
+          - set +x; T='${DARO_GITEE_TOKEN}'; P='${DARO_PROBE}'; echo "subst token_len=${#T} probe_len=${#P}"
+          # set +x 先关回显，免得令牌以明文出现在构建日志里
+          - set +x; python3 daro-rs/scripts/gitee_publish.py
+        notify: []
+        strategy:
+          retry: '0'

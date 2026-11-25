@@ -312,6 +312,11 @@ jobs:
           } > release-notes.md
           cat release-notes.md
 
+      # Gitee 发行版要用同一份正文（含 macOS 放行步骤），别让它在 Gitee 上
+      # 重新生成提交清单——Gitee 镜像仓的 tag/历史都不全，生成出来是错的。
+      - name: 发布说明随产物一起上传
+        run: cp release-notes.md dist/
+
       - name: 发布 release
         shell: bash
         env:
@@ -336,3 +341,32 @@ jobs:
           rid="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .id)"
           gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${rid}" \
             -F prerelease=false -f make_latest=true > /dev/null
+
+  # Gitee 发行版：下载镜像与发行版页面都在 Gitee 自己的机器上执行
+  # （.workflow/gitee-publish.yml → daro-rs/scripts/gitee_publish.py）。从 GitHub
+  # 的 IP 调 Gitee v5 会撞风控（BangHe 项目实测：不稳定、疑似要登录态），
+  # 构建机换到 Gitee Go 的网络里；构建仍只在 GitHub（Gitee Go 没有 Windows/macOS runner）。
+  # 这里只按一下按钮（go-api）并等终态，失败让工作流变红。
+  # 触发接口要求 Gitee 镜像仓 main 上已有 .workflow/gitee-publish.yml——镜像按需同步，
+  # 第一次上线前先在 Gitee 仓库页点「同步」（见 .workflow/gitee-publish.yml 的说明）。
+  publish-gitee:
+    name: 同步发行版到 Gitee
+    if: github.ref_type == 'tag'
+    needs: publish
+    runs-on: ubuntu-latest
+    env:
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: daro-rs/scripts
+
+      # 没配凭据就跳过而不是变红：Gitee Go 的令牌是仓库外的一次性配置
+      - name: 触发并等待 Gitee Go 流水线
+        if: env.GITEE_TOKEN != '' && env.GITEE_OWNER != ''
+        run: python3 daro-rs/scripts/trigger_gitee_pipeline.py
+
+      - name: 未配置 Gitee 凭据，跳过
+        if: env.GITEE_TOKEN == '' || env.GITEE_OWNER == ''
+        run: echo "::warning::没配 GitHub Secrets GITEE_TOKEN / GITEE_OWNER，跳过 Gitee 发行版同步"
