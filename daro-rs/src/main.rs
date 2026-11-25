@@ -71,6 +71,7 @@ mod sql_assoc;
 mod save_query_dialog;
 mod palette;
 mod prompt_dialog;
+mod text_view_dialog;
 mod zed_icons;
 mod role_design;
 mod window_drag;
@@ -42551,7 +42552,7 @@ impl DaroApp {
             .children(
                 [
                     ("查询", None),
-                    ("消息", Some(240.)),
+                    ("消息", Some(264.)),
                     ("查询时间", Some(84.)),
                     ("获取时间", Some(84.)),
                 ]
@@ -42563,7 +42564,8 @@ impl DaroApp {
             .outcomes
             .iter()
             .filter(|o| !o.pinned && (!q.only_errors || query_outcome_failed(o)))
-            .map(|o| {
+            .enumerate()
+            .map(|(i, o)| {
                 let msg = o
                     .message
                     .clone()
@@ -42571,16 +42573,66 @@ impl DaroApp {
                         Some(_) => "OK".to_string(),
                         None => "演示数据：写操作未执行".to_string(),
                     });
+                // 单行预览要压平：消息里夹着整条语句（含换行），一行高不压平会被垂直裁成中段
+                let preview = msg.replace(['\n', '\r'], " ");
+                let (sql_full, msg_full) = (o.sql.clone(), msg.clone());
+                let dark = self.dark;
                 h_flex()
-                    .h(px(20.))
+                    .id(format!("qsum/row/{i}"))
+                    .test_support()
+                    .items_start()
+                    .min_h(px(20.))
                     .flex_none()
                     .border_b_1()
                     .border_color(soft)
                     .hover(move |s| s.bg(to_hsla(p.hover)))
-                    .child(cell(None, fg, o.sql.replace(['\n', '\r'], " ")))
-                    // 报错消息里夹着语句原文（含换行），概览格只有一行高，
-                    // 不压平会按几十行排、被垂直裁成中段乱码。
-                    .child(cell(Some(240.), fg, msg.replace(['\n', '\r'], " ")))
+                    // SQL 按原样换行显示（最多 6 行），整句太长再点行尾「…」看全文
+                    .child(
+                        div()
+                            .id(format!("qsum/sql/{i}"))
+                            .test_support()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(6.))
+                            .py(px(3.))
+                            .line_clamp(6)
+                            .text_size(px(11.5))
+                            .text_color(fg)
+                            .child(o.sql.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .w(px(264.))
+                            .flex_none()
+                            .items_start()
+                            .gap(px(4.))
+                            .px(px(6.))
+                            .py(px(3.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .text_color(fg)
+                                    .child(preview),
+                            )
+                            .child(
+                                ui::compact_button(format!("qsum/detail/{i}"), "…").on_click(
+                                    cx.listener(move |_, _, _, cx| {
+                                        text_view_dialog::open_text_view(
+                                            dark,
+                                            "查询详情",
+                                            vec![
+                                                ("SQL", sql_full.clone()),
+                                                ("消息", msg_full.clone()),
+                                            ],
+                                            cx,
+                                        );
+                                    }),
+                                ),
+                            ),
+                    )
                     .child(cell(Some(84.), fg, query_secs_text(o.elapsed_ms)))
                     .child(cell(Some(84.), fg, "—".to_string()))
                     .into_any_element()
@@ -53865,6 +53917,68 @@ mod designer_tests {
             assert!(window.try_find("qsummary").is_some(), "失败落摘要页");
         })
         .unwrap();
+    }
+
+    /// 摘要页每行不再把 SQL 压成一行：按原样换行显示，行尾「…」弹出详情窗，
+    /// SQL 与驱动报错原文都保留换行，整段可见、可复制。
+    #[gpui_kit::test]
+    fn query_summary_rows_wrap_sql_and_open_detail(cx: &mut TestAppContext) {
+        isolate_store("qsum-detail");
+        let (handle, app) = open_app(cx);
+        let sql = "SELECT TOP {count}\n       RTRIM([buss_date])\n     + '|' + CAST([shift_no] AS VARCHAR(10)) AS TradeId\nFROM dbo.TRADE\nWHERE [pc_time] >= CASE\n  WHEN '{lastOffset}' = '0' THEN DATEADD(MINUTE, -10, GETDATE())\n  ELSE CONVERT(DATETIME, '{fallbackOffset}', 120)\nEND";
+        let msg = "错误：unrecognized token: \"{\" in SELECT TOP {count}\n  RTRIM([buss_date])\n  + '|' AS TradeId at offset 1367";
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.open_query_tab(None, window, cx);
+            });
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                let q = a.opened[0].qstate.as_mut().unwrap();
+                q.outcomes = vec![QueryOutcome {
+                    sql: sql.into(),
+                    result: None,
+                    columns: Vec::new(),
+                    message: Some(msg.into()),
+                    elapsed_ms: 0,
+                    cell: (0, 0),
+                    sel: None,
+                    explain: false,
+                    pinned: false,
+                    pin_seq: 0,
+                }];
+                q.pane = 1;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let row = window.find("qsum/row/0").bounds();
+            assert!(
+                row.size.height > px(40.),
+                "多行 SQL 应把行撑开（当前 {}px，压成一行只有 20px）",
+                row.size.height
+            );
+            assert!(
+                window.try_find("qsum/detail/0").is_some(),
+                "行尾要有「…」详情入口"
+            );
+            window.click("qsum/detail/0", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        let windows = cx.windows();
+        assert_eq!(windows.len(), 2, "点「…」应弹出详情窗");
+        let dlg = *windows.last().unwrap();
+        cx.update_window(dlg, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("textview-scroll").is_some(), "详情窗缺正文区");
+            assert!(window.try_find("tv-copy").is_some(), "详情窗缺复制");
+            window.click("tv-close", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        assert_eq!(cx.windows().len(), 1, "关闭后收回详情窗");
     }
 
     /// 非查询 / 失败的语句没有结果网格：页签条只列有网格的语句，页签号仍按
