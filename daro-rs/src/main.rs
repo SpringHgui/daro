@@ -8616,6 +8616,10 @@ struct DaroApp {
     /// 菜单条常显（选项 → 界面 → 常显菜单栏，Zed 的 `title_bar.show_menus`）：
     /// 不出 ☰、面包屑让位，菜单名一直铺在标题栏上。
     show_menus: bool,
+    /// 自绘标题栏拖动：macOS 主窗口设了 `app_owns_titlebar_drag`，AppKit 不再
+    /// 自己拖；Linux 的 `window_control_area` 也是空操作。按下先记一笔，第一次
+    /// 移动再交给 `start_window_move`。
+    title_drag: bool,
     /// 界面字体族名（选项 → 常规 → 界面字体），只作用于 `Theme::font_family`。
     ui_font: String,
     /// 菜单条的窗口坐标包围盒（prepaint 时刷新）：区分「按在菜单条上换菜单」
@@ -8996,6 +9000,7 @@ impl DaroApp {
             open_menu: None,
             menus_open: false,
             show_menus,
+            title_drag: false,
             ui_font,
             menu_bar_bounds: Rc::new(Cell::new(Bounds::default())),
             conns,
@@ -33979,6 +33984,30 @@ impl DaroApp {
                             cx.stop_propagation();
                         }
                     })
+                    // macOS：主窗口设了 `app_owns_titlebar_drag`，AppKit 不再自己
+                    // 拖标题栏；Linux：`window_control_area` 在 X11 / Wayland 上同样
+                    // 是空操作（只有 Windows 走 WM_NCHITTEST）。两边都得自己把按下
+                    // 转给 `start_window_move`。先记一笔、第一次移动再交出去——直接
+                    // 按下就拖会把面包屑上的点击也吃掉。
+                    .when(
+                        cfg!(any(target_os = "macos", target_os = "linux")),
+                        |s| {
+                            s.on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, _| this.title_drag = true),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, _| this.title_drag = false),
+                            )
+                            .on_mouse_move(cx.listener(|this, _, window, _| {
+                                if this.title_drag {
+                                    this.title_drag = false;
+                                    window.start_window_move();
+                                }
+                            }))
+                        },
+                    )
                     .when(!bar_shown, |s| {
                         s.child(
                             div()
