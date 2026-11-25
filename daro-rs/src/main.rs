@@ -38337,12 +38337,15 @@ impl DaroApp {
             let ident: TabIdent = (t.conn_name.clone(), t.db, t.schema, t.cat, t.obj);
             let fetched = l.fetched.load(AtomicOrdering::Relaxed);
             let stopping = l.cancel.load(AtomicOrdering::Relaxed);
-            div()
+            let load_card = div()
+                .id("table-load-block")
                 .absolute()
                 .left_0()
                 .top_0()
                 .w_full()
                 .h_full()
+                // occlude：没有它，卡片期间的点击会穿透到底下的网格（排序、选格照旧）。
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -38407,7 +38410,8 @@ impl DaroApp {
                             )
                         }),
                 )
-                .into_any_element()
+                .into_any_element();
+            load_card
         });
 
         // 滚轮驱动激活格：回调是 'static 的，得先记住这个页签在 opened 里
@@ -62662,6 +62666,33 @@ mod ui_flows {
             assert!(window.try_find("table-load-stop").is_none(), "卡片已撤");
         })
         .unwrap();
+
+        // 卡片期间的「锁」要能挡住穿透：重取本页时旧数据还在屏上（表头可点），
+        // 断言点表头不排序；撤卡后同一次点击恢复生效，证明是被遮罩挡住而非事件丢了。
+        cx.update_window(handle, |_, window, cx| {
+            window.click("th/0", cx);
+            window.render_frame(cx);
+            app.update(cx, |a, _| {
+                assert_eq!(a.opened[0].sort, Some((0, true)), "撤卡后表头恢复排序");
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |a, cx| a.grid_revert(cx));
+            window.render_frame(cx);
+            app.update(cx, |a, _| {
+                assert!(a.opened[0].load.is_some(), "重取挂在后台，卡片又盖上");
+                assert_eq!(a.opened[0].data.len(), REMOTE_PAGE_SIZE, "旧数据还在");
+            });
+            window.click("th/0", cx);
+            window.render_frame(cx);
+            app.update(cx, |a, _| {
+                assert_eq!(a.opened[0].sort, Some((0, true)), "取数中点表头不该穿透排序");
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
         crate::sqlite_driver::close("取数卡片");
         let _ = std::fs::remove_file(&path);
     }
