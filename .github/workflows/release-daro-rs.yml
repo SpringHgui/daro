@@ -302,6 +302,12 @@ jobs:
                 echo
               fi
             done
+            echo "### macOS 打开说明"
+            echo
+            echo "- 当前安装包为 ad-hoc 签名，首次打开会被 Gatekeeper 拦下。双击后点「完成」，到「系统设置 → 隐私与安全性 → 安全性」点「仍要打开」并输入密码，再双击启动。"
+            echo "- 或打开终端执行 \`xattr -dr com.apple.quarantine <daro-rs.app 路径>\` 后启动；个别新版 macOS 上可能无效。"
+            echo "- 彻底免除以上步骤需要 Developer ID 签名 + 公证。详见发布包内「打开说明.txt」。"
+            echo
             echo "**发布地址**：https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}"
           } > release-notes.md
           cat release-notes.md
@@ -315,6 +321,8 @@ jobs:
           tag="$GITHUB_REF_NAME"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            # 同版本重发时正文也要刷新，否则改动只落在附件里、发布页仍是旧说明。
+            gh release edit "$tag" --notes-file release-notes.md --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" dist/* \
               --repo "$GITHUB_REPOSITORY" \

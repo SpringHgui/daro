@@ -185,38 +185,47 @@ if [[ "$fail" != 0 ]]; then
 fi
 
 # ad-hoc 签名的包从浏览器下载后会被 macOS 打上隔离属性，被 Gatekeeper 拦下
-# （issue #21）。实测 macOS 26 上弹窗没有「仍要打开」，xattr 放行也不保证
-# 有效，所以不再给虚假的放行步骤，只如实说明现状与可行路径。
+# （issue #21）。弹窗里没有「仍要打开」，但 Apple 仍保留「系统设置 → 隐私与
+# 安全性 → 仍要打开」的一次性例外通道，包内说明按这条给用户可执行的步骤。
 if [[ -z "$sign_identity" ]]; then
   cat > "dist/${name}/打开说明.txt" <<'TXT'
 daro-rs macOS 版 · 打开说明
 ============================
 
 当前安装包使用 ad-hoc 临时签名，未加入 Apple 开发者计划，也未做公证。
-在 macOS 26 (arm64) 实测：从浏览器下载解压后双击，Gatekeeper 会直接拦下，
-弹窗是：
+从浏览器或微信下载解压后双击，Gatekeeper 会拦下，弹窗是：
 
     "daro-rs" Not Opened
     Apple could not verify "daro-rs" is free of malware that may harm your
     Mac or compromise your privacy.
 
-按钮只有 Move to Trash / Done，没有「仍要打开」，点不进去。这不是文件损坏，
-是签名问题。目前可行的只有两条路：
+弹窗只有「完成」和「移到废纸篓」，没有「仍要打开」。这不是文件损坏，
+是签名问题。任选下面的方法放行：
 
-1. 等正式签名版：项目配置 Developer ID 证书并做公证后双击即可打开。
-   这是唯一能让官方 zip 直接运行的办法。
+方法一：系统设置里放行（推荐）
+  1. 双击 daro-rs.app，弹出上面的提示时点「完成」（不要点「移到废纸篓」）。
+  2. 打开「系统设置 → 隐私与安全性」，向下滚动到「安全性」，会出现
+     「已阻止“daro-rs”使用，因为它不是来自已识别的开发者」，
+     点右侧「仍要打开」，输入登录密码。
+     该按钮只在尝试打开后 1 小时内出现；如果看不到，回访达再双击一次
+     触发拦截，再回设置页等几秒。
+  3. 再次双击即可启动。系统会记住这次信任，之后直接双击就能打开。
 
-2. 从源码自行构建：本地构建的可执行文件不带浏览器的隔离属性，不会被拦。
-   在 daro-rs/ 目录执行：
+方法二：终端清除隔离属性
+  打开「终端」，执行（路径按实际位置调整）：
 
-       cargo build --release --bin daro-rs
+      xattr -dr com.apple.quarantine /Applications/daro-rs.app
 
-   然后运行 target/release/daro-rs（需已安装 Rust 工具链）。
+  然后再双击启动。个别新版 macOS 上此方法可能无效，无效时用方法一。
 
-xattr -cr daro-rs.app 这类命令行放行在新版 macOS 上不保证有效：CI 实机
-测试中清除隔离属性后 open 虽返回成功，应用仍没有启动。若你的机器也是这样，
-请改用上面的源码构建方式。
+方法三：从源码自行构建
+  本地构建的可执行文件不带下载隔离属性，不会被拦。在 daro-rs/ 目录执行：
 
+      cargo build --release --bin daro-rs
+
+  然后运行 target/release/daro-rs（需已安装 Rust 工具链）。
+
+以上步骤彻底免除需要 Developer ID 正式签名 + 公证（需 Apple 开发者账号）。
 下载完整性可用发布页的 SHA256SUMS.txt 校验。
 TXT
 fi
