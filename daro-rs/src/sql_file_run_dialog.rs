@@ -382,6 +382,11 @@ impl Render for RunSqlDialog {
                             .text_xs()
                             .text_color(muted)
                             .child(status),
+                    )
+                    // 底栏保留「关闭」入口，与其它对话框同款。
+                    .child(
+                        ui::secondary_button("runsql-close", "关闭")
+                            .on_click(|_, window, _| window.remove_window()),
                     ),
             )
     }

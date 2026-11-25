@@ -142,10 +142,20 @@ pub fn compact_button(id: impl Into<ElementId>, label: &'static str) -> Button {
         .rounded(px(RADIUS))
 }
 
-/// 对话框窗口选项：默认模态——子窗口开着时主窗口锁定，关掉才能继续操作。
+/// 对话框窗口选项。
+///
+/// Windows / Linux：`WindowKind::Dialog` 是系统级模态——禁用父窗并设 owner，
+/// 子窗口开着时主窗口锁定，关掉才能继续操作。
+///
+/// macOS：Dialog 会变成挂在主窗上的 sheet，而 sheet 天生没有红绿灯按钮。这里改用
+/// 普通窗口（多窗口形态，不锁主窗）：可独立拖动 / 最小化，关闭走系统红绿灯。
 pub fn dialog_options() -> WindowOptions {
     let mut options = TitleBar::window_options();
-    options.kind = WindowKind::Dialog;
+    options.kind = WindowKind::Normal;
+    #[cfg(not(target_os = "macos"))]
+    {
+        options.kind = WindowKind::Dialog;
+    }
     options
 }
 
@@ -187,13 +197,25 @@ pub fn save_file<T: 'static>(
     .detach();
 }
 
-/// 子窗口统一的 Esc 关窗。挂在按键拦截器上而不是内容根的 `on_key_down`：
-/// 无聚焦元素时按键只派发到窗口 Root，内容根收不到；聚焦输入框时 Esc 还可能
-/// 被编辑器的 Escape 动作消费。拦截器跑在动作派发之前，按窗口句柄限定作用域。
+/// 关窗快捷键：Esc 或 Ctrl-W（macOS 的 ⌘W）。
+pub fn is_close_keystroke(key: &Keystroke) -> bool {
+    key.key == "escape"
+        || (key.key.eq_ignore_ascii_case("w")
+            && (key.modifiers.platform || key.modifiers.control)
+            && !key.modifiers.alt
+            && !key.modifiers.shift)
+}
+
+/// 子窗口统一的 Esc / Ctrl-W 关窗。挂在按键拦截器上而不是内容根的 `on_key_down`：
+/// 无聚焦元素时按键只派发到窗口 Root，内容根收不到；聚焦输入框时 Esc 还可能被
+/// 编辑器的 Escape 动作消费。拦截器跑在动作派发之前，按窗口句柄限定作用域。
+///
+/// Ctrl-W 必须在这里截住：它是全局的「关闭页签」，在对话框窗口里不拦就会去关
+/// 背后主窗的页签，而对话框本身纹丝不动。
 pub fn close_on_escape<T: 'static>(window: &Window, cx: &mut Context<T>) -> Subscription {
     let this_window = window.window_handle();
     cx.intercept_keystrokes(move |ev, window, cx| {
-        if ev.keystroke.key == "escape" && window.window_handle() == this_window {
+        if is_close_keystroke(&ev.keystroke) && window.window_handle() == this_window {
             cx.stop_propagation();
             window.remove_window();
         }

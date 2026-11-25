@@ -605,6 +605,9 @@ pub fn open_structure_compare(
     cx: &mut App,
 ) -> Option<Entity<StructureCompare>> {
     let mut options = ui::dialog_options();
+    // 结构同步是长流程的工具窗（选源目标、比较、看差异、部署），不锁主窗：
+    // 所有平台统一普通窗口，macOS 上同时拿到系统红绿灯。
+    options.kind = WindowKind::Normal;
     options.window_min_size = Some(size(px(760.), px(500.)));
     options.window_bounds = Some(WindowBounds::centered(size(px(1000.), px(660.)), cx));
     if let Some(titlebar) = options.titlebar.as_mut() {
@@ -707,18 +710,20 @@ impl StructureCompare {
             }
         })
         .detach();
-        // Esc：下拉展开时先收下拉（与查询页组合框一致），否则关窗
+        // Esc：下拉展开时先收下拉（与查询页组合框一致），否则关窗；⌘W / Ctrl-W 直接关窗。
         let me = cx.entity().downgrade();
         let this_window = window.window_handle();
         let esc = cx.intercept_keystrokes(move |ev, window, cx| {
-            if ev.keystroke.key != "escape" || window.window_handle() != this_window {
+            if !crate::ui::is_close_keystroke(&ev.keystroke)
+                || window.window_handle() != this_window
+            {
                 return;
             }
             cx.stop_propagation();
             let Some(this) = me.upgrade() else {
                 return;
             };
-            if this.read(cx).open.is_some() {
+            if ev.keystroke.key == "escape" && this.read(cx).open.is_some() {
                 this.update(cx, |this, cx| this.close_picker(cx));
             } else {
                 window.remove_window();

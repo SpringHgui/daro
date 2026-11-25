@@ -58396,6 +58396,24 @@ mod designer_tests {
         .unwrap();
         settle(cx, handle);
         assert_eq!(cx.windows().len(), 1, "Esc 收回扩展窗");
+
+        // Ctrl-W / ⌘W 是全局「关闭页签」，扩展窗里要关本窗，别去动背后的页签。
+        cx.update_window(handle, |_, window, cx| {
+            window.press("ctrl-shift-x", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        let ext = *cx.windows().last().unwrap();
+        cx.update_window(ext, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            window.press("ctrl-w", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        assert_eq!(cx.windows().len(), 1, "Ctrl-W 收回扩展窗");
     }
 
     /// 顶栏「帮助」菜单只保留三条真落点的项：反馈 / 检查更新 / 关于，

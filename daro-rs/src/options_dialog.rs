@@ -197,7 +197,8 @@ impl OptionsDialog {
             if window.window_handle() != this_window {
                 return;
             }
-            if ev.keystroke.key == "escape" {
+            if ui::is_close_keystroke(&ev.keystroke) {
+                cx.stop_propagation();
                 window.remove_window();
                 return;
             }

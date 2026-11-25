@@ -164,12 +164,7 @@ impl ExtensionsDialog {
         });
         // 搜索框聚焦时 InputState 会把 Esc 当动作吃掉，冒泡阶段收不到；
         // 按键拦截器跑在动作派发之前，按窗口 id 限定只关本窗。
-        let this_window = window.window_handle();
-        let esc = cx.intercept_keystrokes(move |ev, window, _cx| {
-            if ev.keystroke.key == "escape" && window.window_handle() == this_window {
-                window.remove_window();
-            }
-        });
+        let esc = ui::close_on_escape(window, cx);
         Self {
             parent,
             dark,

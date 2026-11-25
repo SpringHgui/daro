@@ -99,7 +99,9 @@ impl SqlDumpDialog {
         let this_window = window.window_handle();
         let me = cx.entity().downgrade();
         let esc = cx.intercept_keystrokes(move |ev, window, cx| {
-            if ev.keystroke.key != "escape" || window.window_handle() != this_window {
+            if !crate::ui::is_close_keystroke(&ev.keystroke)
+                || window.window_handle() != this_window
+            {
                 return;
             }
             cx.stop_propagation();
