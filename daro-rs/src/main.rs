@@ -33078,7 +33078,16 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                 // MySQL 系没有模式层，库节点下面直接就是分类
                 if catalog::has_schemas(conn.kind) {
                     let db = catalog::databases(conn).get(d).copied().unwrap_or("");
-                    (Some(catalog::schemas(conn, db).len()), "模式")
+                    // 状态栏只报「已经打开、缓存里有的」模式数：未打开的库
+                    // 不能因为选中就排队加载（库行转圈，issue #22）。
+                    let opened = !backend::is_real_conn(conn)
+                        || self.visited_dbs.contains(&node_key(&conn.name, db));
+                    let n = if opened {
+                        catalog::cached_schemas(conn, db).map_or(0, |s| s.len())
+                    } else {
+                        0
+                    };
+                    (Some(n), "模式")
                 } else {
                     (Some(self.cat_count_for(conn.kind)), "类别")
                 }
@@ -60789,6 +60798,59 @@ mod tree_menu_tests {
             assert!(a.loading.is_empty(), "收尾后不该残留载入中：{:?}", a.loading);
         });
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 回归 issue #22：选中一个还没「打开」的 PG 库时，状态栏数模式不能把
+    /// 目录任务排起来——一排队库行立刻转圈，看起来像单击就自动打开了。
+    #[gpui_kit::test]
+    fn selecting_unopened_pg_db_does_not_start_loading(cx: &mut TestAppContext) {
+        isolate_store("dbsel22");
+        let name = "选中未打开库 PG";
+        let conn = mock::Connection::new(
+            name,
+            DbKind::PostgreSql,
+            "127.0.0.1",
+            5432,
+            "appdb",
+            "postgres",
+            "",
+            "",
+            true,
+        );
+        catalog::seed_databases(&conn, &["appdb"]);
+        let key = node_key(name, "appdb");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.conns = vec![conn.clone()];
+                a.groups.clear();
+                a.sel = Act::Db(0, 0);
+                cx.notify();
+            });
+            // 帧尾的 pump 会把任何被排队的目录任务标成「载入中」
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        app.read_with(cx, |a, _| {
+            assert!(
+                a.loading.is_empty(),
+                "只是选中未打开的库不该排队加载：{:?}",
+                a.loading
+            );
+            assert_eq!(
+                a.sel_child_count(),
+                (Some(0), "模式"),
+                "未打开的库状态栏不该报模式数"
+            );
+        });
+        // 打开后（visited + 模式缓存就绪）状态栏照常给数
+        catalog::seed_schemas(&conn, "appdb", &["public", "app"]);
+        app.update(cx, |a, _| {
+            a.visited_dbs.insert(key);
+        });
+        app.read_with(cx, |a, _| assert_eq!(a.sel_child_count(), (Some(2), "模式")));
     }
 
     /// 树右键「刷新」重查真库目录：外部往库里加表后，不刷看不见、刷了看得见。

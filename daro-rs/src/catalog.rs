@@ -476,6 +476,29 @@ pub fn schemas(conn: &Connection, db: &str) -> &'static [&'static str] {
     })
 }
 
+/// 只读探测模式缓存，未命中不入队。状态栏这类每帧渲染的被动展示路径用它：
+/// 选中一个还没「打开」的库时顺手数模式，不能把加载排起来——否则库行
+/// 立刻转圈，看起来像选一下就自动打开了（issue #22）。
+pub fn cached_schemas(conn: &Connection, db: &str) -> Option<&'static [&'static str]> {
+    if !backend::is_real_conn(conn) || conn.kind != DbKind::PostgreSql {
+        return Some(mock::schemas(conn.kind));
+    }
+    get(&SCHEMAS_CACHE, &schemas_key(&conn.name, db))
+}
+
+/// 测试夹具：直接写入库 / 模式缓存，免得用例为了「已经加载完」的状态真连库。
+#[cfg(test)]
+pub fn seed_databases(conn: &Connection, names: &[&str]) {
+    let v = interned(names.iter().map(|s| s.to_string()).collect());
+    put(&DATABASES_CACHE, &databases_key(&conn.name), v);
+}
+
+#[cfg(test)]
+pub fn seed_schemas(conn: &Connection, db: &str, names: &[&str]) {
+    let v = interned(names.iter().map(|s| s.to_string()).collect());
+    put(&SCHEMAS_CACHE, &schemas_key(&conn.name, db), v);
+}
+
 /// 某库某模式某分类（0 表 / 1 视图 / 2 物化视图 / 3 例程 / 4 查询）的对象清单。
 pub fn objects(conn: &Connection, db: &str, schema: &str, cat: usize) -> &'static [&'static str] {
     if !backend::is_real_conn(conn) {
