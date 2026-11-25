@@ -42491,7 +42491,8 @@ impl DaroApp {
         let total = live.len();
         let failed = live.iter().filter(|o| query_outcome_failed(o)).count();
         let ok = total - failed;
-        let stat = |label: &'static str, value: String| {
+        let err = to_hsla(0xDC2626);
+        let stat = |label: &'static str, value: String, color: Hsla| {
             h_flex()
                 .h(px(18.))
                 .gap(px(6.))
@@ -54103,8 +54104,9 @@ mod designer_tests {
         .unwrap();
     }
 
-    /// 摘要页每行不再把 SQL 压成一行：按原样换行显示，行尾「…」在页内弹浮层看
-    /// 完整 SQL（不开系统窗、不压暗背景）；驱动报错只留前半句，不再回显语句原文。
+    /// 摘要页每行不再把 SQL 压成一行：按原样换行显示，查询格与消息格各自带
+    /// 「…」，在页内弹居中浮层看全文（不开系统窗、不压暗背景）；驱动报错只留
+    /// 前半句，不再回显语句原文。
     #[gpui_kit::test]
     fn query_summary_rows_wrap_sql_and_open_detail(cx: &mut TestAppContext) {
         isolate_store("qsum-detail");
