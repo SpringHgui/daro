@@ -293,6 +293,8 @@ impl OptionsDialog {
         let page_hit = PAGES[page].to_lowercase().contains(needle);
         let section_hit = name.to_lowercase().contains(needle);
         rows.iter()
+            // macOS 的菜单在系统顶栏，窗口内没有可常显的菜单条，这一档没有落点。
+            .filter(|row| !(cfg!(target_os = "macos") && matches!(row.kind, RowKind::ShowMenus)))
             .filter(|row| page_hit || section_hit || self.row_matches(row, needle))
             .collect()
     }

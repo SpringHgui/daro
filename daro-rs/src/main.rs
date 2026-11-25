@@ -135,9 +135,16 @@ actions!(
         Favorite8,
         Favorite9,
         OpenOptions,
-        OpenExtensions
+        OpenExtensions,
+        QuitApp,
+        MinimizeWindow,
+        ToggleFullscreen
     ]
 );
+
+// macOS 系统菜单栏（NSMainMenu）的构建器：菜单树各平台都编译（Windows 上可
+// 单测），只有「装进系统菜单栏」那一步限定 mac。
+mod native_app_menu;
 
 use combo::highlighted_label;
 use conn_dialog::{ConnDialogMode, open_connection_dialog, open_new_connection};
@@ -1078,6 +1085,46 @@ fn copy_as_html(cols: &[&str], rows: &[Vec<String>]) -> String {
 /// 的链路两边一致（键盘派发发生在 win.update 内部，监听器里直接 update 会
 /// 重入失败，所以一律 defer 到本轮 effect 冲刷后再进窗口）。
 fn wire_global_keys(root: Entity<DaroApp>, win: AnyWindowHandle, cx: &mut App) {
+    // macOS 的 Command 同义键要先于下面那套 Ctrl 键注册：系统菜单栏的键位角标
+    // 取同一动作的最早一条绑定（gpui 有意让先注册的胜出），后注册会让菜单显示
+    // 成 ⌃S。键位匹配本身按击键区分，两套并存互不影响。
+    // 补全弹层不搬：⌘Space 被系统的聚焦 / 输入法切换占着。
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("cmd-delete", GridDeleteRows, None),
+        KeyBinding::new("cmd-s", Save, None),
+        KeyBinding::new("cmd-a", GridSelectAll, None),
+        KeyBinding::new("cmd-c", GridCopy, None),
+        KeyBinding::new("cmd-v", GridPaste, None),
+        // 输入框聚焦时压过网格动作（同 Ctrl 那套的说明）。
+        KeyBinding::new("cmd-delete", input_actions::DeleteToEndOfLine, Some("Input")),
+        KeyBinding::new("cmd-a", input_actions::SelectAll, Some("Input")),
+        KeyBinding::new("cmd-c", input_actions::Copy, Some("Input")),
+        KeyBinding::new("cmd-v", input_actions::Paste, Some("Input")),
+        KeyBinding::new("cmd-w", CloseTab, None),
+        KeyBinding::new("cmd-shift-w", CloseAllTabs, None),
+        KeyBinding::new("cmd-r", QueryRun, None),
+        KeyBinding::new("cmd-shift-r", QueryRunStmt, None),
+        KeyBinding::new("cmd-t", QueryStop, None),
+        KeyBinding::new("cmd-e", EditSelectStmt, Some("Input")),
+        KeyBinding::new("cmd-f", QueryFind, None),
+        KeyBinding::new("cmd-h", QueryReplace, None),
+        KeyBinding::new("cmd-1", Favorite1, None),
+        KeyBinding::new("cmd-2", Favorite2, None),
+        KeyBinding::new("cmd-3", Favorite3, None),
+        KeyBinding::new("cmd-4", Favorite4, None),
+        KeyBinding::new("cmd-5", Favorite5, None),
+        KeyBinding::new("cmd-6", Favorite6, None),
+        KeyBinding::new("cmd-7", Favorite7, None),
+        KeyBinding::new("cmd-8", Favorite8, None),
+        KeyBinding::new("cmd-9", Favorite9, None),
+        KeyBinding::new("cmd-,", OpenOptions, None),
+        KeyBinding::new("cmd-shift-x", OpenExtensions, None),
+        // 系统菜单栏的退出 / 最小化 / 全屏
+        KeyBinding::new("cmd-q", QuitApp, None),
+        KeyBinding::new("cmd-m", MinimizeWindow, None),
+        KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, None),
+    ]);
     cx.bind_keys([
         KeyBinding::new("f2", TreeRename, None),
         KeyBinding::new("escape", TreeCancelRename, None),
@@ -1145,41 +1192,6 @@ fn wire_global_keys(root: Entity<DaroApp>, win: AnyWindowHandle, cx: &mut App) {
         KeyBinding::new("ctrl-,", OpenOptions, None),
         // 扩展：与应用菜单里的「扩展...」同一个动作（Zed 的 cmd-shift-x 位）
         KeyBinding::new("ctrl-shift-x", OpenExtensions, None),
-    ]);
-    // macOS 上再挂一套 Command 同义键：Ctrl 那套保留，原有习惯和键盘布局
-    // 不受影响。同一动作后加入的绑定在菜单角标里优先，所以 mac 显示 ⌘ 组合。
-    // 补全弹层不搬：⌘Space 被系统的聚焦 / 输入法切换占着。
-    #[cfg(target_os = "macos")]
-    cx.bind_keys([
-        KeyBinding::new("cmd-delete", GridDeleteRows, None),
-        KeyBinding::new("cmd-s", Save, None),
-        KeyBinding::new("cmd-a", GridSelectAll, None),
-        KeyBinding::new("cmd-c", GridCopy, None),
-        KeyBinding::new("cmd-v", GridPaste, None),
-        // 同非 mac 的说明：输入框聚焦时压过上面的网格动作。
-        KeyBinding::new("cmd-delete", input_actions::DeleteToEndOfLine, Some("Input")),
-        KeyBinding::new("cmd-a", input_actions::SelectAll, Some("Input")),
-        KeyBinding::new("cmd-c", input_actions::Copy, Some("Input")),
-        KeyBinding::new("cmd-v", input_actions::Paste, Some("Input")),
-        KeyBinding::new("cmd-w", CloseTab, None),
-        KeyBinding::new("cmd-shift-w", CloseAllTabs, None),
-        KeyBinding::new("cmd-r", QueryRun, None),
-        KeyBinding::new("cmd-shift-r", QueryRunStmt, None),
-        KeyBinding::new("cmd-t", QueryStop, None),
-        KeyBinding::new("cmd-e", EditSelectStmt, Some("Input")),
-        KeyBinding::new("cmd-f", QueryFind, None),
-        KeyBinding::new("cmd-h", QueryReplace, None),
-        KeyBinding::new("cmd-1", Favorite1, None),
-        KeyBinding::new("cmd-2", Favorite2, None),
-        KeyBinding::new("cmd-3", Favorite3, None),
-        KeyBinding::new("cmd-4", Favorite4, None),
-        KeyBinding::new("cmd-5", Favorite5, None),
-        KeyBinding::new("cmd-6", Favorite6, None),
-        KeyBinding::new("cmd-7", Favorite7, None),
-        KeyBinding::new("cmd-8", Favorite8, None),
-        KeyBinding::new("cmd-9", Favorite9, None),
-        KeyBinding::new("cmd-,", OpenOptions, None),
-        KeyBinding::new("cmd-shift-x", OpenExtensions, None),
     ]);
     let root_rename = root.clone();
     cx.on_action::<TreeRename>(move |_, cx| {
@@ -1420,6 +1432,8 @@ fn wire_global_keys(root: Entity<DaroApp>, win: AnyWindowHandle, cx: &mut App) {
         Favorite8 => 7,
         Favorite9 => 8,
     );
+    // macOS 系统菜单栏的命令载荷 + 退出 / 最小化 / 全屏
+    native_app_menu::wire_menu_actions(root.clone(), win, cx);
 }
 
 fn main() {
@@ -8652,6 +8666,10 @@ struct DaroApp {
     /// 菜单条的窗口坐标包围盒（prepaint 时刷新）：区分「按在菜单条上换菜单」
     /// 和「按在别处收起菜单条」——弹层会把触发按钮也算成「外面」。
     menu_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// macOS 系统菜单栏当前装的那份菜单指纹（菜单树按它整份重建）；
+    /// 其它平台不画系统菜单栏，这个字段不存在。
+    #[cfg(target_os = "macos")]
+    native_menu_rev: Option<u64>,
     conns: Vec<mock::Connection>,
     /// 打开的数据表页签，见 [OpenTab]；`active_tab` 0 号是「对象」页
     opened: Vec<OpenTab>,
@@ -9030,6 +9048,8 @@ impl DaroApp {
             title_drag: false,
             ui_font,
             menu_bar_bounds: Rc::new(Cell::new(Bounds::default())),
+            #[cfg(target_os = "macos")]
+            native_menu_rev: None,
             conns,
             opened: Vec::new(),
             active_tab: 0,
@@ -33734,6 +33754,9 @@ impl Render for DaroApp {
         if self.info_page >= 2 && !self.info_deps_capable() {
             self.info_page = 0;
         }
+        // macOS：菜单条不在窗口里画，整条挂在系统顶栏；指纹变了才重装。
+        #[cfg(target_os = "macos")]
+        self.sync_native_menus(window, cx);
         // 拖拽结束（松开 / Esc 取消）后落点提示要立刻收掉：拖动会话不在时
         // 任何残留的高亮都不该再画。
         if !cx.has_active_drag() && self.drag_hover.take().is_some() {
@@ -34002,8 +34025,11 @@ impl DaroApp {
         let db_name = self.sel_db_name().map(str::to_string);
         let cat_name = self.pane_cat().map(|c| CATEGORIES[c].0);
         let sep_color = to_hsla(p.subtle_foreground);
+        // macOS 的菜单整条挂在系统顶栏：窗口里不再画 ☰ / 菜单条 / 应用菜单按钮，
+        // 标题栏只剩面包屑与窗口按钮。
+        let native_menus = cfg!(target_os = "macos");
         // 菜单条常显时和铺开时一个样：☰ 与面包屑都让位。
-        let bar_shown = self.menus_open || self.show_menus;
+        let bar_shown = !native_menus && (self.menus_open || self.show_menus);
 
         h_flex()
             .id("title-bar")
@@ -34019,7 +34045,9 @@ impl DaroApp {
             // 的 TitleBar 同一个 80px 口径）。
             .when(cfg!(target_os = "macos"), |s| s.pl(px(80.)))
             // ☰ 只在收起态出现：菜单条铺开后由菜单条接管（Zed 同款）。
-            .when(!bar_shown, |s| s.child(self.menu_toggle(fg, cx)))
+            .when(!native_menus && !bar_shown, |s| {
+                s.child(self.menu_toggle(fg, cx))
+            })
             .child(
                 h_flex()
                     .h_full()
@@ -34163,7 +34191,7 @@ impl DaroApp {
                             ),
                     ),
             )
-            .child(self.app_menu_button(cx))
+            .when(!native_menus, |s| s.child(self.app_menu_button(cx)))
             .when(draw_window_controls(window), |s| {
                 s.child(window_control(
                     "win-min",
