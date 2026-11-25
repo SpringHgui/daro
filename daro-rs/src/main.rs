@@ -1446,6 +1446,51 @@ fn main() {
     }
 }
 
+/// 建主窗口并装配键位 / 菜单动作，返回窗口句柄与根视图。
+/// 启动时建首窗用；macOS 上关掉最后一扇窗后进程仍在 Dock 里活着，
+/// 点图标重开时也走这里再建一扇（gpui 的 on_reopen 回调）。
+fn open_main_window(
+    cx: &mut App,
+    startup_files: Vec<std::path::PathBuf>,
+) -> (AnyWindowHandle, Entity<DaroApp>) {
+    let mut options = TitleBar::window_options();
+    options.window_min_size = Some(size(px(1080.), px(700.)));
+    options.window_bounds = Some(WindowBounds::centered(size(px(1440.), px(900.)), cx));
+    if let Some(titlebar) = options.titlebar.as_mut() {
+        titlebar.title = Some("daro".into());
+    }
+
+    let (win, root) = gpui_kit::open_window(options, cx, |window, cx| {
+        // 拖动标题栏移动窗口时，gpui 的移动循环每 10ms 同步重绘整帧；
+        // 本应用单帧元素数极大，模态循环被堵住 → 拖动跳格。纯移动期间
+        // 画面不变，交给 DWM 平移表面，吞掉这些重绘。
+        move_paint_skip::install(window);
+        cx.new(|cx| DaroApp::new(window, cx))
+    })
+    .expect("failed to open window");
+
+    // 树行不持有焦点，元素级 on_action 在无焦点时不进派发路径
+    // （dispatch_path 只有根节点），所以 F2 / Esc 挂在全局动作监听上，
+    // 经窗口句柄桥进窗口上下文（改名编辑器要 window 才能建 + 聚焦）。
+    // open_window 的注册根视图是 base::Root，不能 downcast 回 DaroApp，
+    // 只能拿 Entity<DaroApp> 在窗口更新闭包里套一层 update。
+    wire_global_keys(root.clone(), win, cx);
+
+    // 双击 / 「打开方式」带来的 .sql：窗口建好后逐个载入查询页签。
+    if !startup_files.is_empty() {
+        let root_open = root.clone();
+        let _ = win.update(cx, |_, window, cx| {
+            root_open.update(cx, |this, cx| {
+                for path in startup_files {
+                    this.open_sql_path_in_editor(path, window, cx);
+                }
+            });
+        });
+    }
+
+    (win, root)
+}
+
 fn ui_main() {
     // 双击 .sql / 「打开方式」把文件路径塞进命令行；先取出来（主窗口建好后
     // 再载入页签），同时把自己登记成 .sql 的「打开方式」候选。
@@ -1456,47 +1501,20 @@ fn ui_main() {
 
     let app = gpui_kit::application().with_assets(zed_icons::AppAssets);
 
+    // macOS 关掉最后一扇窗只是关窗不退进程，Dock 图标还在；不接重开事件的话，
+    // 再点图标 gpui 没有回调可派发，界面就再也打不开了。
+    #[cfg(target_os = "macos")]
+    app.on_reopen(|cx| {
+        open_main_window(cx, Vec::new());
+    });
+
     app.run(move |cx| {
         gpui_kit::init(cx);
         menu::init(cx);
         // MCP 开关是开的就补上自启登记与后台进程；关着时什么都不做。
         let _ = daro_rs::mcp::boot();
 
-        let mut options = TitleBar::window_options();
-        options.window_min_size = Some(size(px(1080.), px(700.)));
-        options.window_bounds = Some(WindowBounds::centered(size(px(1440.), px(900.)), cx));
-        if let Some(titlebar) = options.titlebar.as_mut() {
-            titlebar.title = Some("daro".into());
-        }
-
-        let (win, root) =
-            gpui_kit::open_window(options, cx, |window, cx| {
-                // 拖动标题栏移动窗口时，gpui 的移动循环每 10ms 同步重绘整帧；
-                // 本应用单帧元素数极大，模态循环被堵住 → 拖动跳格。纯移动期间
-                // 画面不变，交给 DWM 平移表面，吞掉这些重绘。
-                move_paint_skip::install(window);
-                cx.new(|cx| DaroApp::new(window, cx))
-            })
-            .expect("failed to open window");
-
-        // 树行不持有焦点，元素级 on_action 在无焦点时不进派发路径
-        // （dispatch_path 只有根节点），所以 F2 / Esc 挂在全局动作监听上，
-        // 经窗口句柄桥进窗口上下文（改名编辑器要 window 才能建 + 聚焦）。
-        // open_window 的注册根视图是 base::Root，不能 downcast 回 DaroApp，
-        // 只能拿 Entity<DaroApp> 在窗口更新闭包里套一层 update。
-        wire_global_keys(root.clone(), win, cx);
-
-        // 双击 / 「打开方式」带来的 .sql：窗口建好后逐个载入查询页签。
-        if !startup_files.is_empty() {
-            let root_open = root.clone();
-            let _ = win.update(cx, |_, window, cx| {
-                root_open.update(cx, |this, cx| {
-                    for path in startup_files {
-                        this.open_sql_path_in_editor(path, window, cx);
-                    }
-                });
-            });
-        }
+        let (win, root) = open_main_window(cx, startup_files);
 
         // DARO_DEBUG 自动化冒烟：不依赖真实键盘 / 前台（锁屏下也能跑），
         // 用 dispatch_keystroke 走「键位绑定 → 全局动作 → 内联编辑器 → 提交/取消」全链路。
