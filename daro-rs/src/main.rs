@@ -35950,13 +35950,13 @@ impl DaroApp {
         // 演示连接点开就能看，口径与 db_levels 一致：一律算已打开
         let opened =
             !backend::is_real_conn(conn) || self.visited_dbs.contains(&node_key(&conn.name, db));
-        // issue #27：已打开的库整行转绿（图标 + 名称），未打开保持弱化色，
-        // 一眼能分清哪些库挂在树上（参考界面同款绿色圆柱）。
-        let db_green = to_hsla(if self.dark { 0x66bb6a } else { 0x2e7d32 });
+        // issue #27：已打开的库整行用主题主色（图标 + 名称），未打开保持弱化色，
+        // 一眼能分清哪些库挂在树上。跟着 accent 走，换主题不改代码就跟着变。
+        let db_open_ink = to_hsla(self.pal().accent);
         let icon = if self.db_is_loading(conn, db) {
             loading_spinner()
         } else {
-            art::icon(art::Glyph::Db, 16., if opened { db_green } else { ink.muted })
+            art::icon(art::Glyph::Db, 16., if opened { db_open_ink } else { ink.muted })
         };
         // Redis 的库是命名空间，底下没有子节点，不留折叠三角
         let caret_icon = if conn.kind == DbKind::Redis {
@@ -35966,7 +35966,7 @@ impl DaroApp {
         };
         let row_ink = if opened {
             TreeInk {
-                fg: db_green,
+                fg: db_open_ink,
                 ..*ink
             }
         } else {
