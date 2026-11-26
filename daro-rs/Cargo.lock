@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "daro-rs"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "aes",
  "anyhow",
