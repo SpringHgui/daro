@@ -34106,10 +34106,11 @@ impl DaroApp {
                     // 当成客户区点击、系统不启动移动循环；补发一次非客户区按下。
                     .on_mouse_down(MouseButton::Left, |event, window, cx| {
                         // issue #28：双击标题栏空白 = 最大化 / 还原切换。
-                        // 命中缓存正常时 Windows 走系统 HTCAPTION 双击路径、
-                        // 事件不进客户区；失活兜底路径才在这里处理。
+                        // gpui 把 WM_NCLBUTTONDBLCLK（含命中缓存失活时补发的那次）
+                        // 一并派发进元素树，这里拦下并自己切换，否则系统的默认
+                        // 处理只会走到 zoom 的「最大化」一侧。
                         if event.click_count >= 2 {
-                            window.zoom_window();
+                            window_drag::toggle_zoom(window);
                             cx.stop_propagation();
                             return;
                         }
@@ -34131,7 +34132,7 @@ impl DaroApp {
                                     // 双击 = 最大化 / 还原（issue #28），不再进拖动
                                     if event.click_count >= 2 {
                                         this.title_drag = false;
-                                        window.zoom_window();
+                                        window_drag::toggle_zoom(window);
                                     } else {
                                         this.title_drag = true;
                                     }
