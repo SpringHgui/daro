@@ -34091,6 +34091,14 @@ impl DaroApp {
                     // 窗口失活时 gpui 的命中缓存还停在失焦前，第一次按下会被
                     // 当成客户区点击、系统不启动移动循环；补发一次非客户区按下。
                     .on_mouse_down(MouseButton::Left, |event, window, cx| {
+                        // issue #28：双击标题栏空白 = 最大化 / 还原切换。
+                        // 命中缓存正常时 Windows 走系统 HTCAPTION 双击路径、
+                        // 事件不进客户区；失活兜底路径才在这里处理。
+                        if event.click_count >= 2 {
+                            window.zoom_window();
+                            cx.stop_propagation();
+                            return;
+                        }
                         if event.click_count == 1 && window_drag::begin_window_drag(window) {
                             cx.stop_propagation();
                         }
@@ -34105,7 +34113,15 @@ impl DaroApp {
                         |s| {
                             s.on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, _| this.title_drag = true),
+                                cx.listener(|this, event: &MouseDownEvent, window, _| {
+                                    // 双击 = 最大化 / 还原（issue #28），不再进拖动
+                                    if event.click_count >= 2 {
+                                        this.title_drag = false;
+                                        window.zoom_window();
+                                    } else {
+                                        this.title_drag = true;
+                                    }
+                                }),
                             )
                             .on_mouse_up(
                                 MouseButton::Left,
@@ -35931,23 +35947,30 @@ impl DaroApp {
     ) -> AnyElement {
         let conn = &self.conns[ix];
         let db = catalog::databases(conn).get(dix).copied().unwrap_or_default();
-        let opened = self.visited_dbs.contains(&node_key(&conn.name, db));
+        // 演示连接点开就能看，口径与 db_levels 一致：一律算已打开
+        let opened =
+            !backend::is_real_conn(conn) || self.visited_dbs.contains(&node_key(&conn.name, db));
+        // issue #27：已打开的库整行转绿（图标 + 名称），未打开保持弱化色，
+        // 一眼能分清哪些库挂在树上（参考界面同款绿色圆柱）。
+        let db_green = to_hsla(if self.dark { 0x66bb6a } else { 0x2e7d32 });
         let icon = if self.db_is_loading(conn, db) {
             loading_spinner()
         } else {
-            // 库节点也走 Zed 线稿：打开过用正文色、没打开用弱化色，
-            // 替代旧位图的「彩色 / 灰阶」区分，和表 / 视图等对象同一套字形。
-            art::icon(
-                art::Glyph::Db,
-                16.,
-                if opened { ink.fg } else { ink.muted },
-            )
+            art::icon(art::Glyph::Db, 16., if opened { db_green } else { ink.muted })
         };
         // Redis 的库是命名空间，底下没有子节点，不留折叠三角
         let caret_icon = if conn.kind == DbKind::Redis {
             None
         } else {
             caret_icon
+        };
+        let row_ink = if opened {
+            TreeInk {
+                fg: db_green,
+                ..*ink
+            }
+        } else {
+            *ink
         };
         tree_row(
             rid(&format!("db/{ix}/{dix}")),
@@ -35958,7 +35981,7 @@ impl DaroApp {
             Act::Db(ix, dix),
             None,
             q,
-            ink,
+            &row_ink,
             cx,
         )
         .test_support()
@@ -45768,6 +45791,9 @@ impl DaroApp {
                     .id("status-left")
                     .test_support()
                     .w(px(self.left_w))
+                    // 与侧栏同宽的一格不跟着内容挤压，否则宽 SQL 会把它的
+                    // 分隔线推到窗口最左边（issue #26）
+                    .flex_shrink_0()
                     .px(px(12.))
                     .child(match designer {
                         Some((ncols, _)) => div()
@@ -45816,6 +45842,9 @@ impl DaroApp {
                 s.child(
                     h_flex()
                         .flex_1()
+                        // 同 SQL 段口径：面包屑再长也不把右侧控件挤出窗口
+                        .min_w_0()
+                        .overflow_hidden()
                         .px(px(12.))
                         .gap(px(14.))
                         .items_center()
@@ -45826,6 +45855,10 @@ impl DaroApp {
                 s.child(
                     h_flex()
                         .flex_1()
+                        // 窄窗口保护：SQL 段整体可收缩到 0，长取数语句不再把记录
+                        // 徽章与右侧控件挤出窗口（issue #26）
+                        .min_w_0()
+                        .overflow_hidden()
                         .items_center()
                         .child(
                             div()
@@ -45844,6 +45877,7 @@ impl DaroApp {
                             div()
                                 .id("status-rec")
                                 .test_support()
+                                .flex_shrink_0()
                                 .px(px(12.))
                                 .text_xs()
                                 .text_color(muted)
@@ -45853,6 +45887,8 @@ impl DaroApp {
             })
             .child(
                 h_flex()
+                    // 右侧控件不参与收缩，SQL 再长也挤不走它们（issue #26）
+                    .flex_shrink_0()
                     .items_center()
                     .h_full()
                     .pr(px(8.))
@@ -49990,13 +50026,22 @@ mod ui_test_support {
 
     /// 按生产口径开窗：首次启动读不到存档时，连接 / 分组都是空的。
     pub(crate) fn open_app_raw(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<DaroApp>) {
+        open_app_size(cx, 1440., 900.)
+    }
+
+    /// 同上，但窗口尺寸由用例指定：窄窗口才能复现底栏被内容顶爆的排布。
+    pub(crate) fn open_app_size(
+        cx: &mut TestAppContext,
+        w: f32,
+        h: f32,
+    ) -> (AnyWindowHandle, Entity<DaroApp>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: Default::default(),
-                        size: size(px(1440.), px(900.)),
+                        size: size(px(w), px(h)),
                     })),
                     ..Default::default()
                 },
@@ -50267,7 +50312,8 @@ mod pane_schema_tests {
 mod designer_tests {
     use super::*;
     use crate::ui_test_support::{
-        isolate_store, open_app, settle, sqlite_fixture, with_failure_dump,
+        isolate_store, open_app, open_app_raw, open_app_size, settle, sqlite_fixture,
+        with_failure_dump,
     };
     use gpui_kit::TestAppContext;
     use gpui_kit::test::TestQueryExt as _;
@@ -55902,6 +55948,90 @@ mod designer_tests {
             );
         })
         .unwrap();
+    }
+
+    /// issue #26 回归：默认窗口宽度（738）下打开多列表，取数 SQL 的全文宽超出
+    /// 底栏中段可用宽度时，SQL 段必须自己截断，与侧栏同宽的左格不被压扁，记录
+    /// 徽章与版本号留在窗口内。修复前中段容器带 min_size:auto 内容下限，整条
+    /// SQL 顶宽 → 右侧控件被挤出窗口右缘。
+    #[gpui_kit::test]
+    fn status_bar_wide_sql_keeps_right_controls_in_window(cx: &mut TestAppContext) {
+        isolate_store("statuswide");
+        let cols: Vec<String> = [
+            "id",
+            "name",
+            "code",
+            "sort",
+            "data_scope",
+            "data_scope_dept_ids",
+            "status",
+            "type",
+            "remark",
+            "creator",
+            "create_time",
+            "updater",
+            "update_time",
+            "deleted",
+            "tenant_id",
+        ]
+        .iter()
+        .map(|c| format!("{c} TEXT"))
+        .collect();
+        let ddl = format!("CREATE TABLE system_role({})", cols.join(", "));
+        let (conn, path) = sqlite_fixture("statuswide", &[ddl.as_str()]);
+        let (handle, app) = open_app_size(cx, 738., 450.);
+        app.update(cx, |a, cx| {
+            a.conns = vec![conn];
+            a.groups.clear();
+            a.open_connection(0, cx);
+        });
+        settle(cx, handle);
+        cx.update_window(handle, |_, _window, cx| {
+            app.update(cx, |a, cx| {
+                a.left_w = 250.;
+                a.open_db(0, 0, cx);
+                a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx);
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+        cx.update_window(handle, |_, window, _| {
+            let vp_w = window.viewport_size().width;
+            let version = window
+                .try_find("status-version")
+                .expect("版本格应可见")
+                .bounds();
+            assert!(
+                version.origin.x + version.size.width <= vp_w,
+                "版本号被挤出窗口右缘：version={version:?} vp_w={vp_w:?}"
+            );
+            let rec = window
+                .try_find("status-rec")
+                .expect("记录徽章应可见")
+                .bounds();
+            assert!(
+                rec.origin.x + rec.size.width <= version.origin.x,
+                "记录徽章压到右侧控件上：rec={rec:?} version={version:?}"
+            );
+            let left = window
+                .try_find("status-left")
+                .expect("左格应可见")
+                .bounds();
+            assert!(
+                left.size.width >= px(200.),
+                "左格被长 SQL 压扁，不再与侧栏对齐：left={left:?}"
+            );
+            let sql = window
+                .try_find("status-sql")
+                .expect("SQL 段应可见")
+                .bounds();
+            assert!(
+                sql.origin.x >= left.size.width && sql.size.width < vp_w - px(200.),
+                "SQL 段没有收缩，仍按全文顶宽：sql={sql:?} left={left:?} vp_w={vp_w:?}"
+            );
+        })
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[gpui_kit::test]

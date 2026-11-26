@@ -94,6 +94,8 @@ pub fn open_connection_dialog(
     let editing = matches!(mode, ConnDialogMode::Edit(_));
     let title = if editing { "编辑连接" } else { "新建连接" };
     let mut options = ui::dialog_options();
+    // 自绘栏只有 24 高，红绿灯要跟着对齐（issue #25）
+    ui::align_traffic_lights(&mut options, TITLE_H);
     // 参考图内容区 900×700，另加 24 的自绘标题栏
     options.window_min_size = Some(size(px(900.), px(724.)));
     options.window_bounds = Some(WindowBounds::centered(size(px(900.), px(724.)), cx));

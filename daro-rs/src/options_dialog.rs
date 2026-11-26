@@ -133,6 +133,8 @@ pub(crate) fn open_options_dialog(parent: Entity<DaroApp>, cx: &mut App) {
     let draft = parent.read(cx).app_options();
     let dark = draft.dark;
     let mut options = ui::dialog_options();
+    // 自绘栏只有 24 高，红绿灯要跟着对齐（issue #25）
+    ui::align_traffic_lights(&mut options, TITLE_H);
     options.window_min_size = Some(size(px(720.), px(480.)));
     options.window_bounds = Some(WindowBounds::centered(
         size(px(CONTENT_SIZE.0), px(CONTENT_SIZE.1 + TITLE_H)),

@@ -159,6 +159,21 @@ pub fn dialog_options() -> WindowOptions {
     options
 }
 
+/// 自绘标题栏比默认 34 矮时，把 mac 红绿灯按栏高重新对齐（issue #25）。
+///
+/// `TitleBar::window_options()` 给的 `traffic_light_position = (9, 9)` 是按
+/// 34 高的栏配的：y 是按钮的上下留白，按钮高 16，中心落在 9 + 8 = 17。
+/// 新建连接 / 选项这类窗口自绘栏只有 24 高，标题文字中心在 12，红绿灯
+/// 就整组低 5px。这里按 `(bar_h - 16) / 2` 重算留白，让按钮中心与文字同线。
+pub fn align_traffic_lights(options: &mut WindowOptions, bar_h: f32) {
+    #[cfg(target_os = "macos")]
+    if let Some(titlebar) = options.titlebar.as_mut() {
+        titlebar.traffic_light_position = Some(point(px(9.), px((bar_h - 16.) / 2.)));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (options, bar_h);
+}
+
 /// 原生「打开文件」对话框。必须走异步版：rfd 的同步 API 会在点击回调里起自己的
 /// 消息循环，期间投给 gpui 窗口的消息会重入并二次可变借用 App，进程直接 abort。
 /// 异步版把对话框放到工作线程上显示，选完再回 UI 线程改状态。
