@@ -293,6 +293,7 @@ impl Render for RunSqlDialog {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
                                     .child(ui::field_input(&self.path, self.dark, window, cx)),
                             )
                             .child(
@@ -376,11 +377,13 @@ impl Render for RunSqlDialog {
                             .on_click(cx.listener(|this, _, _, cx| this.run(cx)))
                         },
                     )
-                    .child(div().flex_1())
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .text_xs()
                             .text_color(muted)
+                            .truncate()
                             .child(status),
                     )
                     // 底栏保留「关闭」入口，与其它对话框同款。

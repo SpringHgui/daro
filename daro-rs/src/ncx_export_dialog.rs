@@ -349,6 +349,7 @@ impl ExportDialog {
                                     .child(
                                         div()
                                             .flex_1()
+                                            .min_w_0()
                                             .truncate()
                                             .text_xs()
                                             .text_color(muted)
@@ -458,6 +459,7 @@ impl Render for ExportDialog {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
                                     .child(ui::field_input(&self.path, self.dark, window, cx)),
                             )
                             .child(

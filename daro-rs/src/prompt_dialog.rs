@@ -238,6 +238,7 @@ impl Render for TextPrompt {
                             .id("prompt-input")
                             .test_support()
                             .flex_1()
+                            .min_w_0()
                             .child(ui::field_input(&self.input, self.dark, window, cx)),
                     ),
             )

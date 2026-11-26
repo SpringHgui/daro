@@ -269,6 +269,7 @@ impl Render for HashValueDialog {
         let note = self.note.as_ref().map(|(n, bad)| {
             div()
                 .truncate()
+                .min_w_0()
                 .text_size(px(11.5))
                 .text_color(if *bad { to_hsla(0xDC2626) } else { muted })
                 .child(n.clone())

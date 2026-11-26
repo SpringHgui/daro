@@ -223,18 +223,27 @@ pub fn close_on_escape<T: 'static>(window: &Window, cx: &mut Context<T>) -> Subs
 }
 
 /// 对话框内容面：面板底，直接贴窗口边，不画外框。
+///
+/// `w_full` + `min_w_0`：内容面本身按窗口宽定死，子级里的长文案才没有机会把整页
+/// 撑得比窗口还宽（taffy 默认 flex-shrink 为 0，撑宽后右对齐的按钮就落到窗口外）。
 pub fn dialog_surface(dark: bool) -> Div {
     let p = Palette::of(dark);
     div()
+        .w_full()
+        .min_w_0()
         .flex_1()
         .min_h_0()
         .bg(to_hsla(p.dialog_surface))
 }
 
 /// 对话框底栏：与内容面同色，顶部 1px 分割线。
+///
+/// 宽度同样钉在窗口上：底栏里的说明/报错文案是动态的，不钉住就会连着把整页撑宽。
 pub fn footer_bar(dark: bool) -> Div {
     let p = Palette::of(dark);
     h_flex()
+        .w_full()
+        .min_w_0()
         .h(px(FOOTER_H))
         .px(px(12.))
         .gap(px(8.))

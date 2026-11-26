@@ -364,6 +364,7 @@ impl Render for SqlDumpDialog {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
                                     .child(ui::field_input(&self.path, self.dark, window, cx)),
                             )
                             .child(
@@ -410,8 +411,15 @@ impl Render for SqlDumpDialog {
                             }),
                         ),
                     )
-                    .child(div().flex_1())
-                    .child(div().text_xs().text_color(muted).child(label)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(label),
+                    ),
             )
     }
 }

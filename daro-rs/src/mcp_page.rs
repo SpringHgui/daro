@@ -172,6 +172,7 @@ impl McpPage {
                     .child(
                         div()
                             .truncate()
+                            .min_w_0()
                             .text_size(px(11.5))
                             .text_color(to_hsla(p.muted_foreground))
                             .child(desc.into()),

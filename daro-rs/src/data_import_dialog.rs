@@ -468,6 +468,7 @@ impl ImportDialog {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .child(ui::field_input(&self.path, self.dark, window, cx)),
                     )
                     .child(

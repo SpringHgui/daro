@@ -836,6 +836,12 @@ impl StructureCompare {
         )
     }
 
+    /// 无头用例直接落一条页脚状态文案，量长报错会不会把页面撑宽。
+    #[cfg(test)]
+    pub(crate) fn debug_status(&mut self, text: Option<String>) {
+        self.error = text;
+    }
+
     /// 无头用例读回下拉的临时状态：是否展开、筛选词、键盘高亮、输入框文字。
     #[cfg(test)]
     pub(crate) fn debug_combo(&self, cx: &gpui::App) -> (bool, String, Option<usize>, String) {
@@ -1499,6 +1505,8 @@ impl StructureCompare {
         v_flex()
             .id("sc-setup")
             .test_support()
+            .w_full()
+            .min_w_0()
             .flex_1()
             .min_h_0()
             .p(px(16.))
@@ -2319,8 +2327,6 @@ impl StructureCompare {
             )
         };
         let mut footer = ui::footer_bar(dark)
-            .w_full()
-            .min_w_0()
             .child(
                 ui::secondary_button("sc-save-profile", "保存配置文件")
                     .on_click(cx.listener(|this, _, window, cx| this.save_profile(window, cx))),
@@ -2533,8 +2539,6 @@ impl StructureCompare {
             .on_click(cx.listener(|this, _, _, cx| this.start_deploy(cx)))
         };
         let footer = ui::footer_bar(dark)
-            .w_full()
-            .min_w_0()
             .child(
                 ui::secondary_button("sc-save-profile", "保存配置文件")
                     .on_click(cx.listener(|this, _, window, cx| this.save_profile(window, cx))),

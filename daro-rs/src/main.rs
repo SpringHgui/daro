@@ -7610,6 +7610,7 @@ impl ObjectsPane {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .truncate()
                     .text_xs()
                     .text_color(fg)
@@ -13304,6 +13305,8 @@ impl DaroApp {
                         s.child(
                             div()
                                 .truncate()
+                                .flex_shrink_1()
+                                .min_w_0()
                                 .text_size(px(12.))
                                 .text_color(to_hsla(0xDC2626))
                                 .child(err),
@@ -13313,6 +13316,8 @@ impl DaroApp {
                         s.child(
                             div()
                                 .truncate()
+                                .flex_shrink_1()
+                                .min_w_0()
                                 .text_size(px(12.))
                                 .text_color(muted)
                                 .child(note),
@@ -15662,6 +15667,8 @@ impl DaroApp {
                 let note = k.note.clone().map(|n| {
                     div()
                         .truncate()
+                        .flex_shrink_1()
+                        .min_w_0()
                         .text_size(px(11.5))
                         .text_color(if k.note_bad { to_hsla(0xDC2626) } else { muted })
                         .child(n)
@@ -15718,6 +15725,8 @@ impl DaroApp {
                                     .child(
                                         div()
                                             .truncate()
+                                            .flex_shrink_1()
+                                            .min_w_0()
                                             .text_size(px(11.5))
                                             .text_color(muted)
                                             .child(trunc),
@@ -15899,6 +15908,8 @@ impl DaroApp {
                 let note = k.note.clone().map(|n| {
                     div()
                         .truncate()
+                        .flex_shrink_1()
+                        .min_w_0()
                         .text_size(px(11.5))
                         .text_color(if k.note_bad { to_hsla(0xDC2626) } else { muted })
                         .child(n)
@@ -16022,6 +16033,8 @@ impl DaroApp {
                 let note = k.note.clone().map(|n| {
                     div()
                         .truncate()
+                        .flex_shrink_1()
+                        .min_w_0()
                         .text_size(px(11.5))
                         .text_color(if k.note_bad { to_hsla(0xDC2626) } else { muted })
                         .child(n)
@@ -33503,6 +33516,7 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .truncate()
                             .text_xs()
                             .text_color(fg)
@@ -34118,13 +34132,23 @@ impl DaroApp {
                                 .id("title-crumb")
                                 .test_support()
                                 .truncate()
+                                .flex_shrink_1()
+                                .min_w_0()
                                 .text_xs()
                                 .text_color(muted)
                                 .child(conn_name),
                         )
                         .when_some(db_name, |s, db| {
                             s.child(div().text_xs().text_color(sep_color).child("/"))
-                                .child(div().truncate().text_xs().text_color(muted).child(db))
+                                .child(
+                                    div()
+                                        .flex_shrink_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(db),
+                                )
                         })
                         .when_some(cat_name, |s, cat| {
                             s.child(div().text_xs().text_color(sep_color).child("/"))
@@ -38639,6 +38663,8 @@ impl DaroApp {
                     s.child(
                         div()
                             .truncate()
+                            .flex_shrink_1()
+                            .min_w_0()
                             .text_size(px(12.))
                             .text_color(color)
                             .child(note),
@@ -38648,6 +38674,8 @@ impl DaroApp {
                     s.child(
                         div()
                             .truncate()
+                            .flex_shrink_1()
+                            .min_w_0()
                             .text_size(px(12.))
                             .text_color(to_hsla(0xDC2626))
                             .child(err.clone()),
@@ -40190,6 +40218,8 @@ impl DaroApp {
                 s.child(
                     div()
                         .truncate()
+                        .flex_shrink_1()
+                        .min_w_0()
                         .text_size(px(12.))
                         .text_color(color)
                         .child(note),
@@ -40199,6 +40229,8 @@ impl DaroApp {
                 s.child(
                     div()
                         .truncate()
+                        .flex_shrink_1()
+                        .min_w_0()
                         .text_size(px(12.))
                         .text_color(to_hsla(0xDC2626))
                         .child(err.clone()),
@@ -44271,6 +44303,7 @@ impl DaroApp {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .truncate()
                             .text_xs()
                             .text_color(fg)
@@ -44368,6 +44401,7 @@ impl DaroApp {
                     .child(
                         div()
                             .px(px(4.))
+                            .min_w_0()
                             .truncate()
                             .text_xs()
                             .text_color(fg)
@@ -46219,6 +46253,7 @@ fn tree_row(
                     .id(label_id)
                     .test_support()
                     .flex_1()
+                    .min_w_0()
                     .truncate()
                     .text_xs()
                     .text_color(fg)
@@ -57283,6 +57318,48 @@ mod designer_tests {
         .unwrap();
         settle(cx, handle);
         assert_eq!(cx.windows().len(), base, "关掉结构同步窗应只剩主窗");
+    }
+
+    /// 页脚那条报错文案再长也不能把「比较」按钮顶出窗口：驱动报错的整段原文
+    /// 不换行排在页脚时，会把首屏撑得比窗口还宽，按钮落到窗口外，
+    /// 要拖动窗口大小才看得见。
+    #[gpui_kit::test]
+    fn structure_setup_footer_keeps_run_button_visible(cx: &mut TestAppContext) {
+        isolate_store("structcompare-footer");
+        let (handle, app) = open_app(cx);
+        let (src, _) = sqlite_fixture("sc_foot_src", &["CREATE TABLE demo (id INTEGER)"]);
+        let (dst, _) = sqlite_fixture("sc_foot_dst", &["CREATE TABLE demo (id INTEGER)"]);
+        app.update(cx, |a, _| a.conns = vec![src, dst]);
+        let view = cx
+            .update(|cx| {
+                let dark = app.read(cx).dark;
+                crate::structure_compare::open_structure_compare(app.clone(), dark, cx)
+            })
+            .expect("结构同步窗要打开");
+        settle(cx, handle);
+        let dialog = *cx.windows().last().unwrap();
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |this, cx| {
+                this.debug_status(Some(
+                    "读取数据库清单失败：DriverError { Could not connect to address \
+                     `127.0.0.1:3306': 由于目标计算机积极拒绝，无法连接。 (os error 10061)"
+                        .into(),
+                ));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let vp = window.viewport_size();
+            let bounds = |id: &'static str| window.find(id).bounds();
+            let (setup, run) = (bounds("sc-setup"), bounds("sc-run"));
+            assert_eq!(setup.size.width, vp.width, "首屏不能被页脚长文案撑宽");
+            assert!(
+                run.origin.x + run.size.width <= vp.width,
+                "「比较」按钮要留在窗口里：run={run:?} vp={}",
+                vp.width
+            );
+        })
+        .unwrap();
     }
 
     /// 结构同步用两个真 SQLite 库跑一轮：源端多一列、多一张表，
