@@ -509,6 +509,26 @@ impl Palette {
             THEMES[theme.counterpart].palette
         }
     }
+
+    /// 回执 / 校验失败的红色：13 套主题 JSON 里都没有语义错误色槽位，各主题
+    /// 自带的 accent 可能是蓝、绿甚至橙，报错不能用它。按主题明暗与主色深浅
+    /// 分三档，全主题共用同一组常量，改主题时红仍是红（issue #27 同口径：
+    /// 状态色不再散写 0xc0392b / 0xDC2626 这类字面量）。
+    pub fn error(dark: bool) -> u32 {
+        let p = Self::of(dark);
+        // 相对亮度（Rec.709），主色本身很深时红再压暗一档，避免浮在暗底上刺眼
+        let r = ((p.accent >> 16) & 0xff) as f64;
+        let g = ((p.accent >> 8) & 0xff) as f64;
+        let b = (p.accent & 0xff) as f64;
+        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        if !dark {
+            0xc0_39_2b
+        } else if lum >= 128. {
+            0xe0_6c_75
+        } else {
+            0xd0_56_52
+        }
+    }
 }
 
 /// 主题清单，顺序照选主题列表：先暗后亮，各自按名字排。

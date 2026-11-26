@@ -342,7 +342,7 @@ impl Render for RunSqlDialog {
                             .p(px(6.))
                             .text_xs()
                             .text_color(if self.error.is_some() {
-                                to_hsla(0xc0392b)
+                                to_hsla(Palette::error(self.dark))
                             } else {
                                 muted
                             })

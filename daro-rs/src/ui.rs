@@ -152,6 +152,8 @@ pub fn compact_button(id: impl Into<ElementId>, label: &'static str) -> Button {
 pub fn dialog_options() -> WindowOptions {
     let mut options = TitleBar::window_options();
     options.kind = WindowKind::Normal;
+    // 对话框一律自绘 ui::TITLE_H 高的标题栏，红绿灯按这个高度对齐（issue #25）
+    align_traffic_lights(&mut options, TITLE_H);
     #[cfg(not(target_os = "macos"))]
     {
         options.kind = WindowKind::Dialog;

@@ -605,8 +605,12 @@ impl Render for ExportResultDialog {
                     .px(px(20.))
                     .child(
                         div()
+                            // 回执可能带整条文件路径（没有空格的长 token），不设
+                            // 下限会把对话框撑宽（同 issue #26）；红走 Palette::error
+                            .truncate()
+                            .min_w_0()
                             .text_xs()
-                            .text_color(if is_error { to_hsla(0xc0392b) } else { muted })
+                            .text_color(if is_error { to_hsla(Palette::error(self.dark)) } else { muted })
                             .child(status),
                     ),
             )

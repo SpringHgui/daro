@@ -1468,6 +1468,8 @@ fn open_main_window(
     startup_files: Vec<std::path::PathBuf>,
 ) -> (AnyWindowHandle, Entity<DaroApp>) {
     let mut options = TitleBar::window_options();
+    // 主窗口自绘标题栏是 TITLE_H（32）而不是组件默认的 34，红绿灯要跟着对齐（issue #25）
+    ui::align_traffic_lights(&mut options, TITLE_H);
     options.window_min_size = Some(size(px(1080.), px(700.)));
     options.window_bounds = Some(WindowBounds::centered(size(px(1440.), px(900.)), cx));
     if let Some(titlebar) = options.titlebar.as_mut() {
@@ -15368,7 +15370,14 @@ impl DaroApp {
                     .flex()
                     .justify_end()
                     .pr(px(6.))
-                    .child(div().truncate().text_size(px(11.5)).text_color(muted).child(status)),
+                    .child(
+                        div()
+                            .truncate()
+                            .min_w_0()
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child(status),
+                    ),
             );
 
         // 左：键列表
@@ -26865,11 +26874,16 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
                     .bottom_0()
                     .flex()
                     .items_center()
+                    // 同 issue #26 口径：更新字段是一串没有空格的列名，nowrap 文本
+                    // 的 min-content 就是全文宽，定位层不设下限会顶穿到相邻列上
+                    .min_w_0()
+                    .overflow_hidden()
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(if current { fg } else { subtle })
                             .truncate()
+                            .min_w_0()
                             .child(t.update_fields.clone()),
                     )
                     .into_any_element();
@@ -45821,6 +45835,9 @@ impl DaroApp {
                 s.child(
                     h_flex()
                         .flex_1()
+                        // 同 SQL 段口径：计数文案再长也不把右侧控件挤出窗口
+                        .min_w_0()
+                        .overflow_hidden()
                         .px(px(12.))
                         .items_center()
                         .child(
@@ -46057,9 +46074,13 @@ impl TreeInk {
     }
 }
 
-/// 树底开关图标的选中色：与搜索框的「有词」同色，未选中走灰。
+/// 树底开关图标的选中色：走主题主色（与库行打开态同口径，issue #27），未选中灰。
 fn toggle_ink(ink: &TreeInk, active: bool) -> Hsla {
-    if active { to_hsla(0x2f8fd8) } else { ink.muted }
+    if active {
+        to_hsla(palette::active().palette.accent)
+    } else {
+        ink.muted
+    }
 }
 
 /// 树的折叠三角用线稿：侧栏里是灰色小箭头；方块形旋钮放到 10px 会看成空复选框。
