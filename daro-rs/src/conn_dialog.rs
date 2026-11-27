@@ -113,6 +113,8 @@ pub fn open_connection_dialog(
 pub struct NewConnectionDialog {
     parent: Entity<DaroApp>,
     dark: bool,
+    /// 红绿灯位置是否已在窗口激活后重设过（issue #25，mac 专属，其余平台恒真）。
+    tl_aligned: bool,
     mode: ConnDialogMode,
     _esc: Subscription,
     step: Step,
@@ -239,6 +241,7 @@ impl NewConnectionDialog {
         Self {
             parent,
             dark,
+            tl_aligned: !cfg!(target_os = "macos"),
             mode,
             _esc: esc,
             step: if editing.is_some() || matches!(mode, ConnDialogMode::CreateWithKind(_)) {
@@ -1241,6 +1244,11 @@ impl NewConnectionDialog {
 impl Render for NewConnectionDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_title(window);
+        // 建窗时设过的红绿灯位置会被 AppKit 首次上屏的重排顶回去，激活后补设一次。
+        if !self.tl_aligned && window.is_window_active() {
+            self.tl_aligned = true;
+            crate::ui::reapply_traffic_lights(window, TITLE_H);
+        }
         let p = self.pal();
         v_flex()
             .size_full()

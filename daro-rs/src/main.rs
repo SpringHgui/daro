@@ -8668,6 +8668,8 @@ struct DaroApp {
     /// 自己拖；Linux 的 `window_control_area` 也是空操作。按下先记一笔，第一次
     /// 移动再交给 `start_window_move`。
     title_drag: bool,
+    /// 红绿灯位置是否已在窗口激活后重设过（issue #25，mac 专属，其余平台恒真）。
+    tl_aligned: bool,
     /// 界面字体族名（选项 → 常规 → 界面字体），只作用于 `Theme::font_family`。
     ui_font: String,
     /// 菜单条的窗口坐标包围盒（prepaint 时刷新）：区分「按在菜单条上换菜单」
@@ -9054,6 +9056,7 @@ impl DaroApp {
             menus_open: false,
             show_menus,
             title_drag: false,
+            tl_aligned: !cfg!(target_os = "macos"),
             ui_font,
             menu_bar_bounds: Rc::new(Cell::new(Bounds::default())),
             #[cfg(target_os = "macos")]
@@ -33806,6 +33809,11 @@ impl Render for DaroApp {
         let t0 = if perf_log() { Some(Instant::now()) } else { None };
         // 后台回执靠这个句柄落地（测试 / 失焦时 active_window 可能为空）
         self.win = Some(window.window_handle());
+        // 建窗时设过的红绿灯位置会被 AppKit 首次上屏的重排顶回去，激活后补设一次。
+        if !self.tl_aligned && window.is_window_active() {
+            self.tl_aligned = true;
+            ui::reapply_traffic_lights(window, TITLE_H);
+        }
         self.sync_design_index_name_edits(window, cx);
         self.viewport_h = window.viewport_size().height.as_f32();
         self.viewport_w = window.viewport_size().width.as_f32();
@@ -45913,7 +45921,9 @@ impl DaroApp {
                         .child(self.breadcrumb_items(fg)),
                 )
             })
-            .when(designer.is_none() && has_sql, |s| {
+            .when(designer.is_none() && has_sql, {
+                let sql_text = sql.clone();
+                move |s| {
                 s.child(
                     h_flex()
                         .flex_1()
@@ -45934,6 +45944,29 @@ impl DaroApp {
                                 .text_color(fg)
                                 .child(sql),
                         )
+                        // issue #26 反馈：SQL 大半被裁掉，光显示没有意义——补一个
+                        // 复制按钮，点一下拿完整取数语句（参考 Navicat 底栏同款）。
+                        .child(
+                            div()
+                                .id("status-sql-copy")
+                                .test_support()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .px(px(6.))
+                                .cursor_pointer()
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new("复制 SQL")
+                                        .build(window, cx)
+                                })
+                                .hover(|s| s.text_color(fg))
+                                .child(art::icon(art::Glyph::Zed(ZedIcon::Copy), 13., muted))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        sql_text.clone(),
+                                    ));
+                                }),
+                        )
                         .child(div().w(px(1.)).h_full().bg(border))
                         .child(
                             div()
@@ -45946,6 +45979,7 @@ impl DaroApp {
                                 .child(recinfo),
                         ),
                 )
+                }
             })
             .child(
                 h_flex()
@@ -56011,6 +56045,13 @@ mod designer_tests {
             assert!(
                 rec.origin.x >= sql.origin.x + sql.size.width,
                 "记录数在 SQL 右侧：sql={sql:?} rec={rec:?}"
+            );
+            // issue #26 反馈追加：SQL 段右侧要有复制按钮（截断后全文靠它取）
+            let copy = window.find("status-sql-copy").bounds();
+            assert!(
+                copy.origin.x >= sql.origin.x + sql.size.width - copy.size.width
+                    && copy.origin.x <= rec.origin.x,
+                "复制按钮应在 SQL 与记录数之间：sql={sql:?} copy={copy:?} rec={rec:?}"
             );
         })
         .unwrap();

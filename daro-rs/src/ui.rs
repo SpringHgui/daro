@@ -176,6 +176,20 @@ pub fn align_traffic_lights(options: &mut WindowOptions, bar_h: f32) {
     let _ = (options, bar_h);
 }
 
+/// 建窗之后再设一次红绿灯位置（issue #25）。
+///
+/// `WindowOptions.titlebar.traffic_light_position` 只在原生窗创建时被
+/// `move_traffic_light` 消费一次，窗口首次上屏 / 成为 key 窗后 AppKit 会按
+/// 系统标题栏高度重排标准按钮，把位置顶回默认的 y=9——截图量出来按钮中心
+/// 17.5px、24 高标题栏的文字中心 11px，就是这么错开的。渲染期重设走的是
+/// `Window::set_traffic_light_position`，每次调用都重新按当前栏高摆放。
+pub fn reapply_traffic_lights(window: &gpui_kit::Window, bar_h: f32) {
+    #[cfg(target_os = "macos")]
+    window.set_traffic_light_position(point(px(9.), px((bar_h - 16.) / 2.)));
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, bar_h);
+}
+
 /// 原生「打开文件」对话框。必须走异步版：rfd 的同步 API 会在点击回调里起自己的
 /// 消息循环，期间投给 gpui 窗口的消息会重入并二次可变借用 App，进程直接 abort。
 /// 异步版把对话框放到工作线程上显示，选完再回 UI 线程改状态。

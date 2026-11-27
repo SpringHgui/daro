@@ -156,6 +156,8 @@ struct OptionsDialog {
     /// 窗口自身配色：开窗时应用的明暗。草稿里换主题只让控件状态变化，
     /// 免得半途改全局主题把主窗和本窗一起闪一下。
     dark: bool,
+    /// 红绿灯位置是否已在窗口激活后重设过（issue #25，mac 专属，其余平台恒真）。
+    tl_aligned: bool,
     draft: AppOptions,
     page: usize,
     /// 当前选中的页内分组（`SECTIONS` 下标）；None = 选中根页。
@@ -240,6 +242,7 @@ impl OptionsDialog {
         Self {
             parent,
             dark,
+            tl_aligned: !cfg!(target_os = "macos"),
             draft,
             page: 0,
             section: None,
@@ -989,6 +992,11 @@ fn key_chip(label: &'static str, p: Palette) -> Div {
 impl Render for OptionsDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.pal();
+        // 建窗时设过的红绿灯位置会被 AppKit 的首次上屏重排顶回去，激活后补设一次。
+        if !self.tl_aligned && window.is_window_active() {
+            self.tl_aligned = true;
+            ui::reapply_traffic_lights(window, TITLE_H);
+        }
         v_flex()
             .id("options-root")
             .size_full()
