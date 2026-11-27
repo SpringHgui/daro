@@ -8601,6 +8601,10 @@ struct DaroApp {
     /// 起不了后台任务，所以先排在这里，帧尾和 catalog 一起投到后台线程
     /// （见 [Self::pump_table_ops]）。
     table_ops: Vec<TableOpJob>,
+    /// 右键「删除记录」/ − 按钮确认后的删行+应用（issue #29）：确认框回调只
+    /// 拿得到 `&mut DaroApp`，带 cx 的删除与写回排到帧尾再做
+    /// （见 [DaroApp::pump_pending_row_deletes]）。
+    pending_row_deletes: usize,
     /// 库 / 模式节点右键菜单里确认过的删库、删模式任务：确认框回调只拿得到
     /// `&mut DaroApp`，起不了后台任务，先排在这里，帧尾和表操作一起投后台
     /// （见 [DaroApp::pump_drop_jobs]）。
@@ -9021,6 +9025,7 @@ impl DaroApp {
             ctx_blank: None,
             ctx_row_hit: false,
             table_ops: Vec::new(),
+            pending_row_deletes: 0,
             drop_jobs: Vec::new(),
             table_clip: None,
             table_copies: Vec::new(),
@@ -29281,6 +29286,39 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         cx.notify();
     }
 
+    /// issue #29：右键「删除记录」/ − 按钮 = 弹窗确认，确认后直接删除并写回，
+    /// 不再要求点底部 ✓。删除仍进撤销栈，删错可 Ctrl+Z 找回工作集。
+    fn grid_delete_row_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.active_tab == 0 {
+            return;
+        }
+        if self
+            .opened
+            .get(self.active_tab - 1)
+            .is_some_and(|t| self.tab_read_only(t))
+        {
+            return;
+        }
+        let dark = self.dark;
+        open_confirm(
+            cx.entity(),
+            dark,
+            "删除记录",
+            "确认删除当前行？删除后将立即写回数据库".to_string(),
+            |app| app.pending_row_deletes += 1,
+            cx,
+        );
+    }
+
+    /// 帧尾执行确认过的删行：删除 + 应用连着做（确认回调侧拿不到 cx）。
+    fn pump_pending_row_deletes(&mut self, cx: &mut Context<Self>) {
+        let n = std::mem::take(&mut self.pending_row_deletes);
+        for _ in 0..n {
+            self.grid_delete_row(cx);
+            self.grid_apply(cx);
+        }
+    }
+
     /// 右键菜单的定格状态（非数据页 / 无列时没有菜单可给）。
     fn grid_menu_snapshot(&self) -> Option<GridMenuSnapshot> {
         let t = self.active_data_tab()?;
@@ -33806,6 +33844,10 @@ impl Render for DaroApp {
         cx.defer_in(window, |this, window, cx| {
             this.pump_table_ops(window, cx)
         });
+        // issue #29：确认过的删行在帧尾直接删除并写回，不再等底部 ✓
+        cx.defer_in(window, |this, _window, cx| {
+            this.pump_pending_row_deletes(cx)
+        });
         // 删库 / 删模式确认后的任务同样帧尾投递（确认回调侧拿不到 cx）
         cx.defer_in(window, |this, _window, cx| {
             this.pump_drop_jobs(cx)
@@ -34103,12 +34145,14 @@ impl DaroApp {
                     .pl(px(12.))
                     .window_control_area(WindowControlArea::Drag)
                     // 窗口失活时 gpui 的命中缓存还停在失焦前，第一次按下会被
-                    // 当成客户区点击、系统不启动移动循环；补发一次非客户区按下。
+                    // 当成客户区点击、系统不启动移动循环；直接发 SC_DRAGMOVE
+                    // 进拖动（不能再补发 WM_NCLBUTTONDOWN：它会进元素树并被
+                    // 计入 gpui 的双击计数，双击就变成两次 toggle，issue #28）。
                     .on_mouse_down(MouseButton::Left, |event, window, cx| {
                         // issue #28：双击标题栏空白 = 最大化 / 还原切换。
-                        // gpui 把 WM_NCLBUTTONDBLCLK（含命中缓存失活时补发的那次）
-                        // 一并派发进元素树，这里拦下并自己切换，否则系统的默认
-                        // 处理只会走到 zoom 的「最大化」一侧。
+                        // gpui 把 WM_NCLBUTTONDBLCLK 也当事件派发进元素树，这里
+                        // 拦下并自己切换，否则系统的默认处理只会走到 zoom 的
+                        // 「最大化」一侧。
                         if event.click_count >= 2 {
                             window_drag::toggle_zoom(window);
                             cx.stop_propagation();
@@ -38331,7 +38375,7 @@ impl DaroApp {
                 )
                 .child(
                     edit_btn("del", ZedIcon::Dash, rows > 0 && !read_only)
-                        .on_click(cx.listener(|this, _, _, cx| this.grid_delete_row(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.grid_delete_row_confirm(cx))),
                 )
                 .child(
                     edit_btn("ok", ZedIcon::Check, dirty && !read_only)
@@ -47856,7 +47900,7 @@ fn grid_context_menu(
             app.grid_insert_row(cx)
         }))
         .item(grid_action_item(&me, "删除记录", has_rows && !read_only, |app, cx| {
-            app.grid_delete_row(cx)
+            app.grid_delete_row_confirm(cx)
         }))
         .separator()
         .item(grid_action_item(&me, "复制", has_rows, |app, cx| {
