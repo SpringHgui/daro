@@ -795,7 +795,8 @@ pub fn page_tabs(tabs: &[&'static str], active: usize, dark: bool) -> impl IntoE
 
 /// 单选分段（格式 / 类型这类二选一）：Zed `ToggleButtonGroup` 的 Transparent 档——
 /// 条目各自成块、之间只留一条缝；选中项铺 `ButtonStyle::Tinted(Accent)`
-/// （info.background 面 + info.border 描边 + 强调色文字），未选中无底面、文字走
+/// （info.background 面 + info.border 描边 + `primary_foreground` 文字——
+/// VS Code 2026 两档的 face 是实心品牌蓝，写 accent 会蓝字压蓝底看不见），未选中无底面、文字走
 /// muted、hover 才铺 ghost_element_hover。尺寸 `ButtonSize::Medium` = 28 / px 8。
 pub fn segment(
     id: impl Into<ElementId>,
@@ -816,7 +817,7 @@ pub fn segment(
         .text_size(px(UI_TEXT_SIZE))
         .cursor_pointer()
         .text_color(to_hsla(if selected {
-            p.accent
+            p.primary_foreground
         } else {
             p.muted_foreground
         }))
