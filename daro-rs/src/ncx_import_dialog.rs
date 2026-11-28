@@ -18,7 +18,7 @@ use crate::ncx::{NcxFile, PasswordState};
 use crate::palette::Palette;
 use crate::{to_hsla, DaroApp, ImportItem};
 
-use crate::ui::{self, DIALOG_ROW_H, TITLE_H};
+use crate::ui::{self, DIALOG_ROW_H};
 
 pub fn open_ncx_import(parent: Entity<DaroApp>, dark: bool, cx: &mut App) {
     let mut options = ui::dialog_options();
@@ -45,7 +45,8 @@ struct ImportDialog {
     ncx: Option<NcxFile>,
     error: Option<String>,
     checked: Vec<bool>,
-    /// 与现有连接（或文件内更早条目）重名的下标：默认不勾，勾了会加 " (2)" 序号
+    /// 与现有连接（或文件内更早条目）重名的下标：默认不勾。
+    /// 勾上后同名同类型走覆盖，同名不同类型加 " (2)" 序号。
     duplicates: Vec<bool>,
     /// 现有连接名，判重用
     existing: Vec<String>,
@@ -219,8 +220,11 @@ impl ImportDialog {
             outcome
         });
         let mut summary = format!("已导入 {} 条连接", outcome.imported);
+        if outcome.overwritten > 0 {
+            summary.push_str(&format!("，其中 {} 条同名同类型已覆盖", outcome.overwritten));
+        }
         if outcome.renamed > 0 {
-            summary.push_str(&format!("，其中 {} 条重名已自动改名", outcome.renamed));
+            summary.push_str(&format!("，{} 条同名不同类型已自动改名", outcome.renamed));
         }
         if !outcome.new_groups.is_empty() {
             summary.push_str(&format!("，新建分组：{}", outcome.new_groups.join("、")));
@@ -230,20 +234,7 @@ impl ImportDialog {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child("导入连接"),
-                ),
-        )
+        crate::ui::dialog_title("导入连接", None, self.dark)
     }
 
     fn file_row(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

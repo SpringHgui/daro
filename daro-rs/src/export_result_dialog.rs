@@ -15,7 +15,7 @@ use crate::palette::Palette;
 use crate::table_export::{sql_insert, TableFormat};
 use crate::{to_hsla, DaroApp};
 
-use crate::ui::{self, TITLE_H};
+use crate::ui;
 
 /// 把标签清洗成安全文件名（Flutter `_safeLabel` 同款）
 pub fn safe_label(label: &str) -> String {
@@ -288,20 +288,7 @@ impl ExportResultDialog {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child("导出向导"),
-                ),
-        )
+        crate::ui::dialog_title("导出向导", None, self.dark)
     }
 
     /// 第一步：照参考截图的格式单选列表（企业版格式接通入口，点击弹「敬请期待」）

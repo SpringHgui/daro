@@ -192,23 +192,10 @@ impl HashValueDialog {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new().h(px(ui::TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child(if self.old_field.is_some() {
-                            "编辑字段"
-                        } else {
-                            "新增字段"
-                        }),
-                ),
+        crate::ui::dialog_title(
+            if self.old_field.is_some() { "编辑字段" } else { "新增字段" },
+            None,
+            self.dark,
         )
     }
 }

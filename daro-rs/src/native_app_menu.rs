@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 use gpui_kit::component::input as ed;
 use gpui_kit::*;
 
+use crate::zed_icons::IconTheme;
 use crate::{
     Act, CloseAllTabs, CloseTab, DaroApp, EditFindNext, EditSelectStmt, GridCopy, GridPaste,
     GridRedo, GridSelectAll, GridUndo, MinimizeWindow, OpenExtensions, OpenOptions, QuitApp,
@@ -40,6 +41,7 @@ pub(crate) enum Cmd {
     About,
     CheckUpdates,
     ThemePicker,
+    SetIconTheme(IconTheme),
     Feedback,
     Hide,
     HideOthers,
@@ -106,6 +108,16 @@ fn mi(label: impl Into<SharedString>, cmd: Cmd) -> MenuItem {
     MenuItem::action(label, MenuCmd::new(cmd, 0))
 }
 
+fn icon_theme_menu(app: &DaroApp) -> MenuItem {
+    sub(
+        "图标主题",
+        IconTheme::ALL
+            .into_iter()
+            .map(|theme| mi(theme.label(), Cmd::SetIconTheme(theme)).checked(app.icon_theme == theme))
+            .collect(),
+    )
+}
+
 fn mi_arg(label: impl Into<SharedString>, cmd: Cmd, arg: u32) -> MenuItem {
     MenuItem::action(label, MenuCmd::new(cmd, arg))
 }
@@ -165,6 +177,7 @@ fn app_menu(app: &DaroApp) -> Menu {
         sep(),
         MenuItem::action("设置...", OpenOptions),
         mi("主题...", Cmd::ThemePicker),
+        icon_theme_menu(app),
         MenuItem::action("扩展...", OpenExtensions),
         sub(
             "面板布局",
@@ -418,6 +431,7 @@ fn view_menu(app: &DaroApp, bare: bool) -> Menu {
             mi("详细信息", Cmd::ComingSoon),
             mi("切换主题", Cmd::ToggleTheme),
             mi("选择主题...", Cmd::ThemePicker),
+            icon_theme_menu(app),
         ],
     );
 
@@ -653,6 +667,7 @@ pub(crate) fn menu_revision(app: &DaroApp, fullscreen: bool) -> u64 {
     app.info_page.hash(&mut h);
     app.info_ddl_capable().hash(&mut h);
     app.list_view.hash(&mut h);
+    app.icon_theme.hash(&mut h);
     app.run_pane.hash(&mut h);
     app.sel_conn_ix().is_some().hash(&mut h);
     app.active_query_id().is_some().hash(&mut h);
@@ -765,6 +780,7 @@ pub(crate) fn run_menu_command(
         Cmd::About => crate::about_dialog::open_daro_about(app.dark, cx),
         Cmd::CheckUpdates => crate::update_dialog::open_center(me, app.dark, cx),
         Cmd::ThemePicker => crate::theme_dialog::open_theme_dialog(me, app.dark, window, cx),
+        Cmd::SetIconTheme(theme) => app.set_icon_theme(theme, cx),
         Cmd::Feedback => crate::about_dialog::open_issue_tracker(),
         Cmd::Hide => {
             #[cfg(target_os = "macos")]

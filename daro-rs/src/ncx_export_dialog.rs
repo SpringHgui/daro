@@ -19,7 +19,7 @@ use crate::ncx::{
 use crate::palette::Palette;
 use crate::{to_hsla, DaroApp};
 
-use crate::ui::{self, DIALOG_ROW_H, TITLE_H};
+use crate::ui::{self, DIALOG_ROW_H};
 
 pub fn open_ncx_export(parent: Entity<DaroApp>, dark: bool, cx: &mut App) {
     let mut options = ui::dialog_options();
@@ -234,20 +234,7 @@ impl ExportDialog {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child("导出连接"),
-                ),
-        )
+        crate::ui::dialog_title("导出连接", None, self.dark)
     }
 
     fn list(&self, cx: &mut Context<Self>) -> impl IntoElement {

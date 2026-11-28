@@ -8,7 +8,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -558,16 +557,13 @@ impl UpdateWindow {
                     .child(status_line(self.status.clone(), to_hsla(p.foreground)))
                     .child(
                         div().pt(px(2.)).child(
-                            Progress::new("update-progress")
-                                .loading(self.progress.is_none())
-                                .value(value)
-                                .color(to_hsla(p.accent))
+                            ui::progress_bar("update-progress", value, to_hsla(p.accent), self.progress.is_none())
                                 .accessibility_label(progress_label),
                         ),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(muted)
                             .child(stats_text),
                     );
@@ -619,7 +615,7 @@ impl UpdateWindow {
                             .child(div().flex_1())
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(px(12.))
                                     .text_color(muted)
                                     .child(release_date(release.published_at.as_deref())),
                             ),
@@ -760,29 +756,12 @@ impl Render for UpdateWindow {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(to_hsla(p.foreground))
-            .child(title_bar("更新中心", self.dark))
+            .child(ui::dialog_title("更新中心", None, self.dark))
             .child(self.header())
             .child(self.tabs(cx))
             .child(self.body())
             .child(self.footer(cx))
     }
-}
-
-fn title_bar(label: &'static str, dark: bool) -> impl IntoElement {
-    let p = Palette::of(dark);
-    TitleBar::new().h(px(ui::TITLE_H)).border_b_0().child(
-        h_flex()
-            .h_full()
-            .items_center()
-            .gap(px(6.))
-            .pl(px(4.))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(to_hsla(p.foreground))
-                    .child(label),
-            ),
-    )
 }
 
 fn tab_item(
@@ -837,7 +816,7 @@ fn pill_text(label: impl Into<SharedString>, dark: bool) -> Div {
         .items_center()
         .rounded(px(10.))
         .bg(to_hsla(p.selection))
-        .text_size(px(11.))
+        .text_size(px(12.))
         .text_color(to_hsla(p.muted_foreground))
         .child(label.into())
 }

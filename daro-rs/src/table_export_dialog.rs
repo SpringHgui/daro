@@ -18,7 +18,6 @@ use crate::palette::Palette;
 use crate::table_export::{self, ExportError, TableExportSettings, TableFormat};
 use crate::{db_types, mock, to_hsla, ui, DaroApp};
 
-use crate::ui::TITLE_H;
 
 /// 远程整表：导出时按页现取现写，不先物化整张表。
 #[derive(Clone)]
@@ -379,15 +378,7 @@ impl TableExportDialog {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(div().text_xs().text_color(to_hsla(p.foreground)).child("导出表数据")),
-        )
+        crate::ui::dialog_title("导出表数据", None, self.dark)
     }
 
     fn format_row(&self, cx: &mut Context<Self>) -> impl IntoElement {

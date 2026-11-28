@@ -13,7 +13,6 @@ use gpui_kit::*;
 
 use crate::palette::Palette;
 use crate::sql_dump::{self, DumpError, DumpOutcome, DumpProgress, DumpRequest, DumpScope};
-use crate::ui::TITLE_H;
 use crate::{to_hsla, ui};
 
 fn safe_file_stem(name: &str) -> String {
@@ -270,20 +269,7 @@ impl SqlDumpDialog {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child("转储 SQL 文件"),
-                ),
-        )
+        crate::ui::dialog_title("转储 SQL 文件", None, self.dark)
     }
 
     fn status(&self) -> (String, bool) {

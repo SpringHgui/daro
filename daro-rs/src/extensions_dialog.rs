@@ -196,36 +196,22 @@ impl ExtensionsDialog {
 
     fn title_bar(&self) -> impl IntoElement {
         let p = self.pal();
-        TitleBar::new().h(px(ui::TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(zed_icons::ic(
-                    ZedIcon::Blocks,
-                    14.,
-                    to_hsla(p.muted_foreground),
-                ))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child("扩展"),
-                ),
-        )
+        crate::ui::dialog_title("扩展", Some(zed_icons::ic(ZedIcon::Blocks, 14., to_hsla(p.muted_foreground))), self.dark)
     }
 
     fn badge(&self, text: &'static str, muted: bool) -> AnyElement {
         let p = self.pal();
+        // Zed `Chip`：`px_1` 4、`rounded_sm` 4、1px `border` 描边、
+        // `element_background` 底，高度由内容决定
         div()
-            .h(px(17.))
-            .px(px(5.))
+            .px(px(4.))
             .flex()
             .items_center()
-            .rounded(px(3.))
+            .rounded(px(ui::RADIUS))
+            .border(px(ui::HAIRLINE))
+            .border_color(to_hsla(p.border_soft))
             .bg(to_hsla(p.hover))
-            .text_size(px(10.5))
+            .text_size(px(11.))
             .text_color(to_hsla(if muted {
                 p.subtle_foreground
             } else {

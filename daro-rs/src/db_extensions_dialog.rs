@@ -125,23 +125,7 @@ impl DbExtensionsDialog {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new()
-            .h(px(ui::TITLE_H))
-            .border_b_0()
-            .child(
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap(px(6.))
-                    .pl(px(4.))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(to_hsla(p.foreground))
-                            .child("管理扩展"),
-                    ),
-            )
+        crate::ui::dialog_title("管理扩展", None, self.dark)
     }
 
     /// 小节标题：名字 + 数量角标。

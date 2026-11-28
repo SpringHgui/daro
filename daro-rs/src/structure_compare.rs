@@ -33,7 +33,6 @@ use crate::menu::{DropdownMenu as _, PopupMenuItem};
 use crate::mock::{Connection, DbKind};
 use crate::palette::Palette;
 use crate::sql_preview;
-use crate::ui::TITLE_H;
 use crate::zed_icons;
 use crate::zed_icons::ZedIcon;
 use crate::{DaroApp, to_hsla, ui};
@@ -2039,7 +2038,9 @@ impl StructureCompare {
             focus: to_hsla(p.field_focus),
             selected: to_hsla(p.selection),
             hover: to_hsla(p.hover),
+            active: to_hsla(p.selection_focus),
             highlight: to_hsla(p.accent).opacity(0.35),
+            is_dark: self.dark,
         }
     }
 
@@ -3396,16 +3397,7 @@ impl Render for StructureCompare {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(fg)
-            .child(
-                TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-                    h_flex()
-                        .h_full()
-                        .items_center()
-                        .gap(px(6.))
-                        .pl(px(4.))
-                        .child(div().text_xs().text_color(fg).child("结构同步")),
-                ),
-            )
+            .child(ui::dialog_title("结构同步", None, self.dark))
             .child(
                 ui::dialog_surface(self.dark)
                     // 内容面默认是块级 div，子页面的 flex_1 不会生效，先声明成竖向 flex

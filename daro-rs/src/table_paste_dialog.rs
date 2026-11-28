@@ -249,16 +249,7 @@ impl Render for TablePaste {
                     cx.stop_propagation();
                 }
             }))
-            .child(
-                TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-                    h_flex().h_full().items_center().pl(px(4.)).child(
-                        div()
-                            .text_xs()
-                            .text_color(to_hsla(p.foreground))
-                            .child("粘贴表"),
-                    ),
-                ),
-            )
+            .child(ui::dialog_title("粘贴表", None, self.dark))
             .child(
                 v_flex()
                     .flex_1()

@@ -356,19 +356,6 @@ fn zed_for_lucide(name: IconName) -> Option<ZedIcon> {
     })
 }
 
-/// 布局类按钮只有资源名、没有 Zed 字形，退回 Lucide 线稿。
-fn lucide_for_asset(id: &str) -> Option<IconName> {
-    Some(match id {
-        "GLYPH_GRIDVIEW" | "GLYPH_GRIDVIEW_DARK" => IconName::LayoutGrid,
-        "GLYPH_LISTVIEW" | "GLYPH_LISTVIEW_DARK" => IconName::LayoutList,
-        "GLYPH_DETAILVIEW" | "GLYPH_DETAILVIEW_DARK" => IconName::Rows3,
-        "GLYPH_FORMVIEW" | "GLYPH_FORMVIEW_DARK" => IconName::TextCursorInput,
-        "GLYPH_LEFTPANEL" | "GLYPH_LEFTPANEL_DARK" => IconName::PanelLeft,
-        "GLYPH_RIGHTPANEL" | "GLYPH_RIGHTPANEL_DARK" => IconName::PanelRight,
-        _ => return None,
-    })
-}
-
 /// 画一个图标，返回定宽定高的元素。
 pub fn art(glyph: Glyph, size: f32) -> AnyElement {
     if let Some(z) = zed_for(glyph) {
@@ -387,10 +374,6 @@ pub fn art(glyph: Glyph, size: f32) -> AnyElement {
         Glyph::HeroFolder => db_icons::hero_folder(size),
         Glyph::HeroEngine(kind) => db_icons::hero_engine(kind, size),
         Glyph::Lucide(name) => Icon::new(name).with_size(px(size)).into_any_element(),
-        Glyph::Asset(id) => match lucide_for_asset(id) {
-            Some(name) => Icon::new(name).with_size(px(size)).into_any_element(),
-            None => div().flex_none().w(px(size)).h(px(size)).into_any_element(),
-        },
         // 未登记的 Asset 名没有对应字形，留空位。
         _ => div().flex_none().w(px(size)).h(px(size)).into_any_element(),
     }
@@ -406,13 +389,6 @@ pub fn icon(glyph: Glyph, size: f32, tint: Hsla) -> AnyElement {
             .with_size(px(size))
             .text_color(tint)
             .into_any_element(),
-        Glyph::Asset(id) => match lucide_for_asset(id) {
-            Some(name) => Icon::new(name)
-                .with_size(px(size))
-                .text_color(tint)
-                .into_any_element(),
-            None => art(glyph, size),
-        },
         other => art(other, size),
     }
 }

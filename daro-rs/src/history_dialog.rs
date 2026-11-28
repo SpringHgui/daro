@@ -4,7 +4,6 @@
 //! 支持按连接筛选；每行可「重新运行」（灌入新查询页签）或「复制」；底部可清空。
 
 use gpui_kit::component::*;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui;
 
@@ -97,23 +96,7 @@ impl HistoryDialog {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new()
-            .h(px(crate::ui::TITLE_H))
-            .border_b_0()
-            .child(
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap(px(6.))
-                    .pl(px(4.))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(to_hsla(p.foreground))
-                            .child("查询历史"),
-                    ),
-            )
+        crate::ui::dialog_title("查询历史", None, self.dark)
     }
 }
 

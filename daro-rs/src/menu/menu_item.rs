@@ -113,13 +113,20 @@ impl RenderOnce for MenuItemElement {
                 // Not `group_hover` on the item's own group: GPUI styles an
                 // element before registering its group, and that fallback keeps
                 // the pointer's item lit after a key moves the highlight away.
+                // 三档分开，和 Zed ListItem 一致：指针走 hover，键盘走 selected，
+                // 按下走 active；hover 样式在 gpui 里盖在基础样式上，所以鼠标停住时
+                // 看到的是浅一档的 hover。
                 this.hover(|this| {
                     let c = menu_colors(cx.theme().is_dark());
-                    this.bg(c.hover_bg).text_color(c.hover_text)
+                    this.bg(c.hover_bg)
+                })
+                .active(|this| {
+                    let c = menu_colors(cx.theme().is_dark());
+                    this.bg(c.active_bg)
                 })
                 .when(self.selected, |this| {
                     let c = menu_colors(cx.theme().is_dark());
-                    this.bg(c.hover_bg).text_color(c.hover_text)
+                    this.bg(c.selected_bg)
                 })
                 .when_some(self.on_click, |this, on_click| {
                     this.on_mouse_down(MouseButton::Left, move |_, _, cx| {

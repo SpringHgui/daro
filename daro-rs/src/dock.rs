@@ -26,6 +26,10 @@ use crate::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::ui::{
+    float_shadow, RADIUS, TAB_CLOSE_W, TAB_GAP, TAB_H, TAB_ICON_W, TAB_PAD_X, TAB_STRIP_H,
+    UI_TEXT_SIZE,
+};
 
 use crate::*;
 
@@ -400,15 +404,17 @@ impl Render for TabChip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(self.dark);
         let _ = cx;
+        // Zed 拖页签时的跟手预览：`Tab` 原样 + ElevatedSurface 底与投影
         h_flex()
-            .px(px(9.))
-            .h(px(22.))
+            .px(px(TAB_PAD_X))
+            .h(px(TAB_H))
             .items_center()
-            .rounded(px(3.))
-            .bg(to_hsla(p.chrome))
-            .border(px(0.5))
+            .rounded(px(RADIUS))
+            .bg(to_hsla(p.dialog_surface))
+            .border(px(1.))
             .border_color(to_hsla(p.border))
-            .text_size(px(11.))
+            .shadow(float_shadow(self.dark))
+            .text_size(px(UI_TEXT_SIZE))
             .text_color(to_hsla(p.foreground))
             .child(self.label.clone())
     }
@@ -582,6 +588,10 @@ impl DaroApp {
     /// 页签条：只有 home 窗格带常驻的「对象」页。每个页签都可以拖到别的窗格。
     /// 页签总宽超过条宽时整段横向可滚（滚轮 + 右端两个箭头），活动页签
     /// 激活时自动滚进视野。
+    ///
+    /// 几何照抄 Zed `Tab`/`TabBar`：条带 32 高、格内 `px(Base04)` 4、图标与标题
+    /// 间距 4、图标 12、关闭键位 14，相邻页签共用一条 1px 竖线，选中页签不画
+    /// 底边线（与下方内容连成一片）；圆角保持 Zed 的直角。
     fn pane_tab_bar(
         &self,
         pane_id: u64,
@@ -618,7 +628,7 @@ impl DaroApp {
             .aria_selected(active == 0)
             .aria_label(object_label)
             .h_full()
-            .px(px(8.))
+            .px(px(TAB_PAD_X))
             .items_center()
             .flex_none()
             .relative()
@@ -639,7 +649,7 @@ impl DaroApp {
             }))
             .child(
                 div()
-                    .text_xs()
+                    .text_size(px(UI_TEXT_SIZE))
                     .text_color(if active == 0 { fg } else { muted })
                     .child(object_label),
             )
@@ -671,8 +681,8 @@ impl DaroApp {
                     .aria_selected(is_active)
                     .aria_label(chip_label.clone())
                     .h_full()
-                    .px(px(8.))
-                    .gap(px(4.))
+                    .px(px(TAB_PAD_X))
+                    .gap(px(TAB_GAP))
                     .items_center()
                     // 条带放不下时先收缩页签（文字截断出省略号），
                     // 缩到最小宽仍放不下才整段滚动；最小宽压得比较小，
@@ -725,7 +735,7 @@ impl DaroApp {
                         gpui_kit::component::tooltip::Tooltip::new(tip_label.clone())
                             // 字号与页签一致、内边距收到最小；外边距保持默认，
                             // 它同时是浮层跟指针之间的距离
-                            .text_xs()
+                            .text_size(px(UI_TEXT_SIZE))
                             .py(px(2.))
                             .px(px(6.))
                             // 弹层默认的白面比内容区还亮，边界和阴影都看不出来；
@@ -738,7 +748,7 @@ impl DaroApp {
                     .context_menu(tab_context_menu(cx.entity().clone(), pane_id, Some(ix)))
                     .child(div().flex_none().child(art::icon(
                         glyph,
-                        15.,
+                        TAB_ICON_W,
                         if is_active { to_hsla(accent) } else { muted },
                     )))
                     .child(
@@ -748,14 +758,14 @@ impl DaroApp {
                             .flex_grow_1()
                             .min_w_0()
                             .truncate()
-                            .text_xs()
+                            .text_size(px(UI_TEXT_SIZE))
                             .text_color(if is_active { fg } else { muted })
                             .child(title),
                     )
                     .child(
                         // 活动页签的 × 正常占位（不会被悬停遮住标题）；
                         // 非活动页签的 × 悬浮在右端、悬停才显形，平时不占
-                        // 宽度，那 18px 让给标题文字
+                        // 宽度，那 14px 让给标题文字
                         h_flex()
                             .id(format!("tab-close/{ix}"))
                             .items_center()
@@ -777,7 +787,7 @@ impl DaroApp {
                             .child(
                                 h_flex()
                                     .id(format!("tab-close-box/{ix}"))
-                                    .size(px(18.))
+                                    .size(px(TAB_CLOSE_W))
                                     .items_center()
                                     .justify_center()
                                     .rounded(px(2.))
@@ -788,7 +798,7 @@ impl DaroApp {
                                     .hover(move |s| s.bg(close_hover))
                                     .child(
                                         Icon::new(ZedIcon::Close)
-                                            .with_size(px(13.))
+                                            .with_size(px(TAB_ICON_W))
                                             .text_color(muted),
                                     ),
                             ),
@@ -914,7 +924,7 @@ impl DaroApp {
             .id(("tab-bar", pane_id))
             .role(Role::TabList)
             .aria_label("页签")
-            .h(px(32.))
+            .h(px(TAB_STRIP_H))
             .flex_none()
             .bg(bg)
             .when(is_home, |s| s.child(object_tab))

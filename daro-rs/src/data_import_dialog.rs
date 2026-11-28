@@ -29,7 +29,6 @@ use crate::mock::Connection;
 use crate::palette::Palette;
 use crate::{backend, catalog, to_hsla, ui, DaroApp};
 
-use crate::ui::TITLE_H;
 
 /// 导入目标：一张已存在的表
 #[derive(Clone)]
@@ -1002,21 +1001,7 @@ impl Render for ImportDialog {
             .size_full()
             .bg(to_hsla(p.chrome))
             .text_color(fg)
-            .child(
-                TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-                    h_flex()
-                        .h_full()
-                        .items_center()
-                        .gap(px(6.))
-                        .pl(px(4.))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(to_hsla(p.foreground))
-                                .child("导入向导"),
-                        ),
-                ),
-            )
+            .child(ui::dialog_title("导入向导", None, self.dark))
             .child(
                 v_flex()
                     .flex_1()

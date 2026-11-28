@@ -72,6 +72,7 @@ mod save_query_dialog;
 mod palette;
 mod prompt_dialog;
 mod zed_icons;
+mod tabler_assets;
 mod role_design;
 mod window_drag;
 
@@ -88,7 +89,7 @@ use serde::{Deserialize, Serialize};
 use gpui_kit::assets::IconNamed as _;
 use gpui_kit::base::input as input_actions;
 
-use crate::zed_icons::ZedIcon;
+use crate::zed_icons::{IconTheme, ZedIcon};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{
     Editor, EditorState, Input, InputEvent, InputHighlighter, InputState, RangeDecoration,
@@ -101,6 +102,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use ui::{
+    divider_v, STATUS_GAP, STATUS_INNER_GAP, STATUS_PAD_X, UI_TEXT_SIZE,
+};
 
 actions!(
     daro,
@@ -172,7 +176,7 @@ const SIDE_SPLITTER_W: f32 = 5.;
 /// 连接树底部筛选弹层的选项数：与新建连接向导共用同一份类型清单
 const TREE_TYPE_COUNT: usize = conn_dialog::TILES.len();
 /// 树顶搜索条高：筛选弹层锚在这一行右端按钮的正下方，两处要用同一个数
-const SEARCH_BAR_H: f32 = 30.;
+const SEARCH_BAR_H: f32 = ui::TOOLBAR_H;
 /// 搜索条右内边距（工具组与栏右边框之间留的缝）
 const SEARCH_BAR_PR: f32 = 4.;
 /// 树顶工具组：筛选 / 星标 / 定位 / 折叠，四枚方块加间距，整组靠右对齐
@@ -189,8 +193,9 @@ const RIBBON_H: f32 = 32.;
 const TITLE_H: f32 = 32.;
 /// 标题栏内菜单按钮的高度（菜单本身不再单独占一行）。
 const MENU_H: f32 = 26.;
-/// 状态栏高度，与 Zed 一致。
-const STATUS_BAR_H: f32 = 24.;
+/// 状态栏高度，照 Zed `StatusBar` 的 `p(Base04)` 4 + 条目 22 + 4。
+/// 主界面几处纵向排版按它预留高度，所以条带本身也吃这个定高。
+const STATUS_BAR_H: f32 = 30.;
 const WIN_BTN_W: f32 = 46.;
 
 // ── 数据页密度档（照参考界面数据页 1:1：工具条 27 / 表头两行 20+17 / 行 20）──
@@ -202,6 +207,9 @@ const T_HEAD_NAME_H: f32 = 21.;
 const T_HEAD_TYPE_H: f32 = 18.;
 /// 数据行高
 const T_ROW_H: f32 = 22.;
+/// 横向滚动条轨道厚度：gpui-base 默认 WIDTH = 4*2+8 = 16。覆盖式滚动条贴在
+/// 网格区底边，会压住最后一行；网格区底部按它单独留一条轨道让给横向滚动条。
+const T_HBAR_H: f32 = 16.;
 /// 行虚拟化上下多画几行当缓冲，避免快速滚动时视口边上一帧空白。
 const T_OVERSCAN: usize = 16;
 /// 列虚拟化左右多画几列当缓冲：宽表每帧只建视口附近的列。
@@ -764,6 +772,8 @@ struct Store {
     /// 旧存档缺字段时按 `dark` 落 2026 明暗档
     #[serde(default)]
     theme: String,
+    #[serde(default)]
+    icon_theme: IconTheme,
     list_view: bool,
     show_info: bool,
     /// 左侧对象树是否显示；旧存档缺字段时按显示处理
@@ -7571,9 +7581,10 @@ impl ObjectsPane {
         let app_right = app.clone();
         h_flex()
             .id(("obj", ix))
+            // Zed `ListItem`：行内左右 `px(Base06)` 6、图标 `IconSize::Medium` 16、
+            // 图标与标题 `gap_1` 4，整行铺 hover / selected 底色
             .h(px(LIST_ROW_H))
-            .pl(px(2.))
-            .pr(px(6.))
+            .px(px(ui::ROW_PAD_X))
             .gap(px(4.))
             .items_center()
             .cursor_pointer()
@@ -7614,7 +7625,7 @@ impl ObjectsPane {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_xs()
+                    .text_size(px(UI_TEXT_SIZE))
                     .text_color(fg)
                     .child(name),
             )
@@ -8672,6 +8683,7 @@ struct DaroApp {
     tl_aligned: bool,
     /// 界面字体族名（选项 → 常规 → 界面字体），只作用于 `Theme::font_family`。
     ui_font: String,
+    icon_theme: IconTheme,
     /// 菜单条的窗口坐标包围盒（prepaint 时刷新）：区分「按在菜单条上换菜单」
     /// 和「按在别处收起菜单条」——弹层会把触发按钮也算成「外面」。
     menu_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -8842,6 +8854,8 @@ impl DaroApp {
                 palette::index_for_dark(store.as_ref().is_some_and(|s| s.dark))
             });
         palette::set_active(theme_ix);
+        let icon_theme = store.as_ref().map(|s| s.icon_theme).unwrap_or_default();
+        icon_theme.activate();
         let dark = palette::active().dark;
         Theme::change(
             if dark {
@@ -9058,6 +9072,7 @@ impl DaroApp {
             title_drag: false,
             tl_aligned: !cfg!(target_os = "macos"),
             ui_font,
+            icon_theme,
             menu_bar_bounds: Rc::new(Cell::new(Bounds::default())),
             #[cfg(target_os = "macos")]
             native_menu_rev: None,
@@ -9128,6 +9143,7 @@ impl DaroApp {
             version: 1,
             dark: self.dark,
             theme: palette::active().name.to_string(),
+            icon_theme: self.icon_theme,
             skipped_version: self.skipped_version.clone(),
             ui_font: self.ui_font.clone(),
             list_view: self.list_view,
@@ -9191,10 +9207,11 @@ impl DaroApp {
             // 正文统一用设置里的界面字体（默认 Segoe UI：雅黑 UI 在 12px 下
             // 笔画偏细）；中文缺字由系统回退。
             theme.font_family = ui_font.into();
-            // 连接对话框那套经典 Windows 外观：直角、不要键盘焦点光晕，
-            // 控件外框统一成按钮那档灰。所有对话框共用这套令牌。
+            // 控件直角改回 Zed 档：`rounded_sm` = 4 给控件、`rounded_lg` = 8 给卡片
+            // 与浮层（Zed 的 elevation_2 / elevation_3 都是 rounded_lg + 1px
+            // border_variant）。不要键盘焦点光晕，聚焦靠控件自己换描边色。
             theme.radius = px(4.);
-            theme.radius_lg = px(6.);
+            theme.radius_lg = px(8.);
             theme.focus_ring = false;
             let colors = &mut theme.colors;
             colors.background = to_hsla(p.background);
@@ -9268,6 +9285,15 @@ impl DaroApp {
     pub(crate) fn set_theme(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.preview_theme(ix, cx);
         self.save();
+    }
+
+    fn set_icon_theme(&mut self, theme: IconTheme, cx: &mut Context<Self>) {
+        if self.icon_theme != theme {
+            self.icon_theme = theme;
+            theme.activate();
+            self.save();
+            cx.refresh_windows();
+        }
     }
 
     /// 「工具 ▸ 选项...」开窗时读一份当前设置。
@@ -14057,28 +14083,16 @@ impl DaroApp {
 
     /// 还没复刻的子页：权限。参考界面的权限矩阵要按库逐个对象展开，
     /// 先给一句实话。
-    fn role_placeholder_tab(&self, sub: usize, fg: Hsla, subtle: Hsla, bg: Hsla) -> AnyElement {
+    fn role_placeholder_tab(&self, sub: usize, _fg: Hsla, _subtle: Hsla, bg: Hsla) -> AnyElement {
         let name = R_SUBTABS.get(sub).copied().unwrap_or("子页");
-        v_flex()
-            .size_full()
-            .bg(bg)
-            .p(px(24.))
-            .items_center()
-            .justify_center()
-            .gap(px(12.))
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .text_color(fg)
-                    .child(format!("「{name}」页还没有实现。")),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(subtle)
-                    .child("常规 / 注释 / SQL 预览已经是真的，这一页等对应截图再补。"),
-            )
-            .into_any_element()
+        // Zed `ProjectEmptyState` 那一档空态（见 ui::empty_state）
+        ui::empty_state(
+            format!("「{name}」页还没有实现。"),
+            "常规 / 注释 / SQL 预览已经是真的，这一页等对应截图再补。",
+            self.dark,
+        )
+        .bg(bg)
+        .into_any_element()
     }
 
     /// 新建表点「保存」后的承接（「表名」输入框独立窗口的回调）：
@@ -16600,7 +16614,9 @@ impl DaroApp {
             focus: to_hsla(p.field_focus),
             selected: to_hsla(p.selection),
             hover: to_hsla(p.hover),
+            active: to_hsla(p.selection_focus),
             highlight: to_hsla(p.accent).opacity(0.35),
+            is_dark: self.dark,
         }
     }
 
@@ -33210,7 +33226,18 @@ fn ds_cols_of(app: &DaroApp, did: u64) -> Vec<DesignCol> {
         if let Some(cat) = self.pane_cat() {
             items.push(breadcrumb(CATEGORIES[cat].1, 0x1e9e63, CATEGORIES[cat].0, fg));
         }
-        h_flex().gap(px(14.)).items_center().children(items).into_any_element()
+        // Zed `Breadcrumb`：条目之间夹一枚 `ChevronRight` 分隔，间距 4px
+        let muted = to_hsla(self.pal().subtle_foreground);
+        let with_seps = items.into_iter().enumerate().flat_map(|(ix, item)| {
+            let sep = (ix > 0).then(|| {
+                Icon::new(ZedIcon::ChevronRight)
+                    .with_size(px(12.))
+                    .text_color(muted)
+                    .into_any_element()
+            });
+            sep.into_iter().chain(std::iter::once(item.into_any_element()))
+        });
+        h_flex().gap(px(4.)).items_center().children(with_seps).into_any_element()
     }
 
     fn pane_icon(&self) -> art::Glyph {
@@ -33759,7 +33786,7 @@ fn ribbon_tile_left(target: usize, shown: impl Fn(usize) -> bool) -> f32 {
 /// 下中文一字 12px）+ 下拉箭头的间距 4 + 箭头 8。与渲染共用同一份公式，
 /// 「其它」下拉面板的对齐才不会飘。
 fn ribbon_tile_w(ix: usize) -> f32 {
-    let text = RIBBON[ix].1.chars().count() as f32 * 12.;
+    let text = RIBBON[ix].1.chars().count() as f32 * UI_TEXT_SIZE;
     12. + 15. + 4. + text + if RIBBON[ix].4 { 12. } else { 0. }
 }
 
@@ -34620,7 +34647,12 @@ impl DaroApp {
                             .with_size(px(15.))
                             .text_color(if active { accent } else { ink }),
                     )
-                    .child(div().text_xs().text_color(ink).child(*label))
+                    .child(
+                        div()
+                            .text_size(px(UI_TEXT_SIZE))
+                            .text_color(ink)
+                            .child(*label),
+                    )
                     .when(*caret, |s| {
                         s.child(
                             Icon::new(ZedIcon::ChevronDown)
@@ -35108,9 +35140,9 @@ impl DaroApp {
                             .appearance(false)
                             .bordered(false)
                             .cleanable(true)
-                            // 组件默认左右各留 10px、13px 字号，树里行距紧，各压一档
+                            // 缩小输入框内边距，给树顶工具按钮留空间。
                             .px(px(2.))
-                            .text_size(px(12.)),
+                            .text_size(px(UI_TEXT_SIZE)),
                     ),
                 )
             })
@@ -35136,6 +35168,9 @@ impl DaroApp {
                     .rounded(px(3.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new("筛选对象").build(window, cx)
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.tree_filter_open = !this.tree_filter_open;
                         cx.notify();
@@ -35160,6 +35195,10 @@ impl DaroApp {
                     .rounded(px(3.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new("只显示星标连接")
+                            .build(window, cx)
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.starred_only = !this.starred_only;
                         cx.notify();
@@ -35185,6 +35224,10 @@ impl DaroApp {
                     .rounded(px(3.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new("定位到当前页签的对象")
+                            .build(window, cx)
+                    })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.locate_active_conn(window, cx)
                     }))
@@ -35206,6 +35249,10 @@ impl DaroApp {
                     .rounded(px(3.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new("折叠全部")
+                            .build(window, cx)
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.collapse_tree(cx)))
                     // 参考界面树底的折叠按钮：上下双箭头
                     .child(art::icon(
@@ -35283,7 +35330,9 @@ impl DaroApp {
                             });
                         })
                         .child(
-                            Icon::new(ZedIcon::CursorIBeam)
+                            // 这行筛的是连接（只列有打开页签的连接），用全应用统一的
+                            // 「连接」字形（同 RibbonConn），不要用文本光标那种无信息的图。
+                            Icon::new(ZedIcon::Plug)
                                 .with_size(px(14.))
                                 .text_color(muted),
                         )
@@ -35415,7 +35464,7 @@ impl DaroApp {
             };
             let mut rows = vec![self.conn_row_elem(ix, base, caret_icon, Some(q), &head_ink, cx)];
             if expanded {
-                rows.extend(self.db_levels(ix, base + 12.5, Some(q), &body_ink, cx));
+                rows.extend(self.db_levels(ix, base + ui::INDENT_STEP, Some(q), &body_ink, cx));
             }
             return rows;
         }
@@ -35425,7 +35474,7 @@ impl DaroApp {
         }
         let mut parts: Vec<Vec<AnyElement>> = Vec::new();
         for dix in 0..catalog::databases(conn).len() {
-            let sub = self.filtered_db(ix, dix, base + 12.5, q, &body_ink, cx);
+            let sub = self.filtered_db(ix, dix, base + ui::INDENT_STEP, q, &body_ink, cx);
             if !sub.is_empty() {
                 parts.push(sub);
             }
@@ -35478,14 +35527,14 @@ impl DaroApp {
         if has_schema {
             for six in 0..catalog::schemas(conn, db).len() {
                 let sub =
-                    self.filtered_schema(ix, dix, six, &db_key, db_base + 12.5, q, ink, cx);
+                    self.filtered_schema(ix, dix, six, &db_key, db_base + ui::INDENT_STEP, q, ink, cx);
                 any |= !sub.is_empty();
                 parts.push(sub);
             }
         } else {
             for cix in 0..CATEGORIES.len() {
                 let (shown, rows) = self.filtered_cats(
-                    ix, dix, None, cix, &db_key, db_base + 12.5, q, ink, cx,
+                    ix, dix, None, cix, &db_key, db_base + ui::INDENT_STEP, q, ink, cx,
                 );
                 any |= shown;
                 parts.push(rows);
@@ -35549,7 +35598,7 @@ impl DaroApp {
                     dix,
                     Some(six),
                     &scoped,
-                    sch_base + 12.5,
+                    sch_base + ui::INDENT_STEP,
                     Some(q),
                     ink,
                     cx,
@@ -35561,7 +35610,7 @@ impl DaroApp {
         let mut any = false;
         for cix in 0..CATEGORIES.len() {
             let (shown, rows) =
-                self.filtered_cats(ix, dix, Some(six), cix, &scoped, sch_base + 12.5, q, ink, cx);
+                self.filtered_cats(ix, dix, Some(six), cix, &scoped, sch_base + ui::INDENT_STEP, q, ink, cx);
             any |= shown;
             parts.push(rows);
         }
@@ -35612,7 +35661,7 @@ impl DaroApp {
         let schema = catalog::schemas(conn, db).get(six_val).copied().unwrap_or("");
         let cat_key = node_key(parent_key, label);
         let objs = self.objects_of(conn, db, schema, cix);
-        let indent = cat_base + 12.5;
+        let indent = cat_base + ui::INDENT_STEP;
         // 分类名自己命中：整棵按普通态渲染
         if contains_ci(label, q) {
             let open = self.expanded.contains(&cat_key);
@@ -35646,7 +35695,7 @@ impl DaroApp {
                                 catalog::table_columns(conn, db, schema, obj).iter().enumerate()
                             {
                                 rows.push(self.col_row_elem(
-                                    ix, dix, six_val, cix, oix, colix, indent + 12.5, &col.name,
+                                    ix, dix, six_val, cix, oix, colix, indent + ui::INDENT_STEP, &col.name,
                                     Some(q), ink, cx,
                                 ));
                             }
@@ -35675,7 +35724,7 @@ impl DaroApp {
                             catalog::table_columns(conn, db, schema, obj).iter().enumerate()
                         {
                             r.push(self.col_row_elem(
-                                ix, dix, six_val, cix, oix, colix, indent + 12.5, &col.name,
+                                ix, dix, six_val, cix, oix, colix, indent + ui::INDENT_STEP, &col.name,
                                 Some(q), ink, cx,
                             ));
                         }
@@ -35708,15 +35757,15 @@ impl DaroApp {
                         cix,
                         oix,
                         0,
-                        indent + 12.5,
+                        indent + ui::INDENT_STEP,
                         true,
                         Some(q),
                         ink,
                         cx,
                     ));
-                    indent + 25.
+                    indent + ui::INDENT_STEP * 2.
                 } else {
-                    indent + 12.5
+                    indent + ui::INDENT_STEP
                 };
                 for colix in hits {
                     r.push(self.col_row_elem(
@@ -35752,7 +35801,7 @@ impl DaroApp {
     /// 参考界面实测的固定层级：连接 → 数据库 →（模式）→ 分类 → 对象。
     /// `base` 是连接行自己的缩进：组内连接比分组深一级（30），
     /// 未分组连接与分组同级（17.5）——参考界面里分组只是根下的一个文件夹节点，
-    /// 以下各层全部相对 `base` 递进 12.5。
+    /// 以下各层全部相对 `base` 递进 [`ui::INDENT_STEP`] 12。
     fn conn_rows(
         &self,
         ix: usize,
@@ -35776,7 +35825,7 @@ impl DaroApp {
         let body_ink = tint.map_or(*ink, |t| ink.tinted_rows(t));
         let mut rows = vec![self.conn_row_elem(ix, base, caret_icon, q, &head_ink, cx)];
         if expanded {
-            rows.extend(self.db_levels(ix, base + 12.5, q, &body_ink, cx));
+            rows.extend(self.db_levels(ix, base + ui::INDENT_STEP, q, &body_ink, cx));
         }
         rows
     }
@@ -35840,8 +35889,7 @@ impl DaroApp {
             let db_key = node_key(&name, db);
             // 库要先「打开」才有对象：没打开的库不画三角、不渲染子树（issue #19）。
             // 「打开」和「展开」是两件事：visited_dbs 是开/关，expanded 是折叠。
-            // 演示连接没有真实库要加载，点开就能看，不受这道门约束。
-            let opened = !backend::is_real_conn(conn) || self.visited_dbs.contains(&db_key);
+            let opened = self.db_is_opened(conn, db);
             let db_open = opened && self.expanded.contains(&db_key);
             rows.push(self.db_row_elem(
                 ix,
@@ -35861,7 +35909,7 @@ impl DaroApp {
     }
 
     /// 一条库下的（模式 →）分类 → 对象 → 字段各行（普通态）。
-    /// `db_base` 是库行缩进：模式行在其下 12.5，分类行再进 12.5。
+    /// `db_base` 是库行缩进：模式行在其下 12，分类行再进 12（Zed `indent_step`）。
     #[allow(clippy::too_many_arguments)]
     fn db_children(
         &self,
@@ -35887,7 +35935,7 @@ impl DaroApp {
                     ix,
                     dix,
                     six,
-                    db_base + 12.5,
+                    db_base + ui::INDENT_STEP,
                     Some(caret(schema_open)),
                     schema,
                     q,
@@ -35902,7 +35950,7 @@ impl DaroApp {
                     dix,
                     Some(six),
                     &scoped,
-                    db_base + 25.,
+                    db_base + ui::INDENT_STEP * 2.,
                     q,
                     ink,
                     cx,
@@ -35910,7 +35958,7 @@ impl DaroApp {
             }
         } else {
             // 没有模式层的引擎用 NO_SCHEMA 占位，只走一轮，缩进不变
-            rows.extend(self.cat_levels(ix, dix, None, db_key, db_base + 12.5, q, ink, cx));
+            rows.extend(self.cat_levels(ix, dix, None, db_key, db_base + ui::INDENT_STEP, q, ink, cx));
         }
         rows
     }
@@ -35957,7 +36005,7 @@ impl DaroApp {
             if !cat_open {
                 continue;
             }
-            let indent = cat_base + 12.5;
+            let indent = cat_base + ui::INDENT_STEP;
             for (oix, obj) in objs.iter().enumerate() {
                 // 表 / 视图自己也能展开：表下面是八个分组，其它对象直接挂字段
                 let obj_key = node_key(&cat_key, obj);
@@ -35981,7 +36029,7 @@ impl DaroApp {
                         catalog::table_columns(conn, db, schema, obj).iter().enumerate()
                     {
                         rows.push(self.col_row_elem(
-                            ix, dix, six_val, cix, oix, colix, indent + 12.5, &col.name, q, ink,
+                            ix, dix, six_val, cix, oix, colix, indent + ui::INDENT_STEP, &col.name, q, ink,
                             cx,
                         ));
                     }
@@ -36001,6 +36049,24 @@ impl DaroApp {
         self.loading.contains(&catalog::schemas_key(&conn.name, db))
     }
 
+    /// 库有没有处在「已打开」态。演示连接没有真实库要加载，点开就能看，
+    /// 不受这道门约束（issue #19）。子树渲染和行配色共用这一个口径，
+    /// 免得演示库展开了却画成未打开的灰样。
+    fn db_is_opened(&self, conn: &Connection, db: &str) -> bool {
+        !backend::is_real_conn(conn) || self.visited_dbs.contains(&node_key(&conn.name, db))
+    }
+
+    /// #27：已打开的库整行（图标 + 文字）走主题主色，没打开的走弱化色。
+    /// 只拿正文色 / 弱化色两档灰度区分，在浅色主题里根本看不出「打开过没」，
+    /// 主色才够辨识度；跟所选主题走，换主题不用改代码。
+    fn db_row_tone(&self, conn: &Connection, db: &str, ink: &TreeInk) -> Hsla {
+        if self.db_is_opened(conn, db) {
+            to_hsla(self.pal().accent)
+        } else {
+            ink.muted
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn db_row_elem(
         &self,
@@ -36014,30 +36080,22 @@ impl DaroApp {
     ) -> AnyElement {
         let conn = &self.conns[ix];
         let db = catalog::databases(conn).get(dix).copied().unwrap_or_default();
-        // 演示连接点开就能看，口径与 db_levels 一致：一律算已打开
-        let opened =
-            !backend::is_real_conn(conn) || self.visited_dbs.contains(&node_key(&conn.name, db));
-        // issue #27：已打开的库整行用主题主色（图标 + 名称），未打开保持弱化色，
-        // 一眼能分清哪些库挂在树上。跟着 accent 走，换主题不改代码就跟着变。
-        let db_open_ink = to_hsla(self.pal().accent);
+        // issue #27：已打开的库整行（图标 + 名称）走主题主色，没打开的走弱化色。
+        // 判据和子树渲染共用 db_is_opened，信息卡大图标也按同一口径着色。
+        let tone = self.db_row_tone(conn, db, ink);
         let icon = if self.db_is_loading(conn, db) {
             loading_spinner()
         } else {
-            art::icon(art::Glyph::Db, 16., if opened { db_open_ink } else { ink.muted })
+            // 库节点走 Zed 线稿，和表 / 视图等对象同一套字形；打开态只换色不换形。
+            art::icon(art::Glyph::Db, 16., tone)
         };
+        // 文字跟着图标走，整行一个调（#27）
+        let ink = TreeInk { fg: tone, ..*ink };
         // Redis 的库是命名空间，底下没有子节点，不留折叠三角
         let caret_icon = if conn.kind == DbKind::Redis {
             None
         } else {
             caret_icon
-        };
-        let row_ink = if opened {
-            TreeInk {
-                fg: db_open_ink,
-                ..*ink
-            }
-        } else {
-            *ink
         };
         tree_row(
             rid(&format!("db/{ix}/{dix}")),
@@ -36048,7 +36106,7 @@ impl DaroApp {
             Act::Db(ix, dix),
             None,
             q,
-            &row_ink,
+            &ink,
             cx,
         )
         .test_support()
@@ -36197,7 +36255,7 @@ impl DaroApp {
                 cix,
                 oix,
                 gix,
-                indent + 12.5,
+                indent + ui::INDENT_STEP,
                 open,
                 q,
                 ink,
@@ -36216,7 +36274,7 @@ impl DaroApp {
                         cix,
                         oix,
                         colix,
-                        indent + 25.,
+                        indent + ui::INDENT_STEP * 2.,
                         &col.name,
                         q,
                         ink,
@@ -36235,7 +36293,7 @@ impl DaroApp {
                         oix,
                         gix,
                         iix,
-                        indent + 25.,
+                        indent + ui::INDENT_STEP * 2.,
                         name,
                         q,
                         ink,
@@ -37242,6 +37300,9 @@ impl DaroApp {
             let measured = t.scroll.bounds().size.width.as_f32();
             if measured > 0. { measured } else { self.viewport_w }
         };
+        // 列总宽超出视口才画横向滚动条；据此决定是否给网格底部留一条轨道，
+        // 不留就会让滚动条盖住最后一行（窄表不需要留，避免底部平白空一条）。
+        let has_h_scroll = total_w > view_w;
         let (first_col, last_col, col_pad_l, col_pad_r) = visible_col_window(
             t.scroll.offset().x.as_f32().abs(),
             view_w,
@@ -37547,7 +37608,7 @@ impl DaroApp {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(12.))
+                                    .text_size(px(UI_TEXT_SIZE))
                                     .font_semibold()
                                     .text_color(fg)
                                     .child(col.name.clone()),
@@ -37956,7 +38017,7 @@ impl DaroApp {
                                                     .bordered(false)
                                                     // 右键交给外层应用菜单，原生菜单不弹
                                                     .context_menu(|menu, _, _| menu)
-                                                    .text_size(px(12.)),
+                                                    .text_size(px(UI_TEXT_SIZE)),
                                             ),
                                     )
                             })
@@ -37970,7 +38031,7 @@ impl DaroApp {
                                             .min_w_0()
                                             .max_w_full()
                                             .truncate()
-                                            .text_size(px(12.))
+                                            .text_size(px(UI_TEXT_SIZE))
                                             .text_color(if in_sel || current {
                                                 to_hsla(0xffffff)
                                             } else if na {
@@ -38339,15 +38400,10 @@ impl DaroApp {
 
             // 数据视图切换（参考界面数据页右下角两枚）：网格视图恒选中；
             // 表单视图在 Lite 是企业版功能，入口保留、点击弹「敬请期待」。
-            let (grid_glyph, form_glyph) = if self.dark {
-                ("GLYPH_GRIDVIEW_DARK", "GLYPH_FORMVIEW_DARK")
-            } else {
-                ("GLYPH_GRIDVIEW", "GLYPH_FORMVIEW")
-            };
             // 明暗两套都用主题 accent：亮色原来的淡蓝只对 One Light 成立，
             // 换成 Ayu / Gruvbox 后要跟着主题走。
             let active_border = to_hsla(p.accent);
-            let view_btn = |id: &'static str, glyph: &'static str, active: bool| {
+            let view_btn = |id: &'static str, icon: ZedIcon, active: bool| {
                 h_flex()
                     .id(rid(&format!("nav/{id}")))
                     .w(px(24.))
@@ -38364,7 +38420,11 @@ impl DaroApp {
                     })
                     .when(active, move |s| s.bg(to_hsla(p.selection)))
                     .when(!active, move |s| s.cursor_pointer().hover(move |s| s.bg(hover)))
-                    .child(art::icon(art::Glyph::Asset(glyph), 14., subtle))
+                    .child(art::icon(
+                        art::Glyph::Zed(icon.for_state(active)),
+                        14.,
+                        subtle,
+                    ))
                     .test_support()
             };
 
@@ -38440,8 +38500,8 @@ impl DaroApp {
                 .child(div().w(px(1.)).h(px(14.)).mx(px(4.)).bg(border))
                 .child(ghost("find", art::Glyph::Asset("BTN_SEARCH")))
                 .child(div().w(px(1.)).h(px(14.)).mx(px(4.)).bg(border))
-                .child(view_btn("grid", grid_glyph, true))
-                .child(view_btn("form", form_glyph, false).on_click(cx.listener(
+                .child(view_btn("grid", ZedIcon::GridView, true))
+                .child(view_btn("form", ZedIcon::FormView, false).on_click(cx.listener(
                     |this, _, _, cx| ent_coming_soon(this.dark, cx),
                 )))
         };
@@ -38558,11 +38618,23 @@ impl DaroApp {
                         cx.listener(|this, _, _, cx| this.grid_header_release(cx)),
                     )
                     .child(
+                        // 不滚动的中间层：竖向滚动条覆盖层挂这里（挂 overflow_scroll
+                        // 的 inner 上会把滚动条当内容一起滚走）。用绝对定位 + 底部内缩
+                        // 拿到确定高度（有横向滚动条时给底部轨道让出 T_HBAR_H），inner
+                        // 撑满它，两者等高，竖向滚动条判溢出才准。
                         div()
-                            .id("table-grid-inner")
-                            .size_full()
-                            .overflow_scroll()
-                            .track_scroll(&t.scroll)
+                            .id("table-grid-scroll")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom(if has_h_scroll { px(T_HBAR_H) } else { px(0.) })
+                            .child(
+                                div()
+                                    .id("table-grid-inner")
+                                    .size_full()
+                                    .overflow_scroll()
+                                    .track_scroll(&t.scroll)
                             // 滚轮不再滚视图，改成一格一行地移动激活格；
                             // 当前格要出视口时才由回调带走视图。
                             .when_some(tab_ix, move |d, ix| {
@@ -38612,9 +38684,27 @@ impl DaroApp {
                             .test_support()
                             .context_menu(grid_context_menu(cx.entity().clone(), self.dark))
                             .child(grid),
+                        )
+                        // 竖向滚动条覆盖层挂在不滚动的中间层 grid-scroll 上：它与
+                        // inner 等高，判溢出用 inner 的高度，不会因底部让出横向轨道
+                        // 而误判成「不溢出」把竖向滚动条藏起来；也不能挂 inner 上，
+                        // 否则覆盖层会作为滚动内容一起被滚走。
+                        .vertical_scrollbar(&t.scroll),
                     )
-                    .vertical_scrollbar(&t.scroll)
-                    .horizontal_scrollbar(&t.scroll)
+                    // 横向滚动条单独占底部一条轨道：绝对贴在 wrap 底边，落在
+                    // grid-scroll 让出的 T_HBAR_H 里，不再压住最后一行数据。
+                    .when(has_h_scroll, |s| {
+                        s.child(
+                            div()
+                                .id("table-grid-hbar")
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .h(px(T_HBAR_H))
+                                .horizontal_scrollbar(&t.scroll),
+                        )
+                    })
                     .when_some(load_card, |s, card| s.child(card)),
             )
             .when(self.cell_viewer.open, |s| {
@@ -41999,7 +42089,7 @@ impl DaroApp {
                     .child(art::icon(art::Glyph::PlayOutline, 16., muted))
                     .child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(px(UI_TEXT_SIZE))
                             .text_color(fg)
                             .child(if has_selection {
                                 "运行已选择的"
@@ -42052,7 +42142,7 @@ impl DaroApp {
             .child(art::icon(art::Glyph::StopOutline, 16., muted))
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(px(UI_TEXT_SIZE))
                     .text_color(if running { fg } else { to_hsla(p.subtle_foreground) })
                     .child(if stopping { "停止中…" } else { "停止" }),
             )
@@ -42087,7 +42177,7 @@ impl DaroApp {
             .child(art::icon(art::Glyph::ExplainPlan, 16., muted))
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(px(UI_TEXT_SIZE))
                     .text_color(fg)
                     .child(if has_selection {
                         "解释已选择的"
@@ -43087,7 +43177,6 @@ impl DaroApp {
                 .child(
                     div()
                         .text_size(px(12.))
-                        .when(active, |s| s.font_medium())
                         .text_color(if active { fg } else { muted })
                         .child(label),
                 )
@@ -43981,7 +44070,7 @@ impl DaroApp {
             .id("object-action-bar")
             .role(Role::Toolbar)
             .aria_label("对象工具栏")
-            .h(px(30.))
+            .h(px(ui::TOOLBAR_H))
             .px(px(6.))
             .gap(px(1.))
             .items_center()
@@ -45077,23 +45166,38 @@ impl DaroApp {
                 .unwrap_or(Card::None),
             _ => Card::Conn,
         };
-        let (title, kind, tile_icon) = match &card {
+        let (title, kind, tile) = match &card {
             Card::None => ("", String::new(), None),
-            // 信息卡大图标跟参考界面一致，用功能区那套 FB_*（原生 64px），
-            // 按对象分类取图；之前一律贴 32px 的 OV_Table 放大，才发虚。
+            // 信息卡大图标和左侧树用同一套字形（线稿 + 主题色），不再摆旧的
+            // Navicat 位图档；只有连接卡保留引擎品牌标，树上那也是彩色的。
             Card::Obj(name) => (
                 *name,
                 self.pane_label().to_string(),
-                Some(match self.display_cat() {
-                    0 => art::Glyph::HeroTable,
-                    1 => art::Glyph::HeroView,
-                    2 => art::Glyph::HeroMatView,
-                    3 => art::Glyph::HeroFunction,
-                    _ => art::Glyph::HeroQuery,
-                }),
+                Some((
+                    match self.display_cat() {
+                        0 => art::Glyph::Table,
+                        1 => art::Glyph::View,
+                        2 => art::Glyph::MatView,
+                        3 => art::Glyph::Function,
+                        _ => art::Glyph::Query,
+                    },
+                    muted,
+                )),
             ),
-            Card::Db(name) => (*name, "数据库".to_string(), Some(art::Glyph::HeroDb)),
-            Card::Schema(name) => (*name, "模式".to_string(), Some(art::Glyph::HeroSchema)),
+            // 库卡和树上库行一个口径：开着的走主色，没开的走弱化色（#27）
+            Card::Db(name) => (
+                *name,
+                "数据库".to_string(),
+                Some((
+                    art::Glyph::Db,
+                    if self.db_is_opened(conn, name) {
+                        accent
+                    } else {
+                        muted
+                    },
+                )),
+            ),
+            Card::Schema(name) => (*name, "模式".to_string(), Some((art::Glyph::Schema, muted))),
             Card::Conn => (
                 conn.name.as_str(),
                 if conn.kind == DbKind::PostgreSql {
@@ -45102,7 +45206,7 @@ impl DaroApp {
                     conn.kind.label()
                 }
                 .to_string(),
-                Some(art::Glyph::HeroEngine(conn.kind)),
+                Some((art::Glyph::Conn(conn.kind), muted)),
             ),
             // 参考参考界面：虚拟组的信息卡只有文件夹大图标、名称与对象数
             Card::Group(name) => (
@@ -45111,7 +45215,7 @@ impl DaroApp {
                     "虚拟组（{} 对象）",
                     self.conns.iter().filter(|c| c.group == *name).count()
                 ),
-                Some(art::Glyph::HeroFolder),
+                Some((art::Glyph::Folder, muted)),
             ),
         };
 
@@ -45261,10 +45365,11 @@ impl DaroApp {
                     h_flex()
                         .gap(px(14.))
                         .items_start()
-                        .child(match tile_icon {
-                            // 信息卡大图标与参考同档：64 逻辑像素（200% DPI 下正好对应 128px 素材档）
-                            Some(glyph) => art::art(glyph, 64.),
-                            None => art::art(art::Glyph::HeroDb, 64.),
+                        .child(match tile {
+                            // 信息卡大图标 64 逻辑像素（200% DPI 下正好对应 128px 素材档），
+                            // 字形与左侧树一致
+                            Some((glyph, tint)) => art::icon(glyph, 64., tint),
+                            None => art::icon(art::Glyph::Db, 64., muted),
                         })
                         .child(
                             v_flex()
@@ -45844,15 +45949,18 @@ impl DaroApp {
             .then(|| self.pane_note.clone())
             .flatten();
 
+        // Zed `StatusBar`：整条吃 `p(Base04)` 4、左右两群之间 `gap(Base08)` 8，
+        // 底色 status_bar_background，不画上边框；条目本身是 ghost 控件（悬停才
+        // 出底色），所以不再切 Navicat 那种 12px 定宽格子 + 通高竖线。
         h_flex()
             .id("status-bar")
-            .role(Role::Status)
+            .role(Role::Toolbar)
             .aria_label("状态栏")
             .h(px(STATUS_BAR_H))
             .items_center()
+            .px(px(STATUS_PAD_X))
+            .gap(px(STATUS_GAP))
             .bg(bg)
-            .border_t_1()
-            .border_color(border)
             .child(
                 div()
                     .id("status-left")
@@ -45861,29 +45969,27 @@ impl DaroApp {
                     // 与侧栏同宽的一格不跟着内容挤压，否则宽 SQL 会把它的
                     // 分隔线推到窗口最左边（issue #26）
                     .flex_shrink_0()
-                    .px(px(12.))
                     .child(match designer {
                         Some((ncols, _)) => div()
                             .truncate()
-                            .text_xs()
+                            .text_size(px(UI_TEXT_SIZE))
                             .text_color(fg)
                             .child(format!("字段数: {ncols}")),
                         // 数据页签的取数 SQL 不在这一格：参考界面此格留空，
                         // SQL 从主内容区那段开始（见下面的 has_sql 分支）
                         None if note.is_some() => div()
                             .truncate()
-                            .text_xs()
+                            .text_size(px(UI_TEXT_SIZE))
                             .text_color(fg)
                             .child(note.unwrap_or_default()),
                         None if has_sql => div(),
                         None => div()
                             .truncate()
-                            .text_xs()
+                            .text_size(px(UI_TEXT_SIZE))
                             .text_color(fg)
                             .child(status),
                     }),
             )
-            .child(div().w(px(1.)).h_full().bg(border))
             .when_some(designer.and_then(|(_, e)| e), |s, (label, n)| {
                 s.child(
                     h_flex()
@@ -45891,11 +45997,11 @@ impl DaroApp {
                         // 同 SQL 段口径：计数文案再长也不把右侧控件挤出窗口
                         .min_w_0()
                         .overflow_hidden()
-                        .px(px(12.))
                         .items_center()
+                        .gap(px(STATUS_INNER_GAP))
                         .child(
                             div()
-                                .text_xs()
+                                .text_size(px(UI_TEXT_SIZE))
                                 .text_color(fg)
                                 .child(format!("{label}: {n}")),
                         ),
@@ -45915,15 +46021,14 @@ impl DaroApp {
                         // 同 SQL 段口径：面包屑再长也不把右侧控件挤出窗口
                         .min_w_0()
                         .overflow_hidden()
-                        .px(px(12.))
-                        .gap(px(14.))
+                        .gap(px(STATUS_INNER_GAP))
                         .items_center()
                         .child(self.breadcrumb_items(fg)),
                 )
             })
-            .when(designer.is_none() && has_sql, {
-                let sql_text = sql.clone();
-                move |s| {
+            .when(designer.is_none() && has_sql, |s| {
+                let hover = to_hsla(p.hover);
+                let copy_sql = sql.clone();
                 s.child(
                     h_flex()
                         .flex_1()
@@ -45932,6 +46037,7 @@ impl DaroApp {
                         .min_w_0()
                         .overflow_hidden()
                         .items_center()
+                        .gap(px(STATUS_GAP))
                         .child(
                             div()
                                 .id("status-sql")
@@ -45939,47 +46045,48 @@ impl DaroApp {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .px(px(12.))
-                                .text_xs()
+                                .text_size(px(UI_TEXT_SIZE))
                                 .text_color(fg)
                                 .child(sql),
                         )
-                        // issue #26 反馈：SQL 大半被裁掉，光显示没有意义——补一个
-                        // 复制按钮，点一下拿完整取数语句（参考 Navicat 底栏同款）。
+                        // 取数 SQL 常被截断，抄一份到剪贴板才够用（状态栏同款 22px 命中位）
                         .child(
                             div()
                                 .id("status-sql-copy")
-                                .test_support()
-                                .flex_shrink_0()
+                                .flex_none()
+                                .size(px(22.))
                                 .flex()
                                 .items_center()
-                                .px(px(6.))
+                                .justify_center()
+                                .rounded(px(4.))
                                 .cursor_pointer()
-                                .tooltip(move |window, cx| {
-                                    gpui_kit::component::tooltip::Tooltip::new("复制 SQL")
+                                .hover(move |s| s.bg(hover))
+                                .tooltip(|window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new("复制取数 SQL")
                                         .build(window, cx)
                                 })
-                                .hover(|s| s.text_color(fg))
-                                .child(art::icon(art::Glyph::Zed(ZedIcon::Copy), 13., muted))
-                                .on_click(move |_, _, cx| {
+                                .test_support()
+                                .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        sql_text.clone(),
+                                        copy_sql.clone(),
                                     ));
-                                }),
+                                }))
+                                .child(art::icon(
+                                    art::Glyph::Zed(ZedIcon::Copy),
+                                    14.,
+                                    muted,
+                                )),
                         )
-                        .child(div().w(px(1.)).h_full().bg(border))
                         .child(
                             div()
                                 .id("status-rec")
                                 .test_support()
-                                .flex_shrink_0()
-                                .px(px(12.))
-                                .text_xs()
+                                .flex_none()
+                                .text_size(px(UI_TEXT_SIZE))
                                 .text_color(muted)
                                 .child(recinfo),
                         ),
                 )
-                }
             })
             .child(
                 h_flex()
@@ -45987,33 +46094,27 @@ impl DaroApp {
                     .flex_shrink_0()
                     .items_center()
                     .h_full()
-                    .pr(px(8.))
-                    .child(div().w(px(1.)).h(px(14.)).bg(border).mr(px(4.)))
+                    .gap(px(STATUS_INNER_GAP))
+                    .child(divider_v(border))
                     .child(
                         h_flex()
                             .items_center()
                             .h_full()
-                            .gap(px(2.))
+                            .gap(px(STATUS_INNER_GAP))
                             .child(status_toggle(
                                 "view-grid",
-                                art::Glyph::Asset(if self.dark {
-                                    "GLYPH_LISTVIEW_DARK"
-                                } else {
-                                    "GLYPH_LISTVIEW"
-                                }),
+                                ZedIcon::GridView,
                                 !self.list_view,
+                                "表格视图",
                                 p,
                                 cx,
                                 ViewAct::Grid,
                             ))
                             .child(status_toggle(
                                 "view-list",
-                                art::Glyph::Asset(if self.dark {
-                                    "GLYPH_DETAILVIEW_DARK"
-                                } else {
-                                    "GLYPH_DETAILVIEW"
-                                }),
+                                ZedIcon::ListView,
                                 self.list_view,
+                                "列表视图",
                                 p,
                                 cx,
                                 ViewAct::List,
@@ -46022,43 +46123,34 @@ impl DaroApp {
                             // 这里同样接通入口，点击弹「敬请期待」
                             .child(status_toggle(
                                 "view-detail",
-                                art::Glyph::Asset(if self.dark {
-                                    "GLYPH_GRIDVIEW_DARK"
-                                } else {
-                                    "GLYPH_GRIDVIEW"
-                                }),
+                                ZedIcon::DetailView,
                                 false,
+                                "详细信息视图（企业版）",
                                 p,
                                 cx,
                                 ViewAct::Detail,
                             )),
                     )
-                    .child(div().w(px(1.)).h(px(14.)).bg(border).mx(px(4.)))
+                    .child(divider_v(border))
                     .child(
                         h_flex()
                             .items_center()
                             .h_full()
-                            .gap(px(2.))
+                            .gap(px(STATUS_INNER_GAP))
                             .child(status_toggle(
                                 "view-tree",
-                                art::Glyph::Asset(if self.dark {
-                                    "GLYPH_LEFTPANEL_DARK"
-                                } else {
-                                    "GLYPH_LEFTPANEL"
-                                }),
+                                ZedIcon::LeftPanel,
                                 self.show_tree,
+                                "显示 / 隐藏对象树",
                                 p,
                                 cx,
                                 ViewAct::Tree,
                             ))
                             .child(status_toggle(
                                 "view-info",
-                                art::Glyph::Asset(if self.dark {
-                                    "GLYPH_RIGHTPANEL_DARK"
-                                } else {
-                                    "GLYPH_RIGHTPANEL"
-                                }),
+                                ZedIcon::RightPanel,
                                 self.show_info,
+                                "显示 / 隐藏信息窗格",
                                 p,
                                 cx,
                                 ViewAct::Info,
@@ -46070,9 +46162,8 @@ impl DaroApp {
                         div()
                             .id("status-version")
                             .test_support()
-                            .text_xs()
+                            .text_size(px(UI_TEXT_SIZE))
                             .text_color(muted)
-                            .pl(px(8.))
                             .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
                     ),
             )
@@ -46219,9 +46310,11 @@ fn tree_row(
     let caret_action = if caret_icon.is_some() { caret_action } else { None };
     h_flex()
         .id(row_id)
+        // Zed `ListItem`（project panel 档）：整行铺底不带 inset，行内 `px(Base06)` 6、
+        // 图标与标题 `gap_1` 4，每深一档缩进 [`ui::INDENT_STEP`] 12
         .h(px(ROW_H))
         .pl(px(indent))
-        .pr(px(8.))
+        .pr(px(ui::ROW_PAD_X))
         .gap(px(4.))
         .items_center()
         .cursor_pointer()
@@ -46322,13 +46415,15 @@ fn tree_row(
             }),
         )
         .child({
+            // Zed `Disclosure` = `IconButton` + `IconSize::Small` 14 的
+            // ChevronRight / ChevronDown，`Color::Muted`；方档位给到 16
             let cell = div()
-                .w(px(11.))
+                .w(px(16.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .when_some(caret_icon, |s, c| {
-                    s.child(art::icon(c, 10., muted))
+                    s.child(art::icon(c, ui::CONTROL_ICON, muted))
                 });
             match caret_action {
                 Some(a) => cell
@@ -46381,7 +46476,7 @@ fn tree_row(
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_xs()
+                    .text_size(px(UI_TEXT_SIZE))
                     .text_color(fg)
                     .child(highlighted_label(label, range, ink.hl))
                     .into_any_element(),
@@ -46391,7 +46486,7 @@ fn tree_row(
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_xs()
+                    .text_size(px(UI_TEXT_SIZE))
                     .text_color(fg)
                     .child(label.to_string())
                     .into_any_element(),
@@ -47311,6 +47406,7 @@ fn view_bar_menu(
     let me_theme = me.clone();
     let me_picker = me.clone();
     menu.submenu("显示", window, cx, move |sub, window, cx| {
+        let me_icons = me.clone();
         let (me_grid, me_list, me_theme, me_picker) = (
             me_grid.clone(),
             me_list.clone(),
@@ -47360,6 +47456,9 @@ fn view_bar_menu(
                 let dark = me_picker.read(cx).dark;
                 theme_dialog::open_theme_dialog(me_picker.clone(), dark, window, cx);
             }))
+            .submenu("图标主题", window, cx, move |sub, _, cx| {
+                icon_theme_submenu(sub, &me_icons, cx)
+            })
     })
 }
 
@@ -47578,8 +47677,7 @@ fn tools_bar_menu(
         .item(PopupMenuItem::new("选项...").action(Box::new(OpenOptions)))
 }
 
-/// 标题栏右上角「应用菜单」：只放真入口。目前是设置、主题、扩展与面板布局四组，
-/// 快捷键 / 图标主题等功能落地再往里加，不先挂灰行。
+/// 标题栏右上角「应用菜单」。
 fn app_menu(
     me: Entity<DaroApp>,
     show_tree: bool,
@@ -47589,6 +47687,7 @@ fn app_menu(
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let me_theme = me.clone();
+    let me_icons = me.clone();
     menu.item(PopupMenuItem::new("设置...").action(Box::new(OpenOptions)))
         // 右上角直接开主题清单，和「查看 ▸ 显示 ▸ 选择主题...」同一个窗
         .item(PopupMenuItem::new("主题...").on_click(move |_, window, cx| {
@@ -47596,10 +47695,31 @@ fn app_menu(
             theme_dialog::open_theme_dialog(me_theme.clone(), dark, window, cx);
         }))
         .item(PopupMenuItem::new("扩展...").action(Box::new(OpenExtensions)))
+        .submenu("图标主题", window, cx, move |sub, _, cx| {
+            icon_theme_submenu(sub, &me_icons, cx)
+        })
         .separator()
         .submenu("面板布局", window, cx, move |sub, _, _| {
             panel_layout_submenu(me.clone(), show_tree, show_info, sub)
         })
+}
+
+fn icon_theme_submenu(menu: PopupMenu, app: &Entity<DaroApp>, cx: &App) -> PopupMenu {
+    let selected = app.read(cx).icon_theme;
+    IconTheme::ALL.into_iter().fold(
+        menu.check_side(gpui_kit::component::Side::Right),
+        |menu, theme| {
+            let app = app.clone();
+            menu.item(
+                PopupMenuItem::new(theme.label())
+                    .icon(Icon::new(ZedIcon::Table).path(ZedIcon::Table.path_for(theme)))
+                    .checked(theme == selected)
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |app, cx| app.set_icon_theme(theme, cx));
+                    }),
+            )
+        },
+    )
 }
 
 /// 「面板布局 ▸」：两块常驻窗格的显隐与宽度复位，状态与「查看」菜单、
@@ -48201,8 +48321,7 @@ fn designer_context_menu(
     }
 }
 
-/// 菜单项。用 ElementItem 是为了占住原生菜单左侧的图标槽，让所有菜单文字
-/// 落在同一条竖线上。
+/// 菜单项。自绘行没有图标槽时由菜单按档位补位，文字和普通项对齐。
 fn mi(label: impl Into<SharedString>) -> PopupMenuItem {
     mi_with_id(label, None)
 }
@@ -48212,12 +48331,7 @@ fn mi(label: impl Into<SharedString>) -> PopupMenuItem {
 fn mi_with_id(label: impl Into<SharedString>, test_id: Option<ElementId>) -> PopupMenuItem {
     let label: SharedString = label.into();
     PopupMenuItem::element(move |_, _| {
-        let row = h_flex()
-            .items_center()
-            .gap(px(4.))
-            // 原生项文字从 24px 起，自绘行只有 4px 边距，补住空出来的图标槽。
-            .child(div().w(px(16.)))
-            .child(div().child(label.clone()));
+        let row = h_flex().items_center().gap(px(4.)).child(div().child(label.clone()));
         match test_id.clone() {
             Some(id) => row
                 .id(id)
@@ -49631,22 +49745,29 @@ fn breadcrumb(
     fg: Hsla,
 ) -> impl IntoElement {
     h_flex()
-        .gap(px(5.))
+        .gap(px(4.))
         .items_center()
         .child(art::icon(glyph.into(), 14., to_hsla(tint)))
-        .child(div().text_xs().text_color(fg).child(label.to_string()))
+        .child(
+            div()
+                .text_size(px(UI_TEXT_SIZE))
+                .text_color(fg)
+                .child(label.to_string()),
+        )
 }
 
 fn status_toggle(
     id: &'static str,
-    glyph: art::Glyph,
+    icon: ZedIcon,
     active: bool,
+    tip: &'static str,
     p: Palette,
     cx: &mut Context<DaroApp>,
     act: ViewAct,
 ) -> impl IntoElement {
-    let (hover, active_bg) = (to_hsla(p.hover), to_hsla(p.selection));
-    // Zed 状态栏按钮：无描边，选中只铺一层 selection 底
+    let hover = to_hsla(p.hover);
+    // Zed 状态栏按钮：选中不换底色，换成内部填充更实的同几何图，未选中才给 hover 反馈。
+    let shown = icon.for_state(active);
     h_flex()
         .id(id)
         .size(px(22.))
@@ -49654,8 +49775,10 @@ fn status_toggle(
         .justify_center()
         .rounded(px(4.))
         .cursor_pointer()
-        .when(active, move |s| s.bg(active_bg))
         .when(!active, move |s| s.hover(move |s| s.bg(hover)))
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx)
+        })
         .test_support()
         .on_click(cx.listener(move |this, _, _, cx| {
             match act {
@@ -49675,7 +49798,11 @@ fn status_toggle(
             this.save();
             cx.notify();
         }))
-        .child(art::icon(glyph, 14., to_hsla(p.subtle_foreground)))
+        .child(art::icon(
+            art::Glyph::Zed(shown),
+            14.,
+            to_hsla(if active { p.foreground } else { p.subtle_foreground }),
+        ))
 }
 
 // ── 设计器 headless 测试 ─────────────────────────────────────────────
@@ -56141,6 +56268,33 @@ mod designer_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 底栏那格 SQL 会按宽度截断，旁边那颗复制键要能把整条取数 SQL 原样抄走。
+    #[gpui_kit::test]
+    fn status_sql_copy_button_copies(cx: &mut TestAppContext) {
+        isolate_store("statussqlcopy");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            app.update(cx, |a, cx| {
+                a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx);
+            });
+            window.render_frame(cx);
+            assert!(
+                window.try_find("status-sql-copy").is_some(),
+                "数据页签底栏该有复制取数 SQL 的键"
+            );
+            let want = app.update(cx, |a, _| a.table_page_status(&a.active_table().unwrap()).0);
+            window.click("status-sql-copy", cx);
+            let got = cx
+                .read_from_clipboard()
+                .and_then(|i| i.text())
+                .unwrap_or_default();
+            assert!(!want.is_empty(), "前置：底栏应有取数 SQL");
+            assert_eq!(got, want, "复制的应是整条取数 SQL");
+        })
+        .unwrap();
+    }
+
     #[gpui_kit::test]
     fn f5_refresh_reverts_grid_via_key_binding(cx: &mut TestAppContext) {
         isolate_store("f5refresh");
@@ -58780,7 +58934,7 @@ mod designer_tests {
             window.hover(15usize, cx);
             window.render_frame(cx);
             window.render_frame(cx);
-            // 显示 ▸ 最后一行：切换主题(13) / 选择主题...(14)
+            // 显示 ▸ 选择主题...(14)
             window.within("submenu").click(14usize, cx);
             window.render_frame(cx);
         })
@@ -58894,13 +59048,8 @@ mod designer_tests {
                 window.try_find_by_label("面板布局").is_some(),
                 "应用菜单缺「面板布局」"
             );
-            // 还没落地的能力不挂灰行
-            for absent in ["快捷键...", "图标主题..."] {
-                assert!(
-                    window.try_find_by_label(absent).is_none(),
-                    "应用菜单不该先挂「{absent}」"
-                );
-            }
+            assert!(window.try_find_by_label("图标主题").is_some());
+            assert!(window.try_find_by_label("快捷键...").is_none());
             window.within("popup-menu").click(0usize, cx);
             window.render_frame(cx);
         })
@@ -58970,12 +59119,12 @@ mod designer_tests {
             a.left_w = 300.;
             a.right_w = 400.;
         });
-        // 面板布局（顶层第 5 行，0 基含分隔线）：导航窗格 / 信息窗格 / 分隔线 / 重置宽度
+        // 面板布局（菜单下标 5）：导航窗格 / 信息窗格 / 分隔线 / 重置宽度
         cx.update_window(handle, |_, window, cx| {
             window.click("app-menu", cx);
             window.render_frame(cx);
             window.render_frame(cx);
-            window.hover(4usize, cx);
+            window.hover(5usize, cx);
             window.render_frame(cx);
             window.render_frame(cx);
             for label in ["显示导航窗格", "显示信息窗格", "重置面板宽度"] {
@@ -58994,7 +59143,7 @@ mod designer_tests {
             window.click("app-menu", cx);
             window.render_frame(cx);
             window.render_frame(cx);
-            window.hover(4usize, cx);
+            window.hover(5usize, cx);
             window.render_frame(cx);
             window.render_frame(cx);
             window.within("submenu").click(1usize, cx);
@@ -59007,7 +59156,7 @@ mod designer_tests {
             window.click("app-menu", cx);
             window.render_frame(cx);
             window.render_frame(cx);
-            window.hover(4usize, cx);
+            window.hover(5usize, cx);
             window.render_frame(cx);
             window.render_frame(cx);
             window.within("submenu").click(3usize, cx);
@@ -59023,6 +59172,111 @@ mod designer_tests {
             saved.contains("\"show_tree\": false") && saved.contains("\"show_info\": false"),
             "两块窗格的显隐已落盘：{saved}"
         );
+    }
+
+    #[gpui_kit::test]
+    fn app_menu_switches_icon_theme_and_restores_saved_choice(cx: &mut TestAppContext) {
+        isolate_store("icon-theme");
+        let (handle, app) = open_app(cx);
+        assert_eq!(IconTheme::active(), IconTheme::Zed);
+        let original_colors = palette::active().name;
+        let original_icon = ZedIcon::Table.path();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("app-menu", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            window.hover(3usize, cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(window.within("submenu").try_find_by_label("Lucide").is_some());
+            // 默认那套字形挂 daro 的名，不叫 Zed。
+            assert!(window.within("submenu").try_find_by_label("daro（默认）").is_some());
+            window.within("submenu").click(1usize, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.read_with(cx, |app, _| assert_eq!(app.icon_theme, IconTheme::Lucide));
+        let lucide_icon = ZedIcon::Table.path();
+        assert_ne!(original_icon, lucide_icon);
+        assert!(zed_icons::AppAssets.load(lucide_icon.as_ref()).unwrap().is_some());
+        let saved = load_store().unwrap();
+        assert_eq!(saved.icon_theme, IconTheme::Lucide);
+        assert_eq!(saved.theme, original_colors);
+
+        let (_, reopened) = open_app(cx);
+        reopened.read_with(cx, |app, _| assert_eq!(app.icon_theme, IconTheme::Lucide));
+    }
+
+    /// Tabler 主题：菜单里可选、路径切到内置 assets/tabler，除标题栏窗口按钮外全部变体都有 SVG 可加载。
+    #[gpui_kit::test]
+    fn tabler_icon_theme_covers_every_variant(cx: &mut TestAppContext) {
+        isolate_store("icon-theme-tabler");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("app-menu", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            window.hover(3usize, cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(window.within("submenu").try_find_by_label("Tabler").is_some());
+            window.within("submenu").click(2usize, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+        app.read_with(cx, |app, _| assert_eq!(app.icon_theme, IconTheme::Tabler));
+        for ix in 0..ZedIcon::ALL.len() {
+            let variant = ZedIcon::ALL[ix];
+            let path = variant.path_for(IconTheme::Tabler);
+            if variant.is_window_control() {
+                // 窗口按钮不跟主题走，四种都该留在 Zed 线稿上。
+                assert_eq!(path, variant.asset_path(), "{variant:?} 不该被换图");
+                continue;
+            }
+            assert!(path.starts_with("icons/tabler/"), "{path} 应指向 Tabler 素材");
+            assert!(
+                zed_icons::AppAssets.load(path.as_ref()).unwrap().is_some(),
+                "Tabler 素材缺失：{path}"
+            );
+        }
+        let saved = load_store().unwrap();
+        assert_eq!(saved.icon_theme, IconTheme::Tabler);
+    }
+
+    /// 状态栏 / 工具条的视图与窗格开关按 Zed 口径表达选中态：换一张同几何、内部填充更实的图，
+    /// 而不是铺底色。这里钉住「六个开关都有配对图」+「配对图在三个主题下都取得到素材」+
+    /// 「Zed 主题下选中与未选中确实是两张不同的图」。
+    #[gpui_kit::test]
+    fn status_toggles_pair_an_active_icon(_cx: &mut TestAppContext) {
+        let bases = [
+            ZedIcon::GridView,
+            ZedIcon::ListView,
+            ZedIcon::DetailView,
+            ZedIcon::FormView,
+            ZedIcon::LeftPanel,
+            ZedIcon::RightPanel,
+        ];
+        for base in bases {
+            let active = base
+                .active_variant()
+                .unwrap_or_else(|| panic!("{} 缺选中态配对字形", base.file()));
+            assert_eq!(base.for_state(false), base);
+            assert_eq!(base.for_state(true), active);
+            assert_ne!(base.bytes(), active.bytes(), "{} 的选中态必须换图", base.file());
+            for theme in IconTheme::ALL {
+                for icon in [base, active] {
+                    let path = icon.path_for(theme);
+                    let bytes = zed_icons::AppAssets.load(path.as_ref()).unwrap();
+                    assert!(bytes.is_some(), "{theme:?} 缺素材：{path}");
+                }
+            }
+        }
+        // 非开关字形没有配对图，for_state 必须原样返回，别把别的图标也换了。
+        assert_eq!(ZedIcon::Copy.for_state(true), ZedIcon::Copy);
     }
 
     /// 扩展窗：内置驱动与未接入引擎都列出来，搜索 / 状态 / 分类三路过滤是真过滤；
@@ -61053,7 +61307,7 @@ mod tree_menu_tests {
                 let db = mock::databases(kind)[0];
                 a.open_db(0, 0, cx);
                 let key = node_key(&a.conns[0].name, db);
-                assert!(a.visited_dbs.contains(&key), "打开后图标转绿");
+                assert!(a.visited_dbs.contains(&key), "打开后库行转主色");
                 assert!(a.expanded.contains(&key));
                 // 在这个库里开一张表：关库时必须连带关掉
                 a.open_object(Act::Obj(0, 0, NO_SCHEMA, 0, 0), cx);
@@ -61061,8 +61315,51 @@ mod tree_menu_tests {
                 a.close_db(0, 0);
                 assert!(a.opened.is_empty(), "关库后该库下打开的页签一并关掉");
                 assert_eq!(a.active_tab, 0);
-                assert!(!a.visited_dbs.contains(&key), "关闭后图标回灰");
+                assert!(!a.visited_dbs.contains(&key), "关闭后库行回弱化色");
                 assert!(!a.expanded.contains(&key), "关闭后子树收起");
+            });
+        })
+        .unwrap();
+    }
+
+    /// #27 的辨识度：打开过的库整行（图标 + 文字）用主题主色，没打开的用弱化色。
+    /// 早先只靠正文色 / 弱化色两档灰度区分，浅色主题把灰阶拉近后树上就再也
+    /// 看不出哪个库开过——主色才撞不了色。
+    #[gpui_kit::test]
+    fn opened_db_row_tone_uses_accent(cx: &mut TestAppContext) {
+        isolate_store("dbtone");
+        let (handle, app) = open_app(cx);
+        cx.update_window(handle, |_, _, cx| {
+            app.update(cx, |a, _| {
+                // 演示连接没有「打开」这道门，改成真实连接才比得出两档
+                a.conns[0].kind = DbKind::PostgreSql;
+                a.conns[0].demo = false;
+                let ink = TreeInk {
+                    fg: to_hsla(0x010101),
+                    muted: to_hsla(0x020202),
+                    hover: to_hsla(0x030303),
+                    focus_bg: to_hsla(0x040404),
+                    hl: to_hsla(0x050505),
+                    row_bg: None,
+                    selected: Act::Root,
+                };
+                let db = "tone_db";
+                let key = node_key(&a.conns[0].name, db);
+                a.visited_dbs.remove(&key);
+                let shut = a.db_row_tone(&a.conns[0], db, &ink);
+                a.visited_dbs.insert(key);
+                let opened = a.db_row_tone(&a.conns[0], db, &ink);
+                assert_eq!(
+                    format!("{shut:?}"),
+                    format!("{:?}", ink.muted),
+                    "未打开的库用弱化色"
+                );
+                assert_eq!(
+                    format!("{opened:?}"),
+                    format!("{:?}", to_hsla(a.pal().accent)),
+                    "打开的库用主题主色"
+                );
+                assert_ne!(format!("{shut:?}"), format!("{opened:?}"), "两档不许撞色");
             });
         })
         .unwrap();

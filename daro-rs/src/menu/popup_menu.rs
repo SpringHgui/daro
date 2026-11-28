@@ -1,15 +1,18 @@
 use crate::menu::menu_colors;
 use crate::menu::menu_item::MenuItemElement;
+// 浮层几何取自 Zed `ui::ContextMenu` / `ListItem` 在 ui_font_size=16 下的取值，
+// 常量统一放在 `crate::ui`，和组合框下拉、悬停浮层共用同一档。
+use crate::ui::float_shadow;
 use gpui_kit::base::actions::{Cancel, Confirm, SelectDown, SelectLeft, SelectRight, SelectUp};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{
-    ActiveTheme, ElementExt, Icon, IconName, Side, Size, Sizable as _, h_flex, kbd::Kbd, v_flex,
+    ActiveTheme, ElementExt, Icon, Side, Size, Sizable as _, h_flex, kbd::Kbd, v_flex,
 };
 use gpui_kit::{
     Action, Anchor, AnyElement, App, AppContext, Bounds, BoxShadow, Context, DismissEvent, Edges,
     Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
     ParentElement, Pixels, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, WeakEntity, Window, anchored, deferred, div, hsla, prelude::FluentBuilder, px, rems,
+    Styled, WeakEntity, Window, anchored, deferred, div, prelude::FluentBuilder, px,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::{ClickEvent, MouseDownEvent, OwnedMenuItem, Point, Subscription};
@@ -23,14 +26,19 @@ const CONTEXT: &str = "PopupMenu";
 const SUBMENU_OVERLAP: Pixels = px(3.);
 const SUBMENU_TOP: Pixels = px(-2.);
 
-/// 原生菜单是一层薄软的投影，不靠窗体自带的大阴影。
+/// 图标列宽：`Icon::xsmall()` = size_3 = 12px，加行内 `gap_x_1` 4px。
+const ICON_SLOT: Pixels = px(16.);
+
+const CARD_RADIUS: Pixels = px(crate::ui::FLOAT_RADIUS);
+const CARD_MIN_WIDTH: Pixels = px(crate::ui::FLOAT_MIN_W);
+const ITEM_INSET: Pixels = px(crate::ui::ROW_INSET);
+const ITEM_RADIUS: Pixels = px(crate::ui::ROW_RADIUS);
+const ITEM_PAD_X: Pixels = px(crate::ui::ROW_PAD_X);
+const SEPARATOR_INSET_Y: Pixels = px(crate::ui::SEPARATOR_GAP);
+
+/// 卡片投影照抄 Zed `ElevationIndex::ElevatedSurface.shadow()`。
 fn menu_shadow(is_dark: bool) -> Vec<BoxShadow> {
-    let ink = if is_dark {
-        hsla(0., 0., 0., 0.5)
-    } else {
-        hsla(0., 0., 0., 0.16)
-    };
-    vec![BoxShadow::new(px(0.), px(2.), ink).blur_radius(px(5.))]
+    float_shadow(is_dark)
 }
 
 pub fn init(cx: &mut App) {
@@ -1199,7 +1207,7 @@ impl PopupMenu {
         let icon = if let Some(icon) = icon {
             icon.clone()
         } else if checked {
-            Icon::new(IconName::Check)
+            Icon::new(crate::zed_icons::ZedIcon::Check)
         } else {
             Icon::empty()
         };
@@ -1216,11 +1224,14 @@ impl PopupMenu {
     fn update_submenu_menu_anchor(&mut self, window: &Window) {
         let bounds = self.bounds;
         let max_width = self.max_width();
+        // 偏移以高亮行为原点，行左右各有 `ITEM_INSET` 留白，而 `bounds` 量的是
+        // 内容列：往右翻开要扣掉这 4px，往左翻开要补回来，才和原来压在父菜单
+        // 右缘内的贴边量一致。
         let (anchor, left) = if max_width + bounds.origin.x > window.bounds().size.width {
             // 左边翻开：以行的左上角为锚点镜像贴边
-            (Anchor::TopRight, SUBMENU_OVERLAP)
+            (Anchor::TopRight, SUBMENU_OVERLAP + ITEM_INSET)
         } else {
-            (Anchor::TopLeft, bounds.size.width - SUBMENU_OVERLAP)
+            (Anchor::TopLeft, bounds.size.width - SUBMENU_OVERLAP - ITEM_INSET)
         };
 
         let is_bottom_pos = bounds.origin.y + bounds.size.height > window.bounds().size.height;
@@ -1242,37 +1253,35 @@ impl PopupMenu {
         let has_left_icon = options.has_left_icon;
         let is_left_check = options.check_side.is_left() && item.is_checked();
         let right_check_icon = if options.check_side.is_right() && item.is_checked() {
-            Some(Icon::new(IconName::Check).xsmall())
+            Some(Icon::new(crate::zed_icons::ZedIcon::Check).xsmall())
         } else {
             None
         };
 
         let selected = self.selected_index == Some(ix);
-        // 原生菜单给左侧留一条图标槽：普通项文字从 24px 起，
-        // 自定义元素整行从 4px 起，靠自带的空槽对齐到同一条竖线。
-        const TEXT_INSET: Pixels = px(24.);
-        const EDGE_INSET: Pixels = px(4.);
-        const RIGHT_INSET: Pixels = px(6.);
-
         let is_submenu = matches!(item, PopupMenuItem::Submenu { .. });
 
         let item_height = match self.size {
             Size::Small => px(20.),
             _ => px(24.),
         };
-        let pad_left = if matches!(item, PopupMenuItem::ElementItem { .. }) {
-            EDGE_INSET
+        // Zed 没有固定的文字缩进，图标是行内元素；但自绘行（ElementItem）自己
+        // 带图标槽时不知道菜单里有没有图标列，这里按同一档补位，让它的文字和
+        // 普通项的文字落在同一条竖线上。
+        let icon_slot = if matches!(item, PopupMenuItem::ElementItem { .. }) && has_left_icon {
+            ICON_SLOT
         } else {
-            TEXT_INSET
+            px(0.)
         };
 
         let this = MenuItemElement::new(ix)
             .relative()
             .text_xs()
             .py_0()
-            .pl(pad_left)
-            .pr(RIGHT_INSET)
-            .rounded(px(0.))
+            .mx(ITEM_INSET)
+            .px(ITEM_PAD_X)
+            .pl(ITEM_PAD_X + icon_slot)
+            .rounded(ITEM_RADIUS)
             .items_center()
             .selected(selected)
             .on_hover(cx.listener(move |this, hovered, window, cx| {
@@ -1303,12 +1312,11 @@ impl PopupMenu {
 
         match item {
             PopupMenuItem::Separator => this
-                .h_auto()
+                .mx_0()
+                .my(SEPARATOR_INSET_Y)
                 .p_0()
-                .ml(TEXT_INSET)
-                .mr(px(2.))
-                .border_b(px(1.))
-                .border_color(menu_colors(cx.theme().is_dark()).separator)
+                .h(px(1.))
+                .bg(menu_colors(cx.theme().is_dark()).separator)
                 .disabled(true),
             PopupMenuItem::Label(label) => this.disabled(true).cursor_default().child(
                 h_flex()
@@ -1397,7 +1405,7 @@ impl PopupMenu {
                                     .gap_1p5()
                                     .child(label.clone())
                                     .child(
-                                        Icon::new(IconName::ExternalLink)
+                                        Icon::new(crate::zed_icons::ZedIcon::Link)
                                             .xsmall()
                                             .text_color(cx.theme().muted_foreground),
                                     ),
@@ -1415,12 +1423,12 @@ impl PopupMenu {
                 .selected(selected)
                 .disabled(*disabled)
                 // 子菜单的锚点落在整行盒子左边：行内边距会算进绝对定位子元素的
-                // 静态位置，留着 24px 文字缩进会把子菜单整体往右推 24px。
+                // 静态位置，留着文字缩进会把子菜单整体往右推同样的距离。
                 .pl(px(0.))
                 .items_start()
                 .child(
                     h_flex()
-                        .pl(TEXT_INSET)
+                        .pl(ITEM_PAD_X)
                         .min_h(item_height)
                         .size_full()
                         .items_center()
@@ -1440,7 +1448,7 @@ impl PopupMenu {
                                 .justify_between()
                                 .child(label.clone())
                                 .child(
-                                    Icon::new(IconName::ChevronRight)
+                                    Icon::new(crate::zed_icons::ZedIcon::ChevronRight)
                                         .xsmall()
                                         .text_color(cx.theme().muted_foreground),
                                 ),
@@ -1546,7 +1554,7 @@ impl Render for PopupMenu {
             .text_color(colors.text)
             .border(px(1.))
             .border_color(colors.border)
-            .rounded(px(6.))
+            .rounded(CARD_RADIUS)
             .shadow(menu_shadow(cx.theme().is_dark()))
             .relative()
             .occlude()
@@ -1554,7 +1562,7 @@ impl Render for PopupMenu {
                 v_flex()
                     .id("items")
                     .p_0()
-                    .min_w(rems(8.))
+                    .min_w(CARD_MIN_WIDTH)
                     .when_some(self.min_width, |this, min_width| this.min_w(min_width))
                     .max_w(max_width)
                     .when(self.scrollable, |this| {

@@ -31,8 +31,8 @@ const WIN_W: f32 = 402.;
 const WIN_H: f32 = 187.;
 /// 展开态高度（截图 636 的一半，含连接 / 目录 / 模式三行）
 const WIN_H_OPEN: f32 = 321.;
-/// 自绘标题栏高
-const BAR_H: f32 = 32.;
+/// 标题栏高：与其它对话框同档（gpui-component `TITLE_BAR_HEIGHT`）
+const BAR_H: f32 = ui::TITLE_H;
 /// 正文左右留白
 const MARGIN_X: f32 = 18.;
 /// 标题栏 → 第一个标签
@@ -193,7 +193,9 @@ fn combo_colors(dark: bool) -> combo::Colors {
         focus: to_hsla(p.field_focus),
         selected: to_hsla(p.selection),
         hover: to_hsla(p.hover),
+        active: to_hsla(p.selection_focus),
         highlight: to_hsla(p.accent).opacity(0.35),
+        is_dark: dark,
     }
 }
 
@@ -443,8 +445,6 @@ struct SaveAsDialog {
     popup_entity: Option<Entity<ComboPopup>>,
     /// 本对话框自己的窗口句柄：浮层关闭后把焦点还回来
     win: AnyWindowHandle,
-    /// 标题栏按下后要先让窗口自己接管拖动，直接 start_window_move 会吃掉 × 的点击
-    dragging: bool,
     on_ok: OnOk,
     /// Enter 与按钮可能同时到达，提交只认第一次
     submitted: bool,
@@ -577,7 +577,6 @@ impl SaveAsDialog {
             popup: None,
             popup_entity: None,
             win: window_handle,
-            dragging: false,
             on_ok,
             submitted: false,
         };
@@ -1021,63 +1020,9 @@ impl SaveAsDialog {
         cx.notify();
     }
 
-    /// 自绘标题栏：左标题、右 ×，标题区交给系统当拖动区。
-    fn title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let s = self.skin();
-        h_flex()
-            .id("saveas-bar")
-            .test_support()
-            .h(px(BAR_H))
-            .flex_none()
-            .w_full()
-            .items_center()
-            .bg(to_hsla(s.bar))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.dragging = true),
-            )
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
-            .on_mouse_move(cx.listener(|this, _, window, _| {
-                if this.dragging {
-                    this.dragging = false;
-                    window.start_window_move();
-                }
-            }))
-            .child(
-                h_flex()
-                    .h_full()
-                    .flex_1()
-                    .items_center()
-                    .pl(px(9.))
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(
-                        div()
-                            .text_xs()
-                            .line_height(px(LABEL_H))
-                            .text_color(to_hsla(s.text))
-                            .child(self.title),
-                    ),
-            )
-            .child(
-                div()
-                    .id("saveas-close")
-                    .test_support()
-                    .w(px(30.))
-                    .h(px(BAR_H))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(to_hsla(s.hover)))
-                    .occlude()
-                    .on_click(|_, window, _| window.remove_window())
-                    .child(
-                        Icon::new(ZedIcon::Close)
-                            .with_size(px(12.))
-                            .text_color(to_hsla(s.text)),
-                    ),
-            )
+    /// 标题栏：与其它对话框同一个件（左标题、右 34×34 关闭键、整条是拖动带）。
+    fn title_bar(&self) -> AnyElement {
+        ui::dialog_title(self.title, None, self.dark)
     }
 
     /// 字段标签：12px，行盒在控件上方。
@@ -1406,7 +1351,7 @@ impl Render for SaveAsDialog {
                     cx.stop_propagation();
                 }
             }))
-            .child(self.title_bar(cx))
+            .child(self.title_bar())
             .child(
                 v_flex()
                     .flex_1()
@@ -1546,12 +1491,20 @@ mod tests {
                 "按钮成对水平居中"
             );
 
-            let close = window.find("saveas-close").bounds();
+            let close = window.find("title-bar-close").bounds();
             assert!(
                 near(close.origin.x + close.size.width, (root.origin.x + root.size.width).as_f32()),
                 "关闭按钮贴右"
             );
             assert!(near(close.origin.y, root.origin.y.as_f32()), "关闭按钮在标题栏内");
+            assert!(
+                near(close.size.width, BAR_H) && near(close.size.height, BAR_H),
+                "关闭键 34×34 正方（gpui-component TITLE_BAR_HEIGHT）"
+            );
+            assert!(
+                window.try_find("minimize").is_none() && window.try_find("maximize").is_none(),
+                "对话框标题栏不画最小化 / 最大化"
+            );
 
             let field = window.find("saveas-name-field").bounds();
             let frame = window.find("saveas-name-input").bounds();

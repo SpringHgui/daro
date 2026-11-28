@@ -117,18 +117,7 @@ impl ColumnDialog {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new()
-            .h(px(crate::ui::TITLE_H))
-            .border_b_0()
-            .child(
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap(px(6.))
-                    .pl(px(4.))
-                    .child(div().text_xs().text_color(to_hsla(p.foreground)).child("列")),
-            )
+        crate::ui::dialog_title("列", None, self.dark)
     }
 }
 

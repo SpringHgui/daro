@@ -18,7 +18,7 @@ use crate::backend;
 use crate::palette::Palette;
 use crate::{split_sql_statements, to_hsla, DaroApp};
 
-use crate::ui::{self, TITLE_H};
+use crate::ui;
 
 /// 运行目标：连接名 / 库 / 模式（无模式层引擎模式为空串）。
 pub struct RunSqlTarget {
@@ -397,20 +397,7 @@ impl Render for RunSqlDialog {
 
 impl RunSqlDialog {
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child("运行 SQL 文件"),
-                ),
-        )
+        crate::ui::dialog_title("运行 SQL 文件", None, self.dark)
     }
 
     fn pal(&self) -> Palette {

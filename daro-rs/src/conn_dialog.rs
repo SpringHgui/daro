@@ -16,8 +16,8 @@ use crate::ui;
 use crate::mock::{Connection, DbKind};
 use crate::palette::Palette;
 use crate::to_hsla;
+use crate::zed_icons::ZedIcon;
 
-const TITLE_H: f32 = 24.;
 const LEFT_W: f32 = 180.;
 const TILE_W: f32 = 96.;
 const TILE_H: f32 = 92.;
@@ -95,7 +95,7 @@ pub fn open_connection_dialog(
     let title = if editing { "编辑连接" } else { "新建连接" };
     let mut options = ui::dialog_options();
     // 自绘栏只有 24 高，红绿灯要跟着对齐（issue #25）
-    ui::align_traffic_lights(&mut options, TITLE_H);
+    ui::align_traffic_lights(&mut options, ui::TITLE_H);
     // 参考图内容区 900×700，另加 24 的自绘标题栏
     options.window_min_size = Some(size(px(900.), px(724.)));
     options.window_bounds = Some(WindowBounds::centered(size(px(900.), px(724.)), cx));
@@ -506,20 +506,7 @@ impl NewConnectionDialog {
     fn title_bar(&self) -> impl IntoElement {
         let p = self.pal();
         let title = self.title_text();
-        TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(crate::art::icon(crate::art::Glyph::Db, 14., to_hsla(p.accent)))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child(title),
-                ),
-        )
+        crate::ui::dialog_title(title, Some(crate::art::icon(crate::art::Glyph::Db, 14., to_hsla(p.accent))), self.dark)
     }
 
     fn choose(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -678,11 +665,14 @@ impl NewConnectionDialog {
         let me2 = me.clone();
         h_flex()
             .id(("type-row", ix))
-            .h(px(30.))
-            .px(px(8.))
-            .gap(px(10.))
+            // Zed `ListItem`（Dense + inset）：行 22 高、盒外留白 4、盒内 6、
+            // 圆角 4，hover / selected 两档底色
+            .h(px(22.))
+            .mx(px(ui::ROW_INSET))
+            .px(px(ui::ROW_PAD_X))
+            .gap(px(ui::CONTROL_GAP))
             .items_center()
-            .rounded(px(3.))
+            .rounded(px(ui::ROW_RADIUS))
             .when(selected, |s| s.bg(to_hsla(p.selection)))
             .when(!selected && enabled, {
                 let hover = to_hsla(p.hover);
@@ -702,10 +692,10 @@ impl NewConnectionDialog {
                     this.goto_form(window, cx);
                 });
             })
-            .child(db_icons::vector_tile(tile.icon, 18.))
+            .child(db_icons::vector_tile(tile.icon, 16.))
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(ui::UI_TEXT_SIZE))
                     .text_color(to_hsla(p.foreground))
                     .child(tile.name),
             )
@@ -765,12 +755,7 @@ impl NewConnectionDialog {
             to_hsla(p.border_soft),
             to_hsla(p.hover),
         );
-        let (grid_glyph, list_glyph) = if self.dark {
-            ("GLYPH_GRIDVIEW_DARK", "GLYPH_LISTVIEW_DARK")
-        } else {
-            ("GLYPH_GRIDVIEW", "GLYPH_LISTVIEW")
-        };
-        let toggle = |id: &'static str, glyph: &'static str, active: bool, list: bool| {
+        let toggle = |id: &'static str, icon: ZedIcon, active: bool, list: bool| {
             let me = me.clone();
             div()
                 .id(id)
@@ -780,7 +765,7 @@ impl NewConnectionDialog {
                 .justify_center()
                 .rounded(px(ui::RADIUS))
                 .cursor_pointer()
-                .when(active, |s| s.bg(to_hsla(p.selection)))
+                // 选中态用「内部填充更实」那张图表达，不铺底色（Zed 状态栏口径）。
                 .when(!active, move |s| s.hover(move |s| s.bg(hover)))
                 .on_click(move |_, _, cx| {
                     me.update(cx, |this, cx| {
@@ -788,7 +773,11 @@ impl NewConnectionDialog {
                         cx.notify();
                     });
                 })
-                .child(art::icon(art::Glyph::Asset(glyph), 13., muted))
+                .child(art::icon(
+                    art::Glyph::Zed(icon.for_state(active)),
+                    13.,
+                    if active { to_hsla(p.foreground) } else { muted },
+                ))
         };
 
         h_flex()
@@ -805,8 +794,8 @@ impl NewConnectionDialog {
                     .child("选择一个连接类型:"),
             )
             .child(div().flex_1())
-            .child(toggle("view-grid", grid_glyph, !self.list_mode, false))
-            .child(toggle("view-list", list_glyph, self.list_mode, true))
+            .child(toggle("view-grid", ZedIcon::GridView, !self.list_mode, false))
+            .child(toggle("view-list", ZedIcon::ListView, self.list_mode, true))
             .child(
                 div()
                     .w(px(210.))
@@ -1247,7 +1236,7 @@ impl Render for NewConnectionDialog {
         // 建窗时设过的红绿灯位置会被 AppKit 首次上屏的重排顶回去，激活后补设一次。
         if !self.tl_aligned && window.is_window_active() {
             self.tl_aligned = true;
-            crate::ui::reapply_traffic_lights(window, TITLE_H);
+            crate::ui::reapply_traffic_lights(window, ui::TITLE_H);
         }
         let p = self.pal();
         v_flex()

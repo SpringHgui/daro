@@ -9,7 +9,7 @@ use crate::DaroApp;
 use crate::palette::Palette;
 use crate::to_hsla;
 
-use crate::ui::{self, TITLE_H};
+use crate::ui;
 
 type Submit = Box<dyn Fn(&mut DaroApp, &mut Context<DaroApp>, String)>;
 type Confirm = Box<dyn Fn(&mut DaroApp)>;
@@ -187,20 +187,7 @@ impl TextPrompt {
     }
 
     fn title_bar(&self) -> impl IntoElement {
-        let p = self.pal();
-        TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child(self.title),
-                ),
-        )
+        crate::ui::dialog_title(self.title, None, self.dark)
     }
 }
 
@@ -357,18 +344,7 @@ impl Render for ConfirmPrompt {
                     cx.stop_propagation();
                 }
             }))
-            .child(TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .pl(px(4.))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(to_hsla(p.foreground))
-                            .child(self.title),
-                    ),
-            ))
+            .child(ui::dialog_title(self.title, None, self.dark))
             .child(
                 div()
                     .flex_1()
@@ -465,18 +441,7 @@ impl Render for Notice {
                     cx.stop_propagation();
                 }
             }))
-            .child(TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .pl(px(4.))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(to_hsla(p.foreground))
-                            .child(self.title),
-                    ),
-            ))
+            .child(ui::dialog_title(self.title, None, self.dark))
             .child(
                 div()
                     .flex_1()
@@ -493,5 +458,57 @@ impl Render for Notice {
                             .on_click(|_, window, _| window.remove_window()),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+    use crate::ui_test_support::{isolate_store, open_app};
+    use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::TestAppContext;
+
+    /// 提示窗是 420×170 的死尺寸：标题栏升到 34 之后，底栏那颗 28 高的「确定」
+    /// 仍要整颗落在窗口里，不能被下沿裁掉。
+    #[gpui_kit::test]
+    fn notice_footer_stays_inside_fixed_window(cx: &mut TestAppContext) {
+        isolate_store("notice-geo");
+        let (_handle, _app) = open_app(cx);
+        cx.update(|cx| open_notice(false, "提示", "正文一行".into(), cx));
+        let dlg = *cx.windows().last().unwrap();
+        cx.update_window(dlg, |_, window, cx| {
+            window.render_frame(cx);
+            let near = |a: Pixels, b: f32| (a.as_f32() - b).abs() < 0.6;
+            let root = window.find("notice-root").bounds();
+            let bar = window.find("title-bar").bounds();
+            assert!(near(bar.size.height, ui::TITLE_H), "标题栏 34");
+            assert!(near(root.size.height, 170.), "窗口高 170");
+            let ok = window.find("ok").bounds();
+            assert!(
+                ok.origin.y + ok.size.height <= root.origin.y + root.size.height,
+                "确定键没被窗口下沿裁掉"
+            );
+            assert!(window.try_find("minimize").is_none(), "提示窗不画最小化");
+        })
+        .unwrap();
+    }
+
+    /// 标题栏换成自绘件后，`×` 这条老交互得留住。缩放（双击）没法在无头里验：
+    /// 测试平台的 `zoom_window` 是 `todo!()`，一按就 panic。
+    #[gpui_kit::test]
+    fn notice_title_bar_close_still_closes(cx: &mut TestAppContext) {
+        isolate_store("notice-bar");
+        let (_handle, _app) = open_app(cx);
+        cx.update(|cx| open_notice(false, "提示", "正文一行".into(), cx));
+        let dlg = *cx.windows().last().unwrap();
+        let n = cx.windows().len();
+        cx.update_window(dlg, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("title-bar-drag").is_some(), "拖动带还在");
+            window.click("title-bar-close", cx);
+        })
+        .unwrap();
+        assert_eq!(cx.windows().len(), n - 1, "标题栏 × 关掉提示窗");
     }
 }

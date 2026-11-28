@@ -210,9 +210,12 @@ impl FilterValueDialog {
                         let me = me.clone();
                         let value = self.distinct[ix].clone();
                         h_flex()
+                            // Zed `ListItem` inset 档：盒外 4、盒内 6、圆角 4
                             .h(px(ui::DIALOG_ROW_H))
                             .items_center()
-                            .pl(px(8.))
+                            .mx(px(ui::ROW_INSET))
+                            .px(px(ui::ROW_PAD_X))
+                            .rounded(px(ui::ROW_RADIUS))
                             .hover(move |this| this.bg(to_hsla(p.hover)))
                             .child(ui::checkbox(
                                 ("dv", ix),

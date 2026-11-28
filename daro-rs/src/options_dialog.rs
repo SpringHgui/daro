@@ -20,7 +20,6 @@ use crate::palette::{self, Palette};
 use crate::zed_icons::{self, ZedIcon};
 use crate::{to_hsla, DaroApp, ui};
 
-const TITLE_H: f32 = 24.;
 /// 侧栏宽度（Zed `SIDEBAR_WIDTH`）
 const NAV_W: f32 = 226.;
 /// 设置窗内容区设计尺寸（另加 24 的自绘标题栏）。
@@ -134,10 +133,10 @@ pub(crate) fn open_options_dialog(parent: Entity<DaroApp>, cx: &mut App) {
     let dark = draft.dark;
     let mut options = ui::dialog_options();
     // 自绘栏只有 24 高，红绿灯要跟着对齐（issue #25）
-    ui::align_traffic_lights(&mut options, TITLE_H);
+    ui::align_traffic_lights(&mut options, ui::TITLE_H);
     options.window_min_size = Some(size(px(720.), px(480.)));
     options.window_bounds = Some(WindowBounds::centered(
-        size(px(CONTENT_SIZE.0), px(CONTENT_SIZE.1 + TITLE_H)),
+        size(px(CONTENT_SIZE.0), px(CONTENT_SIZE.1 + ui::TITLE_H)),
         cx,
     ));
     if let Some(titlebar) = options.titlebar.as_mut() {
@@ -345,24 +344,7 @@ impl OptionsDialog {
 
     fn title_bar(&self) -> impl IntoElement {
         let p = self.pal();
-        TitleBar::new().h(px(TITLE_H)).border_b_0().child(
-            h_flex()
-                .h_full()
-                .items_center()
-                .gap(px(6.))
-                .pl(px(4.))
-                .child(zed_icons::ic(
-                    ZedIcon::Settings,
-                    14.,
-                    to_hsla(p.muted_foreground),
-                ))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(to_hsla(p.foreground))
-                        .child("选项"),
-                ),
-        )
+        crate::ui::dialog_title("选项", Some(zed_icons::ic(ZedIcon::Settings, 14., to_hsla(p.muted_foreground))), self.dark)
     }
 
     fn search_box(&self, has_query: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -436,7 +418,7 @@ impl OptionsDialog {
             .flex_shrink_0()
             .px(px(2.))
             .pb(px(2.))
-            .gap(px(2.))
+            .gap(px(ui::KEY_GAP))
             .items_center()
             .border_t(px(ui::HAIRLINE))
             .border_color(to_hsla(p.border_soft))
@@ -976,17 +958,7 @@ impl OptionsDialog {
 }
 
 fn key_chip(label: &'static str, p: Palette) -> Div {
-    div()
-        .h(px(16.))
-        .px(px(4.))
-        .flex()
-        .items_center()
-        .rounded(px(3.))
-        .border(px(ui::HAIRLINE))
-        .border_color(to_hsla(p.border))
-        .text_size(px(10.))
-        .text_color(to_hsla(p.muted_foreground))
-        .child(label)
+    ui::key_cap(label, to_hsla(p.muted_foreground))
 }
 
 impl Render for OptionsDialog {
@@ -995,7 +967,7 @@ impl Render for OptionsDialog {
         // 建窗时设过的红绿灯位置会被 AppKit 的首次上屏重排顶回去，激活后补设一次。
         if !self.tl_aligned && window.is_window_active() {
             self.tl_aligned = true;
-            ui::reapply_traffic_lights(window, TITLE_H);
+            ui::reapply_traffic_lights(window, ui::TITLE_H);
         }
         v_flex()
             .id("options-root")
@@ -1023,5 +995,45 @@ impl Render for OptionsDialog {
                             .on_click(|_, window, _| window.remove_window()),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod titlebar_tests {
+    use super::*;
+    use crate::ui_test_support::{isolate_store, open_app};
+    use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::TestAppContext;
+
+    /// 对话框标题栏走 `ui::dialog_title`：34 高、一枚 34×34 关闭键、左内距 12
+    /// （gpui-component 的 `TitleBar` 会连着画最小化 / 最大化，对话框不要那两枚）。
+    #[gpui_kit::test]
+    fn options_title_bar_uses_shared_zed_bar(cx: &mut TestAppContext) {
+        isolate_store("options-titlebar");
+        let (_handle, app) = open_app(cx);
+        cx.update(|cx| open_options_dialog(app.clone(), cx));
+        let opt = *cx.windows().last().unwrap();
+        cx.update_window(opt, |_, window, cx| {
+            window.render_frame(cx);
+            let near = |a: Pixels, b: f32| (a.as_f32() - b).abs() < 0.6;
+            let bar = window.find("title-bar").bounds();
+            assert!(near(bar.size.height, ui::TITLE_H), "标题栏高 34");
+            let close = window.find("title-bar-close").bounds();
+            assert!(
+                near(close.size.width, ui::TITLE_H) && near(close.size.height, ui::TITLE_H),
+                "关闭键 34×34"
+            );
+            assert!(
+                near(close.origin.y, bar.origin.y.as_f32())
+                    && near(close.center().y, (bar.origin.y + bar.size.height / 2.).as_f32()),
+                "关闭键在标题栏内纵向居中"
+            );
+            assert!(window.try_find("minimize").is_none(), "不画最小化");
+            assert!(window.try_find("maximize").is_none(), "不画最大化");
+            let drag = window.find("title-bar-drag").bounds();
+            assert!(near(drag.origin.x, bar.origin.x.as_f32()), "拖动带从窗左开始");
+        })
+        .unwrap();
     }
 }

@@ -11,9 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use gpui_kit::component::progress::Progress;
 use gpui_kit::component::*;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::release_notes::ReleaseNotes;
@@ -446,11 +444,13 @@ impl DaroApp {
             .id("update-button")
             .test_support()
             .flex_none()
-            .h(px(20.))
-            .px(px(8.))
-            .gap(px(4.))
+            // Zed `Chip` / `ButtonSize::Compact`：18 高、`px_1` 4、`gap_0p5` 2、
+            // `rounded_sm` 4，图标 XSmall 12、标签 Small 12
+            .h(px(ui::COMPACT_H))
+            .px(px(4.))
+            .gap(px(2.))
             .items_center()
-            .rounded(px(10.))
+            .rounded(px(ui::RADIUS))
             .bg(bg)
             .cursor_pointer()
             .hover(move |s| s.opacity(0.86))
@@ -460,12 +460,12 @@ impl DaroApp {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_update_popover(cx)))
             .child(
                 Icon::new(ZedIcon::Download)
-                    .with_size(px(11.))
+                    .with_size(px(12.))
                     .text_color(fg),
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(fg)
                     .child(label),
             )
@@ -533,13 +533,15 @@ impl DaroApp {
             .top(px(TITLE_H + 4.))
             .right(px(right))
             .w(px(PANEL_W))
-            .p(px(14.))
-            .gap(px(10.))
-            .bg(to_hsla(p.background))
+            // Zed `Popover` 的 `elevation_2`：8 圆角、1px `border_variant` 描边、
+            // ElevatedSurface 双层投影，内容留白 8
+            .p(px(8.))
+            .gap(px(8.))
+            .bg(to_hsla(p.dialog_surface))
             .border(px(1.))
-            .border_color(to_hsla(p.border))
-            .rounded(px(6.))
-            .shadow_lg()
+            .border_color(to_hsla(p.border_soft))
+            .rounded(px(crate::ui::FLOAT_RADIUS))
+            .shadow(crate::ui::float_shadow(self.dark))
             .text_color(fg)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
@@ -559,11 +561,11 @@ impl DaroApp {
                     .child(
                         div()
                             .id("update-popover-close")
-                            .size(px(18.))
+                            .size(px(ui::CONTROL_HIT))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(3.))
+                            .rounded(px(ui::RADIUS))
                             .cursor_pointer()
                             .hover(move |s| s.bg(hover))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -572,7 +574,7 @@ impl DaroApp {
                             }))
                             .child(
                                 Icon::new(ZedIcon::Close)
-                                    .with_size(px(11.))
+                                    .with_size(px(ui::CONTROL_ICON))
                                     .text_color(muted),
                             ),
                     ),
@@ -611,7 +613,7 @@ impl DaroApp {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(muted)
                             .child("发布地址"),
                     )
@@ -619,7 +621,7 @@ impl DaroApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .line_height(px(16.))
                             .text_color(to_hsla(p.accent))
                             .child(url),
@@ -638,17 +640,19 @@ impl DaroApp {
             let value = badge.percent().unwrap_or(0.);
             card = card.child(
                 div().child(
-                    Progress::new("update-badge-progress")
-                        .loading(badge.progress.is_none())
-                        .value(value)
-                        .color(to_hsla(p.accent))
-                        .accessibility_label("更新下载进度"),
+                    ui::progress_bar(
+                        "update-badge-progress",
+                        value,
+                        to_hsla(p.accent),
+                        badge.progress.is_none(),
+                    )
+                    .accessibility_label("更新下载进度"),
                 ),
             );
             if let Some(stats) = badge.stats() {
                 card = card.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(muted)
                         .child(stats),
                 );
@@ -743,13 +747,13 @@ fn kv_row(label: &'static str, value: &str, muted: Hsla, fg: Hsla) -> AnyElement
             div()
                 .w(px(52.))
                 .flex_none()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(muted)
                 .child(label),
         )
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(fg)
                 .child(value.to_string()),
         )
